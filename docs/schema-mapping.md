@@ -31,14 +31,14 @@
 |---|---|---|---|
 | `catalog` | 9 | 9 | **完成** |
 | `collections` | 6 | 0 | 待做 |
-| `discovery` | 5 | 0 | 待做 |
+| `discovery` | 5 | 5 | **完成** |
 | `playback` | 6 | 6 | **完成** |
 | `videos` | 3 | 3 | **完成** |
 | `collections` | 6 | 6 | **完成** |
 | `system` | 5 | 5 | **完成** | 进行中（`User` / `UserRefreshToken` 已映射） |
 | `transfers` | 6 | 6 | **完成** |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **37** | **93%** |
+| **合计** | **40** | **40** | **100%** |
 
 ## 已映射
 
@@ -245,6 +245,7 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
 
 
 
