@@ -41,6 +41,7 @@ pub mod error;
 pub mod playback;
 pub mod repo;
 pub mod system;
+pub mod testing;
 pub mod transfers;
 pub mod videos;
 

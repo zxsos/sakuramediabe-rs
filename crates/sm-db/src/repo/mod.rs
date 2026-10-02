@@ -26,6 +26,6 @@ pub mod download;
 pub mod media;
 pub mod movie;
 
-pub use download::DownloadTaskRepository;
-pub use media::MediaRepository;
+pub use download::{DownloadTaskRepository, NewDownloadTask};
+pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};

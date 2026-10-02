@@ -12,3 +12,8 @@ chrono = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# tests/ 下的集成测试是独立二进制，需要自己的 tokio 运行时。
+tokio = { workspace = true }

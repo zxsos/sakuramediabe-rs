@@ -33,7 +33,7 @@ const ENTITY: &str = "Media";
 /// 插入一条媒体。
 #[derive(Debug, Clone)]
 pub struct NewMedia {
-    pub library_id: i64,
+    pub library_id: i32,
     pub file_name: String,
     pub file_size_bytes: i64,
     /// 指向 `Movie.movie_number`（**字符串**），与 `video_item_id` 恰好其一非空。
@@ -84,7 +84,7 @@ impl MediaRepository {
     }
 
     /// 按主键查询。
-    pub async fn find_by_id(&self, id: i64) -> Result<Option<Media>, DbError> {
+    pub async fn find_by_id(&self, id: i32) -> Result<Option<Media>, DbError> {
         Ok(
             sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = $1")
                 .bind(id)
@@ -94,7 +94,7 @@ impl MediaRepository {
     }
 
     /// 按主键查询，未命中返回 [`DbError::NotFound`]。
-    pub async fn require_by_id(&self, id: i64) -> Result<Media, DbError> {
+    pub async fn require_by_id(&self, id: i32) -> Result<Media, DbError> {
         self.find_by_id(id)
             .await?
             .ok_or_else(|| DbError::not_found(ENTITY, id))
@@ -151,7 +151,7 @@ impl MediaRepository {
     ///
     /// 若本次写入会碰到归属列，先做 XOR 预判再落库 —— 否则错误会以
     /// 外键冲突（409）的形式漏出来，而不是业务错误（422）。
-    pub async fn update(&self, id: i64, mut set: UpdateSet<'_>) -> Result<Media, DbError> {
+    pub async fn update(&self, id: i32, mut set: UpdateSet<'_>) -> Result<Media, DbError> {
         let touches_owner = set
             .fields()
             .iter()
@@ -233,7 +233,7 @@ impl MediaRepository {
     /// 网络抖动、存储暂时不可用都属于可恢复情形。
     pub async fn record_thumbnail_failure(
         &self,
-        id: i64,
+        id: i32,
         error_code: &str,
         next_retry_at: NaiveDateTime,
     ) -> Result<Media, DbError> {
@@ -260,7 +260,7 @@ impl MediaRepository {
     }
 
     /// 标记缩略图生成成功（进入终态）。
-    pub async fn record_thumbnail_success(&self, id: i64) -> Result<Media, DbError> {
+    pub async fn record_thumbnail_success(&self, id: i32) -> Result<Media, DbError> {
         let row = sqlx::query_as::<_, Media>(
             "UPDATE media SET \
                 thumbnail_generation_state = $2, \
