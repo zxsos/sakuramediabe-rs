@@ -5,6 +5,7 @@ edition.workspace = true
 description = "共享类型：错误信封、分页、时间、ID、配置快照"
 
 [dependencies]
+hashing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
