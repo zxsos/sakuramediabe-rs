@@ -33,10 +33,12 @@
 | `collections` | 6 | 0 | 待做 |
 | `discovery` | 5 | 0 | 待做 |
 | `playback` | 6 | 6 | **完成** |
+| `videos` | 3 | 3 | **完成** |
+| `collections` | 6 | 6 | **完成** |
 | `system` | 5 | 2 | 进行中（`User` / `UserRefreshToken` 已映射） |
 | `transfers` | 6 | 0 | 待做 |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **17** | **43%** |
+| **合计** | **40** | **26** | **65%** |
 
 ## 已映射
 
@@ -100,6 +102,43 @@ movie（JAV）或 video_item（非 JAV）之一。已镜像为 `satisfies_owner_
 `MediaPoint` / `MediaClip` 的 `movie_number` 是**快照**，不建外键，
 所以删除影片后时刻点与片段仍可归属与展示。
 
+### `videos` + `collections` 域全部 9 个（完成）
+
+| 模型 | 表 | 关键点 |
+|---|---|---|
+| `VideoItem` | `video_item` | 非 JAV 条目，与 `Movie` 平行 |
+| `VideoCollection` | `video_collection` | 实际在 `videos` 目录，不在 `collections` 域 |
+| `VideoCollectionItem` | `video_collection_item` | 有 `position` |
+| `Playlist` | `playlist` | **唯一有 `kind` 字段** |
+| `PlaylistMovie` | `playlist_movie` | **无 `position`** |
+| `MomentCollection` | `moment_collection` | — |
+| `MomentCollectionItem` | `moment_collection_item` | 指向 `MediaPoint` |
+| `ClipCollection` | `clip_collection` | — |
+| `ClipCollectionItem` | `clip_collection_item` | 指向 `MediaClip` |
+
+**三种合集同构但有三处差异**，迁移时不能当成同一张表：
+
+| | `Playlist` | `MomentCollection` | `ClipCollection` |
+|---|---|---|---|
+| 成员指向 | `Movie`（JAV 影片） | `MediaPoint` | `MediaClip` |
+| **`position`** | **无** | 有 | 有 |
+| **`kind`** | **有** | 无 | 无 |
+
+① `PlaylistMovie` 没有 `position` —— JAV 侧播放顺序只能靠加入先后，
+视频侧与时刻/片段侧都显式维护。`playback_order_key()` 返回类型因此不同
+（`i64` vs `(i32, i64)`）。
+
+② 只有 `Playlist` 有 `kind` 区分系统列表（`recently_played`）。数据库无
+CHECK 约束，脏值只能靠 `is_valid_kind()` 挡住。
+
+③ 三者都有 `(owner_plugin_id, plugin_key)` 唯一索引，但 **NULL 不参与
+唯一约束**，所以它防的是「同一插件重复注册同一 key」，不保证 `name`
+唯一（`name` 自身带 unique）。Rust 侧用 `PluginOwned` trait 统一。
+
+**排序次级键不可省**：`MomentCollectionItem` / `ClipCollectionItem` / 
+`VideoCollectionItem` 都用 `(position, id)` 复合键 —— 删除后重排会让多条
+成员 `position` 相同，只按 `position` 排序会导致播放列表抖动。
+
 ### `catalog` 域全部 9 个（完成）
 
 | 模型 | 表 | 字段数 | 备注 |
@@ -141,6 +180,7 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
 
 
 

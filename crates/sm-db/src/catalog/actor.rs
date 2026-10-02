@@ -167,7 +167,7 @@ pub fn merge_alias_name(primary_name: &str, alias_names: &[&str], existing: &str
     let mut merged: Vec<String> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    let mut push = |candidate: &str, merged: &mut Vec<String>, seen: &mut Vec<String>| {
+    let push = |candidate: &str, merged: &mut Vec<String>, seen: &mut Vec<String>| {
         let normalized = candidate.trim();
         if normalized.is_empty() {
             return;

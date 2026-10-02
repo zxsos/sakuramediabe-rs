@@ -163,7 +163,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hashing_support::hex;
 
     fn at(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).unwrap()
@@ -286,8 +285,6 @@ mod tests {
 
 #[cfg(test)]
 mod cross_check {
-    use super::*;
-
     /// 用 Python hmac/hashlib 独立算出的 HMAC-SHA256，锁定与标准库一致。
     #[test]
     fn hmac_agrees_with_python_stdlib() {
