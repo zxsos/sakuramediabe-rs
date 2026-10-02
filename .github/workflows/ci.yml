@@ -29,10 +29,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --workspace --offline || cargo build --workspace
+        run: cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace --offline || cargo test --workspace
+        run: cargo test --workspace
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -85,8 +85,18 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Build parity CLI
-        run: cargo build --release --offline -p parity-cli || cargo build --release -p parity-cli
+      - name: Build parity binaries
+        run: |
+          # 两个二进制对应两个对拍脚本，缺一不可：
+          #   parity-cli   -> compare.py       (media-file-hash)
+          #   core_parity  -> compare_core.py  (错误信封/分页/认证 DTO)
+          # 用 --release：CI 里不需要调试符号，编译快一倍。
+          cargo build --release -p parity-cli -p sm-core --bin core_parity
+
+      - name: Locate binaries
+        run: |
+          ls -l target/release/parity-cli target/release/core_parity
+
 
       - name: Regenerate bencode fixtures
         run: python parity/gen_bencode_fixtures.py
