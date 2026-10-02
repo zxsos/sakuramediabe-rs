@@ -32,11 +32,11 @@
 | `catalog` | 9 | 9 | **完成** |
 | `collections` | 6 | 0 | 待做 |
 | `discovery` | 5 | 0 | 待做 |
-| `playback` | 6 | 0 | 待做 |
+| `playback` | 6 | 6 | **完成** |
 | `system` | 5 | 2 | 进行中（`User` / `UserRefreshToken` 已映射） |
 | `transfers` | 6 | 0 | 待做 |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **11** | **28%** |
+| **合计** | **40** | **17** | **43%** |
 
 ## 已映射
 
@@ -64,6 +64,41 @@
 ## 非结构信息（schema 之外，但必须保留）
 
 ### `system::User` / `system::UserRefreshToken`（认证链路）
+
+### `playback` 域全部 6 个（完成）
+
+| 模型 | 表 | 关键点 |
+|---|---|---|
+| `MediaLibrary` | `media_library` | `provider_config` 是 JsonTextField |
+| `Media` | `media` | 外键指向 `Movie.movie_number`（字符串） |
+| `MediaThumbnail` | `media_thumbnail` | `(media, offset)` 唯一 |
+| `MediaProgress` | `media_progress` | `media` 唯一（一条 Media 至多一条进度） |
+| `MediaPoint` | `media_point` | 三种删除行为并存 |
+| `MediaClip` | `media_clip` | 独立资产，来源删除后 SET NULL |
+
+**Media 归属不变量**：`movie_number` 与 `video_item_id` 恰好其一非空。
+两者都空或都非空都会被 `Media.save` 拒绝 —— 解耦后一条 Media 归属
+movie（JAV）或 video_item（非 JAV）之一。已镜像为 `satisfies_owner_constraint()`。
+
+**缩略图状态机在 `Media` 而非 `MediaThumbnail`**：后者是成功产物，承担不了失败、
+退避与人工重试。索引 `(thumbnail_generation_state, thumbnail_next_retry_at)`
+决定只有 `retry_wait` 会被退避扫描命中。
+
+**`MediaThumbnail` 比 `MoviePlotImage` 多一个状态**：多出 `SKIPPED = 3`，
+因为非 JAV 媒体的缩略图不参与图像检索向量索引，需要落明确终态
+避免长期滞留 PENDING。两个表的同名字段取值范围不同，不要混用。
+
+**删除行为差异（改动 schema 会破坏语义）**：
+
+| 表 | 关系 | on_delete |
+|---|---|---|
+| `media` | movie / video_item / library | CASCADE |
+| `media_point` | media / thumbnail | SET NULL |
+| `media_point` | image | **RESTRICT** |
+| `media_clip` | media | SET NULL |
+
+`MediaPoint` / `MediaClip` 的 `movie_number` 是**快照**，不建外键，
+所以删除影片后时刻点与片段仍可归属与展示。
 
 ### `catalog` 域全部 9 个（完成）
 
@@ -106,5 +141,6 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
 
 

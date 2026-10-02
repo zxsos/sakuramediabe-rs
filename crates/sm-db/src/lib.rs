@@ -37,9 +37,11 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<Db, sqlx::Error>
 }
 
 pub mod catalog;
+pub mod playback;
 pub mod system;
 
 pub use catalog::actor::Actor;
 pub use catalog::asset::{Image, MovieActor, MoviePlotImage, MovieTag, Subtitle, Tag};
 pub use catalog::movie::{Movie, MovieSeries};
+pub use playback::{Media, MediaClip, MediaLibrary, MediaThumbnail};
 pub use system::user::{RefreshTokenStatus, User, UserRefreshToken};

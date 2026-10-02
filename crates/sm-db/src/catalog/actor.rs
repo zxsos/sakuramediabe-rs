@@ -159,7 +159,7 @@ pub fn split_alias_name(alias_name: &str) -> Vec<&str> {
 /// 3. **大小写不敏感去重**，保留首次出现的写法。
 /// 4. 主名恒排第一位。
 ///
-/// ```
+/// ```text
 /// merge_alias_name("苍井空", &["Aoi", "aoi"], "苍井空 / 空")
 /// // => "苍井空 / Aoi / 空"
 /// ```
