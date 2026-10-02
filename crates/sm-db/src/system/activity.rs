@@ -61,8 +61,8 @@ pub struct BackgroundTaskRun {
     /// 状态，默认 `pending`。
     pub state: String,
     /// 进度三件套。三者都可空 —— 不可量化的任务不填。
-    pub progress_current: Option<i64>,
-    pub progress_total: Option<i64>,
+    pub progress_current: Option<i32>,
+    pub progress_total: Option<i32>,
     pub progress_text: Option<String>,
     /// 结构化结果摘要，`JsonTextField`。
     pub result_summary: Option<String>,
@@ -163,7 +163,7 @@ pub struct SystemNotification {
     /// 事件资源类型。新身份字段。
     pub resource_type: Option<String>,
     /// 事件资源 ID。新身份字段，与 `resource_type` 配对使用。
-    pub resource_id: Option<i64>,
+    pub resource_id: Option<i32>,
     pub is_read: bool,
     pub read_at: Option<NaiveDateTime>,
     /// 关联任务台账。删台账行只置空，通知保留。
@@ -171,7 +171,7 @@ pub struct SystemNotification {
     /// 遗留展示关联类型。
     pub related_resource_type: Option<String>,
     /// 遗留展示关联 ID。
-    pub related_resource_id: Option<i64>,
+    pub related_resource_id: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }

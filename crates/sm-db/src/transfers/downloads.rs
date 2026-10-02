@@ -149,7 +149,7 @@ pub mod import_status {
 #[derive(Debug, Clone, FromRow)]
 pub struct DownloadTask {
     pub id: i64,
-    pub client_id: i64,
+    pub client_id: i32,
     /// 影片番号（**字符串，非外键**）。
     ///
     /// 注释：「影片番号不是 provider 身份，只是宿主业务投影，
@@ -231,9 +231,9 @@ impl DownloadResourceBlacklist {
 pub struct DownloadSubmissionRecord {
     pub id: i64,
     /// 裸整数，无外键约束。
-    pub client_id: i64,
+    pub client_id: i32,
     /// 裸整数，无外键约束。任务删除后成为悬空引用。
-    pub task_id: Option<i64>,
+    pub task_id: Option<i32>,
     pub movie_number: String,
     pub indexer_name: String,
     pub title: String,

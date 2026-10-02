@@ -87,7 +87,7 @@ pub struct Media {
     /// 指向 `Movie.movie_number`（**字符串**，非 id）。
     pub movie_number: Option<String>,
     /// 指向 `VideoItem.id`。
-    pub video_item_id: Option<i64>,
+    pub video_item_id: Option<i32>,
     pub library_id: i64,
 
     /// 不透明存储引用，结构由 provider 定义。`JsonTextField`。
@@ -213,7 +213,7 @@ pub struct MediaPoint {
     /// 来源快照，无外键。
     pub movie_number: Option<String>,
     /// 来源快照，无外键。
-    pub video_item_id: Option<i64>,
+    pub video_item_id: Option<i32>,
     pub offset_seconds: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
@@ -260,7 +260,7 @@ impl MediaClip {
 mod tests {
     use super::*;
 
-    fn demo_media(movie: Option<&str>, video: Option<i64>, state: &str) -> Media {
+    fn demo_media(movie: Option<&str>, video: Option<i32>, state: &str) -> Media {
         Media {
             id: 1,
             movie_number: movie.map(str::to_owned),

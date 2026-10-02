@@ -36,13 +36,13 @@ pub mod image_search_status {
 /// 会话持有查询向量与结果游标，靠 `expires_at` 定期清理。
 #[derive(Debug, Clone, FromRow)]
 pub struct ImageSearchSession {
-    pub id: i64,
+    pub id: i32,
     /// 对外暴露的会话 id，唯一且带索引。
     pub session_id: String,
     /// 状态，默认 `ready`。
     pub status: String,
     /// 每页条数，默认 20。
-    pub page_size: i64,
+    pub page_size: i32,
     /// 结果游标（不透明文本）。首轮为空。
     pub next_cursor: Option<String>,
     /// SigLIP2 查询向量，以 JSON 文本存储浮点数组。
@@ -90,17 +90,17 @@ impl ImageSearchSession {
     }
 
     /// 解析命中的影片 id。
-    pub fn parsed_movie_ids(&self) -> Option<Vec<i64>> {
+    pub fn parsed_movie_ids(&self) -> Option<Vec<i32>> {
         parse_ids(self.movie_ids.as_deref())
     }
 
     /// 解析排除的影片 id。
-    pub fn parsed_exclude_movie_ids(&self) -> Option<Vec<i64>> {
+    pub fn parsed_exclude_movie_ids(&self) -> Option<Vec<i32>> {
         parse_ids(self.exclude_movie_ids.as_deref())
     }
 }
 
-fn parse_ids(raw: Option<&str>) -> Option<Vec<i64>> {
+fn parse_ids(raw: Option<&str>) -> Option<Vec<i32>> {
     let raw = raw?.trim();
     if raw.is_empty() {
         return None;
@@ -114,13 +114,13 @@ fn parse_ids(raw: Option<&str>) -> Option<Vec<i64>> {
 #[derive(Debug, Clone, FromRow)]
 pub struct ImageSearchIndexState {
     /// 恒为 1。
-    pub id: i64,
+    pub id: i32,
     /// 已索引向量集合的嵌入空间标识（Qdrant collection / space id）。
     pub indexed_space_id: String,
 }
 
 /// 单例行的约定 id。
-pub const IMAGE_SEARCH_STATE_ID: i64 = 1;
+pub const IMAGE_SEARCH_STATE_ID: i32 = 1;
 
 impl ImageSearchIndexState {
     /// 该状态行是否为约定的单例行。
@@ -195,7 +195,7 @@ mod tests {
     fn parses_movie_id_lists() {
         let s = session(None, at(10));
         assert_eq!(s.parsed_movie_ids().unwrap(), vec![1, 2, 3]);
-        assert_eq!(s.parsed_exclude_movie_ids().unwrap(), Vec::<i64>::new());
+        assert_eq!(s.parsed_exclude_movie_ids().unwrap(), Vec::<i32>::new());
     }
 
     #[test]

@@ -335,3 +335,93 @@ mod tests {
         );
     }
 }
+
+/// 宏生成类型的列名与表名清单。
+///
+/// 静态解析器（`parity/compare_schema.py`）读的是源码而非宏展开结果，
+/// 所以看不到这些类型的字段。显式导出 `COLUMNS` 与 `TABLE_NAME` 后，
+/// schema 对拍才能覆盖到它们 —— 缺了这一步，三张合集表会游离在
+/// 一致性检查之外。
+pub mod columns {
+    use super::{ClipCollection, ClipCollectionItem, MomentCollection, MomentCollectionItem};
+
+    macro_rules! declare {
+        ($ty:ty, $table:literal, $($col:literal),+ $(,)?) => {
+            impl $ty {
+                /// 对应的数据库表名。
+                pub const TABLE_NAME: &'static str = $table;
+                /// 列名清单，顺序与建表一致。
+                pub const COLUMNS: &'static [&'static str] = &[$($col),+];
+            }
+        };
+    }
+
+    declare!(
+        super::Playlist,
+        "playlist",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "kind",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        MomentCollection,
+        "moment_collection",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        ClipCollection,
+        "clip_collection",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        MomentCollectionItem,
+        "moment_collection_item",
+        "id",
+        "collection_id",
+        "point_id",
+        "position",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        ClipCollectionItem,
+        "clip_collection_item",
+        "id",
+        "collection_id",
+        "clip_id",
+        "position",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        super::PlaylistMovie,
+        "playlist_movie",
+        "id",
+        "playlist_id",
+        "movie_id",
+        "created_at",
+        "updated_at",
+    );
+}
