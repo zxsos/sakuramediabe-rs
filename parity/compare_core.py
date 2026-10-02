@@ -321,12 +321,75 @@ def main() -> int:
             expected["ok"] = "true"
         parity.expect(f"auth/{label}", rust, expected)
 
+
+    print("== 分页参数校验 validate_page ==")
+    for page, size, total in PAGE_VALIDATION_CASES:
+        rust = parity.call("validate-page", {"page": page, "page_size": size, "total": total})
+        expected = py_validate_page(page, size, total)
+        parity.expect(f"validate/{page}-{size}", rust, expected)
+        parity.expect(
+            f"offset/{page}-{size}",
+            rust,
+            {"offset": str(max(page, 1) * 0 + (max(page, 1) - 1) * max(size, 1))},
+        )
+        parity.expect(
+            f"lastpage/{total}-{size}",
+            rust,
+            {"last_page": str(py_last_page(total, size))},
+        )
+
     print()
     total = parity.passed + len(parity.failures)
     print(f"对拍结果：通过 {parity.passed}/{total}，失败 {len(parity.failures)}")
     for failure in parity.failures:
         print(f"  - {failure}")
     return 0 if not parity.failures else 1
+
+
+
+
+PAGE_VALIDATION_CASES = [
+    (1, 20, 100),
+    (1, 1, 1),
+    (1, 100, 100),
+    (9999, 20, 500),
+    (0, 20, 100),
+    (-1, 20, 100),
+    (1, 0, 100),
+    (1, -5, 100),
+    (1, 101, 200),
+    (0, 0, 0),
+]
+
+
+def py_validate_page(page: int, page_size: int, total: int):
+    """照后端 service_helpers.validate_page + paginate 的语义重写。
+
+    后端顺序是先 page 再 page_size，两者都非法时只报 page。
+    """
+    if page <= 0:
+        return {
+            "ok": "false",
+            "code": "invalid_page",
+            "message": "page must be greater than 0",
+            "details": json.dumps({"page": page}, separators=(",", ":")),
+        }
+    if page_size <= 0 or page_size > 100:
+        return {
+            "ok": "false",
+            "code": "invalid_page_size",
+            "message": "page_size must be between 1 and 100",
+            "details": json.dumps({"page_size": page_size}, separators=(",", ":")),
+        }
+    return {"ok": "true"}
+
+def py_last_page(total: int, page_size: int) -> int:
+    """对应 Dart (total / pageSize).ceil()。"""
+    if page_size <= 0:
+        return 0
+    return -(-total // page_size)  # 向上取整
+
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

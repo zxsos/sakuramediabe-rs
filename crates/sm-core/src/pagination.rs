@@ -153,3 +153,159 @@ mod tests {
         assert!(parsed.synced_at.is_none(), "非法时间静默忽略，不报错");
     }
 }
+
+// ══════════════════════════════════════════════════════════════════
+// 分页参数校验
+// ══════════════════════════════════════════════════════════════════
+//
+// 对应后端 `src/common/service_helpers.py` 的 `validate_page` 与 `paginate`。
+//
+// # 后端校验风格不统一（重写时必须留意）
+//
+// 同一个后端里并存三种写法，行为并不完全一致：
+//
+// | 风格 | 出现位置 | 行为 |
+// |---|---|---|
+// | `Query(default=1, ge=1)` | `discovery/hot_actress_releases.py` 等 | FastAPI 参数级校验 |
+// | `validate_page()` | 多数 service | 手工校验，错误码由调用方传入 |
+// | `page: int = 1`（无约束） | `playback/media.py:119` | **不校验** |
+//
+// 统一到 `validate_page` 语义是最安全的选择：它是覆盖面最广的一种，
+// 且错误码由端点自己决定，客户端可按 code 分支。
+//
+// # 不变量
+//
+// - `page` 从 **1** 开始，`offset = (page - 1) * page_size`
+// - `page_size` 上限 **硬编码 100**（不是 `config.max_page_size`，那个字段目前未被使用）
+// - 响应回显**请求的** `page` / `page_size`，不是服务端截断后的值
+// - `total` 是**过滤后**的总数，且在取 offset 之前统计
+
+/// `page_size` 上限。硬编码，与后端 `validate_page` 一致。
+pub const MAX_PAGE_SIZE: i64 = 100;
+
+/// 分页参数校验失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageError {
+    /// `page <= 0`
+    InvalidPage { page: i64 },
+    /// `page_size <= 0` 或 `> 100`
+    InvalidPageSize { page_size: i64 },
+}
+
+impl PageError {
+    /// 对应后端抛出的中文/英文提示原文。
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidPage { .. } => "page must be greater than 0",
+            Self::InvalidPageSize { .. } => "page_size must be between 1 and 100",
+        }
+    }
+
+    /// `details` 内容：后端把出错的字段值原样放进 details。
+    pub fn details(self) -> serde_json::Value {
+        match self {
+            Self::InvalidPage { page } => serde_json::json!({ "page": page }),
+            Self::InvalidPageSize { page_size } => serde_json::json!({ "page_size": page_size }),
+        }
+    }
+}
+
+/// 校验分页参数。`error_code` 由端点自行决定，对应后端的 `error_code` 形参。
+pub fn validate_page(page: i64, page_size: i64) -> Result<(), PageError> {
+    if page <= 0 {
+        return Err(PageError::InvalidPage { page });
+    }
+    if page_size <= 0 || page_size > MAX_PAGE_SIZE {
+        return Err(PageError::InvalidPageSize { page_size });
+    }
+    Ok(())
+}
+
+/// 计算 SQL OFFSET，对应后端 `paginate` 的 `(page - 1) * page_size`。
+///
+/// 调用前应先 `validate_page`，否则 `page <= 0` 会得到负 offset。
+pub fn page_offset(page: i64, page_size: i64) -> i64 {
+    (page - 1) * page_size
+}
+
+/// 计算客户端 `fetchAllPagesConcurrently` 会请求的最后一页（1-based）。
+///
+/// 对应 Dart 的 `(total / pageSize).ceil()`。
+pub fn last_page(total: i64, page_size: i64) -> i64 {
+    if page_size <= 0 {
+        return 0;
+    }
+    total.div_euclid(page_size) + i64::from(total.rem_euclid(page_size) != 0)
+}
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_valid_range() {
+        assert!(validate_page(1, 1).is_ok());
+        assert!(validate_page(1, MAX_PAGE_SIZE).is_ok());
+        assert!(validate_page(9999, 20).is_ok());
+    }
+
+    #[test]
+    fn rejects_non_positive_page() {
+        for page in [0, -1, -100] {
+            assert_eq!(
+                validate_page(page, 20),
+                Err(PageError::InvalidPage { page }),
+                "page={page}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_page_size() {
+        for size in [0, -1, MAX_PAGE_SIZE + 1, 1000] {
+            assert_eq!(
+                validate_page(1, size),
+                Err(PageError::InvalidPageSize { page_size: size }),
+                "size={size}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_is_checked_before_page_size() {
+        // 后端顺序是先 page 再 page_size，两个都非法时只报 page。
+        assert_eq!(
+            validate_page(0, 0),
+            Err(PageError::InvalidPage { page: 0 })
+        );
+    }
+
+    #[test]
+    fn error_details_carry_offending_value() {
+        let error = validate_page(-1, 20).unwrap_err();
+        assert_eq!(error.message(), "page must be greater than 0");
+        assert_eq!(error.details(), serde_json::json!({"page": -1}));
+
+        let error = validate_page(1, 101).unwrap_err();
+        assert_eq!(error.message(), "page_size must be between 1 and 100");
+        assert_eq!(error.details(), serde_json::json!({"page_size": 101}));
+    }
+
+    #[test]
+    fn offset_is_one_based() {
+        assert_eq!(page_offset(1, 20), 0);
+        assert_eq!(page_offset(2, 20), 20);
+        assert_eq!(page_offset(4, 25), 75);
+    }
+
+    #[test]
+    fn last_page_matches_dart_ceil() {
+        // Dart: (total / pageSize).ceil()
+        assert_eq!(last_page(7, 2), 4);
+        assert_eq!(last_page(8, 2), 4);
+        assert_eq!(last_page(0, 20), 0);
+        assert_eq!(last_page(1, 20), 1);
+        assert_eq!(last_page(100, 20), 5);
+        assert_eq!(last_page(101, 20), 6);
+        assert_eq!(last_page(50, 0), 0, "page_size 非法时不返回页数");
+    }
+}

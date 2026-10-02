@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 use serde_json::json;
+use sm_core::pagination::{last_page, page_offset, validate_page, PageError};
 use sm_core::{ApiError, AuthTokens, Paginated};
 
 fn emit(fields: &[(&str, String)]) {
@@ -71,6 +72,37 @@ fn main() {
                     ]);
                 }
             }
+        }
+        "validate-page" => {
+            let page = body.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
+            let size = body.get("page_size").and_then(|v| v.as_i64()).unwrap_or(20);
+            match validate_page(page, size) {
+                Ok(()) => emit(&[("ok", "true".to_owned())]),
+                Err(error) => {
+                    let (code, message, details) = match error {
+                        PageError::InvalidPage { page } => (
+                            "invalid_page",
+                            "page must be greater than 0",
+                            serde_json::json!({ "page": page }).to_string(),
+                        ),
+                        PageError::InvalidPageSize { page_size } => (
+                            "invalid_page_size",
+                            "page_size must be between 1 and 100",
+                            serde_json::json!({ "page_size": page_size }).to_string(),
+                        ),
+                    };
+                    emit(&[
+                        ("ok", "false".to_owned()),
+                        ("code", code.to_owned()),
+                        ("message", message.to_owned()),
+                        ("details", details),
+                    ]);
+                }
+            }
+            emit(&[
+                ("offset", page_offset(page.max(1), size.max(1)).to_string()),
+                ("last_page", last_page(body.get("total").and_then(|v| v.as_i64()).unwrap_or(0), size).to_string()),
+            ]);
         }
         "make-error" => {
             let code = args.next().unwrap_or_else(|| "e".to_owned());
