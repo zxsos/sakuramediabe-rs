@@ -90,8 +90,12 @@ jobs:
           # 两个二进制对应两个对拍脚本，缺一不可：
           #   parity-cli   -> compare.py       (media-file-hash)
           #   core_parity  -> compare_core.py  (错误信封/分页/认证 DTO)
-          # 用 --release：CI 里不需要调试符号，编译快一倍。
-          cargo build --release -p parity-cli -p sm-core --bin core_parity
+          #
+          # 必须是两条独立命令：`--bin core_parity` 会把选择器限定到那个
+          # 二进制，写成 `-p parity-cli -p sm-core --bin core_parity` 时
+          # parity-cli 会被静默跳过，然后下一步 ls 才报「文件不存在」。
+          cargo build --release -p parity-cli
+          cargo build --release -p sm-core --bin core_parity
 
       - name: Locate binaries
         run: |
