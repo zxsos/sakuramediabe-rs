@@ -41,11 +41,13 @@ pub mod collections;
 pub mod playback;
 pub mod videos;
 pub mod system;
+pub mod transfers;
 
 pub use catalog::actor::Actor;
 pub use catalog::asset::{Image, MovieActor, MoviePlotImage, MovieTag, Subtitle, Tag};
 pub use catalog::movie::{Movie, MovieSeries};
 pub use collections::{ClipCollection, ClipCollectionItem, MomentCollection, MomentCollectionItem, Playlist, PlaylistMovie};
 pub use playback::{Media, MediaClip, MediaLibrary, MediaThumbnail};
+pub use transfers::{DownloadClient, DownloadSubmissionRecord, DownloadTask, Indexer};
 pub use videos::{VideoCollection, VideoCollectionItem, VideoItem};
 pub use system::user::{RefreshTokenStatus, User, UserRefreshToken};

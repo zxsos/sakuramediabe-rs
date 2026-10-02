@@ -35,10 +35,10 @@
 | `playback` | 6 | 6 | **完成** |
 | `videos` | 3 | 3 | **完成** |
 | `collections` | 6 | 6 | **完成** |
-| `system` | 5 | 2 | 进行中（`User` / `UserRefreshToken` 已映射） |
-| `transfers` | 6 | 0 | 待做 |
+| `system` | 5 | 5 | **完成** | 进行中（`User` / `UserRefreshToken` 已映射） |
+| `transfers` | 6 | 6 | **完成** |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **26** | **65%** |
+| **合计** | **40** | **37** | **93%** |
 
 ## 已映射
 
@@ -139,6 +139,71 @@ CHECK 约束，脏值只能靠 `is_valid_kind()` 挡住。
 `VideoCollectionItem` 都用 `(position, id)` 复合键 —— 删除后重排会让多条
 成员 `position` 相同，只按 `position` 排序会导致播放列表抖动。
 
+### `transfers` + `system` 剩余 9 个（完成）
+
+| 模型 | 表 | 关键点 |
+|---|---|---|
+| `DownloadClient` | `download_client` | provider_config 不透明 |
+| `Indexer` | `indexer` | `api_key` 为空则不带 apikey 参数 |
+| `IndexerDownloadClient` | `indexer_download_client` | 多对多，`(indexer, client)` 唯一 |
+| `DownloadTask` | `download_task` | **两个独立状态机** |
+| `DownloadSubmissionRecord` | `download_submission_record` | **裸整数，非外键** |
+| `DownloadResourceBlacklist` | `download_resource_blacklist` | 40 位 v1 info hash |
+| `BackgroundTaskRun` | `background_task_run` | **任务队列 + 租约回收** |
+| `SystemNotification` | `system_notification` | 新旧两套关联字段并存 |
+| `SchemaMigration` | `schema_migration` | **无 created_at/updated_at** |
+
+**① `DownloadTask` 有两个互不相干的状态机**
+
+| 列 | 归属 | 默认值 |
+|---|---|---|
+| `state` | provider 的远端下载状态 | `queued` |
+| `import_status` | 宿主自己的导入流程 | `pending` |
+
+源码注释：「导入是宿主自己的业务流程，不能与 provider 的远端状态混用」。
+合并成一个 status 列会丢掉「下载完了但导入失败」这个真实存在的状态组合 ——
+`is_stuck_after_download()` 就是为这个组合准备的。
+
+**② `download_submission_record` 用裸整数而非外键**
+
+`client_id` / `task_id` 都是 `IntegerField` 而非 `ForeignKeyField`。
+注释：「保留提交历史，不随下载任务或下载器删除」。若在迁移时
+「顺手」改成真外键 + CASCADE，提交历史会被连带删除，而这正是该表
+存在的意义。`is_orphaned()` 标记任务已删但记录仍在的情形。
+
+**③ `background_task_run` 是任务队列，不是日志表**
+
+表头注释：「pending 行即队列元素；lease_expires_at 过期即可回收」。
+配套索引 `(state, scheduled_at)` 服务于领取路径：
+
+```sql
+WHERE state = 'pending' AND scheduled_at <= now ORDER BY id
+```
+
+`mutex_key` 是**单列唯一索引**（NULL 不参与唯一约束，故多个无互斥
+需求的任务可共存）。租约过期回收是必需机制 —— 没有它，崩溃的
+worker 会让任务永久卡在 `running`。`is_stale_lease()` 检这个状态。
+
+**④ `system_notification` 新旧两套关联字段并存**
+
+| 用途 | 字段 |
+|---|---|
+| 事件身份 | `event_type` / `resource_type` / `resource_id` |
+| 展示关联（遗留） | `related_resource_type` / `related_resource_id` / `related_task_run_id` |
+
+源码注释：「事件身份与展示关联分离：旧 related_resource_* 继续服务现有 API」。
+这是过渡期的有意设计，合并会破坏现有 API 契约。
+
+**⑤ `SchemaMigration` 是全库唯一没有 `TimestampedMixin` 的表**
+
+它继承 `BaseModel` 而非 `TimestampedMixin`，所以**没有 `created_at` /
+`updated_at`**，只有一个 `applied_at`。迁移记录只追加，语义上不需要
+「创建时间」与「更新时间」之分。Rust 侧的 `applied_at` 因此是非 `Option`。
+
+**待对齐**：`task_state` 的终态字面量（`succeeded` / `failed`）在
+`src/model/` 下没有常量定义，只有 `pending` 可从源码取证。实际字面量由
+service 层决定，迁移服务层时需与上游核对。
+
 ### `catalog` 域全部 9 个（完成）
 
 | 模型 | 表 | 字段数 | 备注 |
@@ -180,6 +245,7 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
 
 
 
