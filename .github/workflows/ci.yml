@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 定期重跑是为了发现「上游自己改了模型」——本仓库的 push 触发不了这种漂移。
+  schedule:
+    # 每周一 03:17 UTC。上游是个人项目，周更节奏比日更现实。
+    - cron: '17 3 * * 1'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --offline || cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace --offline || cargo test --workspace
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # 与上游 Peewee 模型逐字段比对。这是本仓库与上游之间唯一的自动防线：
+  # 40 张表的列名、类型、可空性一旦漂移，本仓库的读路径就会静默拿不到值。
+  schema-parity:
+    name: parity / schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 上游 pyproject 要求 >=3.10,<3.11。契约解析只用 ast，但对齐上游
+          # 解释器版本能避免语法边界的意外差异。
+          python-version: '3.10'
+
+      - name: Checkout upstream backend
+        run: |
+          # 只取最新一次提交：契约比对只关心模型的当前形状，不关心历史。
+          git clone --depth 1 https://github.com/tinypinglite/sakuramediabe.git /tmp/backend
+          echo "upstream model files: $(find /tmp/backend/src/model -name '*.py' | wc -l)"
+
+      - name: Schema contract parity
+        env:
+          PEEWEE_ROOT: /tmp/backend/src/model
+          SM_DB_SRC: ${{ github.workspace }}/crates/sm-db/src
+        run: |
+          # 失败意味着列名、类型或可空性发生了漂移。
+          python parity/compare_schema.py
+
+      - name: Dump contract
+        if: always()
+        run: |
+          PEEWEE_ROOT=/tmp/backend/src/model python parity/schema_contract.py \
+            --out contract.json
+          cat contract.json
+
+  # Rust 与 Python 双跑，逐条比对算法结果。
+  algo-parity:
+    name: parity / algorithms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build parity CLI
+        run: cargo build --release --offline -p parity-cli || cargo build --release -p parity-cli
+
+      - name: Regenerate bencode fixtures
+        run: python parity/gen_bencode_fixtures.py
+
+      - name: "Parity: media-file-hash"
+        run: python parity/compare.py
+
+      - name: "Parity: core primitives"
+        run: python parity/compare_core.py
