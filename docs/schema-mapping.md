@@ -29,14 +29,14 @@
 
 | 域 | 模型数 | 已完成 | 状态 |
 |---|---|---|---|
-| `catalog` | 9 | 1 | 进行中（`Movie` / `MovieSeries` 已映射） |
+| `catalog` | 9 | 9 | **完成** |
 | `collections` | 6 | 0 | 待做 |
 | `discovery` | 5 | 0 | 待做 |
 | `playback` | 6 | 0 | 待做 |
 | `system` | 5 | 2 | 进行中（`User` / `UserRefreshToken` 已映射） |
 | `transfers` | 6 | 0 | 待做 |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **4** | **10%** |
+| **合计** | **40** | **11** | **28%** |
 
 ## 已映射
 
@@ -65,6 +65,28 @@
 
 ### `system::User` / `system::UserRefreshToken`（认证链路）
 
+### `catalog` 域全部 9 个（完成）
+
+| 模型 | 表 | 字段数 | 备注 |
+|---|---|---|---|
+| `Movie` | `movie` | 40 | 样板：字段主权 + CHECK 约束 |
+| `MovieSeries` | `movie_series` | 4 | |
+| `Actor` | `actor` | 24 | `birthday` 是 **date** 不是 timestamp |
+| `Image` | `image` | 4 | `origin` 前缀索引 |
+| `Tag` | `tag` | 4 | |
+| `MovieActor` | `movie_actor` | 3 | `(movie,actor)` 唯一 |
+| `MovieTag` | `movie_tag` | 3 | `(movie,tag)` 唯一 |
+| `MoviePlotImage` | `movie_plot_image` | 4 | 图搜索引状态 0/1/2 |
+| `Subtitle` | `subtitle` | 4 | `(movie,file_path)` 唯一 |
+
+映射时确认的细节：
+
+- **`birthday` 是 `DateField`**（PostgreSQL `date`），不是 `DateTimeField`。用错类型会让 sqlx 按 timestamptz 解码。
+- **别名合并是大小写不敏感去重**：`merge_alias_name` 用 `casefold` 判重但保留首次写法，主名恒排首位。读时按 `/` 拆分，写时用 ` / ` 连接。
+- **墓碑指针 `merged_into` 可能成环**（并发合并被打断），`resolve_canonical_ids` 带环检测，停在当前记录而非死循环。
+- **`Actor` 的受护栏字段比插件白名单多 5 个**：`field_owners` / `mutation_revision` / `display_name_override` / `profile_image_override` / `merged_into` 受护栏约束但不可被插件写。
+- **`gender` 只接受 1 和 2**，0 表示未知；`ACTOR_FIELD_ALLOWED_VALUES` 明确限定。
+
 这两张表是认证状态的唯一持久化位置。确认的细节：
 
 - `status` 列存**字符串**（`active` / `revoked` / `expired`），不是数字。改成整数枚举会让既有数据无法反序列化。
@@ -84,4 +106,5 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
 
