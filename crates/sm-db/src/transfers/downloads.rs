@@ -162,7 +162,12 @@ pub struct DownloadTask {
     /// provider 的远端状态，默认 `queued`。
     pub state: String,
     /// 0.0 – 1.0，由 provider 汇报。
-    pub progress: f32,
+    ///
+    /// 必须是 `f64` 而非 `f32`：DDL 里是 `double precision`（float8），
+    /// 而 sqlx 的 `f32: Decode` 走 `decode_float4`，读 float8 列会报类型
+    /// 不匹配。对拍脚本曾把 f32 一并映射成 float8，所以这个错误能通过
+    /// L1、只在集成测试才暴露。
+    pub progress: f64,
     /// 结构由**同 bundle 的 storage provider** 定义，不是 client 的。
     pub completed_source_ref: Option<String>,
     /// 宿主导入状态，默认 `pending`。

@@ -39,6 +39,7 @@ pub mod common;
 pub mod discovery;
 pub mod error;
 pub mod playback;
+pub mod repo;
 pub mod system;
 pub mod transfers;
 pub mod videos;

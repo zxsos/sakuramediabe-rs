@@ -52,7 +52,7 @@ pub struct ImageSearchSession {
     /// 排除的影片 id 列表，JSON 数组。
     pub exclude_movie_ids: Option<String>,
     /// 相似度阈值。为空表示不设下限。
-    pub score_threshold: Option<f32>,
+    pub score_threshold: Option<f64>,
     /// 过期时刻，有索引 —— 清理任务按它扫。
     pub expires_at: NaiveDateTime,
     pub created_at: Option<NaiveDateTime>,

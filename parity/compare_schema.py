@@ -13,13 +13,19 @@
   String / Option<String>          -> text
   i32 / Option<i32>                -> int4
   i64 / Option<i64>                -> int8
-  f32 / Option<f32>                -> float8
+  f64 / Option<f64>                -> float8
   bool                            -> bool
   NaiveDateTime / Option<...>      -> timestamp
   NaiveDate / Option<...>          -> date
   Json / Option<Json>              -> jsonb
   JsonText                        -> text/json
   Vec<u8>                         -> bytea
+
+注意 f32 刻意不在映射表里：Peewee 的 FloatField 一律是 double precision
+(float8)，对应 Rust 的 f64。f32 是 4 字节，PostgreSQL 里对应 real(float4)，
+上游没有任何一列用到它。把 f32 也映射成 float8 会让对拍通过，但 sqlx 的
+`f32: Decode` 走的是 decode_float4，运行时读 float8 列会报类型不匹配 ——
+那正是「对拍通过但集成测试失败」的静默缺陷。
 
 用法：
     python compare_schema.py            # 打印全部差异
@@ -44,7 +50,6 @@ TYPE_MAP = {
     "String": "text",
     "i32": "int4",
     "i64": "int8",
-    "f32": "float8",
     "f64": "float8",
     "bool": "bool",
     "NaiveDateTime": "timestamp",

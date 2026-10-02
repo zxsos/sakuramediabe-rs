@@ -101,9 +101,9 @@ impl FieldGuard {
     ///
     /// 批量更新时**不做部分写入** —— 宁可整批失败，也不要写进去一半：
     /// 那会留下「title 更新了但 is_blacklisted 没更新」的不一致状态。
-    pub fn check_all(
+    pub fn check_all<'a>(
         &self,
-        fields: impl IntoIterator<Item = &'static str>,
+        fields: impl IntoIterator<Item = &'a str>,
         source: WriteSource,
     ) -> Result<(), DbError> {
         for field in fields {
