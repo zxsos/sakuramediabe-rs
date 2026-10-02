@@ -33,10 +33,10 @@
 | `collections` | 6 | 0 | 待做 |
 | `discovery` | 5 | 0 | 待做 |
 | `playback` | 6 | 0 | 待做 |
-| `system` | 5 | 0 | 待做 |
+| `system` | 5 | 2 | 进行中（`User` / `UserRefreshToken` 已映射） |
 | `transfers` | 6 | 0 | 待做 |
 | `videos` | 3 | 0 | 待做 |
-| **合计** | **40** | **2** | **5%** |
+| **合计** | **40** | **4** | **10%** |
 
 ## 已映射
 
@@ -63,6 +63,16 @@
 
 ## 非结构信息（schema 之外，但必须保留）
 
+### `system::User` / `system::UserRefreshToken`（认证链路）
+
+这两张表是认证状态的唯一持久化位置。确认的细节：
+
+- `status` 列存**字符串**（`active` / `revoked` / `expired`），不是数字。改成整数枚举会让既有数据无法反序列化。
+- 未知状态**不降级为 `active`**。`from_str_lossy` 返回 `Option`，遇 `None` 必须拒绝 —— 降级会让已失效令牌被当成有效令牌，这是认证绕过。
+- 刷新令牌是**轮换**模型：`replaced_by_token_id` 指向接替者，`revoked_at` 记录吊销时刻。
+- `client_ip` / `user_agent` 必须保留（审计留痕），不能因为「日志里也有」就省掉。
+- `password_hash` / `token_hash` **永不返回给客户端**。
+
 Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 
 | 行为 | 位置 | 说明 |
@@ -74,3 +84,4 @@ Peewee 模型里有一批**行为**不在表结构中，重写时不能丢：
 | 排序索引 | `movie_release_date_sort` 等 | `DESC NULLS LAST` 与排序表达式同向 |
 
 这些属于 service 层职责，已在 `sm-db` 的类型注释中标注，实现时逐条落地。
+
