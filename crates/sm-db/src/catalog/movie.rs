@@ -25,7 +25,7 @@ pub mod field_owner {
 /// `movie_series` 表。对应 Peewee 的 `MovieSeries`。
 #[derive(Debug, Clone, FromRow)]
 pub struct MovieSeries {
-    pub id: i64,
+    pub id: i32,
     /// Peewee 在 save 前统一 strip，避免同一系列产生重复实体。
     pub name: String,
     pub created_at: Option<NaiveDateTime>,
@@ -38,7 +38,7 @@ pub struct MovieSeries {
 /// 外键在 PostgreSQL 中是 `<field>_id` 整数列，故此处为 `*_id: Option<i64>`。
 #[derive(Debug, Clone, FromRow)]
 pub struct Movie {
-    pub id: i64,
+    pub id: i32,
 
     /// JavDB ID。空串在 save 时归一为 NULL。
     pub javdb_id: Option<String>,

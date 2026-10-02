@@ -15,7 +15,7 @@ use sqlx::FromRow;
 /// 继承 `BaseModel` 而非 `TimestampedMixin`，因此无时间戳列。
 #[derive(Debug, Clone, FromRow)]
 pub struct SchemaMigration {
-    pub id: i64,
+    pub id: i32,
     /// 迁移名称，全局唯一且带索引。启动时按此判定是否已应用。
     pub name: String,
     /// 应用时刻，默认取当前 UTC。

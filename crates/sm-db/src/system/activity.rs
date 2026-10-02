@@ -45,7 +45,7 @@ pub mod task_state {
 /// `background_task_run` 表：后台任务台账兼队列。
 #[derive(Debug, Clone, FromRow)]
 pub struct BackgroundTaskRun {
-    pub id: i64,
+    pub id: i32,
     /// 任务类型键，与 `task_name` 配合定位处理器。
     pub task_key: String,
     /// 人类可读的任务名。
@@ -145,7 +145,7 @@ pub mod notification_category {
 /// 新旧两套并存是过渡期的有意设计，合并会破坏现有 API 契约。
 #[derive(Debug, Clone, FromRow)]
 pub struct SystemNotification {
-    pub id: i64,
+    pub id: i32,
     /// 通知分类，有索引。
     pub category: String,
     pub title: String,

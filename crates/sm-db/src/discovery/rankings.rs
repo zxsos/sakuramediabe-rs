@@ -21,7 +21,7 @@ use sqlx::FromRow;
 /// `ranking_item` 表：来自外部榜单的排名条目。
 #[derive(Debug, Clone, FromRow)]
 pub struct RankingItem {
-    pub id: i64,
+    pub id: i32,
     /// 数据源标识（如 `javdb`）。
     pub source_key: String,
     /// 榜单标识。
@@ -67,7 +67,7 @@ impl RankingItem {
 /// **每天一批，生成前清空** —— 见模块文档关于 `rank` 唯一索引的说明。
 #[derive(Debug, Clone, FromRow)]
 pub struct DailyRecommendationItem {
-    pub id: i64,
+    pub id: i32,
     /// 快照日期。**`DateField` 而非 `DateTimeField`**，无时间部分。
     pub snapshot_date: NaiveDate,
     /// 指向 `Movie`（JAV 影片）。**唯一** —— 一部电影在表里至多一条。
@@ -146,7 +146,7 @@ pub mod moment_strategy {
 /// 依据没了推荐仍然成立，只是失去可解释性。
 #[derive(Debug, Clone, FromRow)]
 pub struct MomentRecommendation {
-    pub id: i64,
+    pub id: i32,
     /// 名次，**全表唯一**（与 `daily_recommendation_item.rank` 同理）。
     pub rank: i32,
     /// 综合得分。

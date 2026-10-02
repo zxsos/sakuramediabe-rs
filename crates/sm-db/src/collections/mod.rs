@@ -52,7 +52,7 @@ macro_rules! owned_collection {
         #[doc = $doc]
         #[derive(Debug, Clone, FromRow)]
         pub struct $name {
-            pub id: i64,
+            pub id: i32,
             /// 全局唯一。
             pub name: String,
             pub description: String,
@@ -142,7 +142,7 @@ pub fn is_system_playlist_kind(kind: &str) -> bool {
 /// **本表没有 `position` 字段** —— 唯一索引是 `(playlist, movie)`。
 #[derive(Debug, Clone, FromRow)]
 pub struct PlaylistMovie {
-    pub id: i64,
+    pub id: i32,
     pub playlist_id: i64,
     /// 指向 `Movie`（JAV 影片）。注意 `Movie` 有 `movie_number` 字段，
     /// 但这个外键指向的是它的 `id`。
@@ -156,7 +156,7 @@ impl PlaylistMovie {
     ///
     /// **本表没有 `position`**，顺序只能靠 `id` —— 即加入播放列表的先后。
     /// 这与 `MomentCollectionItem` / `ClipCollectionItem` 不同。
-    pub fn playback_order_key(&self) -> i64 {
+    pub fn playback_order_key(&self) -> i32 {
         self.id
     }
 }
@@ -167,7 +167,7 @@ macro_rules! ordered_collection_item {
         #[doc = $doc]
         #[derive(Debug, Clone, FromRow)]
         pub struct $name {
-            pub id: i64,
+            pub id: i32,
             pub collection_id: i64,
             pub $field: i64,
             /// 显式播放顺序。
@@ -181,7 +181,7 @@ macro_rules! ordered_collection_item {
             ///
             /// `id` 作为次级键是必要的 —— 删除后重排会让多条成员 `position`
             /// 相同，只按 `position` 排序时顺序不确定，会导致播放列表抖动。
-            pub fn playback_order_key(&self) -> (i32, i64) {
+            pub fn playback_order_key(&self) -> (i32, i32) {
                 (self.position, self.id)
             }
         }

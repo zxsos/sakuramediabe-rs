@@ -50,7 +50,7 @@ pub const GENDER_ALLOWED: [i32; 2] = [GENDER_FEMALE, GENDER_MALE];
 /// `actor` 表。
 #[derive(Debug, Clone, FromRow)]
 pub struct Actor {
-    pub id: i64,
+    pub id: i32,
 
     /// JavDB ID。空串在 save 时归一为 NULL。
     pub javdb_id: Option<String>,

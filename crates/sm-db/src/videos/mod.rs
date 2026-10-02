@@ -22,7 +22,7 @@ use sqlx::FromRow;
 /// 与 `Movie` 完全平行 —— 文件都归 `Media`，区别是没有番号与外部元数据。
 #[derive(Debug, Clone, FromRow)]
 pub struct VideoItem {
-    pub id: i64,
+    pub id: i32,
     /// `save` 会做 `strip()`，所以库里不会有纯空白标题。
     pub title: String,
     pub summary: String,
@@ -50,7 +50,7 @@ impl VideoItem {
 /// 与 JAV 的 `Playlist` 平行，但语义更简单 —— 不参与刮削与订阅。
 #[derive(Debug, Clone, FromRow)]
 pub struct VideoCollection {
-    pub id: i64,
+    pub id: i32,
     /// 全局唯一。
     pub name: String,
     pub description: String,
@@ -70,9 +70,9 @@ impl VideoCollection {
 /// 唯一索引 `(collection, video_item)` —— 同一个视频不能在一个合集里出现两次。
 #[derive(Debug, Clone, FromRow)]
 pub struct VideoCollectionItem {
-    pub id: i64,
+    pub id: i32,
     pub collection_id: i64,
-    pub video_item_id: i64,
+    pub video_item_id: i32,
     /// 显式播放顺序。JAV 侧的 `PlaylistMovie` 缺此字段。
     pub position: i32,
     pub created_at: Option<NaiveDateTime>,
@@ -84,7 +84,7 @@ impl VideoCollectionItem {
     ///
     /// `id` 作为次级键是必要的：删除后重排会让多条成员 `position` 相同，
     /// 只按 `position` 排序时顺序不确定，会导致播放列表抖动。
-    pub fn playback_order_key(&self) -> (i32, i64) {
+    pub fn playback_order_key(&self) -> (i32, i32) {
         (self.position, self.id)
     }
 }

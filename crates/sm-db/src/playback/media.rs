@@ -22,7 +22,7 @@ use sqlx::FromRow;
 /// `provider_config` 是 `JsonTextField` —— JSON 以**文本**存储，空串视为 `None`。
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaLibrary {
-    pub id: i64,
+    pub id: i32,
     /// 库名全局唯一（`unique + index`）。
     pub name: String,
     /// 决定用哪个 provider 实现来解释 `provider_config`。
@@ -82,7 +82,7 @@ pub mod thumbnail_state {
 /// `media` 表。
 #[derive(Debug, Clone, FromRow)]
 pub struct Media {
-    pub id: i64,
+    pub id: i32,
 
     /// 指向 `Movie.movie_number`（**字符串**，非 id）。
     pub movie_number: Option<String>,
@@ -169,7 +169,7 @@ pub mod image_search_index_status {
 /// 唯一索引 `(media, offset)`，保证同一时刻点不重复产出。
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaThumbnail {
-    pub id: i64,
+    pub id: i32,
     pub media_id: i64,
     pub image_id: i64,
     /// 距片头的秒数。
@@ -184,7 +184,7 @@ pub struct MediaThumbnail {
 /// `media` 上有唯一索引，一条 Media 至多一条进度。
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaProgress {
-    pub id: i64,
+    pub id: i32,
     pub media_id: i64,
     pub position_seconds: i32,
     pub last_watched_at: Option<NaiveDateTime>,
@@ -205,7 +205,7 @@ pub struct MediaProgress {
 /// `movie_number` / `video_item_id` 是**快照**，不建外键。
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaPoint {
-    pub id: i64,
+    pub id: i32,
     pub media_id: Option<i64>,
     pub thumbnail_id: Option<i64>,
     /// 删图会被数据库拒绝（RESTRICT）。
@@ -227,7 +227,7 @@ pub struct MediaPoint {
 /// 这正是期望行为。
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaClip {
-    pub id: i64,
+    pub id: i32,
     pub media_id: Option<i64>,
     /// 来源快照，便于来源删除后仍可归属与展示。
     pub movie_number: Option<String>,

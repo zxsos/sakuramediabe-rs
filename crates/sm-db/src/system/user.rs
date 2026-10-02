@@ -50,7 +50,7 @@ impl std::fmt::Display for RefreshTokenStatus {
 /// `users` 表。
 #[derive(Debug, Clone, FromRow)]
 pub struct User {
-    pub id: i64,
+    pub id: i32,
     pub username: String,
     /// argon2 哈希。**永不返回给客户端**。
     pub password_hash: String,
@@ -65,7 +65,7 @@ pub struct User {
 /// `revoked_at` 记录吊销时刻，`client_ip` / `user_agent` 用于审计。
 #[derive(Debug, Clone, FromRow)]
 pub struct UserRefreshToken {
-    pub id: i64,
+    pub id: i32,
     /// 对外下发的令牌标识（非哈希值）。唯一。
     pub token_id: String,
     /// 令牌哈希。**永不返回给客户端**。
