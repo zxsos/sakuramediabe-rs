@@ -6,6 +6,9 @@ description = "共享类型：错误信封、分页、时间、ID、配置快照
 
 [dependencies]
 hashing = { workspace = true }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
