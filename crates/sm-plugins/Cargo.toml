@@ -1,0 +1,13 @@
+[package]
+name = "sm-plugins"
+version = "0.1.0"
+description = "插件宿主：进程管理、gRPC 客户端、能力注册表"
+
+[dependencies]
+sm-core = { workspace = true }
+sm-plugin-api = { workspace = true }
+sm-db = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

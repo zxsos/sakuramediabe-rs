@@ -1,0 +1,17 @@
+[package]
+name = "sm-plugin-api"
+version = "0.1.0"
+description = "SakuraMedia 插件 gRPC 契约（prost/tonic 生成）"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = "0.14"
+prost = { workspace = true }
+prost-types = { workspace = true }
+protoc-bin-vendored = "3"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"

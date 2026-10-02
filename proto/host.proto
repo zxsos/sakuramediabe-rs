@@ -1,0 +1,449 @@
+syntax = "proto3";
+
+package sakuramedia.v1;
+
+import "google/protobuf/struct.proto";
+
+// ══════════════════════════════════════════════════════════════════
+// 宿主提供给插件的能力（对应 Python 的 PluginContext）
+// ══════════════════════════════════════════════════════════════════
+//
+// 迁移自 plugin-development.md 里 PluginContext 的稳定能力清单。
+// 语义要点全部保留：
+//   · get() 找不到返回 NOT_FOUND，插件据此返回 None
+//   · 分页用 after_id 游标，limit 上限 1000
+//   · patch() 走乐观并发（expected_revision），冲突返回 false 且整次零修改
+//   · 字段归属：plugin:<id> 或 host:manual，插件只能写未接管或自己持有的字段
+
+// ── 影片 ────────────────────────────────────────────────────────
+
+message MovieSnapshot {
+  int64 movie_id = 1;
+  int64 revision = 2;
+  map<string, google.protobuf.Value> values = 3;
+  repeated string owners = 4;
+  repeated ActorSnapshot actors = 5;
+  repeated TagSnapshot tags = 6;
+}
+
+message TagSnapshot {
+  int64 tag_id = 1;
+  string name = 2;
+}
+
+message ActorSnapshot {
+  int64 actor_id = 1;
+  int64 revision = 2;
+  map<string, google.protobuf.Value> values = 3;
+  repeated string owners = 4;
+}
+
+message GetMovieRequest { int64 movie_id = 1; }
+message GetMovieResponse { MovieSnapshot movie = 1; }
+
+message FindByNumbersRequest { repeated string movie_numbers = 1; }
+message FindByNumbersResponse { repeated MovieSnapshot movies = 1; }
+
+message ListMoviesRequest {
+  // 游标分页，上限 1000。
+  int64 after_id = 1;
+  int32 limit = 2;
+  // 筛选条件，结构对应 MovieQueryFilters。
+  optional google.protobuf.Struct filters = 3;
+}
+message ListMoviesResponse {
+  repeated MovieSnapshot movies = 1;
+  optional int64 next_cursor = 2;
+}
+
+message PatchMovieRequest {
+  int64 movie_id = 1;
+  map<string, google.protobuf.Value> fields = 2;
+  int64 expected_revision = 3;
+}
+message PatchMovieResponse { bool updated = 1; }
+
+// ── 演员 ────────────────────────────────────────────────────────
+
+message GetActorRequest { int64 actor_id = 1; }
+message GetActorResponse { ActorSnapshot actor = 1; }
+
+message ListActorsRequest {
+  int64 after_id = 1;
+  int32 limit = 2;
+  optional google.protobuf.Struct filters = 3;
+}
+message ListActorsResponse {
+  repeated ActorSnapshot actors = 1;
+  optional int64 next_cursor = 2;
+}
+
+message PatchActorRequest {
+  int64 actor_id = 1;
+  map<string, google.protobuf.Value> fields = 2;
+  int64 expected_revision = 3;
+}
+message PatchActorResponse { bool updated = 1; }
+
+// ── 订阅 ────────────────────────────────────────────────────────
+
+message SubscriptionSnapshot {
+  int64 movie_id = 1;
+  string movie_number = 2;
+  string status = 3;
+  bool searched = 4;
+}
+
+message ListSubscriptionsRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+}
+message ListSubscriptionsResponse {
+  repeated SubscriptionSnapshot subscriptions = 1;
+  int32 total = 2;
+}
+
+message CountSubscriptionsByStatusRequest {}
+message CountSubscriptionsByStatusResponse {
+  map<string, int32> counts = 1;
+}
+
+message SetSubscriptionRequest {
+  string movie_number = 1;
+  bool subscribed = 2;
+}
+message SetSubscriptionResponse { bool ok = 1; }
+
+message ResetSubscriptionSearchRequest {
+  // 为空表示重置全部订阅的搜索状态。
+  repeated int64 movie_ids = 1;
+}
+message ResetSubscriptionSearchResponse { int32 reset_count = 1; }
+
+// ── 通知 ────────────────────────────────────────────────────────
+
+message CreateNotificationRequest {
+  string dedupe_key = 1;
+  string title = 2;
+  string body = 3;
+  string level = 4;
+  optional google.protobuf.Struct payload = 5;
+}
+message CreateNotificationResponse { int64 notification_id = 1; }
+
+message ListNotificationsRequest {
+  // 按 ID 升序增量读取，上限 100。
+  int64 after_id = 1;
+  int32 limit = 2;
+}
+message ListNotificationsResponse {
+  repeated google.protobuf.Struct notifications = 1;
+  optional int64 next_cursor = 2;
+}
+
+message ResolveNotificationRequest { string dedupe_key = 1; }
+message ResolveNotificationResponse { bool resolved = 1; }
+
+// ── 合集（playlist / moment / clip / video）────────────────────
+
+message CollectionRef {
+  int64 collection_id = 1;
+  // 合集类型：playlist | moment | clip | video
+  string collection_type = 2;
+  string key = 3;
+  string name = 4;
+}
+
+message EnsureCollectionRequest {
+  string collection_type = 1;
+  string key = 2;
+  string name = 3;
+  optional string description = 4;
+}
+message EnsureCollectionResponse { CollectionRef collection = 1; }
+
+message SetCollectionMembersRequest {
+  string collection_type = 1;
+  string key = 2;
+  // 成员 id 列表；设置时会替换全部成员。
+  repeated int64 member_ids = 3;
+}
+message SetCollectionMembersResponse { int32 replaced_count = 1; }
+
+message AddVideoItemsRequest {
+  int64 collection_id = 1;
+  repeated int64 video_ids = 2;
+}
+message AddVideoItemsResponse { int32 added_count = 1; }
+
+message RemoveVideoItemsRequest {
+  int64 collection_id = 1;
+  repeated int64 video_ids = 2;
+}
+message RemoveVideoItemsResponse { int32 removed_count = 1; }
+
+// ── 字幕 ────────────────────────────────────────────────────────
+
+message SubtitleAsset {
+  int64 subtitle_id = 1;
+  string file_name = 2;
+  string format = 3;
+  int64 size_bytes = 4;
+  string created_at = 5;
+}
+
+message ListSubtitlesRequest { int64 movie_id = 1; }
+message ListSubtitlesResponse { repeated SubtitleAsset subtitles = 1; }
+
+message ReadSubtitleRequest {
+  int64 movie_id = 1;
+  int64 subtitle_id = 2;
+}
+message ReadSubtitleResponse {
+  bytes content = 1;
+  // 本次读取内容的指纹。
+  string sha256 = 2;
+}
+
+message ImportSubtitleRequest {
+  string movie_number = 1;
+  bytes content = 2;
+  string file_name = 3;
+  optional string language = 4;
+}
+message ImportSubtitleResponse {
+  // imported | duplicate | movie_not_found | invalid_format
+  string status = 1;
+  int64 subtitle_id = 2;
+}
+
+// ── 媒体 ────────────────────────────────────────────────────────
+
+message MediaSnapshot {
+  int64 media_id = 1;
+  int64 movie_id = 2;
+  string movie_number = 3;
+  int64 library_id = 4;
+  string library_name = 5;
+  string provider_key = 6;
+  string file_name = 7;
+  string resolution = 8;
+  int64 file_size_bytes = 9;
+  int64 duration_seconds = 10;
+  bool valid = 11;
+  optional google.protobuf.Struct video_info = 12;
+}
+
+message ListMediaRequest {
+  int64 movie_id = 1;
+  optional int64 library_id = 2;
+}
+message ListMediaResponse { repeated MediaSnapshot medias = 1; }
+
+message MediaPresence {
+  int64 movie_id = 1;
+  // 存在任意 Media 记录（含 valid=false）。
+  bool has_any = 2;
+  // 至少有一条 valid=true。
+  bool has_playable = 3;
+}
+
+message PresenceRequest {
+  repeated int64 movie_ids = 1;
+  optional int64 library_id = 2;
+}
+message PresenceResponse { repeated MediaPresence presence = 1; }
+
+// ── 下载 ────────────────────────────────────────────────────────
+
+message DownloadTarget {
+  int64 download_client_id = 1;
+  int64 library_id = 2;
+  string library_name = 3;
+  string provider_key = 4;
+  string display_name = 5;
+  // 绑定顺序即默认路由优先级；插件不能依赖返回顺序判断优先级。
+  int32 binding_order = 6;
+}
+
+message ListDownloadTargetsRequest {}
+message ListDownloadTargetsResponse { repeated DownloadTarget targets = 1; }
+
+message SearchCandidatesRequest {
+  string movie_number = 1;
+  // pt | movie 等
+  string indexer_kind = 2;
+  // 为空表示由宿主按索引器-下载器绑定顺序自动路由。
+  optional int64 download_client_id = 3;
+}
+message SearchCandidatesResponse {
+  repeated google.protobuf.Struct candidates = 1;
+}
+
+message SubmitDownloadRequest {
+  string movie_number = 1;
+  // 必须来自 search_candidates 的结果，宿主会校验其 download_client_id。
+  google.protobuf.Struct candidate = 2;
+  optional int64 download_client_id = 3;
+}
+message SubmitDownloadResponse {
+  string task_id = 1;
+  string state = 2;
+}
+
+// ── 导入 ────────────────────────────────────────────────────────
+
+message PluginLibrary {
+  int64 library_id = 1;
+  string name = 2;
+  string provider_key = 3;
+}
+
+message ListLibrariesRequest {}
+message ListLibrariesResponse { repeated PluginLibrary libraries = 1; }
+
+message BrowseLibraryRequest {
+  // 支持 id 或名称（名称唯一）。
+  string library = 1;
+  optional google.protobuf.Struct parent_ref = 2;
+  optional string cursor = 3;
+  int32 limit = 4;
+}
+message BrowseLibraryResponse {
+  repeated google.protobuf.Struct entries = 1;
+  optional string next_cursor = 2;
+}
+
+message EnqueueImportRequest {
+  // jav | video
+  string media_kind = 1;
+  string library = 2;
+  // 必须来自 browse() 的条目，由该库的 provider 解释。
+  google.protobuf.Struct source_ref = 3;
+  optional int64 collection_id = 4;
+  // keep | delete_after_commit
+  string source_disposition = 5;
+}
+message EnqueueImportResponse {
+  string task_run_id = 1;
+  string task_key = 2;
+  string state = 3;
+}
+
+message GetImportStatusRequest { string task_run_id = 1; }
+message GetImportStatusResponse {
+  string state = 1;
+  int32 imported_count = 2;
+  int32 skipped_count = 3;
+  int32 failed_count = 4;
+  repeated int64 created_video_ids = 5;
+  repeated int64 created_movie_ids = 6;
+  optional string error_message = 7;
+}
+
+// ── 普通视频 ────────────────────────────────────────────────────
+
+message VideoSnapshot {
+  int64 video_id = 1;
+  string title = 2;
+  string summary = 3;
+  string release_date = 4;
+  int32 media_count = 5;
+  bool has_playable = 6;
+  repeated int64 collection_ids = 7;
+  string created_at = 8;
+  string updated_at = 9;
+}
+
+message GetVideoRequest { int64 video_id = 1; }
+message GetVideoResponse { VideoSnapshot video = 1; }
+
+message ListVideosRequest {
+  int64 after_id = 1;
+  int32 limit = 2;
+}
+message ListVideosResponse {
+  repeated VideoSnapshot videos = 1;
+  optional int64 next_cursor = 2;
+}
+
+// ── 杂项 ────────────────────────────────────────────────────────
+
+message ImportMovieByNumberRequest {
+  string movie_number = 1;
+  bool force_subscribed = 2;
+}
+message ImportMovieByNumberResponse {
+  MovieSnapshot movie = 1;
+  bool created = 2;
+}
+
+message ListMovieNumbersRequest {}
+message ListMovieNumbersResponse { repeated string movie_numbers = 1; }
+
+message SyncRankingSourcesRequest {}
+message SyncRankingSourcesResponse { int32 synced_count = 1; }
+
+// ══════════════════════════════════════════════════════════════════
+// Service 定义（由宿主实现，插件作为客户端调用）
+// ══════════════════════════════════════════════════════════════════
+
+service PluginHost {
+  // ── 影片 ──
+  rpc GetMovie(GetMovieRequest) returns (GetMovieResponse);
+  rpc FindMoviesByNumbers(FindByNumbersRequest) returns (FindByNumbersResponse);
+  rpc ListMovies(ListMoviesRequest) returns (ListMoviesResponse);
+  rpc PatchMovie(PatchMovieRequest) returns (PatchMovieResponse);
+
+  // ── 演员 ──
+  rpc GetActor(GetActorRequest) returns (GetActorResponse);
+  rpc ListActors(ListActorsRequest) returns (ListActorsResponse);
+  rpc PatchActor(PatchActorRequest) returns (PatchActorResponse);
+
+  // ── 订阅 ──
+  rpc ListSubscriptions(ListSubscriptionsRequest) returns (ListSubscriptionsResponse);
+  rpc CountSubscriptionsByStatus(CountSubscriptionsByStatusRequest) returns (CountSubscriptionsByStatusResponse);
+  rpc SetSubscription(SetSubscriptionRequest) returns (SetSubscriptionResponse);
+  rpc ResetSubscriptionSearch(ResetSubscriptionSearchRequest) returns (ResetSubscriptionSearchResponse);
+
+  // ── 通知（幂等键自动带插件命名空间，插件间不会互相覆盖）──
+  rpc CreateNotification(CreateNotificationRequest) returns (CreateNotificationResponse);
+  rpc CreateNotificationOnce(CreateNotificationRequest) returns (CreateNotificationResponse);
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+  rpc ResolveNotification(ResolveNotificationRequest) returns (ResolveNotificationResponse);
+
+  // ── 合集 ──
+  rpc EnsureCollection(EnsureCollectionRequest) returns (EnsureCollectionResponse);
+  rpc SetCollectionMembers(SetCollectionMembersRequest) returns (SetCollectionMembersResponse);
+  rpc AddVideoItems(AddVideoItemsRequest) returns (AddVideoItemsResponse);
+  rpc RemoveVideoItems(RemoveVideoItemsRequest) returns (RemoveVideoItemsResponse);
+
+  // ── 字幕 ──
+  rpc ListSubtitles(ListSubtitlesRequest) returns (ListSubtitlesResponse);
+  rpc ReadSubtitle(ReadSubtitleRequest) returns (ReadSubtitleResponse);
+  rpc ImportSubtitle(ImportSubtitleRequest) returns (ImportSubtitleResponse);
+
+  // ── 媒体 ──
+  rpc ListMedia(ListMediaRequest) returns (ListMediaResponse);
+  rpc PresenceForMovies(PresenceRequest) returns (PresenceResponse);
+
+  // ── 下载 ──
+  rpc ListDownloadTargets(ListDownloadTargetsRequest) returns (ListDownloadTargetsResponse);
+  rpc SearchDownloadCandidates(SearchCandidatesRequest) returns (SearchCandidatesResponse);
+  rpc SubmitDownload(SubmitDownloadRequest) returns (SubmitDownloadResponse);
+
+  // ── 导入 ──
+  rpc ListLibraries(ListLibrariesRequest) returns (ListLibrariesResponse);
+  rpc BrowseLibrary(BrowseLibraryRequest) returns (BrowseLibraryResponse);
+  rpc EnqueueImport(EnqueueImportRequest) returns (EnqueueImportResponse);
+  rpc GetImportStatus(GetImportStatusRequest) returns (GetImportStatusResponse);
+
+  // ── 视频 ──
+  rpc GetVideo(GetVideoRequest) returns (GetVideoResponse);
+  rpc ListVideos(ListVideosRequest) returns (ListVideosResponse);
+
+  // ── 杂项 ──
+  rpc ImportMovieByNumber(ImportMovieByNumberRequest) returns (ImportMovieByNumberResponse);
+  rpc ListExistingMovieNumbers(ListMovieNumbersRequest) returns (ListMovieNumbersResponse);
+  rpc SyncRankingSources(SyncRankingSourcesRequest) returns (SyncRankingSourcesResponse);
+}

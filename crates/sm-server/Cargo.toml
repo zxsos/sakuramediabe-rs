@@ -1,0 +1,16 @@
+[package]
+name = "sm-server"
+version = "0.1.0"
+description = "组合根：单进程同时承载 API(8000) 与调度器"
+
+[dependencies]
+sm-core = { workspace = true }
+sm-db = { workspace = true }
+sm-api = { workspace = true }
+sm-scheduler = { workspace = true }
+sm-plugins = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+config = { workspace = true }
