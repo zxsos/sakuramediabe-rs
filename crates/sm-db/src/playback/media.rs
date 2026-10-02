@@ -346,10 +346,10 @@ mod tests {
         assert!(image_search_index_status::is_terminal(
             image_search_index_status::SUCCESS
         ));
-        assert!(image_search_index_status::is_terminal(
-            image_search_index_status::SKIPPED
-        ),
-            "跳过也是终态，否则会长期滞留");
+        assert!(
+            image_search_index_status::is_terminal(image_search_index_status::SKIPPED),
+            "跳过也是终态，否则会长期滞留"
+        );
         assert!(!image_search_index_status::is_terminal(
             image_search_index_status::PENDING
         ));
@@ -392,12 +392,12 @@ mod tests {
             updated_at: None,
         };
 
+        assert_eq!(make(Some("  ")).parsed_config(), None, "空白文本视为 None");
         assert_eq!(
-            make(Some("  ")).parsed_config(),
+            make(Some("not json")).parsed_config(),
             None,
-            "空白文本视为 None"
+            "非法 JSON 视为 None"
         );
-        assert_eq!(make(Some("not json")).parsed_config(), None, "非法 JSON 视为 None");
 
         let parsed = make(Some(r#"{"root":"/data"}"#)).parsed_config().unwrap();
         assert_eq!(parsed["root"], "/data");

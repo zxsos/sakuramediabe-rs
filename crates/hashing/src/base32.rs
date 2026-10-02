@@ -23,9 +23,15 @@ impl fmt::Display for Base32Error {
             Self::InvalidCharacter {
                 character,
                 position,
-            } => write!(f, "invalid base32 character {character:?} at position {position}"),
+            } => write!(
+                f,
+                "invalid base32 character {character:?} at position {position}"
+            ),
             Self::DataAfterPadding { position } => {
-                write!(f, "base32 data character after padding at position {position}")
+                write!(
+                    f,
+                    "base32 data character after padding at position {position}"
+                )
             }
             Self::InvalidLength { length } => {
                 write!(f, "invalid base32 payload length {length}")

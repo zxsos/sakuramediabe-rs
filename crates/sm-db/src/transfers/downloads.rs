@@ -193,8 +193,7 @@ impl DownloadTask {
     ///
     /// 只有把两个状态机分开建模，才能表达这个组合。
     pub fn is_stuck_after_download(&self) -> bool {
-        self.state == download_state::COMPLETED
-            && self.import_status == import_status::FAILED
+        self.state == download_state::COMPLETED && self.import_status == import_status::FAILED
     }
 }
 
@@ -301,7 +300,10 @@ mod tests {
     fn indexer_apikey_presence_is_protocol_level() {
         // Torznab 允许无鉴权索引器，此时请求不能带 apikey 参数。
         assert!(!indexer("bt", None).requires_apikey());
-        assert!(!indexer("bt", Some("   ")).requires_apikey(), "空白视同无 key");
+        assert!(
+            !indexer("bt", Some("   ")).requires_apikey(),
+            "空白视同无 key"
+        );
         assert!(indexer("bt", Some("k")).requires_apikey());
     }
 
@@ -354,7 +356,9 @@ mod tests {
             "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
         ));
         assert!(!DownloadResourceBlacklist::is_valid_info_hash("abc"));
-        assert!(!DownloadResourceBlacklist::is_valid_info_hash(&"z".repeat(40)));
+        assert!(!DownloadResourceBlacklist::is_valid_info_hash(
+            &"z".repeat(40)
+        ));
         assert!(
             !DownloadResourceBlacklist::is_valid_info_hash(&"a".repeat(64)),
             "v2 是 64 位 hex，本表存不下 —— svc-hash 上游已提前拒绝 v2-only"

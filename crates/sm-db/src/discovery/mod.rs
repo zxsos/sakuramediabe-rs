@@ -8,6 +8,4 @@ pub mod rankings;
 pub use image_search::{
     image_search_status, ImageSearchIndexState, ImageSearchSession, IMAGE_SEARCH_STATE_ID,
 };
-pub use rankings::{
-    DailyRecommendationItem, MomentRecommendation, MomentSeedKind, RankingItem,
-};
+pub use rankings::{DailyRecommendationItem, MomentRecommendation, MomentSeedKind, RankingItem};

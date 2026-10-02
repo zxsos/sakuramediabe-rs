@@ -5,6 +5,6 @@
 pub mod media;
 
 pub use media::{
-    image_search_index_status, thumbnail_state, Media, MediaClip, MediaLibrary,
-    MediaPoint, MediaProgress, MediaThumbnail,
+    image_search_index_status, thumbnail_state, Media, MediaClip, MediaLibrary, MediaPoint,
+    MediaProgress, MediaThumbnail,
 };

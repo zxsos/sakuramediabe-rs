@@ -82,11 +82,11 @@ pub fn encode_access_token(user_id: i64, expires_at: DateTime<Utc>, secret: &str
     let payload = serde_json::to_vec(&claims).unwrap_or_default();
 
     let mut signing_input = base64url(header);
-    signing_input.push_str(".");
+    signing_input.push('.');
     signing_input.push_str(&base64url(&payload));
     let signature = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
     let mut token = signing_input;
-    token.push_str(".");
+    token.push('.');
     token.push_str(&base64url(&signature));
     token
 }
@@ -181,7 +181,10 @@ mod tests {
     fn header_is_exact_minimal_form() {
         let token = encode_access_token(1, at(1_800_000_000), "k");
         let raw = base64url_decode(token.split(".").next().unwrap()).unwrap();
-        assert_eq!(String::from_utf8(raw).unwrap(), r#"{"alg":"HS256","typ":"JWT"}"#);
+        assert_eq!(
+            String::from_utf8(raw).unwrap(),
+            r#"{"alg":"HS256","typ":"JWT"}"#
+        );
     }
 
     #[test]
@@ -189,12 +192,7 @@ mod tests {
         let token = encode_access_token(7, at(1_800_000_000), "k");
         let raw = base64url_decode(token.split(".").nth(1).unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        let mut keys: Vec<String> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, vec!["exp", "sub", "type"], "不引入 iat/nbf/iss/aud");
         assert_eq!(value["sub"], "7", "sub 必须是字符串形式");
@@ -252,8 +250,14 @@ mod tests {
 
     #[test]
     fn rejects_malformed() {
-        assert_eq!(decode_access_token("onepart", "k", at(0)), Err(JwtError::Malformed));
-        assert_eq!(decode_access_token("a.b.c.d", "k", at(0)), Err(JwtError::Malformed));
+        assert_eq!(
+            decode_access_token("onepart", "k", at(0)),
+            Err(JwtError::Malformed)
+        );
+        assert_eq!(
+            decode_access_token("a.b.c.d", "k", at(0)),
+            Err(JwtError::Malformed)
+        );
     }
 
     #[test]
@@ -262,22 +266,21 @@ mod tests {
         let header = base64url(br#"{"alg":"none","typ":"JWT"}"#);
         let payload = base64url(br#"{"sub":"1","type":"access","exp":1800000000}"#);
         let token = format!("{header}.{payload}.");
-        assert!(
-            matches!(
-                decode_access_token(&token, "k", at(1_700_000_000)),
-                Err(JwtError::SignatureMismatch) | Err(JwtError::Base64)
-            ),
-        );
+        assert!(matches!(
+            decode_access_token(&token, "k", at(1_700_000_000)),
+            Err(JwtError::SignatureMismatch) | Err(JwtError::Base64)
+        ),);
     }
 
     fn sign_raw(payload: &[u8], secret: &str) -> String {
         let header = base64url(br#"{"alg":"HS256","typ":"JWT"}"#);
         let mut signing_input = header;
-        signing_input.push_str(".");
+        signing_input.push('.');
         signing_input.push_str(&base64url(payload));
-        let signature = crate::hashing_support::hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
+        let signature =
+            crate::hashing_support::hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
         let mut token = signing_input;
-        token.push_str(".");
+        token.push('.');
         token.push_str(&base64url(&signature));
         token
     }

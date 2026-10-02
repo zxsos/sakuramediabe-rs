@@ -52,7 +52,11 @@ pub enum HashError {
     /// 声明的文件大小与数据源实际大小不一致。
     SizeMismatch { declared: u64, actual: u64 },
     /// 在指定偏移未能读满请求长度。
-    ShortRead { offset: u64, requested: u64, actual: usize },
+    ShortRead {
+        offset: u64,
+        requested: u64,
+        actual: usize,
+    },
     /// 读取过程中数据源发生了可观测的变化（仅文件路径场景会检测）。
     SourceChanged,
     /// 底层 IO 失败。
@@ -63,7 +67,10 @@ impl fmt::Display for HashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SizeMismatch { declared, actual } => {
-                write!(f, "media size mismatch: declared={declared} actual={actual}")
+                write!(
+                    f,
+                    "media size mismatch: declared={declared} actual={actual}"
+                )
             }
             Self::ShortRead {
                 offset,
@@ -247,12 +254,10 @@ impl RandomAccessRead for SliceSource {
     }
 
     fn read_exact_at(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, HashError> {
-        let end = offset
-            .checked_add(length)
-            .ok_or(HashError::SizeMismatch {
-                declared: u64::MAX,
-                actual: self.data.len() as u64,
-            })?;
+        let end = offset.checked_add(length).ok_or(HashError::SizeMismatch {
+            declared: u64::MAX,
+            actual: self.data.len() as u64,
+        })?;
         if end > self.data.len() as u64 {
             return Err(HashError::ShortRead {
                 offset,
@@ -347,10 +352,7 @@ pub fn compute_file_hash(
     let actual = source.size()?;
     if let Some(declared) = expected_size {
         if declared != actual {
-            return Err(HashError::SizeMismatch {
-                declared,
-                actual,
-            });
+            return Err(HashError::SizeMismatch { declared, actual });
         }
     }
 
@@ -498,7 +500,10 @@ mod tests {
         assert_ne!(slots.slot_1, slots.slot_2);
         assert!(slots.slot_1 < slot_count);
         assert!(slots.slot_2 < slot_count);
-        assert_eq!(slots.offset_1, HEAD_TAIL_BYTES + slots.slot_1 * MIDDLE_BYTES);
+        assert_eq!(
+            slots.offset_1,
+            HEAD_TAIL_BYTES + slots.slot_1 * MIDDLE_BYTES
+        );
     }
 
     #[test]

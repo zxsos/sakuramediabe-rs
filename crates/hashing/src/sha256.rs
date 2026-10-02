@@ -84,7 +84,12 @@ impl Sha256 {
             self.compress(&block);
             self.buffered = 0;
         }
-        for slot in self.buffer.iter_mut().skip(self.buffered).take(56 - self.buffered) {
+        for slot in self
+            .buffer
+            .iter_mut()
+            .skip(self.buffered)
+            .take(56 - self.buffered)
+        {
             *slot = 0;
         }
         self.buffer[56..64].copy_from_slice(&length_bits.to_be_bytes());
@@ -107,8 +112,9 @@ impl Sha256 {
             let s0 = words[index - 15].rotate_right(7)
                 ^ words[index - 15].rotate_right(18)
                 ^ (words[index - 15] >> 3);
-            let s1 =
-                words[index - 2].rotate_right(17) ^ words[index - 2].rotate_right(19) ^ (words[index - 2] >> 10);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
             words[index] = words[index - 16]
                 .wrapping_add(s0)
                 .wrapping_add(words[index - 7])
@@ -139,11 +145,7 @@ impl Sha256 {
             a = temp1.wrapping_add(temp2);
         }
 
-        for (slot, value) in self
-            .state
-            .iter_mut()
-            .zip([a, b, c, d, e, f, g, h])
-        {
+        for (slot, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *slot = slot.wrapping_add(value);
         }
     }
@@ -164,11 +166,7 @@ mod tests {
             for chunk in data.chunks(chunk_size) {
                 hasher.update(chunk);
             }
-            assert_eq!(
-                hex(&hasher.finalize()),
-                one_shot,
-                "chunk_size={chunk_size}"
-            );
+            assert_eq!(hex(&hasher.finalize()), one_shot, "chunk_size={chunk_size}");
         }
     }
 
@@ -178,7 +176,11 @@ mod tests {
             let data = vec![b'x'; length];
             let mut hasher = Sha256::new();
             hasher.update(&data);
-            assert_eq!(hex(&hasher.finalize()), sha256_hex(&data), "length={length}");
+            assert_eq!(
+                hex(&hasher.finalize()),
+                sha256_hex(&data),
+                "length={length}"
+            );
         }
     }
 }

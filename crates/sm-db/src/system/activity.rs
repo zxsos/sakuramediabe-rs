@@ -42,7 +42,6 @@ pub mod task_state {
     }
 }
 
-
 /// `background_task_run` 表：后台任务台账兼队列。
 #[derive(Debug, Clone, FromRow)]
 pub struct BackgroundTaskRun {
@@ -89,10 +88,7 @@ impl BackgroundTaskRun {
     /// 对应队列查询 `state = 'pending' AND scheduled_at <= now`。
     /// `scheduled_at` 为 NULL 视为立即可领。
     pub fn is_claimable(&self, now: NaiveDateTime) -> bool {
-        self.state == task_state::PENDING
-            && self
-                .scheduled_at
-                .is_none_or(|at| at <= now)
+        self.state == task_state::PENDING && self.scheduled_at.is_none_or(|at| at <= now)
     }
 
     /// 是否持有租约。
@@ -209,10 +205,17 @@ mod tests {
     use chrono::NaiveDate;
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
-    fn run(state: &str, scheduled: Option<NaiveDateTime>, lease: Option<NaiveDateTime>) -> BackgroundTaskRun {
+    fn run(
+        state: &str,
+        scheduled: Option<NaiveDateTime>,
+        lease: Option<NaiveDateTime>,
+    ) -> BackgroundTaskRun {
         BackgroundTaskRun {
             id: 1,
             task_key: "probe".to_owned(),
@@ -341,7 +344,10 @@ mod tests {
     fn reports_read_flag_timestamp_mismatch() {
         let mut n = note();
         n.is_read = true;
-        assert!(n.read_state_inconsistent(), "先置标记再补时间是常见两步写法");
+        assert!(
+            n.read_state_inconsistent(),
+            "先置标记再补时间是常见两步写法"
+        );
         n.read_at = Some(at(2026, 10, 2, 12, 0));
         assert!(!n.read_state_inconsistent());
         n.is_read = false;

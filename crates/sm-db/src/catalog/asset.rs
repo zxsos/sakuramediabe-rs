@@ -8,7 +8,6 @@ use sqlx::FromRow;
 /// `image` 表。
 ///
 /// 影片资产按目录前缀查询 `origin`（`LIKE '目录/%'`），因此有
-
 /// `image_origin_pattern` 索引（`text_pattern_ops`，按字节序比较），
 /// 保证前缀匹配走索引扫描而非全表扫。
 #[derive(Debug, Clone, FromRow)]
@@ -108,9 +107,9 @@ mod tests {
         assert!(!image_search_index_status::is_terminal(
             image_search_index_status::PENDING
         ));
-        assert!(!image_search_index_status::is_terminal(
-            image_search_index_status::FAILED
-        ),
-            "失败状态需要重试，不算终态");
+        assert!(
+            !image_search_index_status::is_terminal(image_search_index_status::FAILED),
+            "失败状态需要重试，不算终态"
+        );
     }
 }

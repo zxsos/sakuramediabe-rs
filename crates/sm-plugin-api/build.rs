@@ -13,7 +13,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("crate 位于 <workspace>/crates/<name>")
         .to_path_buf();
 
-    let protos = ["common.proto", "storage.proto", "plugin.proto", "host.proto"];
+    let protos = [
+        "common.proto",
+        "storage.proto",
+        "plugin.proto",
+        "host.proto",
+    ];
     let inputs: Vec<std::path::PathBuf> = protos
         .iter()
         .map(|name| root.join("proto").join(name))

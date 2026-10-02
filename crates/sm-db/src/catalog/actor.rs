@@ -254,8 +254,15 @@ mod tests {
     #[test]
     fn protected_fields_match_backend_whitelist() {
         let mut expected = vec![
-            "gender", "birthday", "height_cm", "bust_cm", "waist_cm",
-            "hips_cm", "cup", "birthplace", "blood_type",
+            "gender",
+            "birthday",
+            "height_cm",
+            "bust_cm",
+            "waist_cm",
+            "hips_cm",
+            "cup",
+            "birthplace",
+            "blood_type",
         ];
         expected.sort_unstable();
         let mut actual = PROTECTED_ACTOR_FIELDS.to_vec();
@@ -330,8 +337,16 @@ mod tests {
     #[test]
     fn age_counts_whole_years_relative_to_today() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
-        assert_eq!(demo_actor(Some("1990-10-02")).age_on(today), Some(36), "生日当天算满岁");
-        assert_eq!(demo_actor(Some("1990-10-03")).age_on(today), Some(35), "生日未到减 1");
+        assert_eq!(
+            demo_actor(Some("1990-10-02")).age_on(today),
+            Some(36),
+            "生日当天算满岁"
+        );
+        assert_eq!(
+            demo_actor(Some("1990-10-03")).age_on(today),
+            Some(35),
+            "生日未到减 1"
+        );
         assert_eq!(demo_actor(Some("1990-01-01")).age_on(today), Some(36));
         assert_eq!(demo_actor(None).age_on(today), None);
     }
@@ -361,18 +376,16 @@ mod tests {
     #[test]
     fn canonical_follows_merge_chain() {
         let table = [(3i64, Some(2i64)), (2, Some(1)), (1, None)];
-        let resolved = resolve_canonical_ids(3, |id| {
-            table.iter().find(|(key, _)| *key == id).copied()
-        });
+        let resolved =
+            resolve_canonical_ids(3, |id| table.iter().find(|(key, _)| *key == id).copied());
         assert_eq!(resolved, Some(1));
     }
 
     #[test]
     fn canonical_stops_on_cycle_instead_of_looping() {
         let table = [(1i64, Some(2i64)), (2, Some(1))];
-        let resolved = resolve_canonical_ids(1, |id| {
-            table.iter().find(|(key, _)| *key == id).copied()
-        });
+        let resolved =
+            resolve_canonical_ids(1, |id| table.iter().find(|(key, _)| *key == id).copied());
         assert!(resolved.is_some(), "成环也要返回结果，不能死循环");
     }
 

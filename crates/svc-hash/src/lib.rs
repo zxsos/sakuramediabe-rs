@@ -120,9 +120,9 @@ pub fn canonical_info_hash(value: &str) -> Result<String, ResolveError> {
 
     // Python 正则 `[A-Za-z2-7]{32}`：注意排除了 0/1/8/9。
     let is_base32_alphabet = !trimmed.is_empty()
-        && trimmed.bytes().all(|byte| {
-            byte.is_ascii_alphabetic() || (b'2'..=b'7').contains(&byte)
-        });
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || (b'2'..=b'7').contains(&byte));
     if trimmed.len() == 32 && is_base32_alphabet {
         // Python 侧是 `base64.b32decode(value.upper())`，因此小写 base32 也必须
         // 接受；本 crate 的 `base32_decode` 只认大写，故先统一转大写。
@@ -205,7 +205,10 @@ pub fn check_torrent_size(length: usize) -> Result<(), ResolveError> {
 
 /// 链接是否是磁力链接。对应 Python `resolve_resource_hash` 的分派条件。
 pub fn is_magnet(source_uri: &str) -> bool {
-    source_uri.trim().to_ascii_lowercase().starts_with("magnet:")
+    source_uri
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("magnet:")
 }
 
 /// 校验链接协议，对应 Python 里的 scheme 白名单检查。
@@ -313,10 +316,10 @@ mod tests {
         for input in [
             "",
             "abc",
-            &"z".repeat(40),   // 长度对但非 hex
-            &"0".repeat(39),   // 长度不足
-            &"0".repeat(41),   // 长度超
-            &"0".repeat(32),   // 数字不在 base32 字母表内
+            &"z".repeat(40), // 长度对但非 hex
+            &"0".repeat(39), // 长度不足
+            &"0".repeat(41), // 长度超
+            &"0".repeat(32), // 数字不在 base32 字母表内
         ] {
             assert_eq!(
                 canonical_info_hash(input),

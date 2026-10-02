@@ -22,7 +22,6 @@ pub enum RefreshTokenStatus {
 impl RefreshTokenStatus {
     /// 数据库中存储的字面量。
     pub const fn as_str(self) -> &'static str {
-
         match self {
             Self::Active => "active",
             Self::Revoked => "revoked",
@@ -136,8 +135,11 @@ mod tests {
         // 关键：把未知状态降级成 Active 会让失效令牌被当成有效令牌。
         assert_eq!(RefreshTokenStatus::from_str_lossy("bogus"), None);
         assert_eq!(RefreshTokenStatus::from_str_lossy(""), None);
-        assert_eq!(RefreshTokenStatus::from_str_lossy("ACTIVE"), None,
-            "大小写敏感，与数据库字面量一致");
+        assert_eq!(
+            RefreshTokenStatus::from_str_lossy("ACTIVE"),
+            None,
+            "大小写敏感，与数据库字面量一致"
+        );
     }
 
     #[test]

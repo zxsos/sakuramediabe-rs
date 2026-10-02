@@ -130,8 +130,9 @@ impl AuthTokens {
             .and_then(Value::as_str)
             .unwrap_or("Bearer")
             .to_owned();
-        let expires_in = crate::json::as_int_or_null(body.get("expires_in").unwrap_or(&Value::Null))
-            .unwrap_or(0);
+        let expires_in =
+            crate::json::as_int_or_null(body.get("expires_in").unwrap_or(&Value::Null))
+                .unwrap_or(0);
 
         Ok(Self {
             access_token,
@@ -288,12 +289,11 @@ mod tests {
 ///
 /// FastAPI 在 `auto_error=False` 下，遇到「头缺失 / scheme 非 Bearer / token 为空」
 /// 一律返回 `None`，随后落到 `get_current_user` 的第一个分支：
-
 /// ```text
 /// 401 unauthorized "Authentication required"   <- 头有问题
 /// 401 unauthorized "Invalid access token"     <- 头正常但 token 校验不过
 /// ```
-
+///
 /// 错误码相同，消息不同。客户端按 code 分支，但日志与提示文案依赖它。
 ///
 /// 对应 `auto_error = False` 返回 `None` 的三种情况。
@@ -314,9 +314,7 @@ impl MissingCredentials {
     pub const MESSAGE: &str = "Authentication required";
 
     /// 用于日志的区分标签。
-    pub const fn log_tag(self) -> &
-'static str
- {
+    pub const fn log_tag(self) -> &'static str {
         match self {
             Self::NoHeader => "no_header",
             Self::NotBearer => "not_bearer",
@@ -411,7 +409,10 @@ mod credential_tests {
 
     #[test]
     fn extracts_well_formed_bearer() {
-        assert_eq!(extract_bearer_token(Some("Bearer abc.def.ghi")), Ok("abc.def.ghi"));
+        assert_eq!(
+            extract_bearer_token(Some("Bearer abc.def.ghi")),
+            Ok("abc.def.ghi")
+        );
         assert_eq!(extract_bearer_token(Some("bearer abc")), Ok("abc"));
         assert_eq!(extract_bearer_token(Some("BEARER abc")), Ok("abc"));
         assert_eq!(extract_bearer_token(Some("Bearer   abc  ")), Ok("abc"));
@@ -419,9 +420,18 @@ mod credential_tests {
 
     #[test]
     fn missing_header_is_no_header() {
-        assert_eq!(extract_bearer_token(None), Err(MissingCredentials::NoHeader));
-        assert_eq!(extract_bearer_token(Some("")), Err(MissingCredentials::NoHeader));
-        assert_eq!(extract_bearer_token(Some("   ")), Err(MissingCredentials::NoHeader));
+        assert_eq!(
+            extract_bearer_token(None),
+            Err(MissingCredentials::NoHeader)
+        );
+        assert_eq!(
+            extract_bearer_token(Some("")),
+            Err(MissingCredentials::NoHeader)
+        );
+        assert_eq!(
+            extract_bearer_token(Some("   ")),
+            Err(MissingCredentials::NoHeader)
+        );
     }
 
     #[test]
@@ -437,8 +447,14 @@ mod credential_tests {
 
     #[test]
     fn bearer_without_token_is_empty() {
-        assert_eq!(extract_bearer_token(Some("Bearer")), Err(MissingCredentials::EmptyToken));
-        assert_eq!(extract_bearer_token(Some("Bearer    ")), Err(MissingCredentials::EmptyToken));
+        assert_eq!(
+            extract_bearer_token(Some("Bearer")),
+            Err(MissingCredentials::EmptyToken)
+        );
+        assert_eq!(
+            extract_bearer_token(Some("Bearer    ")),
+            Err(MissingCredentials::EmptyToken)
+        );
     }
 
     #[test]
@@ -446,7 +462,11 @@ mod credential_tests {
         let missing = AuthFailure::from(MissingCredentials::NoHeader);
         let invalid = AuthFailure::from(crate::jwt::JwtError::Expired);
 
-        assert_eq!(AuthFailure::ERROR_CODE, AuthFailure::ERROR_CODE, "错误码相同");
+        assert_eq!(
+            AuthFailure::ERROR_CODE,
+            AuthFailure::ERROR_CODE,
+            "错误码相同"
+        );
         assert_eq!(AuthFailure::STATUS, 401);
         assert_eq!(AuthFailure::STATUS, 401);
 

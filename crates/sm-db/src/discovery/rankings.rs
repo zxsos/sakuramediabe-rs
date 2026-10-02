@@ -191,7 +191,10 @@ impl MomentRecommendation {
 
     /// 推荐所依据的检索路径。
     pub fn seed_kind(&self) -> MomentSeedKind {
-        match (self.seed_thumbnail_id.is_some(), self.source_movie_id.is_some()) {
+        match (
+            self.seed_thumbnail_id.is_some(),
+            self.source_movie_id.is_some(),
+        ) {
             (true, true) => MomentSeedKind::Both,
             (true, false) => MomentSeedKind::Thumbnail,
             (false, true) => MomentSeedKind::Movie,

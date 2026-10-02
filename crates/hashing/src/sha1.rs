@@ -19,7 +19,13 @@ impl Sha1 {
     /// 创建空状态（对应 `hashlib.sha1()`）。
     pub fn new() -> Self {
         Self {
-            state: [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476, 0xc3d2_e1f0],
+            state: [
+                0x6745_2301,
+                0xefcd_ab89,
+                0x98ba_dcfe,
+                0x1032_5476,
+                0xc3d2_e1f0,
+            ],
             buffer: [0u8; 64],
             buffered: 0,
             length_bits: 0,
@@ -71,7 +77,12 @@ impl Sha1 {
             self.compress(&block);
             self.buffered = 0;
         }
-        for slot in self.buffer.iter_mut().skip(self.buffered).take(56 - self.buffered) {
+        for slot in self
+            .buffer
+            .iter_mut()
+            .skip(self.buffered)
+            .take(56 - self.buffered)
+        {
             *slot = 0;
         }
         self.buffer[56..64].copy_from_slice(&length_bits.to_be_bytes());

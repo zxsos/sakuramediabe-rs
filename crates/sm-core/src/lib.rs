@@ -14,8 +14,8 @@
 pub mod auth;
 pub mod error;
 pub mod hashing_support;
-pub mod jwt;
 pub mod json;
+pub mod jwt;
 pub mod pagination;
 pub mod password;
 pub mod refresh_token;

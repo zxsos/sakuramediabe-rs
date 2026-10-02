@@ -146,7 +146,10 @@ mod tests {
     use chrono::NaiveDate;
 
     fn at(h: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(2026, 10, 2).unwrap().and_hms_opt(h, 0, 0).unwrap()
+        NaiveDate::from_ymd_opt(2026, 10, 2)
+            .unwrap()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
     }
 
     fn session(vector: Option<&str>, expires: NaiveDateTime) -> ImageSearchSession {
@@ -205,8 +208,14 @@ mod tests {
             indexed_space_id: "siglip2-768".to_owned(),
         };
         assert!(state.is_singleton_row());
-        let stray = ImageSearchIndexState { id: 2, ..state.clone() };
-        assert!(!stray.is_singleton_row(), "id 恒为 1，出现第二行说明写入方用了 insert");
+        let stray = ImageSearchIndexState {
+            id: 2,
+            ..state.clone()
+        };
+        assert!(
+            !stray.is_singleton_row(),
+            "id 恒为 1，出现第二行说明写入方用了 insert"
+        );
     }
 
     #[test]

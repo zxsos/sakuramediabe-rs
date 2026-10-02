@@ -236,7 +236,7 @@ mod tests {
             !is_system_playlist_kind(PLAYLIST_KIND_CUSTOM),
             "用户列表不是系统列表"
         );
-        assert!(playlist("custom", None, None).is_system() == false);
+        assert!(!playlist("custom", None, None).is_system());
         assert!(playlist("recently_played", None, None).is_system());
     }
 
@@ -318,10 +318,7 @@ mod tests {
             created_at: None,
             updated_at: None,
         };
-        let same_pos_later_id = MomentCollectionItem {
-            id: 6,
-            ..a.clone()
-        };
+        let same_pos_later_id = MomentCollectionItem { id: 6, ..a.clone() };
         let next_pos = MomentCollectionItem {
             id: 2,
             position: 2,

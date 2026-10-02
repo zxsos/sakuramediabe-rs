@@ -1,4 +1,3 @@
-
 use chrono::NaiveDateTime;
 use serde_json::Value as Json;
 use sqlx::FromRow;
@@ -115,8 +114,12 @@ mod tests {
     #[test]
     fn protected_fields_match_backend_whitelist() {
         let mut expected = vec![
-            "title", "summary", "maker_name",
-            "director_name", "is_collection", "is_blacklisted",
+            "title",
+            "summary",
+            "maker_name",
+            "director_name",
+            "is_collection",
+            "is_blacklisted",
         ];
         expected.sort_unstable();
         let mut actual = PROTECTED_MOVIE_FIELDS.to_vec();
@@ -126,31 +129,53 @@ mod tests {
 
     #[test]
     fn plugin_owner_tag_matches_documented_format() {
-        assert_eq!(field_owner::plugin("sakuramedia_local_provider"),
-                   "plugin:sakuramedia_local_provider");
+        assert_eq!(
+            field_owner::plugin("sakuramedia_local_provider"),
+            "plugin:sakuramedia_local_provider"
+        );
     }
 
     #[test]
     fn blacklist_constraint_is_mirrored() {
         let base = Movie {
-            id: 1, javdb_id: None, metadata_source: None, javdb_next_check_at: None,
-            movie_number: "ABC-001".to_owned(), title: "t".to_owned(),
-            release_date: None, duration_minutes: 0, score: 0.0, score_number: 0,
-            watched_count: 0, cover_image_id: None, thin_cover_image_id: None,
-            summary: String::new(), series_id: None, maker_name: None,
-            director_name: None, want_watch_count: 0, comment_count: 0,
-            interaction_synced_at: None, heat: 0, is_collection: false,
-            is_subscribed: false, is_blacklisted: false, subscribed_at: None,
+            id: 1,
+            javdb_id: None,
+            metadata_source: None,
+            javdb_next_check_at: None,
+            movie_number: "ABC-001".to_owned(),
+            title: "t".to_owned(),
+            release_date: None,
+            duration_minutes: 0,
+            score: 0.0,
+            score_number: 0,
+            watched_count: 0,
+            cover_image_id: None,
+            thin_cover_image_id: None,
+            summary: String::new(),
+            series_id: None,
+            maker_name: None,
+            director_name: None,
+            want_watch_count: 0,
+            comment_count: 0,
+            interaction_synced_at: None,
+            heat: 0,
+            is_collection: false,
+            is_subscribed: false,
+            is_blacklisted: false,
+            subscribed_at: None,
             subscription_search_state: "pending".to_owned(),
-            subscription_search_attempt_count: 0, subscription_search_retry_round: 0,
+            subscription_search_attempt_count: 0,
+            subscription_search_retry_round: 0,
             subscription_search_last_attempted_at: None,
             subscription_search_last_succeeded_at: None,
             subscription_search_next_retry_at: None,
-            subscription_search_error_code: None, subscription_search_last_error: None,
+            subscription_search_error_code: None,
+            subscription_search_last_error: None,
             subscription_search_last_error_at: None,
             field_owners: serde_json::json!({}),
             mutation_revision: 0,
-            created_at: None, updated_at: None,
+            created_at: None,
+            updated_at: None,
         };
         assert!(base.satisfies_blacklist_constraint());
 
@@ -160,7 +185,9 @@ mod tests {
 
         let mut conflict = subscribed.clone();
         conflict.is_blacklisted = true;
-        assert!(!conflict.satisfies_blacklist_constraint(),
-            "同时订阅与屏蔽会被数据库 CHECK 拒绝，必须提前拦截");
+        assert!(
+            !conflict.satisfies_blacklist_constraint(),
+            "同时订阅与屏蔽会被数据库 CHECK 拒绝，必须提前拦截"
+        );
     }
 }
