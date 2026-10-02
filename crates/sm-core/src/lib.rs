@@ -11,9 +11,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod error;
 pub mod json;
 pub mod pagination;
 
+pub use auth::{AuthTokens, AuthUser, InvalidAuthResponse};
 pub use error::{ApiError, ErrorEnvelope};
 pub use pagination::Paginated;

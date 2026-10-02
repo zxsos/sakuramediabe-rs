@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use serde_json::json;
-use sm_core::{ApiError, Paginated};
+use sm_core::{ApiError, AuthTokens, Paginated};
 
 fn emit(fields: &[(&str, String)]) {
     for (key, value) in fields {
@@ -47,6 +47,30 @@ fn main() {
                 ("has_synced_at", page.synced_at.is_some().to_string()),
                 ("total_pages", page.total_pages().to_string()),
             ]);
+        }
+        "auth-from-body" => {
+            match AuthTokens::from_body(&body) {
+                Ok(tokens) => {
+                    let json = tokens.to_client_json();
+                    emit(&[
+                        ("ok", "true".to_owned()),
+                        ("access_token", tokens.access_token.clone()),
+                        ("refresh_token", tokens.refresh_token.clone()),
+                        ("token_type", tokens.token_type.clone()),
+                        ("expires_in", tokens.expires_in.to_string()),
+                        ("expires_at", json["expires_at"].as_str().unwrap_or_default().to_owned()),
+                        ("refresh_expires_at", json["refresh_expires_at"].as_str().unwrap_or_default().to_owned()),
+                        ("username", tokens.user.username.clone()),
+                    ]);
+                }
+                Err(_) => {
+                    emit(&[
+                        ("ok", "false".to_owned()),
+                        ("code", sm_core::auth::INVALID_AUTH_RESPONSE.to_owned()),
+                        ("message", sm_core::auth::INVALID_AUTH_RESPONSE_MESSAGE.to_owned()),
+                    ]);
+                }
+            }
         }
         "make-error" => {
             let code = args.next().unwrap_or_else(|| "e".to_owned());

@@ -20,6 +20,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -62,6 +63,17 @@ def dart_as_datetime(value):
     if not text:
         return None
     return text if ISO_RE.match(text) else None
+
+def normalize_iso(text: str) -> str:
+    """把 ISO 时间规范化为 Dart `toUtc().toIso8601String()` 的形态。
+
+    Dart 对 UTC 输出 3 位毫秒且以 Z 结尾：2026-10-02T12:00:00.000Z。
+    Rust 侧用 to_rfc3339_opts(SecondsFormat::Millis, true) 与之对齐。
+    """
+    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
 
 def py_error_from_body(body):
     """对应 ApiErrorDto.fromJson。"""
@@ -159,6 +171,101 @@ PAGE_CASES = [
     ("negative-total", {"items": [], "total": -5}),
 ]
 
+AUTH_CASES = [
+    ("well-formed", {
+        "access_token": "at", "refresh_token": "rt", "token_type": "Bearer",
+        "expires_in": 3600, "expires_at": "2026-10-02T12:00:00Z",
+        "refresh_expires_at": "2026-11-02T12:00:00Z", "user": {"username": "account"},
+    }),
+    ("trim-tokens", {
+        "access_token": "  at  ", "refresh_token": "  rt  ",
+        "expires_at": "2026-10-02T12:00:00Z",
+    }),
+    ("offset-expires", {
+        "access_token": "at", "refresh_token": "rt",
+        "expires_at": "2026-10-02T20:00:00+08:00",
+    }),
+    ("lenient-defaults", {
+        "access_token": "at", "refresh_token": "rt",
+        "expires_at": "2026-10-02T12:00:00Z",
+    }),
+    ("lenient-wrong-types", {
+        "access_token": "at", "refresh_token": "rt",
+        "expires_at": "2026-10-02T12:00:00Z",
+        "token_type": 7, "expires_in": "900",
+        "refresh_expires_at": "garbage", "user": "not-an-object",
+    }),
+    ("missing-access-token", {"refresh_token": "rt", "expires_at": "2026-10-02T12:00:00Z"}),
+    ("missing-refresh-token", {"access_token": "at", "expires_at": "2026-10-02T12:00:00Z"}),
+    ("missing-expires-at", {"access_token": "at", "refresh_token": "rt"}),
+    ("blank-access-token", {"access_token": "   ", "refresh_token": "rt", "expires_at": "2026-10-02T12:00:00Z"}),
+    ("non-string-token", {"access_token": 42, "refresh_token": "rt", "expires_at": "2026-10-02T12:00:00Z"}),
+    ("malformed-expires", {"access_token": "at", "refresh_token": "rt", "expires_at": "not-a-date"}),
+    ("empty-body", {}),
+]
+
+
+def py_auth_from_body(body):
+    """严格照 SessionTokenPayload + AuthTokensDto 的 Dart 语义重写。
+
+    返回 (ok, fields dict)。
+    """
+    if not isinstance(body, dict):
+        return False, {}
+
+    def required_token(key):
+        value = body.get(key)
+        if not isinstance(value, str):
+            raise ValueError("not a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("blank")
+        return normalized
+
+    def required_expires(key):
+        value = body.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("bad")
+        if not ISO_RE.match(value.strip()):
+            raise ValueError("unparseable")
+        return normalize_iso(value.strip())
+
+    try:
+        access_token = required_token("access_token")
+        refresh_token = required_token("refresh_token")
+        expires_at = required_expires("expires_at")
+    except ValueError:
+        return False, {
+            "code": "invalid_auth_response",
+            "message": "认证响应格式错误",
+        }
+
+    token_type = body.get("token_type")
+    if not isinstance(token_type, str):
+        token_type = "Bearer"
+
+    expires_in = dart_as_int(body.get("expires_in"), 0)
+
+    raw_refresh = body.get("refresh_expires_at")
+    refresh_expires_at = "1970-01-01T00:00:00.000Z"
+    if isinstance(raw_refresh, str) and ISO_RE.match(raw_refresh.strip()):
+        refresh_expires_at = normalize_iso(raw_refresh.strip())
+
+    user = body.get("user")
+    username = user.get("username") if isinstance(user, dict) else None
+    if not isinstance(username, str):
+        username = ""
+
+    return True, {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": token_type,
+        "expires_in": str(expires_in),
+        "expires_at": expires_at,
+        "refresh_expires_at": refresh_expires_at,
+        "username": username,
+    }
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
@@ -204,6 +311,15 @@ def main() -> int:
                 "has_synced_at": str(synced is not None).lower(),
             },
         )
+
+    print("== 认证令牌 AuthTokens.from_body ==")
+    for label, body in AUTH_CASES:
+        rust = parity.call("auth-from-body", body)
+        ok, expected = py_auth_from_body(body)
+        if ok:
+            expected = dict(expected)
+            expected["ok"] = "true"
+        parity.expect(f"auth/{label}", rust, expected)
 
     print()
     total = parity.passed + len(parity.failures)
