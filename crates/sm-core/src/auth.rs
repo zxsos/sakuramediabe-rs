@@ -281,3 +281,201 @@ mod tests {
         assert_eq!(tokens.expires_at.to_rfc3339(), "2026-10-02T12:00:00+00:00");
     }
 }
+
+/// 从 `Authorization` 头提取 Bearer token。
+///
+/// 对应后端 `deps.py` 的 `OAuth2PasswordBearer(tokenUrl=..., auto_error=False)`。
+///
+/// # 关键：格式错误与 token 无效走**不同的消息**
+///
+/// FastAPI 在 `auto_error=False` 下，遇到「头缺失 / scheme 非 Bearer / token 为空」
+/// 一律返回 `None`，随后落到 `get_current_user` 的第一个分支：
+
+/// ```text
+/// 401 unauthorized "Authentication required"   <- 头有问题
+/// 401 unauthorized "Invalid access token"     <- 头正常但 token 校验不过
+/// ```
+
+/// 错误码相同，消息不同。客户端按 code 分支，但日志与提示文案依赖它。
+///
+/// 对应 `auto_error = False` 返回 `None` 的三种情况。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingCredentials {
+    /// 没有 `Authorization` 头。
+    NoHeader,
+    /// scheme 不是 `bearer`（大小写不敏感）。
+    NotBearer,
+    /// scheme 是 bearer 但后面没有 token。
+    EmptyToken,
+}
+
+impl MissingCredentials {
+    /// 对应后端 `ApiError(401, "unauthorized", "Authentication required")`。
+    pub const ERROR_CODE: &str = "unauthorized";
+    /// 与后端一致的英文提示。
+    pub const MESSAGE: &str = "Authentication required";
+
+    /// 用于日志的区分标签。
+    pub const fn log_tag(self) -> &
+'static str
+ {
+        match self {
+            Self::NoHeader => "no_header",
+            Self::NotBearer => "not_bearer",
+            Self::EmptyToken => "empty_token",
+        }
+    }
+}
+
+/// token 校验失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidAccessToken;
+
+impl InvalidAccessToken {
+    pub const ERROR_CODE: &str = "unauthorized";
+    /// 与后端 `AuthService.get_current_user` 抛出的提示一致。
+    pub const MESSAGE: &str = "Invalid access token";
+}
+
+/// 提取 Bearer token。
+///
+/// `header` 是完整的 `Authorization` 头值。`Ok` 拿到 token，`Err` 表示缺失或格式不对。
+pub fn extract_bearer_token(header: Option<&str>) -> Result<&str, MissingCredentials> {
+    let Some(raw) = header else {
+        return Err(MissingCredentials::NoHeader);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(MissingCredentials::NoHeader);
+    }
+
+    // 复刻 FastAPI 的 get_authorization_scheme_param：用 partition(空格)，
+    // 切不出空格时 param 为空串。因此 `Bearer`（无 token）得到空 token 而非
+    // 「非 Bearer」——这决定了它报 "Invalid access token" 而非
+    // "Authentication required"，必须与后端一致。
+    let (scheme, param) = match raw.find(char::is_whitespace) {
+        Some(index) => (&raw[..index], raw[index + 1..].trim()),
+        None => (raw, ""),
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(MissingCredentials::NotBearer);
+    }
+
+    let token = param.trim();
+    if token.is_empty() {
+        return Err(MissingCredentials::EmptyToken);
+    }
+    Ok(token)
+}
+
+/// 认证失败的整体结果，供路由层直接映射成错误信封。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// 缺少或格式不对的凭据。
+    Missing(MissingCredentials),
+    /// 凭据格式正确但校验不过。
+    Invalid(InvalidAccessToken),
+}
+
+impl AuthFailure {
+    /// 两种情况的错误码都是 `unauthorized`。
+    pub const ERROR_CODE: &str = "unauthorized";
+
+    /// HTTP 状态码。
+    pub const STATUS: u16 = 401;
+
+    /// 与后端一致的提示文案。
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Missing(_) => MissingCredentials::MESSAGE,
+            Self::Invalid(_) => InvalidAccessToken::MESSAGE,
+        }
+    }
+}
+
+impl From<MissingCredentials> for AuthFailure {
+    fn from(value: MissingCredentials) -> Self {
+        Self::Missing(value)
+    }
+}
+
+impl From<crate::jwt::JwtError> for AuthFailure {
+    fn from(_value: crate::jwt::JwtError) -> Self {
+        // 后端把 jwt.decode 的任何失败（含过期、验签失败）统一收敛成
+        // "Invalid access token"，不区分具体原因。
+        Self::Invalid(InvalidAccessToken)
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_well_formed_bearer() {
+        assert_eq!(extract_bearer_token(Some("Bearer abc.def.ghi")), Ok("abc.def.ghi"));
+        assert_eq!(extract_bearer_token(Some("bearer abc")), Ok("abc"));
+        assert_eq!(extract_bearer_token(Some("BEARER abc")), Ok("abc"));
+        assert_eq!(extract_bearer_token(Some("Bearer   abc  ")), Ok("abc"));
+    }
+
+    #[test]
+    fn missing_header_is_no_header() {
+        assert_eq!(extract_bearer_token(None), Err(MissingCredentials::NoHeader));
+        assert_eq!(extract_bearer_token(Some("")), Err(MissingCredentials::NoHeader));
+        assert_eq!(extract_bearer_token(Some("   ")), Err(MissingCredentials::NoHeader));
+    }
+
+    #[test]
+    fn wrong_scheme_is_not_bearer() {
+        for header in ["Basic abc", "Token abc", "abc", "Bearerish abc"] {
+            assert_eq!(
+                extract_bearer_token(Some(header)),
+                Err(MissingCredentials::NotBearer),
+                "header={header}"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_without_token_is_empty() {
+        assert_eq!(extract_bearer_token(Some("Bearer")), Err(MissingCredentials::EmptyToken));
+        assert_eq!(extract_bearer_token(Some("Bearer    ")), Err(MissingCredentials::EmptyToken));
+    }
+
+    #[test]
+    fn both_failures_share_code_but_differ_in_message() {
+        let missing = AuthFailure::from(MissingCredentials::NoHeader);
+        let invalid = AuthFailure::from(crate::jwt::JwtError::Expired);
+
+        assert_eq!(AuthFailure::ERROR_CODE, AuthFailure::ERROR_CODE, "错误码相同");
+        assert_eq!(AuthFailure::STATUS, 401);
+        assert_eq!(AuthFailure::STATUS, 401);
+
+        assert_eq!(missing.message(), "Authentication required");
+        assert_eq!(invalid.message(), "Invalid access token");
+        assert_ne!(missing.message(), invalid.message(), "消息必须不同");
+    }
+
+    #[test]
+    fn jwt_errors_all_collapse_to_invalid_token() {
+        // 后端不区分过期/验签失败/类型错误，统一收敛。
+        for error in [
+            crate::jwt::JwtError::Malformed,
+            crate::jwt::JwtError::SignatureMismatch,
+            crate::jwt::JwtError::Expired,
+            crate::jwt::JwtError::WrongTokenType,
+            crate::jwt::JwtError::InvalidSubject,
+        ] {
+            let failure = AuthFailure::from(error);
+            assert_eq!(failure.message(), "Invalid access token");
+        }
+    }
+
+    #[test]
+    fn log_tags_distinguish_credential_problems() {
+        assert_eq!(MissingCredentials::NoHeader.log_tag(), "no_header");
+        assert_eq!(MissingCredentials::NotBearer.log_tag(), "not_bearer");
+        assert_eq!(MissingCredentials::EmptyToken.log_tag(), "empty_token");
+    }
+}
