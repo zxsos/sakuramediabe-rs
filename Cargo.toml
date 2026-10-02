@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hashing",
+    "crates/media-file-hash",
+    "crates/svc-hash",
+    "crates/parity-cli",
+]
+
+# 媒体 IO 服务最终以静态二进制塞进 sakuramedia 镜像的 /opt/rust-media-io，
+# 因此统一指向 Linux 目标，避免在 Windows 上误产出不可用的交叉编译产物。
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
