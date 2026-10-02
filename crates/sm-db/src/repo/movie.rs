@@ -370,8 +370,8 @@ pub(crate) fn bind_value<'q, O>(
 /// `assignments()` 按字段数生成，与 bind 数量严格一致。
 ///
 /// 如果将来引入了接受外部列名的入口，这里就是唯一需要重新审计的地方。
-pub(crate) fn safe_sql(sql: String) -> sqlx::AssertSqlSafe<String> {
-    sqlx::AssertSqlSafe(sql)
+pub(crate) fn safe_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
 }
 
 /// 影片系列仓储。

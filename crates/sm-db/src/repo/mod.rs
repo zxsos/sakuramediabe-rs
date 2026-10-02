@@ -23,9 +23,11 @@
 //! | [`download`] | 两个独立状态机 | 分离的 setter，形状上无法混传 |
 
 pub mod download;
+pub mod gateway;
 pub mod media;
 pub mod movie;
 
 pub use download::{DownloadTaskRepository, NewDownloadTask};
+pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
