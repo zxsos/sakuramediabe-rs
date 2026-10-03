@@ -25,19 +25,18 @@
 //! | [`task`] | 队列互斥 + 租约 | `SKIP LOCKED` 领取，终态释放 `mutex_key` |
 //! | [`playback`] | 三个不同形状的唯一索引 | 各表分别 upsert / 允许重复 |
 //!
-//! # 覆盖范围：40 张表里的 27 张
+//! # 覆盖范围：40 张表里的 31 张
 //!
-//! 剩下的 13 张按「不解锁别的就写不了」排序。每组后面的括号是**阻塞原因**
+//! 剩下的 9 张按「不解锁别的就写不了」排序。每组后面的括号是**阻塞原因**
 //! 或**该表被谁引用**——不是难度描述。
 //!
 //! | 缺口 | 表 | 阻塞了什么 / 被谁引用 |
 //! |---|---|---|
-//! | **资产 3 张** | `image`、`movie_plot_image`、`subtitle` | `image` 没有仓储，而 `media_point.image_id` 是 **NOT NULL 且无 DEFAULT** —— 所以「给时刻配一张图」这件事现在只能手写 SQL。`asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
-//! | **合集族 2 张** | `video_collection`(+item) | **不是照抄就能完** —— 与另三个合集有三处不同：没有 `owner_plugin_id` / `plugin_key`（不实现 `PluginOwned`）、模型在 `crate::videos` 而不在 `collections`、`position` 有 `DEFAULT 0` 且**有独立的位置索引**（另三个合集没有）。成员表形状则与 `moment/clip_collection_item` 一致 |
-//! | **发现与检索索引 3 张** | `ranking_item`、`image_search_session`、`image_search_index_state` | `ranking_item` 的模型刚在可空性那轮修正（`movie_id` 是 NOT NULL，「入库后回填」的设计不成立）。三张表互相引用，构成一个完整但空白的子系统 |
+//! | **发现子系统 3 张** | `ranking_item`、`image_search_session`、`image_search_index_state` | 三张表互相引用，构成一个完整但空白的子系统。`ranking_item` 的模型已在可空性那轮修正（`movie_id` 是 NOT NULL，「入库后回填」的设计不成立）；`image_search_session` 与 `image_search_index_state` 的模型都存在，一个方法都没有 |
+//! | **资产 2 张** | `movie_plot_image`、`subtitle` | 影片剧情图与字幕。两者都是「有产物但无处可存」—— 与此前 `media_thumbnail` 的情况同类。`subtitle` 还是播放链的必需输入 |
 //! | **推荐 2 张** | `daily_recommendation_item`、`moment_recommendation` | 每日推荐的产物落点；与 `ranking_item` 同属「上游抓、下游存」的那一侧 |
 //! | **通知** | `system_notification` | 后台任务的失败需要一个面向用户的出口，否则任务只存在于 `background_task_run` 里 |
-//! | **杂项 2 张** | `video_item`、`schema_migration` | `video_item` 是非 JAV 媒体的归属方（`media.video_item_id` 指向它），而 `MediaRepository::insert` **已经要求** `movie_number` 与 `video_item_id` 恰好给一个 —— 所以非 JAV 媒体现在写不进去。`schema_migration` 是 DDL 版本记录，读多写少 |
+//! | **杂项** | `schema_migration` | DDL 版本记录，读多写少。唯一一个「仓储的主要价值是让别人能查」的表 |
 //!
 //! # 两个不属于表清单的缺口
 //!
@@ -46,7 +45,7 @@
 //! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写。`UnitOfWork::merge_actors` 也等它 |
 //! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //!
-//! # 两条链已打通
+//! # 三条链已打通
 //!
 //! ```text
 //! 传输链
@@ -54,16 +53,23 @@
 //!                        ↑
 //!                  indexer_download_client ── indexer
 //!
-//! 合集链
+//! JAV 合集链
 //! playlist ── playlist_movie ── movie
 //! moment_collection ── moment_collection_item ── media_point
 //! clip_collection ── clip_collection_item ── media_clip
+//!
+//! 非 JAV 链
+//! video_item ── media（另一侧归属）
+//!      ↑
+//! video_collection ── video_collection_item
+//! image ──↑（封面与时刻配图）
 //! ```
 //!
 //! [`transfer`] 四张表（`download_client` / `indexer` /
 //! `indexer_download_client` / `download_resource_blacklist`）、
-//! [`submission`]（提交历史）与 [`collection`] 六张（三个父表 + 三个
-//! 成员表）都已落地，且**都有集成测试**。剩下的 13 张里没有这两条链了。
+//! [`submission`]（提交历史）、[`collection`] 六张（三个父表 + 三个
+//! 成员表）、[`image`] 与 [`video_item`]
+//! 都已落地，且**都有集成测试**。剩下的 9 张里没有这三条链了。
 //!
 //! # 分页：11 个 list 方法已覆盖，3 个刻意不分页
 //!
@@ -148,6 +154,7 @@ pub mod submission;
 pub mod task;
 pub mod transfer;
 pub mod user;
+pub mod video_collection;
 pub mod video_item;
 
 pub use actor::{ActorRepository, NewActor, SyncState};
@@ -174,4 +181,7 @@ pub use transfer::{
     IndexerRepository, NewDownloadClient, NewIndexer,
 };
 pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, UserRepository};
+pub use video_collection::{
+    NewVideoCollection, VideoCollectionItemRepository, VideoCollectionRepository,
+};
 pub use video_item::{NewVideoItem, VideoItemRepository};

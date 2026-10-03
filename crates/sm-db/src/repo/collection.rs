@@ -532,6 +532,21 @@ impl_paged!(
 /// - `unlink` **不重排**留下的空位。删中间一个就为补洞而重写全部
 ///   `position`，代价是 O(n) 次写，且会让并发读者看到中间状态。缺口在
 ///   播放时不可见（`ORDER BY position, id` 仍给出确定顺序）。
+/// # 为什么用 `#[macro_export]` 而不是 `pub(crate) use`
+///
+/// `macro_rules!` 默认只在**定义点之后**的文本作用域内可见，所以
+/// `video_collection.rs` 里想复用它就得按路径引用。两条路都试过：
+///
+/// - `pub(crate) use impl_ordered_member_repo;` 放在宏**前面** ——
+///   报 `unresolved import`，因为重导出的目标还不存在。
+/// - 放在宏**后面** —— 报 `E0252: defined multiple times`，
+///   `macro_rules!` 已经用这个名字引入了一个绑定。
+///
+/// `#[macro_export]` 把它导出到 crate 根，于是
+/// `crate::impl_ordered_member_repo!(...)` 干净可用。它同时让这个宏出现在
+/// `cargo doc` 里 —— 对一个「给三张同构表生成七个方法」的宏来说，
+/// 那反而是有用的。
+#[macro_export]
 macro_rules! impl_ordered_member_repo {
     (
         $repo:ident, $model:ty, $table:literal, $member:literal, $entity:literal
@@ -561,7 +576,7 @@ macro_rules! impl_ordered_member_repo {
                 collection_id: i32,
                 member_id: i32,
             ) -> Result<$model, DbError> {
-                let now = crate::common::time::now_utc();
+                let now = $crate::common::time::now_utc();
                 sqlx::query_as::<_, $model>(concat!(
                     "INSERT INTO ",
                     $table,
@@ -592,7 +607,7 @@ macro_rules! impl_ordered_member_repo {
                 member_id: i32,
                 position: i32,
             ) -> Result<$model, DbError> {
-                let now = crate::common::time::now_utc();
+                let now = $crate::common::time::now_utc();
                 sqlx::query_as::<_, $model>(concat!(
                     "INSERT INTO ",
                     $table,
@@ -618,7 +633,7 @@ macro_rules! impl_ordered_member_repo {
                 member_id: i32,
                 position: i32,
             ) -> Result<$model, DbError> {
-                let now = crate::common::time::now_utc();
+                let now = $crate::common::time::now_utc();
                 sqlx::query_as::<_, $model>(concat!(
                     "INSERT INTO ",
                     $table,
@@ -735,6 +750,7 @@ macro_rules! impl_ordered_member_repo {
         }
     };
 }
+
 impl_ordered_member_repo!(
     MomentCollectionItemRepository,
     MomentCollectionItem,
