@@ -218,15 +218,21 @@ impl DownloadTaskRepository {
     /// 则会重复领取。
     pub async fn claim_queued(&self) -> Result<Option<DownloadTask>, DbError> {
         let now = crate::common::time::now_utc();
+
+        // 三个占位符**必须分开**。曾经把子查询的过滤条件也写成 $1，
+        // 而 $1 绑的是 'submitted'（写入目标），于是子查询在找「已提交」
+        // 的任务而不是排队中的 —— 永远返回 None，不报任何错。
+        // 队列非空却领不到任务，排查起来极其困难。
         let row = sqlx::query_as::<_, DownloadTask>(
             "UPDATE download_task SET state = $1, updated_at = $2 \
              WHERE id = ( \
-                SELECT id FROM download_task WHERE state = $1 \
+                SELECT id FROM download_task WHERE state = $3 \
                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING *",
         )
         .bind(download_state::SUBMITTED)
         .bind(now)
+        .bind(download_state::QUEUED)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)

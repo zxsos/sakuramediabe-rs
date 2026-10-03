@@ -541,7 +541,7 @@ async fn full_lifecycle_plugin_then_host_then_release() {
         .unwrap();
     assert_eq!(raw_field(db.pool(), "title", m.id).await, "v1");
 
-    // 3) 人工覆盖成功
+    // 3) 人工覆盖成功，并**夺走归属**
     gw.update_host_manual(&[m.id], &title_patch("v3"))
         .await
         .unwrap();
@@ -553,11 +553,87 @@ async fn full_lifecycle_plugin_then_host_then_release() {
         .await
         .unwrap();
     assert_eq!(raw_field(db.pool(), "title", m.id).await, "v3");
+}
 
-    // 5) 释放后宿主可写
-    gw.release_plugin_owners("p1", None).await.unwrap();
+#[tokio::test]
+async fn release_frees_the_field_for_the_host_automatically() {
+    // 「释放后宿主可写」这条链必须**从插件接管直接进入 release**。
+    //
+    // 它与 `full_lifecycle_...` 是两件不同的事：那条链里人工覆盖已把
+    // owner 换成 `host:manual`，而 `release_plugin_owners` 的语义是
+    // 「只摘除属于该插件的记录」，对 `host:manual` 不生效 —— 那是设计，
+    // 不是缺陷。
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = MovieRepository::new(db.pool().clone());
+    let gw = MovieOwnershipGateway::new(db.pool().clone());
+    let m = repo.insert(&movie("GW-018")).await.unwrap();
+
+    assert!(gw
+        .patch_plugin(m.id, "p1", &title_patch("v1"), 0)
+        .await
+        .unwrap());
+
+    // 接管期间宿主写不进
+    gw.update_host_unowned(m.id, &title_patch("blocked"))
+        .await
+        .unwrap();
+    assert_eq!(raw_field(db.pool(), "title", m.id).await, "v1");
+
+    // **必须断言 rows_affected**：release 的 WHERE 只匹配「owner 等于
+    // 该插件」的行，条件不满足时返回 0 且不报错。原先这里没断言返回值，
+    // 于是「owner 其实是 host:manual、release 什么也没做」被完全掩盖，
+    // 表现为后续断言莫名其妙地失败。
+    let affected = gw.release_plugin_owners("p1", None).await.unwrap();
+    assert_eq!(affected, 1, "释放 owner 应命中这一行");
+    assert_eq!(
+        raw_owners(db.pool(), m.id)
+            .await
+            .as_object()
+            .map(|o| o.len()),
+        Some(0),
+        "释放后不应残留任何 owner"
+    );
+
+    // 释放后宿主可写
     gw.update_host_unowned(m.id, &title_patch("v5"))
         .await
         .unwrap();
     assert_eq!(raw_field(db.pool(), "title", m.id).await, "v5");
+}
+
+#[tokio::test]
+async fn release_of_a_plugin_that_owns_nothing_reports_zero_rows() {
+    // 把上一条测试踩到的「静默 0 行」固化成显式契约。
+    //
+    // `release_plugin_owners` 是幂等清理，不是业务操作：owner 已经
+    // 被别的来源接管时，调用它**不报错也不改数据**。调用方必须靠
+    // 返回值判断是否真的清理过 —— 所以返回 0 是有意义的结果，
+    // 而不是需要隐藏的失败。
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let repo = MovieRepository::new(db.pool().clone());
+    let gw = MovieOwnershipGateway::new(db.pool().clone());
+    let m = repo.insert(&movie("GW-019")).await.unwrap();
+
+    // 从未被任何插件接管
+    assert_eq!(gw.release_plugin_owners("p1", None).await.unwrap(), 0);
+
+    // 人工 owner 存在时，释放「插件 p1」同样不匹配
+    gw.update_host_manual(&[m.id], &title_patch("manual"))
+        .await
+        .unwrap();
+    assert_eq!(raw_owners(db.pool(), m.id).await["title"], "host:manual");
+    assert_eq!(
+        gw.release_plugin_owners("p1", None).await.unwrap(),
+        0,
+        "host:manual 不属于任何插件，不应被 release 摘掉"
+    );
+    assert_eq!(
+        raw_owners(db.pool(), m.id).await["title"],
+        "host:manual",
+        "字段归属不该被无关插件的 release 改动"
+    );
 }

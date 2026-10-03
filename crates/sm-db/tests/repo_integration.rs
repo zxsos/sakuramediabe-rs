@@ -115,6 +115,25 @@ mod fixtures {
         }
     }
 
+    /// 造一个 video_item 并返回它的 id。
+    ///
+    /// `media.video_item_id` 有外键指向它（`ON DELETE CASCADE`），所以
+    /// 想测「Media 挂 video_item」这一侧就必须先把父行造出来。
+    /// 这与 `movie_number` 侧形成对照：那边指向字符串业务键，这边指向
+    /// 代理主键 —— 两种归属的外键强度并不对称。
+    pub async fn video_item(pool: &PgPool, title: &str) -> i32 {
+        sqlx::query(
+            "INSERT INTO video_item (title, summary, created_at, updated_at)
+             VALUES ($1, '', now(), now())
+             RETURNING id",
+        )
+        .bind(title)
+        .fetch_one(pool)
+        .await
+        .map(|r| r.get::<i32, _>(0))
+        .expect("video_item insert")
+    }
+
     /// 造一条 DownloadTask（自动建好 client 前置行）。
     pub async fn download_task(pool: &PgPool, remote_id: &str) -> sm_db::repo::NewDownloadTask {
         let client_id = download_client(pool).await;
@@ -352,15 +371,21 @@ async fn media_accepts_either_parent() {
     assert!(jav.movie_number.is_some());
 
     // 挂 video_item（非 JAV）
+    //
+    // 必须先造出父行：`media.video_item_id` 有真实外键
+    // （`media_video_item_id_fk`，ON DELETE CASCADE）。直接写 42 会被
+    // 外键拒绝 —— 那是 409 而不是 422，说明它绕过我们的 XOR 校验，
+    // 由数据库兜底拦下的。
+    let video_id = fixtures::video_item(db.pool(), "非 JAV 影片").await;
     let mut non_jav = fixtures::media_for_movie(db.pool(), "ABC-010").await;
     non_jav.movie_number = None;
-    non_jav.video_item_id = Some(42);
+    non_jav.video_item_id = Some(video_id);
     let created = repo
         .insert(&non_jav)
         .await
         .expect("video_item 归属应被接受");
     assert!(created.satisfies_owner_constraint());
-    assert_eq!(created.video_item_id, Some(42));
+    assert_eq!(created.video_item_id, Some(video_id));
 }
 
 #[tokio::test]

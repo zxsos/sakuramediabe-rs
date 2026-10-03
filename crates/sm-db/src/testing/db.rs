@@ -12,17 +12,23 @@ pub const SCHEMA_SQL: &str = include_str!("../../../../docker/schema.sql");
 
 /// 拿到测试连接池，拿不到返回 `None`。
 ///
-/// 读 `SMDB_TEST_DATABASE_URL`，回退到 `DATABASE_URL`。两个都没有时
-/// 返回 `None` —— 调用方应据此跳过测试而不是 panic。
-pub async fn maybe_pool() -> Option<PgPool> {
-    let url = std::env::var("SMDB_TEST_DATABASE_URL")
+/// 读 `SMDB_TEST_DATABASE_URL`，回退到 `DATABASE_URL`。
+///
+/// 单独抽出来是因为 `TestDb` 的清理需要**独立于当前 runtime** 建立
+/// 新连接，见 [`TestDb`] 的 `Drop` 实现。
+pub fn test_database_url() -> Option<String> {
+    std::env::var("SMDB_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .ok()?;
+        .ok()
+}
 
+/// 拿到测试连接池，拿不到返回 `None`。
+pub async fn maybe_pool() -> Option<PgPool> {
+    let url = test_database_url()?;
     let options = PgConnectOptions::from_str(&url).ok()?;
 
-    // max_connections=1：schema 是共享的，并发连接会互相看到对方的
-    // search_path 状态。测试本身是串行的，池大没有意义。
+    // max_connections=1：`search_path` 是**会话级**设置，只有单一连接
+    // 才能保证 DDL 之后的所有查询都落在同一个测试 schema 里。
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(5))
@@ -53,6 +59,8 @@ pub async fn test_pool() -> Option<PgPool> {
 pub struct TestDb {
     pool: PgPool,
     schema: String,
+    /// 连接串，仅供 `Drop` 里的清理路径另建连接使用。
+    url: String,
 }
 
 impl TestDb {
@@ -61,6 +69,7 @@ impl TestDb {
     /// 拿不到连接时返回 `None` —— 测试应直接 `return`，算作通过。
     pub async fn create() -> Option<Self> {
         let pool = test_pool().await?;
+        let url = test_database_url()?;
         let schema = format!("smdb_test_{}", unique_suffix());
 
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
@@ -68,7 +77,7 @@ impl TestDb {
             .await
             .expect("CREATE SCHEMA 失败（需要 CREATE 权限）");
 
-        let db = Self { pool, schema };
+        let db = Self { pool, schema, url };
         db.apply_schema().await;
         Some(db)
     }
@@ -116,18 +125,74 @@ impl TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        // 同步清理：Drop 里不能 await。用后台任务，但 pool 可能已被
-        // drop，所以克隆一个连接先绑好。
-        let pool = self.pool.clone();
+        let url = self.url.clone();
         let schema = self.schema.clone();
-        tokio::spawn(async move {
-            let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE"
-            )))
-            .execute(&pool)
-            .await;
-            pool.close().await;
+
+        // 清理必须**在 Drop 返回前完成**，否则每次跑测试都会留下一批
+        // 废弃 schema（实测 31 个测试留下 64 个，跑得越多库里越脏）。
+        //
+        // 两条走不通的路都试过：
+        //
+        // - `tokio::spawn`：测试主体结束时 runtime 已进入 shutdown，
+        //   spawn 出去的任务不会被 poll，全部残留。
+        // - `block_in_place` + `Handle::block_on`：`#[tokio::test]`
+        //   默认是 **current_thread** runtime，而 `block_in_place`
+        //   只在 multi_thread 下可用，会 panic。
+        //
+        // 所以走完全独立的路径：另开一个 OS 线程，在**自己的** runtime
+        // 里新建连接执行 DROP，并 `join` 等它结束。新连接的代价是每个
+        // 测试多一次握手（毫秒级），换来的是「Drop 返回即已清干净」
+        // 这个可验证的性质。
+        let worker = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                use sqlx::Connection;
+
+                // 清理本身要和所有测试抢连接：本机 `max_connections=20`
+                // 而 `cargo test` 默认按 CPU 数并行（这里是 16），峰值时
+                // 16 个测试各持一个连接，这里再开一个就正好撞上限 ——
+                // `connect` 失败，schema 残留。
+                //
+                // 所以退避重试：残留一个 schema 的代价（库里长期堆积
+                // 40 张废弃表，远超几次握手的开销）远大于多等几百毫秒。
+                for (attempt, backoff_ms) in [0u64, 40, 160, 500].into_iter().enumerate() {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    }
+
+                    let Ok(mut conn) = sqlx::PgConnection::connect(&url).await else {
+                        continue;
+                    };
+                    let dropped = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+                    )))
+                    .execute(&mut conn)
+                    .await
+                    .is_ok();
+                    let _ = conn.close().await;
+
+                    if dropped {
+                        return;
+                    }
+                }
+
+                // 四次都失败：只能留给调用者兜底，但必须可见 ——
+                // 静默残留正是这个 bug 当初的成因。
+                eprintln!(
+                    "WARN: 未能清理测试 schema {schema}；\
+                     可执行 DROP SCHEMA {schema} CASCADE 手动清理"
+                );
+            });
         });
+
+        // join 而非 detach：进程可能在 detach 的任务完成前就退出，
+        // 那和 spawn 一样留残留。测试收尾时阻塞几毫秒是值得的。
+        let _ = worker.join();
     }
 }
 
