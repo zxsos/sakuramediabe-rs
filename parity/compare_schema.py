@@ -145,6 +145,13 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # library 批次（library.rs）
         "MediaLibraryRepository",
         "NewMediaLibrary",
+        # transfer 批次（transfer.rs）
+        "DownloadClientRepository",
+        "IndexerRepository",
+        "IndexerDownloadClientRepository",
+        "DownloadResourceBlacklistRepository",
+        "NewDownloadClient",
+        "NewIndexer",
         # submission 批次（submission.rs）
         "DownloadSubmissionRepository",
         # 插入 DTO：download_submission_record 的列子集
@@ -173,6 +180,8 @@ INSERT_DTO_TARGETS = {
     "NewDownloadTask": "DownloadTask",
     "NewMediaClip": "MediaClip",
     "NewSubmissionRecord": "DownloadSubmissionRecord",
+    "NewDownloadClient": "DownloadClient",
+    "NewIndexer": "Indexer",
 }
 
 

@@ -25,19 +25,16 @@
 //! | [`task`] | 队列互斥 + 租约 | `SKIP LOCKED` 领取，终态释放 `mutex_key` |
 //! | [`playback`] | 三个不同形状的唯一索引 | 各表分别 upsert / 允许重复 |
 //!
-//! # 覆盖范围：40 张表里的 23 张
+//! # 覆盖范围：40 张表里的 27 张
 //!
-//! 剩下的 17 张按「不解锁别的就写不了」排序。每组后面的括号是**阻塞原因**
+//! 剩下的 13 张按「不解锁别的就写不了」排序。每组后面的括号是**阻塞原因**
 //! 或**该表被谁引用**——不是难度描述。
 //!
 //! | 缺口 | 表 | 阻塞了什么 / 被谁引用 |
 //! |---|---|---|
-//! | **幂等提交链** | `download_submission_record` | [`download`] 的注释把幂等提交建立在 `(client_id, remote_id)` 唯一索引上，但「先查后插」要查的正是这张表。**那个设计目前是空的** —— 索引存在，查询不存在 |
-//! | **传输链的地基** | `indexer`、`indexer_download_client`、`download_client` | `download_task.client_id` 指向 `download_client`；索引器配置与「哪个索引器下到哪个客户端」没有落点。写下载任务前必须先有客户端 |
-//! | **下载资源黑名单** | `download_resource_blacklist` | 没有它，「这个 URL / 这个磁力链不该再下」这条规则无处表达 |
 //! | **发现与检索索引** | `ranking_item`、`image_search_session`、`image_search_index_state` | `ranking_item` 的模型刚在可空性那轮修正（`movie_id` 是 NOT NULL，「入库后回填」的设计不成立）。三张表互相引用，构成一个完整但空白的子系统 |
 //! | **合集族 6 张** | `clip_collection`(+item)、`moment_collection`(+item)、`video_collection`(+item) | `PluginOwned` trait 与 `playback_order_key()` 已为仓储预留形状，一个方法都没有 |
-//! | **播放列表 2 张** | `playlist`、`playlist_movie` | 与合集族同构，`playlist_movie` 的唯一索引决定 `replace_all` 的语义 |
+//! | **播放列表 2 张** | `playlist`、`playlist_movie` | 与合集族同构，`playlist_movie` 的唯一索引决定「替换全部」��语义 |
 //! | **通知** | `system_notification` | 后台任务的失败需要一个面向用户的出口，否则任务只存在于 `background_task_run` 里 |
 //!
 //! # 两个不属于表清单的缺口
@@ -47,11 +44,17 @@
 //! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写。`UnitOfWork::merge_actors` 也等它 |
 //! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //!
-//! # 上一批补上的（曾经也在这张表里）
+//! # 传输链已打通
 //!
-//! [`actor`]（含墓碑链）、[`asset`] 的 `Tag` / `MovieActor` / `MovieTag`、
-//! [`library`]（`MediaLibrary` —— `media` 的地基，没有它 `media` 一行都写不了）、
-//! 以及 [`user`] 的两个 P0 仓储与 [`task`]。
+//! ```text
+//! media_library ── download_client ── download_task
+//!                        ↑
+//!                  indexer_download_client ── indexer
+//! ```
+//!
+//! [`transfer`] 四张表（`download_client` / `indexer` /
+//! `indexer_download_client` / `download_resource_blacklist`）与
+//! [`submission`]（提交历史）都已落地。剩下的 13 张里没有传输链了。
 //!
 //! # 分页：11 个 list 方法已覆盖，3 个刻意不分页
 //!
@@ -132,6 +135,7 @@ pub mod movie;
 pub mod playback;
 pub mod submission;
 pub mod task;
+pub mod transfer;
 pub mod user;
 
 pub use actor::{ActorRepository, NewActor, SyncState};
@@ -148,4 +152,8 @@ pub use playback::{
 };
 pub use submission::{DownloadSubmissionRepository, NewSubmissionRecord};
 pub use task::{BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskOutcome, TaskProgress};
+pub use transfer::{
+    DownloadClientRepository, DownloadResourceBlacklistRepository, IndexerDownloadClientRepository,
+    IndexerRepository, NewDownloadClient, NewIndexer,
+};
 pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, UserRepository};
