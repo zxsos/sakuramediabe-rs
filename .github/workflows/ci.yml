@@ -40,6 +40,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # 文档里的类型链接是**活的引用**，写错不会让编译失败、也不会让
+      # clippy 失败，只在 cargo doc 时报 warning。而坏链接意味着读者
+      # 点不开他去查的那个类型 —— 在这个项目里那正是最常需要的动作。
+      #
+      # -D warnings 让未解析链接、指向私有项的链接、以及 `sqlx::query_as`
+      # 这类「函数与宏同名」的歧义都变成硬错误。
+      - name: Documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
   # 集成测试需要一个真实的 PostgreSQL。
   #
   # 单独一个 job 而不是给上面的 rust 加 service：那里的 `cargo test --workspace`

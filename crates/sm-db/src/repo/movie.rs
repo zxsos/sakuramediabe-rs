@@ -4,7 +4,7 @@
 //!
 //! `sqlx` 开了 `macros` feature，但 `query!` 需要**编译期**数据库连接。
 //! 本机有 PG、CI 没有，用宏会让 CI 直接编译失败。所以全部走
-//! [`sqlx::query_as`] + [`FromRow`]（运行时解析）。
+//! `sqlx::query_as()` + `#[derive(sqlx::FromRow)]`（运行时解析）。
 //!
 //! 代价是失去编译期列名校验，补偿手段是两道验证：
 //!

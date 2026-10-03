@@ -20,8 +20,9 @@
 //! > （READ COMMITTED 下并发行更新会在 EvalPlanQual 阶段重新评估 WHERE）
 //! > 保证原子性
 //!
-//! 所以这里刻意**不用** [`UpdateSet`]：它的语义是「无条件覆盖」，
-//! 而这三个写入口都需要 `WHERE` 里带条件、且返回值是「是否命中」而非行数据。
+//! 所以这里刻意**不用** [`crate::common::update::UpdateSet`]：它的语义是
+//! 「无条件覆盖」，而这三个写入口都需要 `WHERE` 里带条件、且返回值是
+//! 「是否命中」而非行数据。
 //!
 //! # 字段主权模型
 //!
@@ -76,7 +77,7 @@ impl FieldCodec {
 /// 字段名 -> 期望 codec。
 ///
 /// 覆盖 [`crate::catalog::movie::PROTECTED_MOVIE_FIELDS`] 的全部 6 个字段。
-/// 任何不在此表里的受保护字段都会被 [`MovieOwnershipGateway::validate_fields`]
+/// 任何不在此表里的受保护字段都会被 `validate_fields`
 /// 拒绝 —— 这是有意的：类型校验必须显式声明，不能默认放行。
 pub const MOVIE_FIELD_CODECS: [(&str, FieldCodec); 6] = [
     ("title", FieldCodec::Text),
@@ -98,7 +99,7 @@ pub fn codec_of(field: &str) -> Option<FieldCodec> {
 /// 受保护字段写入的值。
 ///
 /// 用枚举而非 `serde_json::Value`，让「字段类型与 codec 不匹配」在
-/// **构造时**就成为可能，而校验放在 [`MovieOwnershipGateway::validate_fields`]。
+/// **构造时**就成为可能，而校验放在 `validate_fields`（模块内私有）。
 #[derive(Debug, Clone)]
 pub enum FieldValue {
     /// 文本（含 `None`，见 [`FieldCodec::accepts_none`]）。

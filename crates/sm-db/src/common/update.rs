@@ -44,7 +44,7 @@ use crate::error::DbError;
 ///
 /// 之所以统一包成 [`Json`] 而不是分开维护「字符串 / 整数 / 时间」三套
 /// `Vec`：sqlx 的 `encode` 对这��类型都是 trait based，用 `Json` 作为
-/// 中间表示可以让 [`sqlx::query`] 的 bind 逻辑保持单一路径。
+/// 中间表示可以让 `sqlx::query` 的 bind 逻辑保持单一路径。
 pub type Value<'a> = Json<Cow<'a, ValueInner>>;
 
 /// 列值的内部表示。
