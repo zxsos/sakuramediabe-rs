@@ -32,10 +32,12 @@
 //!
 //! | 缺口 | 表 | 阻塞了什么 / 被谁引用 |
 //! |---|---|---|
-//! | **发现与检索索引** | `ranking_item`、`image_search_session`、`image_search_index_state` | `ranking_item` 的模型刚在可空性那轮修正（`movie_id` 是 NOT NULL，「入库后回填」的设计不成立）。三张表互相引用，构成一个完整但空白的子系统 |
-//! | **合集族 6 张** | `clip_collection`(+item)、`moment_collection`(+item)、`video_collection`(+item) | `PluginOwned` trait 与 `playback_order_key()` 已为仓储预留形状，一个方法都没有 |
-//! | **播放列表 2 张** | `playlist`、`playlist_movie` | 与合集族同构，`playlist_movie` 的唯一索引决定「替换全部」��语义 |
+//! | **资产 3 张** | `image`、`movie_plot_image`、`subtitle` | `image` 没有仓储，而 `media_point.image_id` 是 **NOT NULL 且无 DEFAULT** —— 所以「给时刻配一张图」这件事现在只能手写 SQL。`asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
+//! | **合集族 2 张** | `video_collection`(+item) | **不是照抄就能完** —— 与另三个合集有三处不同：没有 `owner_plugin_id` / `plugin_key`（不实现 `PluginOwned`）、模型在 `crate::videos` 而不在 `collections`、`position` 有 `DEFAULT 0` 且**有独立的位置索引**（另三个合集没有）。成员表形状则与 `moment/clip_collection_item` 一致 |
+//! | **发现与检索索引 3 张** | `ranking_item`、`image_search_session`、`image_search_index_state` | `ranking_item` 的模型刚在可空性那轮修正（`movie_id` 是 NOT NULL，「入库后回填」的设计不成立）。三张表互相引用，构成一个完整但空白的子系统 |
+//! | **推荐 2 张** | `daily_recommendation_item`、`moment_recommendation` | 每日推荐的产物落点；与 `ranking_item` 同属「上游抓、下游存」的那一侧 |
 //! | **通知** | `system_notification` | 后台任务的失败需要一个面向用户的出口，否则任务只存在于 `background_task_run` 里 |
+//! | **杂项 2 张** | `video_item`、`schema_migration` | `video_item` 是非 JAV 媒体的归属方（`media.video_item_id` 指向它），而 `MediaRepository::insert` **已经要求** `movie_number` 与 `video_item_id` 恰好给一个 —— 所以非 JAV 媒体现在写不进去。`schema_migration` 是 DDL 版本记录，读多写少 |
 //!
 //! # 两个不属于表清单的缺口
 //!
@@ -44,17 +46,24 @@
 //! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写。`UnitOfWork::merge_actors` 也等它 |
 //! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //!
-//! # 传输链已打通
+//! # 两条链已打通
 //!
 //! ```text
+//! 传输链
 //! media_library ── download_client ── download_task
 //!                        ↑
 //!                  indexer_download_client ── indexer
+//!
+//! 合集链
+//! playlist ── playlist_movie ── movie
+//! moment_collection ── moment_collection_item ── media_point
+//! clip_collection ── clip_collection_item ── media_clip
 //! ```
 //!
 //! [`transfer`] 四张表（`download_client` / `indexer` /
-//! `indexer_download_client` / `download_resource_blacklist`）与
-//! [`submission`]（提交历史）都已落地。剩下的 13 张里没有传输链了。
+//! `indexer_download_client` / `download_resource_blacklist`）、
+//! [`submission`]（提交历史）与 [`collection`] 六张（三个父表 + 三个
+//! 成员表）都已落地，且**都有集成测试**。剩下的 13 张里没有这两条链了。
 //!
 //! # 分页：11 个 list 方法已覆盖，3 个刻意不分页
 //!
