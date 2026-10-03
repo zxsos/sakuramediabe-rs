@@ -40,6 +40,70 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # 集成测试需要一个真实的 PostgreSQL。
+  #
+  # 单独一个 job 而不是给上面的 rust 加 service：那里的 `cargo test --workspace`
+  # 不依赖数据库，而集成测试在无 DATABASE_URL 时会**跳过**（算通过）。混在一起
+  # 会让人误以为集成测试跑过了，实际是静默跳过 —— 这正是本仓库踩过的坑。
+  #
+  # 容器必须设 timezone=UTC：列是 `timestamp without time zone`，容器时区
+  # 不是 UTC 会让 naive datetime 的往返比较出现偏移。
+  integration:
+    name: rust / integration (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sakuramedia
+          POSTGRES_PASSWORD: sakuramedia
+          POSTGRES_DB: sakuramedia_test
+          TZ: UTC
+          PGTZ: UTC
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U sakuramedia -d sakuramedia_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SMDB_TEST_DATABASE_URL: postgres://sakuramedia:sakuramedia@localhost:5433/sakuramedia_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Apply generated DDL
+        # DDL 由 parity/gen_ddl.py 从上游 Peewee 模型生成，CI 里重新生成而不是
+        # 用仓库里那份 —— 免得有人手改 schema.sql 却没改生成器。
+        run: |
+          python3 parity/gen_ddl.py --out /tmp/schema.sql
+          psql -v ON_ERROR_STOP=1 \
+               -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
+               -c 'CREATE SCHEMA IF NOT EXISTS sakuramedia_test;'
+          psql -v ON_ERROR_STOP=1 \
+               -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
+               -c 'SET search_path TO sakuramedia_test;' -f /tmp/schema.sql
+
+      - name: Integration tests
+        run: cargo test -p sm-db --test repo_integration --test gateway_integration
+
+      - name: Verify tests actually ran
+        # 集成测试在无 DATABASE_URL 时是「跳过且通过」，所以只看退出码会在
+        # 环境配错时静默变绿。这里断言真的跑了 49 个。
+        run: |
+          output=$(cargo test -p sm-db --test repo_integration --test gateway_integration \
+                     -- --include-ignored 2>&1 || true)
+          echo "$output"
+          if ! echo "$output" | grep -qE '31 passed|49 passed'; then
+            echo "::error::integration tests appear to have been skipped, not executed"
+            exit 1
+          fi
+
   # 与上游 Peewee 模型逐字段比对。这是本仓库与上游之间唯一的自动防线：
   # 40 张表的列名、类型、可空性一旦漂移，本仓库的读路径就会静默拿不到值。
   schema-parity:
