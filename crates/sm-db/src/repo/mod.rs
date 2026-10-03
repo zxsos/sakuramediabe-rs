@@ -25,22 +25,25 @@
 //! | [`task`] | 队列互斥 + 租约 | `SKIP LOCKED` 领取，终态释放 `mutex_key` |
 //! | [`playback`] | 三个不同形状的唯一索引 | 各表分别 upsert / 允许重复 |
 //!
-//! # 覆盖范围：40 张表里的 36 张
+//! # 覆盖范围：40 张表**全部**有仓储
 //!
-//! 剩下的 4 张按「不解锁别的就写不了」排序。
-//!
-//! | 缺口 | 表 | 阻塞了什么 / 被谁引用 |
-//! |---|---|---|
-//! | **资产 2 张** | `movie_plot_image`、`subtitle` | 影片剧情图与字幕。两者都是「有产物但无处可存」—— 与此前 `media_thumbnail` 的情况同类。`subtitle` 还是播放链的必需输入：字幕不落地，播放页就只有画面 |
-//! | **通知** | `system_notification` | 后台任务的失败需要一个面向用户的出口，否则任务只存在于 `background_task_run` 里 |
-//! | **杂项** | `schema_migration` | DDL 版本记录，读多写少。唯一一个「仓储的主要价值是让别人能查」的表 |
-//!
-//! # 两个不属于表清单的缺口
+//! 剩下的是两个**不属于表清单**的缺口。
 //!
 //! | 缺口 | 阻塞了什么 |
 //! |---|---|
 //! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写。`UnitOfWork::merge_actors` 也等它 |
 //! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
+//!
+//! # 全表覆盖之后，接下来不是加表
+//!
+//! 剩下的工作不在 `sm-db` 的**表清单**里，而在两处：一是上面那两个缺口，
+//! 二是上层 —— [`sm-service`](../../sm_service/index.html) 对应上游 114 个
+//! service 文件（25,174 行，占上游代码量的 57%），目前是 1 行占位。
+//!
+//! 值得记的是：这批仓储**每一张都配了集成测试**，而每一批测试都挖出了
+//! 缺陷（占位符错位、依赖不存在的 DEFAULT、`count` 与 `items` 过滤不一致、
+//! 上游 `primary_key` kwarg 被解析器丢掉导致 DDL 少了主键）。「有仓储」与
+//! 「仓储正确」是两件事，前者不带来后者。
 //!
 //! # 三条链已打通
 //!
@@ -153,6 +156,7 @@ pub mod movie;
 pub mod playback;
 pub mod recommendation;
 pub mod submission;
+pub mod subtitle;
 pub mod task;
 pub mod transfer;
 pub mod user;
@@ -185,6 +189,10 @@ pub use recommendation::{
     NewMomentRecommendation,
 };
 pub use submission::{DownloadSubmissionRepository, NewSubmissionRecord};
+pub use subtitle::{
+    MoviePlotImageRepository, NewNotification, NewSubtitle, SchemaMigrationRepository,
+    SubtitleRepository, SystemNotificationRepository,
+};
 pub use task::{BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskOutcome, TaskProgress};
 pub use transfer::{
     DownloadClientRepository, DownloadResourceBlacklistRepository, IndexerDownloadClientRepository,
