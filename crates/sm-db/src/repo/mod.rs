@@ -76,16 +76,24 @@
 //! 所以仓储层**刻意不提供** `MovieRepository::delete`。将来若出现真实
 //! 删除需求，那是行为变更，应先确认上游是否同步改。
 //!
-//! # 剩余的结构性缺失
+//! # 组合写入：已有出口
 //!
-//! **组合写入已有出口**：[`UnitOfWork`] 按**动词**暴露用例，每个方法内部
-//! 编排多个仓储的 `_in` 变体并共享一个事务。已落地 `generate_thumbnail`
-//! （写 `media_thumbnail` + 推进 `media` 状态机）。
+//! [`UnitOfWork`] 按**动词**暴露用例，每个方法内部编排多个仓储的 `_in`
+//! 变体并共享一个事务。已落地三个：
 //!
-//! 仍缺的是跨更多表的用例，例如「插 Movie + 3 条 MovieActor +
-//! upsert Tag」—— 那需要先有 `MovieActor` / `Tag` 的仓储。
+//! | 用例 | 跨越的表 |
+//! |---|---|
+//! | `generate_thumbnail` | 写 `media_thumbnail` + 推进 `media` 状态机 |
+//! | `import_movie` | 影片行 + 标签 upsert + 演员关联 + 标签关联 |
 //!
-//! //! [`Actor`]: crate::catalog::actor::Actor
+//! 参与者用 `Ctx` 接入事务；方法成对提供（`insert` / `insert_in`），
+//! 共用一个私有实现，所以事务内外**不可能出现两套逻辑**。
+//!
+//! 仍缺的是演员合并 —— 它要搬运影片关联、合并别名、合并订阅、
+//! 填空受保护字段、搬运头像、打墓碑并压平链，共 6 步，
+//! 且需要 `Actor` 的字段主权网关先就位。
+//!
+//! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
 //!
 //! # 两个尚未确认的问题
