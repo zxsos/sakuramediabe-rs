@@ -68,7 +68,10 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      SMDB_TEST_DATABASE_URL: postgres://sakuramedia:sakuramedia@localhost:5433/sakuramedia_test
+      # 必须是 127.0.0.1 而不是 localhost：runner 上 localhost 先解析到 ::1，
+      # 而 service 的端口映射只监听 IPv4，会报
+      # "fe_sendauth: no password supplied"（连的其实是另一个 listener）。
+      SMDB_TEST_DATABASE_URL: postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -92,12 +95,12 @@ jobs:
             echo "SET search_path TO sakuramedia_test;"
             cat /tmp/schema.sql
           } > /tmp/apply.sql
-          psql -v ON_ERROR_STOP=1 \
-               -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
+          PGPASSWORD=sakuramedia psql -v ON_ERROR_STOP=1 \
+               -h 127.0.0.1 -p 5433 -U sakuramedia -d sakuramedia_test \
                -f /tmp/apply.sql
           # 确认表真的落在目标 schema 里，而不是 public —— 上面那个坑的回归防线。
-          psql -v ON_ERROR_STOP=1 -t \
-               -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
+          PGPASSWORD=sakuramedia psql -v ON_ERROR_STOP=1 -t \
+               -h 127.0.0.1 -p 5433 -U sakuramedia -d sakuramedia_test \
                -c "SELECT count(*) FROM information_schema.tables
                    WHERE table_schema='sakuramedia_test';"
 
