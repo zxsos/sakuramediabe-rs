@@ -50,18 +50,39 @@
 //! 区分标准是**调用方是人还是 worker**。人看列表需要翻页与总数，
 //! worker 循环需要「下一批待办」—— 给它 `page=1` 只会让它反复取第一页。
 //!
-//! # 两条结构性缺失
+//! # 删除策略：已从上游确认，无需再问
 //!
-//! **零 `delete`**：只有 `media_point` 与 `media_progress` 两处局部例外
-//! （`delete` / `clear`），其余表的删除路径只存在于注释里。
+//! 上游 `src/model/` 里**没有软删除**：无 `deleted` 字段，
+//! `TimestampedMixin` 也不含删除状态。全部是硬删。
+//!
+//! 46 个外键**全部显式声明** `on_delete`，零个依赖数据库默认：
+//!
+//! | 行为 | 数量 | 典型 |
+//! |---|---|---|
+//! | `CASCADE` | 30 | `movie_actor`、`movie_tag`、`movie_plot_image`、`subtitle` 随 `movie` 级联 |
+//! | `SET NULL` | 15 | `movie.cover_image_id` / `series_id`；`media_point.media_id` 置空但快照列保留 |
+//! | `RESTRICT` | 1 | 仅 `media_point.image_id` —— 有引用时禁止删图 |
+//!
+//! # `Movie` 与 `Actor` 不可删
+//!
+//! 全仓库搜不到 `Movie.delete` 或 `movie.delete_instance` 的调用点。
+//! 业务上的「移除一部影片」实际是**删关联行**
+//! （`catalog_import_service.py` 删 `MovieActor` / `MovieTag` / `MoviePlotImage`），
+//! `movie` 行本身留着 —— 因为大量列记录的是**采集到的事实**而非用户意图。
+//!
+//! 所以仓储层**刻意不提供** `MovieRepository::delete`。将来若出现真实
+//! 删除需求，那是行为变更，应先确认上游是否同步改。
+//!
+//! # 剩余的结构性缺失
 //!
 //! **组合写入已有出口**：[`UnitOfWork`] 按**动词**暴露用例，每个方法内部
-//! 编排多个仓储的 `_in` 变体并共享一个事务。已落地的用例：
-//! `generate_thumbnail`（写 `media_thumbnail` + 推进 `media` 状态机）。
-//! 仍缺的是跨**更多**表的用例，例如「插 Movie + 3 条 MovieActor +
+//! 编排多个仓储的 `_in` 变体并共享一个事务。已落地 `generate_thumbnail`
+//! （写 `media_thumbnail` + 推进 `media` 状态机）。
+//!
+//! 仍缺的是跨更多表的用例，例如「插 Movie + 3 条 MovieActor +
 //! upsert Tag」—— 那需要先有 `MovieActor` / `Tag` 的仓储。
 //!
-//! [`Actor`]: crate::catalog::actor::Actor
+//! //! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
 //!
 //! # 两个尚未确认的问题
@@ -78,6 +99,7 @@
 //!
 //! 上游 Python 侧不在本仓库内，CI 里 clone。这些问题需要查上游才能定论。
 
+pub mod asset;
 pub mod ctx;
 pub mod download;
 pub mod gateway;
@@ -87,6 +109,7 @@ pub mod playback;
 pub mod task;
 pub mod user;
 
+pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};

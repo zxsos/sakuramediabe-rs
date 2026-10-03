@@ -13,6 +13,7 @@
 
 use sqlx::{PgPool, Postgres};
 
+use super::ctx::Ctx;
 use crate::catalog::movie::{field_owner, Movie, MovieSeries, PROTECTED_MOVIE_FIELDS};
 use crate::common::guard::{FieldGuard, WriteSource};
 use crate::common::page::{Page, PageRequest};
@@ -130,6 +131,14 @@ impl MovieRepository {
     /// 所以用固定 SQL + Rust 侧填默认值。`insert_defaults_match_ddl` 测试
     /// 锁定了这些默认值与 DDL 的一致性。
     pub async fn insert(&self, new: &NewMovie) -> Result<Movie, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.insert_in(&mut ctx, new).await
+    }
+
+    /// [`Self::insert`] 的事务内变体。见 [`Ctx`]。
+    ///
+    /// 「导入一部影片」用例需要它与标签 upsert、演员关联共享一个事务。
+    pub async fn insert_in(&self, ctx: &mut Ctx<'_>, new: &NewMovie) -> Result<Movie, DbError> {
         let javdb_id = new
             .javdb_id
             .as_deref()
@@ -172,7 +181,7 @@ impl MovieRepository {
             .bind(new.thin_cover_image_id)
             .bind(new.metadata_source.as_ref())
             .bind(now)
-            .fetch_one(&self.pool)
+            .fetch_one(ctx.conn().await?.as_conn())
             .await
             .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
 

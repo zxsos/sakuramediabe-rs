@@ -44,7 +44,9 @@ use crate::error::DbError;
 #[allow(unused_imports)]
 use crate::playback::media::image_search_index_status;
 
+use super::asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 use super::media::MediaRepository;
+use super::movie::{MovieRepository, NewMovie};
 use super::playback::MediaThumbnailRepository;
 
 /// 执行上下文。
@@ -231,6 +233,26 @@ impl<'a> UnitOfWork<'a> {
         MediaThumbnailRepository::new(self.pool.clone())
     }
 
+    /// Movie 仓储。同上：方法需要显式传 `&mut Ctx` 才会走本事务。
+    pub fn movies(&self) -> MovieRepository {
+        MovieRepository::new(self.pool.clone())
+    }
+
+    /// 标签仓储。
+    pub fn tags(&self) -> TagRepository {
+        TagRepository::new(self.pool.clone())
+    }
+
+    /// 影片-演员关联仓储。
+    pub fn movie_actors(&self) -> MovieActorRepository {
+        MovieActorRepository::new(self.pool.clone())
+    }
+
+    /// 影片-标签关联仓储。
+    pub fn movie_tags(&self) -> MovieTagRepository {
+        MovieTagRepository::new(self.pool.clone())
+    }
+
     /// **用例**：为某条 Media 的某个时刻点生成缩略图。
     ///
     /// 三步在**同一事务**里：
@@ -287,4 +309,90 @@ pub struct GeneratedThumbnail {
     pub thumb: crate::playback::media::MediaThumbnail,
     /// 状态机已推进到终态的 Media 行。
     pub media: crate::playback::media::Media,
+}
+
+/// 一次影片导入的结果。
+#[derive(Debug, Clone)]
+pub struct ImportedMovie {
+    /// 已落库的影片行。
+    pub movie: crate::catalog::movie::Movie,
+    /// upsert 后的标签（已存在的会被复用）。
+    pub tags: Vec<crate::catalog::asset::Tag>,
+    /// 建立的演员关联。
+    pub actor_links: usize,
+}
+
+impl UnitOfWork<'_> {
+    /// **用例**：导入一部影片及其标签、演员关联。
+    ///
+    /// 全部在**同一事务**里：影片行、N 个标签 upsert、M 条演员关联。
+    ///
+    /// # 为什么必须原子
+    ///
+    /// 上游 `catalog_import_service.py` 的流程是「先建影片，再逐个
+    /// upsert 标签，再逐条建演员关联」。拆成独立提交时，中途失败会留下：
+    ///
+    /// - 影片有了但演员关联没建 → 影片页显示「未知演员」，且**没有任何
+    ///   机制会发现**，因为关联表是空的而非标记为不完整
+    /// - 标签建了一半 → 标签筛选器里出现该影片只有部分标签，而用户
+    ///   看到的是一个「正常」的影片
+    ///
+    /// # 标签去重由数据库做
+    ///
+    /// `upsert_by_name` 走 `ON CONFLICT (name) DO UPDATE ... RETURNING *`，
+    /// 所以并发导入同一部影片的不同资源时不会撞唯一约束，也不会产生
+    /// 重���标签。
+    ///
+    /// # `actor_ids` 里的重复会被 `link` 吞掉
+    ///
+    /// `(movie_id, actor_id)` 唯一索引 + `ON CONFLICT DO UPDATE`，
+    /// 所以调用方不需要先去重。
+    pub async fn import_movie(
+        &mut self,
+        movie: &NewMovie,
+        tag_names: &[&str],
+        actor_ids: &[i32],
+    ) -> Result<ImportedMovie, DbError> {
+        // 仓储先构造：它们只持 pool 句柄、本身无状态，所以在事务被借出
+        // 之前构造好，就不必在 `ctx` 存活期间再借 `self`。
+        let tag_repo = self.tags();
+        let movie_repo = self.movies();
+        let actor_link_repo = self.movie_actors();
+        let tag_link_repo = self.movie_tags();
+
+        // 先 upsert 标签：它们可能被多部影片共用，先建好能让关联插入
+        // 不必担心外键目标不存在。标签天然重复，所以冲突概率高。
+        let mut tags = Vec::with_capacity(tag_names.len());
+        for name in tag_names {
+            let mut ctx = self.ctx();
+            tags.push(tag_repo.upsert_by_name_in(&mut ctx, name).await?);
+        }
+
+        let movie_row = {
+            let mut ctx = self.ctx();
+            movie_repo.insert_in(&mut ctx, movie).await?
+        };
+
+        // 影片行到位后才建关联 —— 顺序反过来会撞外键。
+        let mut actor_links = 0usize;
+        for actor_id in actor_ids {
+            let mut ctx = self.ctx();
+            actor_link_repo
+                .link_in(&mut ctx, movie_row.id, *actor_id)
+                .await?;
+            actor_links += 1;
+        }
+        for tag in &tags {
+            let mut ctx = self.ctx();
+            tag_link_repo
+                .link_in(&mut ctx, movie_row.id, tag.id)
+                .await?;
+        }
+
+        Ok(ImportedMovie {
+            movie: movie_row,
+            tags,
+            actor_links,
+        })
+    }
 }

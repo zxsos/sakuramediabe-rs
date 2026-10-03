@@ -124,6 +124,11 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "CtxConnection",
         "UnitOfWork",
         "GeneratedThumbnail",
+        "ImportedMovie",
+        # asset 批次（asset.rs）
+        "TagRepository",
+        "MovieActorRepository",
+        "MovieTagRepository",
     }
 )
 
