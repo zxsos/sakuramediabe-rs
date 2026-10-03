@@ -173,8 +173,8 @@ pub mod image_search_index_status {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaThumbnail {
     pub id: i32,
-    pub media_id: i64,
-    pub image_id: i64,
+    pub media_id: i32,
+    pub image_id: i32,
     /// 距片头的秒数。
     pub offset: i32,
     pub image_search_index_status: i32,
@@ -188,7 +188,7 @@ pub struct MediaThumbnail {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaProgress {
     pub id: i32,
-    pub media_id: i64,
+    pub media_id: i32,
     pub position_seconds: i32,
     pub last_watched_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
@@ -209,10 +209,10 @@ pub struct MediaProgress {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaPoint {
     pub id: i32,
-    pub media_id: Option<i64>,
-    pub thumbnail_id: Option<i64>,
+    pub media_id: Option<i32>,
+    pub thumbnail_id: Option<i32>,
     /// 删图会被数据库拒绝（RESTRICT）。
-    pub image_id: i64,
+    pub image_id: i32,
     /// 来源快照，无外键。
     pub movie_number: Option<String>,
     /// 来源快照，无外键。
@@ -231,7 +231,7 @@ pub struct MediaPoint {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaClip {
     pub id: i32,
-    pub media_id: Option<i64>,
+    pub media_id: Option<i32>,
     /// 来源快照，便于来源删除后仍可归属与展示。
     pub movie_number: Option<String>,
     pub start_offset_seconds: i32,

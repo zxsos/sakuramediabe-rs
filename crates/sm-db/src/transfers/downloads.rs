@@ -37,7 +37,7 @@ pub struct DownloadClient {
     /// 不透明 JSON 文本，由 provider 解释。宿主只保存与原样回传。
     pub provider_config: Option<String>,
     /// 归属库。删库会连带删除该库的下载器。
-    pub library_id: i64,
+    pub library_id: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -100,8 +100,8 @@ impl Indexer {
 #[derive(Debug, Clone, FromRow)]
 pub struct IndexerDownloadClient {
     pub id: i32,
-    pub indexer_id: i64,
-    pub download_client_id: i64,
+    pub indexer_id: i32,
+    pub download_client_id: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -173,7 +173,7 @@ pub struct DownloadTask {
     /// 宿主导入状态，默认 `pending`。
     pub import_status: String,
     /// 关联的后台任务台账。删台账记录只置空，不影响下载任务。
-    pub import_task_run_id: Option<i64>,
+    pub import_task_run_id: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }

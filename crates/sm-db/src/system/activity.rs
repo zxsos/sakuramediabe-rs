@@ -163,7 +163,7 @@ pub struct SystemNotification {
     pub is_read: bool,
     pub read_at: Option<NaiveDateTime>,
     /// 关联任务台账。删台账行只置空，通知保留。
-    pub related_task_run_id: Option<i64>,
+    pub related_task_run_id: Option<i32>,
     /// 遗留展示关联类型。
     pub related_resource_type: Option<String>,
     /// 遗留展示关联 ID。

@@ -143,10 +143,10 @@ pub fn is_system_playlist_kind(kind: &str) -> bool {
 #[derive(Debug, Clone, FromRow)]
 pub struct PlaylistMovie {
     pub id: i32,
-    pub playlist_id: i64,
+    pub playlist_id: i32,
     /// 指向 `Movie`（JAV 影片）。注意 `Movie` 有 `movie_number` 字段，
     /// 但这个外键指向的是它的 `id`。
-    pub movie_id: i64,
+    pub movie_id: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }

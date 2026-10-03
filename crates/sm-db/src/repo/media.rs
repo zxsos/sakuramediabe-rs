@@ -53,6 +53,20 @@ pub struct NewMedia {
 }
 
 impl NewMedia {
+    /// 写入前的全部业务校验。
+    ///
+    /// 两项都归到这里而不是散在 `insert` 里：原先空文件名检查内联在
+    /// `insert` 中，导致单元测试只能测到 `str::trim`，实际拒绝逻辑
+    /// 一行都没被执行过。合成一个入口后，测试可以直接断言错误类型。
+    fn validate(&self) -> Result<(), DbError> {
+        self.check_owner()?;
+
+        if self.file_name.trim().is_empty() {
+            return Err(DbError::business(ENTITY, "file_name 不能为空"));
+        }
+        Ok(())
+    }
+
     /// 校验 XOR 归属，返回业务错误。
     fn check_owner(&self) -> Result<(), DbError> {
         if self.movie_number.is_some() == self.video_item_id.is_some() {
@@ -100,13 +114,9 @@ impl MediaRepository {
             .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
-    /// 插入。**写入前校验 XOR 归属。**
+    /// 插入。**写入前校验 XOR 归属与文件名。**
     pub async fn insert(&self, new: &NewMedia) -> Result<Media, DbError> {
-        new.check_owner()?;
-
-        if new.file_name.trim().is_empty() {
-            return Err(DbError::business(ENTITY, "file_name 不能为空"));
-        }
+        new.validate()?;
 
         let sql = "\
             INSERT INTO media (
@@ -339,9 +349,26 @@ mod tests {
 
     #[test]
     fn empty_file_name_is_rejected_before_touching_db() {
+        // 断言的是 `validate()` 的行为，不是 `str::trim` 的行为。
+        // 原先这里只写了 `assert!(m.file_name.trim().is_empty())` ——
+        // 一个恒真断言，`insert` 里的拒绝逻辑从未被执行过。
         let mut m = new_media(Some("ABC-001"), None);
         m.file_name = "   ".to_owned();
-        assert!(m.file_name.trim().is_empty());
+        let err = m.validate().expect_err("空白 file_name 应被拒绝");
+        assert!(matches!(err, DbError::Business { .. }), "应为业务错误(422)");
+        assert!(err.to_string().contains("file_name"), "{err}");
+
+        // 归属错误优先于文件名错误：XOR 是更根本的不变量。
+        let mut both = new_media(Some("ABC-001"), Some(7));
+        both.file_name = "  ".to_owned();
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("恰好归属"));
+
+        // 正常输入通过
+        assert!(new_media(Some("ABC-001"), None).validate().is_ok());
     }
 
     #[test]

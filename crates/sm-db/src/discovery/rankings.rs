@@ -36,7 +36,7 @@ pub struct RankingItem {
     /// `movie_id` 在影片入库后回填。查询番号用这一列，join 用外键。
     pub movie_number: String,
     /// 指向 `Movie`（JAV 影片）的 `id`。影片未入库时为空。
-    pub movie_id: Option<i64>,
+    pub movie_id: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -73,7 +73,7 @@ pub struct DailyRecommendationItem {
     /// 指向 `Movie`（JAV 影片）。**唯一** —— 一部电影在表里至多一条。
     ///
     /// 注意这个唯一性是全表的，不按 `snapshot_date` 分组。
-    pub movie_id: i64,
+    pub movie_id: i32,
     /// 名次，**全表唯一**（见模块文档）。
     pub rank: i32,
     /// 综合得分。
@@ -156,19 +156,19 @@ pub struct MomentRecommendation {
     /// 可读的推荐理由。
     pub reason: String,
     /// 目标影片。
-    pub movie_id: i64,
+    pub movie_id: i32,
     /// 目标媒体文件。
-    pub media_id: i64,
+    pub media_id: i32,
     /// 目标缩略图（**唯一** —— 一个缩略图至多被推荐一次）。
-    pub thumbnail_id: i64,
+    pub thumbnail_id: i32,
     /// 距片头的秒数。
     pub offset_seconds: i32,
     /// 种子时刻点，即「从这个时刻出发找相似内容」。
-    pub seed_point_id: Option<i64>,
+    pub seed_point_id: Option<i32>,
     /// 种子缩略图（视觉检索路径）。
-    pub seed_thumbnail_id: Option<i64>,
+    pub seed_thumbnail_id: Option<i32>,
     /// 种子来源影片（影片相似度路径）。
-    pub source_movie_id: Option<i64>,
+    pub source_movie_id: Option<i32>,
     /// 视觉相似度分量得分。无视觉依据时为空。
     pub visual_score: Option<f64>,
     /// 影片相似度分量得分。无影片依据时为空。
@@ -226,7 +226,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
-    fn ranking(period: &str, movie_id: Option<i64>) -> RankingItem {
+    fn ranking(period: &str, movie_id: Option<i32>) -> RankingItem {
         RankingItem {
             id: 1,
             source_key: "javdb".to_owned(),
@@ -259,7 +259,7 @@ mod tests {
         }
     }
 
-    fn moment(seed_thumb: Option<i64>, seed_movie: Option<i64>) -> MomentRecommendation {
+    fn moment(seed_thumb: Option<i32>, seed_movie: Option<i32>) -> MomentRecommendation {
         MomentRecommendation {
             id: 1,
             rank: 1,

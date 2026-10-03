@@ -70,6 +70,37 @@ DECLARE_RE = re.compile(
 )
 STR_RE = re.compile(r'"([^"]+)"')
 
+# 豁免名单：Rust 侧存在、但**不是**上游 Peewee 表镜像的结构体。
+#
+# 加入条件（必须同时满足，否则不许豁免）：
+#   1. 不参与任何 SQL —— 没有 #[derive(FromRow)]，不被 query_as! 使用；
+#   2. 不是数据库表的列集合（仓储、请求/响应 DTO、测试夹具、纯值对象）。
+#
+# 名单之外的每个未检查 struct 都会让对拍失败。这是刻意的：新增一个
+# struct 却忘了给它 Python 对应物时，应该被问到，而不是安静地跳过。
+#
+# 下面 11 个都满足上述两条：它们是本仓库自己造的访问层与数据结构，
+# 上游 Python 侧按定义就不存在对应模型。
+UNCHECKED_STRUCT_EXEMPT = frozenset(
+    {
+        # 仓储与网关：持有 PgPool，不映射任何表
+        "MovieRepository",
+        "MovieSeriesRepository",
+        "MediaRepository",
+        "DownloadTaskRepository",
+        "MovieOwnershipGateway",
+        # 插入 DTO：只列出调用方需要显式提供的列，是子集而非全表
+        "NewMovie",
+        "NewMedia",
+        "NewDownloadTask",
+        # 纯值对象：字段主权补丁与护栏，不落库
+        "FieldPatch",
+        "FieldGuard",
+        # 集成测试夹具
+        "TestDb",
+    }
+)
+
 
 def strip_option(rust_type: str):
     t = rust_type.strip()
@@ -151,6 +182,9 @@ def main() -> int:
 
     problems = []
     checked = 0
+    # 用单元素 list 当可变计数器（Python 3 的 nonlocal 在闭包里不便于
+    # 从 summarize 读取）。它只用于 summary 输出，不影响判定。
+    fk_checked = [0]
 
     for m in models:
         sname = m["struct"]
@@ -168,7 +202,58 @@ def main() -> int:
                 problems.append(("MISSING_FIELD", m["table"], col, "Python 有，Rust 没有"))
                 continue
             py_type = py_cols[col]["type"]
-            if py_type in ("implicit", "fk", "bare"):
+            if py_type == "fk":
+                # 外键列**不是没有类型**，它的类型就是被引用列的类型。
+                #
+                # 此前这里直接 continue，于是 `media_thumbnail.media_id: i64`
+                # 长期「通过」对拍，而 DDL 里那一列是 integer（gen_ddl.py
+                # 跟随被引用表的 id 类型）。读列时 sqlx 会把 int4 解码进
+                # i64 而失败 —— 与之前 f32 缺陷完全同类，只是发生在集成
+                # 测试而不是对拍阶段。
+                #
+                # 现在比对该 fk 指向的列在 Python 侧的规范化类型。
+                #
+                # 两个键名细节：
+                #  - 是 `ref_table` 而非 `ref_model`：`collect()` 的第二遍
+                #    会把类名解析成表名后 `pop("ref_model")`。
+                #  - `ref_field` 为空是常态：Peewee 的
+                #    `ForeignKeyField(Model)` 不写 `field=` 时默认指向
+                #    `Model.id`，所以要自己补上这个默认值。
+                ref = py_cols[col].get("ref_table")
+                if not ref:
+                    continue
+                target = next((x for x in models if x["table"] == ref), None)
+                if target is None:
+                    continue
+                if rust_fields[col] == "COLUMNS_CONST":
+                    # 宏生成类型只声明了列名，没有类型信息 —— 与非 fk
+                    # 分支同样的理由无法判定，跳过。
+                    continue
+                ref_field = py_cols[col].get("ref_field") or "id"
+                ref_col = target["columns"].get(ref_field)
+                if not ref_col or ref_col["type"] in ("implicit", "fk", "bare"):
+                    continue
+                base, _, raw = normalize(rust_fields[col])
+                if base is None:
+                    problems.append(
+                        ("UNKNOWN_TYPE", m["table"], col, "Rust 类型 %s 未在映射表中" % raw)
+                    )
+                else:
+                    # 记账：这个数字一旦归零，说明上面的规则被改坏或
+                    # 解析路径失效了，而没有任何 problem 会暴露出来。
+                    fk_checked[0] += 1
+                if base is not None and not types_compatible(ref_col["type"], base):
+                    problems.append(
+                        (
+                            "FK_TYPE_MISMATCH",
+                            m["table"],
+                            col,
+                            "引用 %s.%s(Python=%s) 但 Rust=%s"
+                            % (ref, ref_field, ref_col["type"], raw),
+                        )
+                    )
+                continue
+            if py_type in ("implicit", "bare"):
                 continue
             if rust_fields[col] == "COLUMNS_CONST":
                 # 宏生成类型只声明了列名，没有类型信息；类型正确性由
@@ -192,13 +277,56 @@ def main() -> int:
             if fname not in py_cols:
                 problems.append(("EXTRA_FIELD", m["table"], fname, "Rust 有，Python 没有"))
 
+    # 反向检查：Rust 里多出来的结构体，**一个都没被上面验证过**。
+    #
+    # 主循环遍历的是 Python 模型，所以任何只有 Rust 侧存在的 struct
+    # 都被静默跳过。此前一直报 40/40 全通过，而 rust_structs=51 ——
+    # 11 个 struct 从未与任何东西比对过，包括 media_thumbnail 的
+    # `media_id: i64`（DDL 是 integer），那正是 f32 缺陷的同一类问题：
+    # 类型错了要等到运行时读列才报。
+    #
+    # 这里不试图给它们补 Python 模型（那需要上游确实有对应表），只保证
+    # 差异**可见**：每个未被检查的 struct 都会列出来，附带一个显式的
+    # 豁免名单，名单之外的必须处理。
+    #
+    # 豁免的判断依据是「它不是 Peewee 表的镜像」：
+    #   - 纯值对象 / 枚举包装（没有 #[FromRow]，不参与任何 SQL）
+    #   - 请求/响应 DTO（由 sm-api 拥有，不落库）
+    checked_structs = {m["struct"] for m in models}
+    unchecked = sorted(set(rust) - checked_structs)
+    unexempt = [s for s in unchecked if s not in UNCHECKED_STRUCT_EXEMPT]
+    for s in unexempt:
+        r = rust[s]
+        problems.append(
+            (
+                "UNCHECKED_STRUCT",
+                r["table"] or s,
+                s,
+                "Rust 侧结构体没有对应的 Python 模型，列与类型均未验证",
+            )
+        )
+
     if args.summary:
-        print("models=%d  rust_structs=%d  checked=%d  problems=%d"
-              % (len(models), len(rust), checked, len(problems)))
+        print(
+            "models=%d  rust_structs=%d  checked=%d  unchecked=%d (exempt %d)  "
+            "fk_cols_checked=%d  problems=%d"
+            % (
+                len(models),
+                len(rust),
+                checked,
+                len(unchecked),
+                len(unchecked) - len(unexempt),
+                fk_checked[0],
+                len(problems),
+            )
+        )
         return 1 if problems else 0
 
     if not problems:
-        print("schema 对拍：通过 %d/%d 张表，列名/类型/可空性全部一致" % (checked, len(models)))
+        print(
+            "schema 对拍：通过 %d/%d 张表，列名/类型/可空性全部一致"
+            "（含 %d 个外键列与被引用列的类型一致性）" % (checked, len(models), fk_checked[0])
+        )
         return 0
 
     buckets = {}

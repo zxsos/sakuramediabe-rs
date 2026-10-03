@@ -58,10 +58,10 @@ pub struct Actor {
     /// 别名合并后的结果，格式 `"主名 / 别名1 / 别名2"`，去重且主名在首位。
     pub alias_name: String,
     /// 墓碑指针：指向合并后的保留记录。
-    pub merged_into_id: Option<i64>,
-    pub profile_image_id: Option<i64>,
+    pub merged_into_id: Option<i32>,
+    pub profile_image_id: Option<i32>,
     /// 本地头像覆盖。优先于 `profile_image_id`。
-    pub profile_image_override_id: Option<i64>,
+    pub profile_image_override_id: Option<i32>,
     /// 本地显示名覆盖。为空串时归一为 NULL。
     pub display_name_override: Option<String>,
 
@@ -121,7 +121,7 @@ impl Actor {
     }
 
     /// 生效头像：覆盖优先。
-    pub fn effective_profile_image_id(&self) -> Option<i64> {
+    pub fn effective_profile_image_id(&self) -> Option<i32> {
         self.profile_image_override_id.or(self.profile_image_id)
     }
 
@@ -194,9 +194,13 @@ pub fn merge_alias_name(primary_name: &str, alias_names: &[&str], existing: &str
 ///
 /// 对应 `Actor.resolve_canonical`。带环检测：指针成环时停在当前记录，
 /// 而不是死循环 —— 合并操作可能被并发打断而留下环。
-pub fn resolve_canonical_ids<F>(start_id: i64, mut lookup: F) -> Option<i64>
+///
+/// 泛型而非写死 `i32`：墓碑链的遍历逻辑与 id 的具体宽度无关，
+/// 调用方可以传闭包做数据库查询。
+pub fn resolve_canonical_ids<T, F>(start_id: T, mut lookup: F) -> Option<T>
 where
-    F: FnMut(i64) -> Option<(i64, Option<i64>)>,
+    T: Copy + PartialEq,
+    F: FnMut(T) -> Option<(T, Option<T>)>,
 {
     let (mut current_id, mut merged_into) = lookup(start_id)?;
     let mut seen = vec![start_id];
