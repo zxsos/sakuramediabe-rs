@@ -80,14 +80,26 @@ jobs:
       - name: Apply generated DDL
         # DDL 由 parity/gen_ddl.py 从上游 Peewee 模型生成，CI 里重新生成而不是
         # 用仓库里那份 —— 免得有人手改 schema.sql 却没改生成器。
+        #
+        # search_path 必须和 DDL 在**同一次连接**里生效：`psql -c 'SET search_path'`
+        # 与 `psql -f` 是两个独立会话，SET 不会带过去，40 张表会落进 public。
+        # 所以把 SET 与 DDL 拼成一个文件一次喂进去。
         run: |
           python3 parity/gen_ddl.py --out /tmp/schema.sql
+          {
+            echo "DROP SCHEMA IF EXISTS sakuramedia_test CASCADE;"
+            echo "CREATE SCHEMA sakuramedia_test;"
+            echo "SET search_path TO sakuramedia_test;"
+            cat /tmp/schema.sql
+          } > /tmp/apply.sql
           psql -v ON_ERROR_STOP=1 \
                -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
-               -c 'CREATE SCHEMA IF NOT EXISTS sakuramedia_test;'
-          psql -v ON_ERROR_STOP=1 \
+               -f /tmp/apply.sql
+          # 确认表真的落在目标 schema 里，而不是 public —— 上面那个坑的回归防线。
+          psql -v ON_ERROR_STOP=1 -t \
                -h localhost -p 5433 -U sakuramedia -d sakuramedia_test \
-               -c 'SET search_path TO sakuramedia_test;' -f /tmp/schema.sql
+               -c "SELECT count(*) FROM information_schema.tables
+                   WHERE table_schema='sakuramedia_test';"
 
       - name: Integration tests
         run: cargo test -p sm-db --test repo_integration --test gateway_integration
