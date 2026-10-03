@@ -188,6 +188,12 @@ impl PageArgCopy for u32 {}
 impl PageArgCopy for f64 {}
 impl PageArgCopy for chrono::NaiveDateTime {}
 
+/// `NaiveDate` 也是可按值复制的 —— 纯日期（`DateField`）的过滤参数。
+///
+/// 与 `NaiveDateTime` 分开列出而不是靠某个 blanket impl 覆盖：这两者是
+/// 不同类型，而 `chrono` 没有把它们统一到同一个 trait 下。
+impl PageArgCopy for chrono::NaiveDate {}
+
 /// `Option<T>` 也是可按值复制的 —— 「可选过滤条件」是分页的常见形态。
 ///
 /// `since: Option<NaiveDateTime>` 意为「不传下界」。绑 `None` 时 SQL 写

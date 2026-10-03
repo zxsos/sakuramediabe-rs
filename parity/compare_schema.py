@@ -162,6 +162,10 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "ImageSearchSessionRepository",
         "NewImageSearchSession",
         "ImageSearchIndexStateRepository",
+        "DailyRecommendationItemRepository",
+        "NewDailyRecommendation",
+        "MomentRecommendationRepository",
+        "NewMomentRecommendation",
         "MomentCollectionItemRepository",
         "ClipCollectionItemRepository",
         # transfer 批次（transfer.rs）
