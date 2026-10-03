@@ -583,16 +583,25 @@ fn bind_patch_values<'q>(
     acc
 }
 
-/// 绑定三轮字段值（`SET` / `revision` / `updated_at` 各一轮）。
+/// 绑定三轮 `(key, value)`，对应 SQL 里 `SET` / `revision` / `updated_at`
+/// 三段子句各占一轮。
 ///
-/// 顺序必须与 SQL 里三段子句的占位符编号一致 —— [`MovieOwnershipGateway::update_host_unowned`]
-/// 依次为每字段分配 `(key, value)` 三次。
+/// **每轮必须绑两个值**：`(key, value)` 在 SQL 里是两个独立占位符
+/// （`field_owners->>$1 IS NULL THEN $2`），少绑一个就会得到
+/// 「supplies 7 parameters, but prepared statement requires 13」。
+/// 这条只在真实数据库上暴露过 —— 单元测试不构造查询。
+///
+/// 顺序必须与 [`MovieOwnershipGateway::update_host_unowned`] 里 `q`
+/// 计数器的分配顺序一致：每轮先全部 key，再全部 value。
 fn bind_patch_triples<'q>(
     query: Query<'q, Postgres, PgArguments>,
     patch: &FieldPatch,
 ) -> Query<'q, Postgres, PgArguments> {
     let mut acc = query;
     for _ in 0..3 {
+        for (name, _) in patch.iter() {
+            acc = acc.bind(name);
+        }
         for (_, value) in patch.iter() {
             acc = value.clone().bind(acc);
         }
