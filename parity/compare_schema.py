@@ -111,6 +111,12 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "ClaimedTask",
         "TaskProgress",
         "TaskOutcome",
+        # Media 族批次（playback.rs）
+        "MediaThumbnailRepository",
+        "MediaProgressRepository",
+        "MediaPointRepository",
+        "MediaClipRepository",
+        "NewMediaClip",
     }
 )
 

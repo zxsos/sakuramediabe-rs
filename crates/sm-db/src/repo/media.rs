@@ -97,6 +97,56 @@ impl MediaRepository {
         &self.pool
     }
 
+    /// 按内容哈希查找。
+    ///
+    /// `file_hash` 的模型注释写明它是「跨存储识别重复文件的依据」——
+    /// 同一个文件在两个 storage 里各有一份时，靠这个认出它们是同一个。
+    ///
+    /// 返回 `Vec` 而非 `Option`：同一个哈希对应多条**是可能的**（同一
+    /// 文件被导入到两个库），真出现多条说明导入逻辑有问题，但仓储不该
+    /// 因此拒绝回答「有哪几条」—— 那会让调用方既拿不到数据、又拿不到
+    /// 错误。
+    pub async fn find_by_file_hash(&self, hash: &str) -> Result<Vec<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE file_hash = $1 ORDER BY id")
+                .bind(hash.trim())
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 列出某个库的全部媒体。
+    pub async fn list_by_library(
+        &self,
+        library_id: i32,
+        limit: i64,
+    ) -> Result<Vec<Media>, DbError> {
+        Ok(sqlx::query_as::<_, Media>(
+            "SELECT * FROM media WHERE library_id = $1 ORDER BY id LIMIT $2",
+        )
+        .bind(library_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按影片番号列出媒体。
+    ///
+    /// 这是「JAV 影片详情页列出所有正片」的主查询。
+    pub async fn list_by_movie_number(
+        &self,
+        movie_number: &str,
+        limit: i64,
+    ) -> Result<Vec<Media>, DbError> {
+        Ok(sqlx::query_as::<_, Media>(
+            "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2",
+        )
+        .bind(movie_number.trim())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 按主键查询。
     pub async fn find_by_id(&self, id: i32) -> Result<Option<Media>, DbError> {
         Ok(

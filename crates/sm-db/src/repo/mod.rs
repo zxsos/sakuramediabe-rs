@@ -23,8 +23,9 @@
 //! | [`download`] | 两个独立状态机 | 分离的 setter，形状上无法混传 |
 //! | [`user`] | 令牌轮换的原子性 | 事务 + `FOR UPDATE`（本 crate 第一个事务） |
 //! | [`task`] | 队列互斥 + 租约 | `SKIP LOCKED` 领取，终态释放 `mutex_key` |
+//! | [`playback`] | 三个不同形状的唯一索引 | 各表分别 upsert / 允许重复 |
 //!
-//! # 覆盖范围：40 张表里的 7 张
+//! # 覆盖范围：40 张表里的 11 张
 //!
 //! 下面这些是**已知缺口**，不是待办清单里的小事。按「不解锁别的就写不了」
 //! 的顺序排列：
@@ -32,27 +33,22 @@
 //! | 优先级 | 缺口 | 阻塞了什么 |
 //! |---|---|---|
 //! | P0 | 任何表都没有分页与计数 | `sm-core::pagination::Paginated` 需要 `offset` 与 `total`，而所有 list 方法只有 `limit`。**这是横切缺口**，不是单表缺口 |
-//! | P1 | [`MediaThumbnail`] 无仓储 | `media` 上已有的缩略图状态机（[`media::MediaRepository::record_thumbnail_success`]）**产出的行无处可存** —— 现有代码内部就已经断裂 |
-//! | P1 | `Media` 缺业务键查询 | 只有 `find_by_id`。`file_hash` 的模型注释明说它是「跨存储识别重复文件的依据」，却没有对应的去重查询 |
-//! | P1 | [`MediaProgress`] / [`MediaPoint`] / [`MediaClip`] 无仓储 | 播放进度是典型 upsert（`media` 上有唯一索引），最需要 `upsert_progress` |
 //! | P1 | [`Actor`] 无仓储 | 与 `Movie` 完全对称的主数据（9 个受保护字段 + 合并链 + 字段主权），却连 `find_by_javdb_id` 都没有 |
 //! | P1 | `Image` / `Tag` / `MovieActor` / `MovieTag` / `Subtitle` 无仓储 | `asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
+//! | P1 | [`MediaLibrary`] 无仓储 | `media.library_id` 指向它，但库管理端点（增删改查 provider 配置）无落点。写 `media` 前必须先有库 |
 //! | P2 | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //! | P2 | `DownloadSubmissionRecord` 无仓储 | `download.rs` 的注释把幂等提交建立在 `(client, remote_id)` 唯一索引上，但「先查后插」要查的正是这张表 |
 //! | P2 | 合集族 6 张表 / 其余 5 张传输表 | `PluginOwned` trait 与 `playback_order_key()` 已为仓储预留形状，一个方法都没有 |
 //!
-//! 结构性缺失仍有一条：**零 `delete`**。`media_point` 的 RESTRICT /
-//! SET NULL 语义、`user_refresh_tokens` 之外的清理路径，目前只存在于注释里。
+//! 结构性缺失仍有一条：**零 `delete`**，只有 `media_point` 与 `media_progress`
+//! 两处局部例外（`clear` / `delete`），其余表的删除路径只存在于注释里。
 //!
 //! 事务已不再是缺失 —— [`user::UserRefreshTokenRepository::rotate`]
 //! 开了第一个。但它把事务**关在方法内部**，跨仓储组合写入（例如
 //! 「插 Movie + 3 条 MovieActor + upsert Tag」）仍无处表达原子性。
 //!
-//! [`MediaThumbnail`]: crate::playback::media::MediaThumbnail
-//! [`MediaProgress`]: crate::playback::media::MediaProgress
-//! [`MediaPoint`]: crate::playback::media::MediaPoint
-//! [`MediaClip`]: crate::playback::media::MediaClip
 //! [`Actor`]: crate::catalog::actor::Actor
+//! [`MediaLibrary`]: crate::playback::media::MediaLibrary
 //!
 //! # 两个尚未确认的问题
 //!
@@ -72,6 +68,7 @@ pub mod download;
 pub mod gateway;
 pub mod media;
 pub mod movie;
+pub mod playback;
 pub mod task;
 pub mod user;
 
@@ -79,5 +76,9 @@ pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
+pub use playback::{
+    MediaClipRepository, MediaPointRepository, MediaProgressRepository, MediaThumbnailRepository,
+    NewMediaClip,
+};
 pub use task::{BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskOutcome, TaskProgress};
 pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, UserRepository};
