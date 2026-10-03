@@ -145,6 +145,11 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # library 批次（library.rs）
         "MediaLibraryRepository",
         "NewMediaLibrary",
+        # collection 批次（collection.rs）：宏生成，三个父表
+        "PlaylistRepository",
+        "MomentCollectionRepository",
+        "ClipCollectionRepository",
+        "NewCollection",
         # transfer 批次（transfer.rs）
         "DownloadClientRepository",
         "IndexerRepository",

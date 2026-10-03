@@ -126,6 +126,7 @@
 
 pub mod actor;
 pub mod asset;
+pub mod collection;
 pub mod ctx;
 pub mod download;
 pub mod gateway;
@@ -140,6 +141,9 @@ pub mod user;
 
 pub use actor::{ActorRepository, NewActor, SyncState};
 pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
+pub use collection::{
+    ClipCollectionRepository, MomentCollectionRepository, NewCollection, PlaylistRepository,
+};
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
