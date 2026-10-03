@@ -99,6 +99,7 @@
 //!
 //! 上游 Python 侧不在本仓库内，CI 里 clone。这些问题需要查上游才能定论。
 
+pub mod actor;
 pub mod asset;
 pub mod ctx;
 pub mod download;
@@ -109,6 +110,7 @@ pub mod playback;
 pub mod task;
 pub mod user;
 
+pub use actor::{ActorRepository, NewActor, SyncState};
 pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};

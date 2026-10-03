@@ -129,6 +129,10 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "TagRepository",
         "MovieActorRepository",
         "MovieTagRepository",
+        # actor 批次（actor.rs）
+        "ActorRepository",
+        "NewActor",
+        "SyncState",
     }
 )
 
