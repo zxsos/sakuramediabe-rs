@@ -348,6 +348,27 @@ macro_rules! impl_collection_repo {
                 .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))
             }
 
+            /// 推进 `updated_at`，返回是否真的改了。
+            ///
+            /// 合集的「最近活跃」靠这一列 —— 列表页按它排序。上游在增删
+            /// 成员时都会 `_touch_playlist`，所以这个入口是必需的。
+            ///
+            /// 刻意**只**更新 `updated_at`：连 name / description 一起写
+            /// 会在并发下把别人的改动覆盖掉。
+            pub async fn touch(&self, id: i32) -> Result<bool, DbError> {
+                let result = sqlx::query(concat!(
+                    "UPDATE ",
+                    $table,
+                    " SET updated_at = $2 WHERE id = $1",
+                ))
+                .bind(id)
+                .bind(crate::common::time::now_utc())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+                Ok(result.rows_affected() > 0)
+            }
+
             /// 删合集。**连带删除全部成员行**（`ON DELETE CASCADE`）。
             pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
                 let result = sqlx::query(concat!("DELETE FROM ", $table, " WHERE id = $1"))
@@ -779,6 +800,64 @@ impl_ordered_member_repo!(
 #[derive(Debug, Clone)]
 pub struct PlaylistMovieRepository {
     pool: PgPool,
+}
+
+/// `Playlist` 专属的仓储方法。
+///
+/// **不**放进 `impl_collection_repo!` —— 宏生成的三个父表里只有 `playlist`
+/// 有 `kind` 列，另外两张表（`moment_collection` / `clip_collection`）
+/// 没有。把引用 `kind` 的 SQL 放进宏会为它们生成一段引用不存在列的查询
+/// —— 那正是本仓库此前反复出现的缺陷形状。
+impl PlaylistRepository {
+    /// 按 `kind` 查一个系统列表。**至多一行。**
+    ///
+    /// 「最近播放」是系统单例：按 kind 查，不存在才建。所以这个查询返回
+    /// `Option` 而不是分页列表 —— 出现两行就是数据损坏，而不是正常情况。
+    pub async fn find_by_system_kind(&self, kind: &str) -> Result<Option<Playlist>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Playlist>("SELECT * FROM playlist WHERE kind = $1 LIMIT 1")
+                .bind(kind.trim())
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 改描述，返回是否真的改了。
+    ///
+    /// 与 [`Self::rename`] 分开而不是一个 `update` —— 上游
+    /// `update_playlist` 是「局部可更新，未传的字段保持原值」。一个全字段
+    /// 写入口会把「只改描述」变成「连名字一起重写」，在并发下覆盖别人的
+    /// 改名。
+    pub async fn set_description(&self, id: i32, description: &str) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("UPDATE playlist SET description = $2, updated_at = $3 WHERE id = $1")
+                .bind(id)
+                .bind(description.trim())
+                .bind(crate::common::time::now_utc())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 改名，返回是否真的改了。空白名按业务错误拒绝。
+    ///
+    /// `name` 是唯一索引，所以重名会撞约束 —— 唯一性判断留给 service 层
+    /// （它能区分「保留名」与「已被占用」，而仓储不能）。
+    pub async fn rename(&self, id: i32, name: &str) -> Result<bool, DbError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(DbError::business(COLLECTION_ENTITY, "name 不能为空"));
+        }
+        let result = sqlx::query("UPDATE playlist SET name = $2, updated_at = $3 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .bind(crate::common::time::now_utc())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 impl PlaylistMovieRepository {

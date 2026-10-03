@@ -16,3 +16,9 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+sm-db = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
