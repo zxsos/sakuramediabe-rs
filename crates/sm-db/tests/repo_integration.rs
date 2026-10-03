@@ -6,13 +6,37 @@
 //! —— 拿不到连接就直接返回，测试算**通过**。这样 `cargo test` 在没起
 //! 库的环境里仍然是全绿，而起了库就会真的跑。
 //!
-//! 跑之前需要：
+//! **代价是「跳过」和「通过」在退出码上无法区分**，所以 CI 里额外有一
+//! 步按 suite 断言通过数，见 `.github/workflows/ci.yml`。
 //!
-//! ```text
-//! python parity/apply_ddl.py            # 起库 + 建表
-//! $env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia:...@localhost:5433/sakuramedia_test"
+//! # 怎么跑
+//!
+//! ```powershell
+//! # 1) 起库（本机是便携版 PostgreSQL 16，容器则用 docker compose）
+//! pg_ctl -D $env:LOCALAPPDATA\pg16\data -l $env:LOCALAPPDATA\pg16\startup.log -o "-p 5433" start
+//!
+//! # 2) 建表（DDL 由 parity/gen_ddl.py 从上游 Peewee 模型生成）
+//! python parity/apply_ddl.py
+//!
+//! # 3) 跑测试
+//! $env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia@127.0.0.1:5433/sakuramedia_test"
 //! cargo test -p sm-db --test repo_integration -- --nocapture
 //! ```
+//!
+//! # 两个环境要求
+//!
+//! - **`timezone=UTC`**：列是 `timestamp without time zone`，容器时区不是
+//!   UTC 会让 naive datetime 的往返比较出现偏移。
+//! - **`max_connections >= 50`**：每个测试在 `Drop` 时会另开一个连接做
+//!   清理。便携版 PostgreSQL 默认只有 20，18 个测试并行时
+//!   `TestDb::create()` 会直接因抢不到连接而 panic —— 报出来的是连接
+//!   超时，不是任何业务逻辑问题。
+//!
+//! # 并行度
+//!
+//! `--test-threads=4` 比默认的「按 CPU 数」**更快**（本机 16 核：
+//! 20s vs 35s）。每个测试都要建 40 张表，这是 CPU/IO 密集而非等待型，
+//! 并行只会加剧连接与 DDL 竞争。
 //!
 //! # 覆盖的七件事
 //!

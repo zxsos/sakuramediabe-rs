@@ -105,19 +105,32 @@ jobs:
                    WHERE table_schema='sakuramedia_test';"
 
       - name: Integration tests
-        run: cargo test -p sm-db --test repo_integration --test gateway_integration
+        # 输出留档给下一步断言用：集成测试在无 DATABASE_URL 时是「跳过
+        # 且通过」，只看退出码会在环境配错时静默变绿。
+        run: |
+          cargo test -p sm-db --test repo_integration --test gateway_integration \
+               2>&1 | tee /tmp/integration.log
+          # tee 会吞掉 cargo 的退出码，必须显式取回来。
+          exit "${PIPESTATUS[0]}"
 
       - name: Verify tests actually ran
-        # 集成测试在无 DATABASE_URL 时是「跳过且通过」，所以只看退出码会在
-        # 环境配错时静默变绿。这里断言真的跑了 49 个。
+        # 每个 suite 的通过数**逐个断言**，而不是只匹配一个总数。
+        #
+        # 写成 `grep -qE '31 passed|49 passed'` 的话，任一 suite 单独匹配上
+        # 就会放行 —— 另一个 suite 整体跳过也发现不了，那正是这个步骤要防的
+        # 情况。数值改动时这个步骤会失败，是有意的：改了测试数量就得同步
+        # 确认这里。
         run: |
-          output=$(cargo test -p sm-db --test repo_integration --test gateway_integration \
-                     -- --include-ignored 2>&1 || true)
-          echo "$output"
-          if ! echo "$output" | grep -qE '31 passed|49 passed'; then
-            echo "::error::integration tests appear to have been skipped, not executed"
-            exit 1
-          fi
+          fail=0
+          for expected in "31 passed" "20 passed"; do
+            if ! grep -q "$expected" /tmp/integration.log; then
+              echo "::error::expected '$expected' in /tmp/integration.log -- an integration suite was likely skipped rather than executed"
+              fail=1
+            fi
+          done
+          echo "--- per-suite results ---"
+          grep -E '^(test result|running)' /tmp/integration.log || true
+          exit $fail
 
   # 与上游 Peewee 模型逐字段比对。这是本仓库与上游之间唯一的自动防线：
   # 40 张表的列名、类型、可空性一旦漂移，本仓库的读路径就会静默拿不到值。
