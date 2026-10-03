@@ -73,8 +73,12 @@ pub mod download;
 pub mod gateway;
 pub mod media;
 pub mod movie;
+pub mod task;
+pub mod user;
 
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
+pub use task::{BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskOutcome, TaskProgress};
+pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, UserRepository};

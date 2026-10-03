@@ -365,27 +365,51 @@ fn as_bool(value: &crate::common::update::Value<'_>) -> bool {
     matches!(&*value.0, crate::common::update::ValueInner::Bool(true))
 }
 
-/// 把 [`UpdateSet`](crate::common::update::UpdateSet) 的值绑到无返回行的
-/// `query` 上。
+/// 生成「把 [`UpdateSet`](crate::common::update::UpdateSet) 的值绑到
+/// 查询上」的两个函数。
 ///
-/// sqlx 的 `bind` 是泛型方法，这里必须按运行时类型分派 —— 这正是
-/// 「不用 `query!` 宏」的直接成本：宏能生成静态绑定代码，手写就得
-/// 自己维护这个 `match`。
-pub(crate) fn bind_value_exec<'q>(
-    query: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
-    value: &crate::common::update::Value<'_>,
-) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments> {
-    use crate::common::update::ValueInner;
-    match &*value.0 {
-        ValueInner::Null => query.bind(Option::<String>::None),
-        ValueInner::Bool(v) => query.bind(*v),
-        ValueInner::Int(v) => query.bind(*v),
-        ValueInner::Float(v) => query.bind(*v),
-        ValueInner::Text(v) => query.bind(v.clone()),
-        ValueInner::Timestamp(v) => query.bind(*v),
-        ValueInner::Json(v) => query.bind(v.clone()),
-    }
+/// sqlx 的 `bind` 是泛型方法且**按类型静态分发**，所以无返回行的 `Query`
+/// 与有返回行的 `QueryAs` 各要一份签名。它们的 `match` 逻辑完全相同 ——
+/// 写两遍的话，加一个 [`ValueInner`] 变体就可能只改一处，而漏掉的那处
+/// 会在编译期不报错（因为 match 仍然穷尽）、运行时才崩。
+///
+/// 用宏生成保证两份永远同步。编译器会在变体不匹配时报错。
+///
+/// `$generics` 只在 `QueryAs` 那个版本里传 `O`，因为 `Query` 没有输出
+/// 类型参数 —— 多声明一个会让调用点的类型推断失败。
+macro_rules! impl_bind_value {
+    ($name:ident, [$($gen:ident),*], $query:ty, $doc:literal) => {
+        #[doc = $doc]
+        pub(crate) fn $name<'q, $($gen),*>(
+            query: $query,
+            value: &crate::common::update::Value<'_>,
+        ) -> $query {
+            use crate::common::update::ValueInner;
+            match &*value.0 {
+                ValueInner::Null => query.bind(Option::<String>::None),
+                ValueInner::Bool(v) => query.bind(*v),
+                ValueInner::Int(v) => query.bind(*v),
+                ValueInner::Float(v) => query.bind(*v),
+                ValueInner::Text(v) => query.bind(v.clone()),
+                ValueInner::Timestamp(v) => query.bind(*v),
+                ValueInner::Json(v) => query.bind(v.clone()),
+            }
+        }
+    };
 }
+
+impl_bind_value!(
+    bind_value_exec,
+    [],
+    sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    "把值绑到无返回行的 `query` 上。"
+);
+impl_bind_value!(
+    bind_value,
+    [O],
+    sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>,
+    "把值绑到有返回行的 `query_as` 上。"
+);
 
 /// 把受控的动态 SQL 交给 sqlx 0.9。
 ///

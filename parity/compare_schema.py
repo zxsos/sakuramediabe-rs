@@ -98,6 +98,19 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "FieldGuard",
         # 集成测试夹具
         "TestDb",
+        # P0 批次的访问层与数据结构（user.rs / task.rs）
+        "UserRepository",
+        "UserRefreshTokenRepository",
+        "BackgroundTaskRunRepository",
+        "NewUser",
+        "NewRefreshToken",
+        "NewTaskRun",
+        # 轮换结果：包两行数据库记录，不映射任何表
+        "Rotation",
+        # 领取结果 / 进度 / 结果：方法参数与返回值
+        "ClaimedTask",
+        "TaskProgress",
+        "TaskOutcome",
     }
 )
 
