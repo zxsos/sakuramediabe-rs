@@ -55,9 +55,11 @@
 //! **零 `delete`**：只有 `media_point` 与 `media_progress` 两处局部例外
 //! （`delete` / `clear`），其余表的删除路径只存在于注释里。
 //!
-//! **事务关在方法内**：[`user::UserRefreshTokenRepository::rotate`] 开了
-//! 第一个事务，但它不对外暴露 `&mut Transaction`，所以跨仓储组合写入
-//! （「插 Movie + 3 条 MovieActor + upsert Tag」）仍无处表达原子性。
+//! **组合写入已有出口**：[`UnitOfWork`] 按**动词**暴露用例，每个方法内部
+//! 编排多个仓储的 `_in` 变体并共享一个事务。已落地的用例：
+//! `generate_thumbnail`（写 `media_thumbnail` + 推进 `media` 状态机）。
+//! 仍缺的是跨**更多**表的用例，例如「插 Movie + 3 条 MovieActor +
+//! upsert Tag」—— 那需要先有 `MovieActor` / `Tag` 的仓储。
 //!
 //! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
@@ -76,6 +78,7 @@
 //!
 //! 上游 Python 侧不在本仓库内，CI 里 clone。这些问题需要查上游才能定论。
 
+pub mod ctx;
 pub mod download;
 pub mod gateway;
 pub mod media;
@@ -84,6 +87,7 @@ pub mod playback;
 pub mod task;
 pub mod user;
 
+pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
 pub use media::{MediaRepository, NewMedia};

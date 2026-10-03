@@ -21,6 +21,7 @@
 
 use sqlx::PgPool;
 
+use super::ctx::Ctx;
 use crate::common::page::{Page, PageRequest};
 use crate::error::DbError;
 use crate::paged_list;
@@ -67,6 +68,20 @@ impl MediaThumbnailRepository {
         image_id: i32,
         index_status: i32,
     ) -> Result<MediaThumbnail, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.upsert_in(&mut ctx, media_id, offset_seconds, image_id, index_status)
+            .await
+    }
+
+    /// [`Self::upsert`] 的事务内变体。见 [`Ctx`]。
+    pub async fn upsert_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        media_id: i32,
+        offset_seconds: i32,
+        image_id: i32,
+        index_status: i32,
+    ) -> Result<MediaThumbnail, DbError> {
         if !image_search_index_status::is_valid(index_status) {
             return Err(DbError::business(
                 THUMBNAIL_ENTITY,
@@ -74,6 +89,7 @@ impl MediaThumbnailRepository {
             ));
         }
         let now = crate::common::time::now_utc();
+        let mut conn = ctx.conn().await?;
         sqlx::query_as::<_, MediaThumbnail>(
             "INSERT INTO media_thumbnail ( \
                  media_id, image_id, \"offset\", image_search_index_status, created_at, updated_at \
@@ -89,7 +105,7 @@ impl MediaThumbnailRepository {
         .bind(offset_seconds)
         .bind(index_status)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(conn.as_conn())
         .await
         .map_err(|e| DbError::from(e).with_entity(THUMBNAIL_ENTITY))
     }

@@ -27,6 +27,7 @@ use crate::error::DbError;
 use crate::paged_list;
 use crate::playback::media::{thumbnail_state, Media};
 
+use super::ctx::Ctx;
 use super::movie::{bind_value_exec, safe_sql};
 
 /// 实体名，用于错误分类。
@@ -311,6 +312,19 @@ impl MediaRepository {
         error_code: &str,
         next_retry_at: NaiveDateTime,
     ) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_failure_in(&mut ctx, id, error_code, next_retry_at)
+            .await
+    }
+
+    /// [`Self::record_thumbnail_failure`] 的事务内变体。见 [`Ctx`]。
+    pub async fn record_thumbnail_failure_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
         let row = sqlx::query_as::<_, Media>(
             "UPDATE media SET \
                 thumbnail_generation_state = $2, \
@@ -326,7 +340,7 @@ impl MediaRepository {
         .bind(error_code)
         .bind(next_retry_at)
         .bind(crate::common::time::now_utc())
-        .fetch_optional(&self.pool)
+        .fetch_optional(ctx.conn().await?.as_conn())
         .await?
         .ok_or_else(|| DbError::not_found(ENTITY, id))?;
 
@@ -335,6 +349,20 @@ impl MediaRepository {
 
     /// 标记缩略图生成成功（进入终态）。
     pub async fn record_thumbnail_success(&self, id: i32) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_success_in(&mut ctx, id).await
+    }
+
+    /// [`Self::record_thumbnail_success`] 的事务内变体。见 [`Ctx`]。
+    ///
+    /// 「缩略图生成」用例需要它与
+    /// [`MediaThumbnailRepository::upsert_in`](super::playback::MediaThumbnailRepository::upsert_in)
+    /// 在同一事务里 —— 见 [`super::UnitOfWork`]。
+    pub async fn record_thumbnail_success_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+    ) -> Result<Media, DbError> {
         let row = sqlx::query_as::<_, Media>(
             "UPDATE media SET \
                 thumbnail_generation_state = $2, \
@@ -348,7 +376,7 @@ impl MediaRepository {
         .bind(id)
         .bind(thumbnail_state::SUCCEEDED)
         .bind(crate::common::time::now_utc())
-        .fetch_optional(&self.pool)
+        .fetch_optional(ctx.conn().await?.as_conn())
         .await?
         .ok_or_else(|| DbError::not_found(ENTITY, id))?;
 

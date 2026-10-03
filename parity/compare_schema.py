@@ -119,6 +119,11 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "NewMediaClip",
         # 分页值对象：校验过的请求参数，不是任何表的列集合
         "PageRequest",
+        # 事务编排层：执行上下文与用例结果，不映射任何表
+        "Ctx",
+        "CtxConnection",
+        "UnitOfWork",
+        "GeneratedThumbnail",
     }
 )
 
