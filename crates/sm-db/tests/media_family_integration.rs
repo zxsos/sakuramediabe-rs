@@ -17,7 +17,9 @@ use sm_db::repo::playback::{
     MediaClipRepository, MediaPointRepository, MediaProgressRepository, MediaThumbnailRepository,
     NewMediaClip,
 };
-use sm_db::repo::{MediaRepository, NewMedia};
+use sm_db::repo::{
+    MediaLibraryRepository, MediaRepository, MovieRepository, NewMedia, NewMediaLibrary, NewMovie,
+};
 use sm_db::testing::TestDb;
 
 mod fixtures {
@@ -35,7 +37,7 @@ mod fixtures {
             resolution: Some("1080p".to_owned()),
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: Some(120),
+            duration_seconds: 120,
             video_info: None,
         }
     }
@@ -46,7 +48,7 @@ mod fixtures {
             movie_number: Some("ABC-001".to_owned()),
             start_offset_seconds: start,
             end_offset_seconds: end,
-            title: None,
+            title: String::new(),
             file_path: format!("clip-{start}-{end}.mp4"),
             file_size_bytes: 2048,
             duration_seconds: end - start,
@@ -55,8 +57,27 @@ mod fixtures {
 }
 
 /// 建一条 media，返回它的 id。
-async fn seed_media(repo: &MediaRepository, movie_number: &str) -> i32 {
-    repo.insert(&fixtures::media(movie_number, 1))
+///
+/// 夹具负责把**两个父行**都准备好，因为 `media` 有两个不可回避的外键：
+///
+/// | 列 | 指向 | 缺了会怎样 |
+/// |---|---|---|
+/// | `library_id` | `media_library.id` | `media_library_id_fk` 违例 |
+/// | `movie_number` | `movie.movie_number` | `media_movie_number_fk` 违例 |
+///
+/// 此前这个函数硬编码 `library_id: 1` 而**从不建那一行**，于是本文件
+/// 里 18 个用它的地方全部失败在 `media_library_id_fk` 上。这些测试从未在
+/// CI 里跑过（integration job 只跑 repo_integration 与
+/// gateway_integration），本地无数据库时它们还会静默返回算作通过 ——
+/// 两个机制都堵上之后才暴露。
+///
+/// 番号唯一的约束是 `movie_number` 唯一，所以每次 seed 也要建 movie；
+/// 用 `create_if_absent` 幂等处理，重复 seed 同一番号不会撞约束。
+async fn seed_media(db: &TestDb, movie_number: &str) -> i32 {
+    let library_id = seed_library(db, movie_number).await;
+    seed_movie(db, movie_number).await;
+    MediaRepository::new(db.pool().clone())
+        .insert(&fixtures::media(movie_number, library_id))
         .await
         .unwrap()
         .id
@@ -64,26 +85,85 @@ async fn seed_media(repo: &MediaRepository, movie_number: &str) -> i32 {
 
 /// 建一条 media_library 行（`media.library_id` 指向它）。
 ///
-/// `media_library` 还没有仓储，所以这里直接写 SQL —— 这正是缺口的
-/// 样子：为了测试下游，得手工准备上游的父行。
-async fn seed_library(pool: &sqlx::PgPool, name: &str) -> i32 {
-    let row = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO media_library (name, created_at, updated_at) VALUES ($1, $2, $2) RETURNING id",
-    )
-    .bind(name)
-    .bind(now_utc())
-    .fetch_one(pool)
+/// 走 `MediaLibraryRepository` 而不是裸 SQL —— 仓储已经补上，裸 SQL 只
+/// 会让「provider_config 是 NOT NULL」这类约束在测试里绕过去。
+async fn seed_library(db: &TestDb, name: &str) -> i32 {
+    let repo = MediaLibraryRepository::new(db.pool().clone());
+    if let Some(existing) = repo.find_by_name(name).await.unwrap() {
+        return existing.id;
+    }
+    repo.insert(&NewMediaLibrary {
+        name: name.to_owned(),
+        provider_key: "local".to_owned(),
+        provider_config: None,
+        account_key: None,
+    })
     .await
-    .expect("插入 media_library 失败");
-    row.0
+    .unwrap()
+    .id
+}
+
+/// 建一条 movie 行（`media.movie_number` 指向它的 `movie_number` 列）。
+///
+/// 幂等：`movie_number` 上有唯一索引，重复 seed 同一番号会撞约束。
+async fn seed_movie(db: &TestDb, movie_number: &str) {
+    let repo = MovieRepository::new(db.pool().clone());
+    if repo.find_by_number(movie_number).await.unwrap().is_some() {
+        return;
+    }
+    repo.insert(&NewMovie {
+        movie_number: movie_number.to_owned(),
+        title: format!("{movie_number} 影片"),
+        javdb_id: None,
+        summary: String::new(),
+        maker_name: None,
+        director_name: None,
+        release_date: None,
+        duration_minutes: 0,
+        score: 0.0,
+        score_number: 0,
+        series_id: None,
+        cover_image_id: None,
+        thin_cover_image_id: None,
+        metadata_source: None,
+    })
+    .await
+    .unwrap();
+}
+
+/// 往一个**已存在**的库里插 media，并确保 movie 父行存在。
+///
+/// 与 [`seed_media`] 的区别：不建 library，只补 movie。用于「同一个库里
+/// 放多条 media」或「library 由测试自己指定」的场景。
+async fn insert_media(db: &TestDb, movie_number: &str, library_id: i32) -> i32 {
+    seed_movie(db, movie_number).await;
+    MediaRepository::new(db.pool().clone())
+        .insert(&fixtures::media(movie_number, library_id))
+        .await
+        .unwrap()
+        .id
 }
 
 /// 建一条 `image` 行（`media_thumbnail.image_id` 指向它）。
-async fn seed_image(pool: &sqlx::PgPool, key: &str) -> i32 {
+///
+/// `image` 表**还没有仓储**（缺口清单里的 P1），所以这里只能写裸 SQL。
+/// 列名是 `origin`（`varchar(255) NOT NULL UNIQUE`）—— 此前这里写的是
+/// `image_key`，而那一列从来不存在：
+///
+/// ```text
+/// ERROR: column "image_key" of relation "image" does not exist
+/// ```
+///
+/// 这个错误能活下来是因为本 suite 从未在 CI 里跑过（integration job
+/// 只跑 `repo_integration` 与 `gateway_integration`），而本地无数据库时
+/// 它还会静默返回算作通过。
+///
+/// 补上 `ImageRepository` 之后，这个函数应该改用仓储。
+async fn seed_image(pool: &sqlx::PgPool, origin: &str) -> i32 {
     let row = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO image (image_key, created_at, updated_at) VALUES ($1, $2, $2) RETURNING id",
+        "INSERT INTO image (origin, created_at, updated_at) VALUES ($1, $2, $2) RETURNING id",
     )
-    .bind(key)
+    .bind(origin)
     .bind(now_utc())
     .fetch_one(pool)
     .await
@@ -97,17 +177,27 @@ async fn seed_image(pool: &sqlx::PgPool, key: &str) -> i32 {
 async fn thumbnail_upsert_lands_the_artifact_the_state_machine_claimed() {
     // 这是本文件存在的理由：record_thumbnail_success 说「生成成功」，
     // 而产物必须能落到 media_thumbnail。闭环在这里接上。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let image_id = seed_image(db.pool(), "thumb-0").await;
 
     // 状态机标记成功
     let media_repo2 = MediaRepository::new(db.pool().clone());
+
+    // 先制造一次失败，把状态机推进到 `retry_wait`。
+    //
+    // `list_pending_thumbnails` 只扫 `retry_wait`（已失败待重试），
+    // 而新建的 media 处于 `pending`（从未尝试过）—— 两者是不同的领域
+    // 状态，方法名里的 "pending" 指的是「待办」而不是状态机的
+    // `PENDING` 常量。此前这个测试直接查新建的行并期望 1 条，
+    // 与实现的实际口径不符；它从未真正执行过，所以没人发现。
+    media_repo2
+        .record_thumbnail_failure(media_id, "extract-failed", now_utc())
+        .await
+        .unwrap();
+
     let claimed = media_repo2.list_pending_thumbnails(10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     let finished = media_repo2
@@ -142,13 +232,10 @@ async fn thumbnail_upsert_lands_the_artifact_the_state_machine_claimed() {
 #[tokio::test]
 async fn thumbnail_upsert_at_the_same_offset_overwrites_rather_than_duplicating() {
     // 唯一索引 (media_id, offset) + 重试是常态 -> 必须覆盖不新增。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let first_image = seed_image(db.pool(), "thumb-v1").await;
     let better_image = seed_image(db.pool(), "thumb-v2").await;
 
@@ -188,13 +275,10 @@ async fn thumbnail_upsert_at_the_same_offset_overwrites_rather_than_duplicating(
 #[tokio::test]
 async fn thumbnail_upsert_keeps_the_original_created_at_across_retries() {
     // created_at 记录的是「这个时刻点被首次识别出来」，重试不该改写它。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let first_image = seed_image(db.pool(), "thumb-v1").await;
     let second_image = seed_image(db.pool(), "thumb-v2").await;
 
@@ -224,13 +308,10 @@ async fn thumbnail_upsert_keeps_the_original_created_at_across_retries() {
 
 #[tokio::test]
 async fn thumbnail_upsert_rejects_an_unknown_index_status() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let image_id = seed_image(db.pool(), "thumb-0").await;
 
     let err = thumbs
@@ -251,13 +332,10 @@ async fn thumbnail_upsert_rejects_an_unknown_index_status() {
 async fn index_status_moves_through_its_own_state_machine() {
     // 这台状态机与 media 上的那台**刻意分开**：
     // 「有没有生成出来」与「有没有进检索索引」是两件事。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let image_id = seed_image(db.pool(), "thumb-0").await;
     let thumb = thumbs
         .upsert(media_id, 0, image_id, image_search_index_status::PENDING)
@@ -284,22 +362,28 @@ async fn index_status_moves_through_its_own_state_machine() {
 async fn skipped_is_a_valid_terminal_state_for_non_jav_media() {
     // 非 JAV 媒体的缩略图不进检索索引，但必须落明确终态，
     // 否则永久滞留 PENDING。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_repo = MediaRepository::new(db.pool().clone());
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
     // 挂 video_item（非 JAV）
-    let mut m = fixtures::media("ignored", 1);
+    //
+    // 此前这里硬编码 `library_id: 1` 与 `video_item_id: Some(1)`，两个外键
+    // 都没有对应的父行，于是插入必然违反 `media_library_id_fk`。该测试
+    // 从未真正执行过，所以一直没人看到。
+    let lib = seed_library(&db, "库-非JAV").await;
+    let mut m = fixtures::media("ignored", lib);
     m.movie_number = None;
-    m.video_item_id = Some(1);
-    // video_item_id 指向 video_item 表，先建它
-    sqlx::query("INSERT INTO video_item (title, created_at, updated_at) VALUES ('x', $1, $1)")
-        .bind(now_utc())
-        .execute(db.pool())
-        .await
-        .unwrap();
+    // video_item_id 指向 video_item 表，先建它并取回真实 id
+    let video_item_id = sqlx::query_as::<_, (i32,)>(
+        "INSERT INTO video_item (title, created_at, updated_at) VALUES ('x', $1, $1) RETURNING id",
+    )
+    .bind(now_utc())
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .0;
+    m.video_item_id = Some(video_item_id);
     let media_id = media_repo.insert(&m).await.unwrap().id;
 
     let image_id = seed_image(db.pool(), "thumb-nonjav").await;
@@ -320,13 +404,10 @@ async fn skipped_is_a_valid_terminal_state_for_non_jav_media() {
 #[tokio::test]
 async fn pending_index_queue_returns_only_pending_rows() {
     // 索引是 (image_search_index_status, id) —— 只按状态取，不 join。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let img1 = seed_image(db.pool(), "a").await;
     let img2 = seed_image(db.pool(), "b").await;
     let img3 = seed_image(db.pool(), "c").await;
@@ -363,9 +444,7 @@ async fn pending_index_queue_returns_only_pending_rows() {
 
 #[tokio::test]
 async fn mark_indexed_of_a_missing_row_reports_not_found() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let thumbs = MediaThumbnailRepository::new(db.pool().clone());
     let err = thumbs.mark_indexed(999_999).await.unwrap_err();
     assert!(matches!(err, DbError::NotFound { .. }), "实际 {err:?}");
@@ -376,13 +455,10 @@ async fn mark_indexed_of_a_missing_row_reports_not_found() {
 #[tokio::test]
 async fn progress_save_is_upsert_not_insert() {
     // media_id 上有单列唯一索引 -> 反复保存是一行。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let progress = MediaProgressRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let first = progress.save(media_id, 30).await.unwrap();
     let second = progress.save(media_id, 90).await.unwrap();
 
@@ -395,13 +471,10 @@ async fn progress_save_is_upsert_not_insert() {
 async fn progress_may_move_backwards_on_request() {
     // 真实场景：用户拖回去重看。「只许前进」会让这些操作
     // 看起来成功却没生效 —— 比倒退本身更糟。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let progress = MediaProgressRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     progress.save(media_id, 300).await.unwrap();
     let back = progress.save(media_id, 30).await.unwrap();
     assert_eq!(back.position_seconds, 30, "回看重看是合法操作");
@@ -409,13 +482,10 @@ async fn progress_may_move_backwards_on_request() {
 
 #[tokio::test]
 async fn progress_rejects_a_negative_position() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let progress = MediaProgressRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let err = progress.save(media_id, -1).await.expect_err("负数应被拒");
     assert!(err.to_string().contains("不能为负"), "{err}");
 }
@@ -423,13 +493,10 @@ async fn progress_rejects_a_negative_position() {
 #[tokio::test]
 async fn progress_clear_deletes_rather_than_zeroing() {
     // 归零会让「看到片尾」与「刚开始看」变成同一个值。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let progress = MediaProgressRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     progress.save(media_id, 300).await.unwrap();
 
     assert!(progress.clear(media_id).await.unwrap(), "应删掉一行");
@@ -440,14 +507,11 @@ async fn progress_clear_deletes_rather_than_zeroing() {
 
 #[tokio::test]
 async fn progress_load_many_avoids_n_plus_one() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let progress = MediaProgressRepository::new(db.pool().clone());
 
-    let watched = seed_media(&media_repo, "ABC-001").await;
-    let unwatched = seed_media(&media_repo, "ABC-002").await;
+    let watched = seed_media(&db, "ABC-001").await;
+    let unwatched = seed_media(&db, "ABC-002").await;
     progress.save(watched, 60).await.unwrap();
 
     let loaded = progress.load_many(&[watched, unwatched]).await.unwrap();
@@ -463,13 +527,10 @@ async fn progress_load_many_avoids_n_plus_one() {
 
 #[tokio::test]
 async fn point_insert_and_list_by_media() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let points = MediaPointRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let img1 = seed_image(db.pool(), "p1").await;
     let img2 = seed_image(db.pool(), "p2").await;
 
@@ -495,13 +556,10 @@ async fn point_insert_and_list_by_media() {
 #[tokio::test]
 async fn point_survives_its_source_media_being_deleted() {
     // on_delete = SET NULL：来源删后时刻点仍在，快照列仍能归属与展示。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let points = MediaPointRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let image_id = seed_image(db.pool(), "p1").await;
     let point = points
         .insert(image_id, 100, Some(media_id), Some("ABC-001"), None)
@@ -532,9 +590,7 @@ async fn point_survives_its_source_media_being_deleted() {
 
 #[tokio::test]
 async fn point_delete_removes_the_row() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let points = MediaPointRepository::new(db.pool().clone());
     let image_id = seed_image(db.pool(), "p1").await;
 
@@ -550,13 +606,10 @@ async fn point_delete_removes_the_row() {
 
 #[tokio::test]
 async fn clip_insert_and_list() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let clips = MediaClipRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let c1 = clips
         .insert(&fixtures::clip(Some(media_id), 0, 30))
         .await
@@ -580,13 +633,10 @@ async fn clip_insert_and_list() {
 #[tokio::test]
 async fn clip_duplicate_range_on_the_same_source_hits_the_unique_constraint() {
     // (media_id, start, end) 唯一 —— 同一来源的同一区间不重复登记。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let clips = MediaClipRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     clips
         .insert(&fixtures::clip(Some(media_id), 0, 30))
         .await
@@ -603,9 +653,7 @@ async fn clip_duplicate_range_on_the_same_source_hits_the_unique_constraint() {
 
 #[tokio::test]
 async fn clip_range_is_rejected_when_inverted_or_path_is_blank() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let clips = MediaClipRepository::new(db.pool().clone());
 
     let err = clips
@@ -624,9 +672,7 @@ async fn clip_range_is_rejected_when_inverted_or_path_is_blank() {
 async fn detached_clips_coexist_because_null_does_not_join_unique_constraints() {
     // 唯一索引含可空的 media_id，NULL 不参与约束 —— 这正是期望行为：
     // 多个「来源已删除」的片段可以共存。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let clips = MediaClipRepository::new(db.pool().clone());
 
     // 三个都 media_id=NULL，且区间也相同 —— 若 media_id 参与约束就会撞
@@ -652,13 +698,10 @@ async fn detached_clips_coexist_because_null_does_not_join_unique_constraints() 
 #[tokio::test]
 async fn clip_snapshot_column_survives_source_deletion() {
     // 来源删后片段仍在，快照列让归属与展示仍可用。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let media_repo = MediaRepository::new(db.pool().clone());
+    let db = TestDb::require().await;
     let clips = MediaClipRepository::new(db.pool().clone());
 
-    let media_id = seed_media(&media_repo, "ABC-001").await;
+    let media_id = seed_media(&db, "ABC-001").await;
     let clip = clips
         .insert(&fixtures::clip(Some(media_id), 0, 30))
         .await
@@ -690,18 +733,19 @@ async fn clip_snapshot_column_survives_source_deletion() {
 #[tokio::test]
 async fn file_hash_lookup_finds_the_same_file_across_libraries() {
     // file_hash 的模型注释：「跨存储识别重复文件的依据」。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_repo = MediaRepository::new(db.pool().clone());
-    let lib_a = seed_library(db.pool(), "库A").await;
-    let lib_b = seed_library(db.pool(), "库B").await;
+    let lib_a = seed_library(&db, "库A").await;
+    let lib_b = seed_library(&db, "库B").await;
 
     let hash = "media-file-hash-v1:0123456789abcdef0123456789abcdef01234567";
     let mut m1 = fixtures::media("ABC-001", lib_a);
     m1.file_hash = Some(hash.to_owned());
     let mut m2 = fixtures::media("ABC-001", lib_b);
     m2.file_hash = Some(hash.to_owned());
+    // 两个库各一条、番号相同 —— `media.movie_number` 指向 `movie.movie_number`，
+    // 所以 movie 父行必须存在。
+    seed_movie(&db, "ABC-001").await;
     media_repo.insert(&m1).await.unwrap();
     media_repo.insert(&m2).await.unwrap();
 
@@ -713,9 +757,7 @@ async fn file_hash_lookup_finds_the_same_file_across_libraries() {
 
 #[tokio::test]
 async fn file_hash_lookup_returns_empty_for_unknown_hash() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_repo = MediaRepository::new(db.pool().clone());
     let found = media_repo
         .find_by_file_hash("media-file-hash-v1:doesnotexist")
@@ -726,17 +768,14 @@ async fn file_hash_lookup_returns_empty_for_unknown_hash() {
 
 #[tokio::test]
 async fn list_by_library_and_movie_number() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_repo = MediaRepository::new(db.pool().clone());
-    let lib = seed_library(db.pool(), "库A").await;
+    let lib = seed_library(&db, "库A").await;
 
     for number in ["ABC-001", "ABC-001", "ABC-002"] {
-        media_repo
-            .insert(&fixtures::media(number, lib))
-            .await
-            .unwrap();
+        // 番号重复两次是故意的（同一文件被登记两次），所以 movie 父行
+        // 必须幂等建立，否则第二次会撞 `movie_number` 唯一约束。
+        insert_media(&db, number, lib).await;
     }
 
     let page = PageRequest::new(1, 50).unwrap();

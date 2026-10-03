@@ -102,6 +102,23 @@ pub struct Rotation {
     pub retired: UserRefreshToken,
 }
 
+/// [`UserRefreshTokenRepository::rotate_within`] 的结果。
+///
+/// 需要区分「成功」与「失败但要提交」：把过期令牌标成 `expired` 是
+/// 持久化意图（审计要能区分「过期」与「被主动撤销」），与「校验不通过、
+/// 一个字节都不该写」是不同的事。
+///
+/// `Done` 里是 `Box`：它内含两个完整的 `UserRefreshToken` 行（几十个
+/// `String` 与 `Option`），而 `CommitThenFail` 只带一个错误信封。装箱让
+/// 两个变体大小接近，否则 clippy 的 `large_enum_variant` 会指出这里。
+/// 换来的是一次堆分配 —— 这条路径每个 HTTP 请求走一次，不是热循环。
+enum RotationOutcome {
+    /// 轮换成功，调用方提交。
+    Done(Box<Rotation>),
+    /// 失败，但事务里有**要保留的**写入，调用方提交后返回该错误。
+    CommitThenFail(DbError),
+}
+
 /// `users` 表仓储。
 #[derive(Debug, Clone)]
 pub struct UserRepository {
@@ -236,19 +253,34 @@ impl UserRefreshTokenRepository {
 
     /// 插入一个令牌。
     ///
-    /// `status` 不在这里赋值 —— 走数据库 DEFAULT `"active"`。
-    /// 让初始状态住在 schema 里，裸 SQL 插入与仓储插入的初始状态一定一致。
+    /// `status` **显式写入** `"active"`，不依赖数据库 DEFAULT。
+    ///
+    /// 此前这里省略 `status` 并注释说明「走数据库 DEFAULT `"active"`,
+    /// 让初始状态住在 schema 里」。但 DDL 里**没有**这个 DEFAULT：
+    ///
+    /// ```sql
+    /// status varchar(32) NOT NULL,     -- 没有 DEFAULT
+    /// ```
+    ///
+    /// 上游确实声明了 `default=RefreshTokenStatus.ACTIVE.value`，但那是
+    /// **属性引用**而不是字面量，`parity/schema_contract.py` 的
+    /// `literal()` 解析不出来，于是 `gen_ddl.py` 把它丢了。
+    ///
+    /// 依赖一个不存在的 DEFAULT 的后果是每次插入都违反 NOT NULL。这正是
+    /// 本文件那批集成测试第一次真正执行时暴露的 —— 它们从未在 CI 里跑过。
+    /// 显式写入让插入不依赖任何 schema 假设。
     pub async fn insert(&self, new: &NewRefreshToken) -> Result<UserRefreshToken, DbError> {
         new.validate()?;
         let now = crate::common::time::now_utc();
         sqlx::query_as::<_, UserRefreshToken>(
             "INSERT INTO user_refresh_tokens ( \
-                 token_id, token_hash, expires_at, client_ip, user_agent, \
+                 token_id, token_hash, status, expires_at, client_ip, user_agent, \
                  created_at, updated_at \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING *",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7) RETURNING *",
         )
         .bind(new.token_id.trim())
         .bind(new.token_hash.trim())
+        .bind(RefreshTokenStatus::Active.as_str())
         .bind(new.expires_at)
         .bind(new.client_ip.as_deref())
         .bind(new.user_agent.as_deref())
@@ -281,6 +313,18 @@ impl UserRefreshTokenRepository {
     ///
     /// 吊销与插入之间**不能有任何可见中间态**。若这里不是原子的，
     /// 「新行已插入、旧行仍 active」会让被截获的旧令牌无限续期。
+    ///
+    /// # 为什么每条错误路径都显式 `rollback().await`
+    ///
+    /// 依赖 `Transaction` 的 `Drop` 隐式回滚在这里**会死锁**。
+    ///
+    /// 测试用的连接池是 `max_connections(1)` —— 唯一那条连接正被这个
+    /// 事务占着，而 `Drop` 触发的回滚要等它自己。表现为测试挂住、
+    /// 永不返回，且没有任何错误信息。
+    ///
+    /// 那个池只有一条连接是刻意的（`search_path` 是会话级设置，见
+    /// `testing::maybe_pool`），所以「靠 drop 回滚」这条在别处能用的
+    /// 惯用法在这里不可用。显式回滚在任何池配置下都正确。
     pub async fn rotate(
         &self,
         token_id: &str,
@@ -288,10 +332,43 @@ impl UserRefreshTokenRepository {
         fresh: &NewRefreshToken,
         now: NaiveDateTime,
     ) -> Result<Rotation, DbError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+
+        let outcome = self
+            .rotate_within(&mut tx, token_id, presented_hash, fresh, now)
+            .await;
+
+        match outcome {
+            Ok(RotationOutcome::Done(rotation)) => {
+                tx.commit().await?;
+                Ok(*rotation)
+            }
+            // 「过期」那条路径：标记已写入，提交它，然后如实报告失败。
+            Ok(RotationOutcome::CommitThenFail(err)) => {
+                tx.commit().await?;
+                Err(err)
+            }
+            Err(err) => {
+                // 回滚失败不掩盖原本的业务错误 —— 后者才是调用方要处理的。
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// [`Self::rotate_within`] 的结果类型见模块内的 [`RotationOutcome`]。
+    ///
+    /// [`Self::rotate`] 的事务内主体。**不**自己提交或回滚。
+    async fn rotate_within(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        token_id: &str,
+        presented_hash: &str,
+        fresh: &NewRefreshToken,
+        now: NaiveDateTime,
+    ) -> Result<RotationOutcome, DbError> {
         fresh.validate()?;
         let token_id = token_id.trim().to_owned();
-
-        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
 
         // 1. 取出旧行。用 FOR UPDATE 拿行锁 —— 两个并发刷新请求
         //    只有一个能过这关，另一个会等到事务结束再读到 revoked 状态。
@@ -299,7 +376,7 @@ impl UserRefreshTokenRepository {
             "SELECT * FROM user_refresh_tokens WHERE token_id = $1 FOR UPDATE",
         )
         .bind(&token_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| DbError::not_found(TOKEN_ENTITY, &token_id))?;
 
@@ -320,13 +397,17 @@ impl UserRefreshTokenRepository {
             .bind(retired.id)
             .bind(RefreshTokenStatus::Expired.as_str())
             .bind(now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
-            tx.commit().await?;
-            return Err(DbError::business(
+            // 把过期令牌标成 `expired` 是**持久化意图** —— 审计要能区分
+            // 「过期」与「被主动撤销」，所以这一条路径要提交而不是回滚。
+            //
+            // 用返回值告诉外层「提交我」，而不是在这里 `tx.commit()`：
+            // 这里的 tx 是 `&mut Transaction`，commit 会消耗它。
+            return Ok(RotationOutcome::CommitThenFail(DbError::business(
                 TOKEN_ENTITY,
                 "令牌已过期（已标记为 expired）",
-            ));
+            )));
         }
 
         // 3. 哈希匹配。放在状态检查之后 —— 一个过期的令牌不值得
@@ -339,19 +420,22 @@ impl UserRefreshTokenRepository {
         }
 
         // 4. 插入新行（先插，这样 FK/唯一约束失败会早于状态变更暴露）。
+        //
+        // `status` 显式写 `"active"`，理由同 `insert`：DDL 里没有 DEFAULT。
         let inserted = sqlx::query_as::<_, UserRefreshToken>(
             "INSERT INTO user_refresh_tokens ( \
-                 token_id, token_hash, expires_at, client_ip, user_agent, \
+                 token_id, token_hash, status, expires_at, client_ip, user_agent, \
                  created_at, updated_at \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING *",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7) RETURNING *",
         )
         .bind(fresh.token_id.trim())
         .bind(fresh.token_hash.trim())
+        .bind(RefreshTokenStatus::Active.as_str())
         .bind(fresh.expires_at)
         .bind(fresh.client_ip.as_deref())
         .bind(fresh.user_agent.as_deref())
         .bind(now)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| DbError::from(e).with_entity(TOKEN_ENTITY))?;
 
@@ -366,7 +450,7 @@ impl UserRefreshTokenRepository {
         .bind(RefreshTokenStatus::Revoked.as_str())
         .bind(now)
         .bind(&inserted.token_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| DbError::from(e).with_entity(TOKEN_ENTITY))?;
 
@@ -375,12 +459,12 @@ impl UserRefreshTokenRepository {
             "轮换后旧行必须指向新令牌，否则重放拦不住"
         );
 
-        tx.commit().await?;
-
-        Ok(Rotation {
+        // 提交由调用方（`rotate`）负责 —— 它需要先看清成功还是失败，
+        // 才能决定 commit 还是 rollback。
+        Ok(RotationOutcome::Done(Box::new(Rotation {
             fresh: inserted,
             retired: retired_after,
-        })
+        })))
     }
 
     /// 吊销单个令牌（登出）。

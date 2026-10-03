@@ -43,8 +43,22 @@ const ENTITY: &str = "Actor";
 /// 新建一位演员。
 #[derive(Debug, Clone)]
 pub struct NewActor {
-    /// JavDB ID。空串在写入前归一为 `None`。
-    pub javdb_id: Option<String>,
+    /// JavDB ID。**必填**。
+    ///
+    /// 类型是 `String` 而非 `Option<String>`，因为上游是
+    /// `CaseSensitiveCharField(max_length=64, unique=True, index=True)` ——
+    /// 没有 `null=True`，Peewee 的 Field 默认 `null=False`，
+    /// 所以这一列是 `NOT NULL`。
+    ///
+    /// 此前这里是 `Option<String>`，空白被归一为 `None` 后绑进 INSERT，
+    /// 必然违反 NOT NULL 约束。这个缺陷能活下来是因为对拍的可空性检查
+    /// 从未真正生效（契约把「省略 `null=`」记成「解析不出来」，
+    /// 而判定条件是 `py_nullable is False`），
+    /// 同时集成测试在没有数据库时会静默跳过。
+    ///
+    /// 空白字符串按**业务错误**拒绝，而不是静默变 NULL：调用方没打算
+    /// 给这个演员编号却传了空串，这是调用方的 bug，应该被告知。
+    pub javdb_id: String,
     pub name: String,
 }
 
@@ -53,20 +67,22 @@ impl NewActor {
         if self.name.trim().is_empty() {
             return Err(DbError::business(ENTITY, "name 不能为空"));
         }
+        if self.javdb_id.trim().is_empty() {
+            return Err(DbError::business(
+                ENTITY,
+                "javdb_id 不能为空：该列是 NOT NULL，写入空值会被数据库拒绝",
+            ));
+        }
         Ok(())
     }
 
     /// 归一后的插入参数。
-    fn normalized(&self) -> Result<(&str, Option<String>), DbError> {
+    fn normalized(&self) -> Result<(&str, &str), DbError> {
         self.validate()?;
-        // 空串会让 `WHERE javdb_id = ''` 命中一条「没有 JavDB 编号」的假记录。
-        let javdb_id = self
-            .javdb_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-        Ok((self.name.trim(), javdb_id))
+        // 保留 trim：唯一索引是大小写敏感的，而 JavDB 侧的 id 常被无意
+        // 前后带空格。trim 后再存，可以让「同一部影片」的不同写入路径
+        // 落到同一行上。
+        Ok((self.name.trim(), self.javdb_id.trim()))
     }
 }
 
@@ -364,7 +380,7 @@ mod tests {
         for blank in ["", "   ", "\t\n"] {
             let err = repo
                 .insert(&NewActor {
-                    javdb_id: None,
+                    javdb_id: "ABC".to_owned(),
                     name: blank.to_owned(),
                 })
                 .await
@@ -377,20 +393,35 @@ mod tests {
     }
 
     #[test]
-    fn javdb_id_blank_normalises_to_none() {
-        // 空串会让 `WHERE javdb_id = ''` 命中一条「没有编号」的假记录。
-        let a = NewActor {
-            javdb_id: Some("   ".to_owned()),
-            name: "演员".to_owned(),
-        };
-        assert_eq!(a.normalized().unwrap().1, None);
+    fn blank_javdb_id_is_rejected_because_the_column_is_not_null() {
+        // 上游：`CaseSensitiveCharField(max_length=64, unique=True, index=True)`，
+        // 没有 `null=True` → DDL 是 `javdb_id varchar(64) NOT NULL UNIQUE`。
+        //
+        // 所以空白不能「归一为 NULL」——那会让 INSERT 违反 NOT NULL。
+        // 按业务错误拒绝，调用方能立刻看到是哪个字段有问题。
+        for blank in ["", "   ", "\t\n"] {
+            let a = NewActor {
+                javdb_id: blank.to_owned(),
+                name: "演员".to_owned(),
+            };
+            let err = a
+                .normalized()
+                .expect_err("空白 javdb_id 应被拒绝：该列 NOT NULL");
+            assert!(err.to_string().contains("javdb_id"), "{err}");
+        }
+    }
 
+    #[test]
+    fn both_fields_are_trimmed() {
+        // 保留 trim 的理由：唯一索引大小写敏感，而 JavDB id 常被无意
+        // 前后带空格。trim 后再存，「同一部影片」的不同写入路径才能落到
+        // 同一行上，否则会插出两条 javdb_id 分别是 "ABC" 与 " ABC " 的行。
         let b = NewActor {
-            javdb_id: Some("  ABC  ".to_owned()),
+            javdb_id: "  ABC  ".to_owned(),
             name: " 演员 ".to_owned(),
         };
         let (name, javdb) = b.normalized().unwrap();
         assert_eq!(name, "演员", "name 应被 trim");
-        assert_eq!(javdb.as_deref(), Some("ABC"), "javdb_id 应被 trim");
+        assert_eq!(javdb, "ABC", "javdb_id 应被 trim");
     }
 }

@@ -32,7 +32,14 @@ jobs:
         run: cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace
+        # `--lib` 是刻意的：集成测试需要真实的 PostgreSQL，而本 job 没有
+        # 那个 service。带 integration suite 的话，`TestDb::require()` 会
+        # 因为连不上库而 panic —— 那是**正确**的行为（静默跳过会让「跳过」
+        # 与「通过」在报告里无法区分），但它会让这个 job 变得毫无意义。
+        #
+        # 集成测试全部由下面的 `integration` job 跑，那里**跑全部 8 个
+        # suite**，不再只挑两个。
+        run: cargo test --workspace --lib
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -51,9 +58,9 @@ jobs:
 
   # 集成测试需要一个真实的 PostgreSQL。
   #
-  # 单独一个 job 而不是给上面的 rust 加 service：那里的 `cargo test --workspace`
-  # 不依赖数据库，而集成测试在无 DATABASE_URL 时会**跳过**（算通过）。混在一起
-  # 会让人误以为集成测试跑过了，实际是静默跳过 —— 这正是本仓库踩过的坑。
+  # 单独一个 job 而不是给上面的 rust 加 service：那里的 `cargo test --lib`
+  # 不依赖数据库，而集成测试在无 DATABASE_URL 时会**失败**（`TestDb::require`
+  # 直接 panic）。混在一起会让那个 job 变成纯噪声。
   #
   # 容器必须设 timezone=UTC：列是 `timestamp without time zone`，容器时区
   # 不是 UTC 会让 naive datetime 的往返比较出现偏移。
@@ -114,31 +121,52 @@ jobs:
                    WHERE table_schema='sakuramedia_test';"
 
       - name: Integration tests
-        # 输出留档给下一步断言用：集成测试在无 DATABASE_URL 时是「跳过
-        # 且通过」，只看退出码会在环境配错时静默变绿。
-        run: |
-          cargo test -p sm-db --test repo_integration --test gateway_integration \
-               2>&1 | tee /tmp/integration.log
-          # tee 会吞掉 cargo 的退出码，必须显式取回来。
-          exit "${PIPESTATUS[0]}"
-
-      - name: Verify tests actually ran
-        # 每个 suite 的通过数**逐个断言**，而不是只匹配一个总数。
+        # 全部 8 个 suite。**不是**只挑几个。
         #
-        # 写成 `grep -qE '31 passed|49 passed'` 的话，任一 suite 单独匹配上
-        # 就会放行 —— 另一个 suite 整体跳过也发现不了，那正是这个步骤要防的
-        # 情况。数值改动时这个步骤会失败，是有意的：改了测试数量就得同步
-        # 确认这里。
+        # 此前这里只跑 `repo_integration` 与 `gateway_integration`，另外 6 个
+        # suite（99 个测试）编译但从不执行。它们长期藏着真实缺陷 ——
+        # NOT NULL 违例、缺失的外键父行、不存在的列名、占位符编号错、
+        # 单连接池下靠 `Drop` 回滚导致的死锁。每一条都是在 suite 第一次
+        # 真正执行时才暴露的。
+        #
+        # `--test-threads=8` 不是性能取舍，是**正确性**要求：每个测试的
+        # `TestDb` 自建一个连接池，析构时还要另建一条连接做清理，所以
+        # 峰值连接数约为并行度的两倍。不限制时本机（多核）峰值超过 100，
+        # 撞上 PostgreSQL 的 `max_connections` 上限 —— 表现是大量测试报
+        # 「连不上库」，以及**整个数据库进程被拖垮**。
+        #
+        # 8 × 2 = 16 条连接，远低于容器默认上限，且不依赖 runner 的核数。
+        run: |
+          set -o pipefail
+          cargo test -p sm-db --tests -- --test-threads=8 2>&1 | tee /tmp/integration.log
+
+      - name: Verify every suite actually ran
+        # 逐个 suite 断言它的名字出现在日志里。
+        #
+        # 此前是 `grep -q "31 passed"` 那类断言，两个问题：任一 suite 单独
+        # 匹配上就会放行；而且写死通过数会在每次增删测试时误报 —— 它本来防
+        # 的事情（整体跳过）现在由 `TestDb::require()` 的 panic 兜住了。
+        #
+        # 数 `test result:` 行也不对：`--tests` 会把 lib 的单元测试也算进去
+        # （9 行 vs 8 个 suite）。所以按名字逐个确认。
         run: |
           fail=0
-          for expected in "31 passed" "20 passed"; do
-            if ! grep -q "$expected" /tmp/integration.log; then
-              echo "::error::expected '$expected' in /tmp/integration.log -- an integration suite was likely skipped rather than executed"
+          for suite in actor gateway media_family multi_table p0 pagination repo unit_of_work; do
+            if ! grep -q "$suite" /tmp/integration.log; then
+              echo "::error::suite '$suite' produced no output -- it was skipped or aborted"
               fail=1
             fi
           done
-          echo "--- per-suite results ---"
-          grep -E '^(test result|running)' /tmp/integration.log || true
+          echo "--- per-suite ---"
+          grep -E '^(     Running|test result:)' /tmp/integration.log || true
+          if grep -q 'SKIP: 未设置' /tmp/integration.log; then
+            echo "::error::a suite skipped for want of a database"
+            fail=1
+          fi
+          if grep -q 'test result: FAILED' /tmp/integration.log; then
+            echo "::error::at least one suite failed"
+            fail=1
+          fi
           exit $fail
 
   # 与上游 Peewee 模型逐字段比对。这是本仓库与上游之间唯一的自动防线：

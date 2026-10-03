@@ -86,9 +86,7 @@ async fn raw_revision(pool: &sqlx::PgPool, id: i32) -> i64 {
 
 #[tokio::test]
 async fn patch_plugin_takes_ownership_and_bumps_revision() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
 
@@ -111,9 +109,7 @@ async fn patch_plugin_takes_ownership_and_bumps_revision() {
 
 #[tokio::test]
 async fn patch_plugin_rejects_stale_revision_with_zero_modification() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-002")).await.unwrap();
@@ -133,9 +129,7 @@ async fn patch_plugin_rejects_stale_revision_with_zero_modification() {
 
 #[tokio::test]
 async fn patch_plugin_cannot_steal_a_field_held_by_another_plugin() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-003")).await.unwrap();
@@ -163,9 +157,7 @@ async fn patch_plugin_cannot_steal_a_field_held_by_another_plugin() {
 
 #[tokio::test]
 async fn patch_plugin_fails_when_blacklisting_a_subscribed_movie() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-004")).await.unwrap();
@@ -190,9 +182,7 @@ async fn patch_plugin_fails_when_blacklisting_a_subscribed_movie() {
 
 #[tokio::test]
 async fn patch_plugin_allows_unowned_field_while_another_is_held() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-005")).await.unwrap();
@@ -229,9 +219,7 @@ async fn patch_plugin_allows_unowned_field_while_another_is_held() {
 
 #[tokio::test]
 async fn host_unowned_writes_only_unowned_fields() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-006")).await.unwrap();
@@ -259,9 +247,7 @@ async fn host_unowned_writes_only_unowned_fields() {
 
 #[tokio::test]
 async fn host_unowned_does_not_bump_revision_when_nothing_changes() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-007")).await.unwrap();
@@ -281,9 +267,7 @@ async fn host_unowned_does_not_bump_revision_when_nothing_changes() {
 
 #[tokio::test]
 async fn host_unowned_bumps_revision_once_per_changed_field() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-008")).await.unwrap();
@@ -307,9 +291,7 @@ async fn host_unowned_bumps_revision_once_per_changed_field() {
 
 #[tokio::test]
 async fn host_unowned_allows_null_for_text_fields() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-009")).await.unwrap();
@@ -332,9 +314,7 @@ async fn host_unowned_allows_null_for_text_fields() {
 
 #[tokio::test]
 async fn host_unowned_rejects_unprotected_field() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let gw = MovieOwnershipGateway::new(db.pool().clone());
 
     // watched_count 不在白名单里
@@ -349,9 +329,7 @@ async fn host_unowned_rejects_unprotected_field() {
 
 #[tokio::test]
 async fn host_manual_overrides_plugin_owner() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-010")).await.unwrap();
@@ -378,9 +356,7 @@ async fn host_manual_overrides_plugin_owner() {
 
 #[tokio::test]
 async fn host_manual_updates_many_ids_at_once() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
 
@@ -401,9 +377,7 @@ async fn host_manual_updates_many_ids_at_once() {
 
 #[tokio::test]
 async fn host_manual_with_empty_ids_short_circuits() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let gw = MovieOwnershipGateway::new(db.pool().clone());
 
     // 空列表必须返回 0 且不发 SQL
@@ -415,9 +389,7 @@ async fn host_manual_with_empty_ids_short_circuits() {
 
 #[tokio::test]
 async fn release_removes_only_the_target_plugins_keys() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-014")).await.unwrap();
@@ -452,9 +424,7 @@ async fn release_removes_only_the_target_plugins_keys() {
 
 #[tokio::test]
 async fn release_all_clears_every_key_owned_by_that_plugin() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-015")).await.unwrap();
@@ -474,9 +444,7 @@ async fn release_all_clears_every_key_owned_by_that_plugin() {
 
 #[tokio::test]
 async fn release_leaves_field_values_and_revision_untouched() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-016")).await.unwrap();
@@ -505,9 +473,7 @@ async fn release_leaves_field_values_and_revision_untouched() {
 
 #[tokio::test]
 async fn release_rejects_unprotected_field_list() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let gw = MovieOwnershipGateway::new(db.pool().clone());
 
     let err = gw
@@ -521,9 +487,7 @@ async fn release_rejects_unprotected_field_list() {
 
 #[tokio::test]
 async fn full_lifecycle_plugin_then_host_then_release() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-017")).await.unwrap();
@@ -563,9 +527,7 @@ async fn release_frees_the_field_for_the_host_automatically() {
     // owner 换成 `host:manual`，而 `release_plugin_owners` 的语义是
     // 「只摘除属于该插件的记录」，对 `host:manual` 不生效 —— 那是设计，
     // 不是缺陷。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-018")).await.unwrap();
@@ -611,9 +573,7 @@ async fn release_of_a_plugin_that_owns_nothing_reports_zero_rows() {
     // 被别的来源接管时，调用它**不报错也不改数据**。调用方必须靠
     // 返回值判断是否真的清理过 —— 所以返回 0 是有意义的结果，
     // 而不是需要隐藏的失败。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let gw = MovieOwnershipGateway::new(db.pool().clone());
     let m = repo.insert(&movie("GW-019")).await.unwrap();

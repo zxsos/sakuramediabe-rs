@@ -11,7 +11,9 @@
 //! | 重放被拒 | 依赖事务内的状态可见性 |
 //! | `token_id` 唯一约束 | 依赖真实唯一索引 |
 //!
-//! 没有数据库时全部跳过（`TestDb::create()` 返回 `None`）。
+//! 没有数据库时会**失败**（`TestDb::require()` 直接 panic）—— 静默跳过
+//! 曾让本 suite 里的「单连接池 + `Drop` 隐式回滚 = 死锁」藏了很久：
+//! 测试挂起、永不返回、报告里却什么异常都没有。
 
 use sm_db::common::page::PageRequest;
 use sm_db::common::time::now_utc;
@@ -66,9 +68,7 @@ mod fixtures {
 
 #[tokio::test]
 async fn user_insert_and_lookup_by_username() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
 
     let created = repo.insert(&fixtures::user("account")).await.unwrap();
@@ -89,9 +89,7 @@ async fn user_insert_and_lookup_by_username() {
 
 #[tokio::test]
 async fn username_uniqueness_is_enforced_by_the_database() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::user("account")).await.unwrap();
@@ -109,9 +107,7 @@ async fn username_uniqueness_is_enforced_by_the_database() {
 #[tokio::test]
 async fn primary_user_is_the_lowest_id() {
     // 对应上游 `User.select().order_by(User.id).first()`。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
 
     assert!(repo.find_primary().await.unwrap().is_none(), "空库无主用户");
@@ -129,9 +125,7 @@ async fn primary_user_is_the_lowest_id() {
 
 #[tokio::test]
 async fn last_login_is_touched_through_a_dedicated_method() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::user("account")).await.unwrap();
 
@@ -145,9 +139,7 @@ async fn last_login_is_touched_through_a_dedicated_method() {
 #[tokio::test]
 async fn set_password_hash_rejects_blank_but_accepts_rehash() {
     // 密码哈希不可经由通用 update 改，所以必须有专用方法。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::user("account")).await.unwrap();
 
@@ -168,9 +160,7 @@ async fn set_password_hash_rejects_blank_but_accepts_rehash() {
 
 #[tokio::test]
 async fn touch_last_login_on_missing_user_reports_not_found() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRepository::new(db.pool().clone());
     let err = repo.touch_last_login(999_999).await.unwrap_err();
     assert!(matches!(err, DbError::NotFound { .. }), "实际 {err:?}");
@@ -180,9 +170,7 @@ async fn touch_last_login_on_missing_user_reports_not_found() {
 
 #[tokio::test]
 async fn token_defaults_to_active_from_schema() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let created = repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -197,9 +185,7 @@ async fn token_defaults_to_active_from_schema() {
 
 #[tokio::test]
 async fn token_id_is_unique() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -215,9 +201,7 @@ async fn token_id_is_unique() {
 
 #[tokio::test]
 async fn rotation_retires_old_and_installs_new_atomically() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let original = repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -251,9 +235,7 @@ async fn rotation_retires_old_and_installs_new_atomically() {
 #[tokio::test]
 async fn replaying_a_rotated_token_is_rejected() {
     // 安全边界：旧令牌必须在第一次轮换后立刻失效。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -280,9 +262,7 @@ async fn replaying_a_rotated_token_is_rejected() {
 async fn rotation_rejects_a_mismatched_hash() {
     // 有人拿着合法的 token_id 配错误的令牌 —— 可能是重放，也可能是
     // id 泄露后的探测。两种都拒绝。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -306,9 +286,7 @@ async fn rotation_rejects_a_mismatched_hash() {
 #[tokio::test]
 async fn rotation_marks_an_expired_token_as_expired_not_revoked() {
     // 过期与被吊销必须可区分，否则审计时看不出攻击者用的是哪种。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let mut expired = fixtures::token("t1", "h1");
@@ -331,9 +309,7 @@ async fn rotation_marks_an_expired_token_as_expired_not_revoked() {
 
 #[tokio::test]
 async fn rotation_of_missing_token_reports_not_found() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let err = repo
@@ -346,9 +322,7 @@ async fn rotation_of_missing_token_reports_not_found() {
 #[tokio::test]
 async fn rotation_validates_the_new_token_before_touching_the_old_one() {
     // 参数校验必须发生在任何写入之前。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -381,9 +355,7 @@ async fn concurrent_rotation_of_the_same_token_admits_exactly_one_winner() {
     //
     // 若吊销与插入不在同一事务，两个并发请求会各自看到 status=active，
     // 各自插入一个新令牌 —— 于是 t2 和 t3 同时有效，轮换失效。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -444,9 +416,7 @@ async fn concurrent_rotation_of_the_same_token_admits_exactly_one_winner() {
 #[tokio::test]
 async fn revoke_leaves_no_replacement() {
     // 登出与轮换的区别：不创建接替者。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -459,9 +429,7 @@ async fn revoke_leaves_no_replacement() {
 
 #[tokio::test]
 async fn revoke_all_active_leaves_revoked_ones_untouched() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     repo.insert(&fixtures::token("t1", "h1")).await.unwrap();
@@ -484,9 +452,7 @@ async fn revoke_all_active_leaves_revoked_ones_untouched() {
 
 #[tokio::test]
 async fn purge_expired_removes_by_expiry_regardless_of_status() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let mut expired = fixtures::token("t-old", "h1");
@@ -519,9 +485,7 @@ async fn purge_expired_removes_by_expiry_regardless_of_status() {
 #[tokio::test]
 async fn token_hash_never_leaves_the_repository_layer() {
     // 类型层面的保证：NewRefreshToken 没有 plain_token 字段。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = UserRefreshTokenRepository::new(db.pool().clone());
 
     let created = repo
@@ -539,9 +503,7 @@ async fn token_hash_never_leaves_the_repository_layer() {
 
 #[tokio::test]
 async fn enqueue_defaults_to_pending_with_empty_summary() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -560,9 +522,7 @@ async fn enqueue_defaults_to_pending_with_empty_summary() {
 #[tokio::test]
 async fn params_roundtrip_as_json_text() {
     // params 是 JsonTextField —— TEXT 列装 JSON 文本，不是 jsonb。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let mut t = fixtures::task("probe");
@@ -577,9 +537,7 @@ async fn params_roundtrip_as_json_text() {
 
 #[tokio::test]
 async fn blank_required_fields_are_rejected_before_insert() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     for mutate in [
@@ -596,9 +554,7 @@ async fn blank_required_fields_are_rejected_before_insert() {
 
 #[tokio::test]
 async fn claim_moves_pending_to_running_with_a_lease() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -621,9 +577,7 @@ async fn claim_moves_pending_to_running_with_a_lease() {
 #[tokio::test]
 async fn claim_on_empty_queue_returns_none_not_error() {
     // 空闲 worker 反复领取是正常的，不是错误。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     assert!(repo
@@ -635,9 +589,7 @@ async fn claim_on_empty_queue_returns_none_not_error() {
 
 #[tokio::test]
 async fn a_claimed_task_is_not_claimed_again() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -658,9 +610,7 @@ async fn a_claimed_task_is_not_claimed_again() {
 
 #[tokio::test]
 async fn scheduled_tasks_wait_for_their_time() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     // 未来才执行
@@ -687,9 +637,7 @@ async fn scheduled_tasks_wait_for_their_time() {
 async fn concurrent_claims_do_not_hand_out_the_same_task_twice() {
     // 这是 FOR UPDATE SKIP LOCKED 的**全部理由**。
     // 「先 SELECT 再 UPDATE」会让两个 worker 读到同一行 pending。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     // 只放一个任务 —— 如果领取不是排他的，两个 worker 会拿到同一个
@@ -714,9 +662,7 @@ async fn concurrent_claims_do_not_hand_out_the_same_task_twice() {
 #[tokio::test]
 async fn lease_expiry_makes_a_task_claimable_again() {
     // 没有回收，崩溃的 worker 会让任务永久卡在 running。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -760,9 +706,7 @@ async fn lease_expiry_makes_a_task_claimable_again() {
 
 #[tokio::test]
 async fn reclaim_does_not_touch_tasks_with_a_valid_lease() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -785,9 +729,7 @@ async fn reclaim_does_not_touch_tasks_with_a_valid_lease() {
 #[tokio::test]
 async fn renew_lease_fails_after_reclaim() {
     // 若回收后仍能续租，会「复活」一个别人正在跑的任务。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -819,9 +761,7 @@ async fn mutex_key_blocks_concurrent_enqueue_and_is_released_on_finish() {
     //
     // 唯一索引不含 state，所以**不释放**的话同键的下一个任务永久无法
     // 创建。finish 把它置 NULL，靠「NULL 不参与唯一约束」释放。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     // 互斥生效：同键第二个插不进去
@@ -875,9 +815,7 @@ async fn mutex_key_blocks_concurrent_enqueue_and_is_released_on_finish() {
 #[tokio::test]
 async fn failure_also_releases_the_mutex_key() {
     // 保留失败的 key 会让重试永远撞唯一约束，而重试正是失败后最该做的事。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let first = repo
@@ -905,9 +843,7 @@ async fn failure_also_releases_the_mutex_key() {
 #[tokio::test]
 async fn tasks_without_a_mutex_key_never_conflict() {
     // NULL 不参与唯一约束，所以无互斥需求的任务可以共存。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     for i in 0..3 {
@@ -922,9 +858,7 @@ async fn tasks_without_a_mutex_key_never_conflict() {
 #[tokio::test]
 async fn finish_and_fail_require_running_state() {
     // 否则一个 pending 任务可以被凭空置为 succeeded。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -951,9 +885,7 @@ async fn finish_and_fail_require_running_state() {
 #[tokio::test]
 async fn progress_requires_a_positive_total() {
     // 模型注释：进度三件套要么都不填，要么都填。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -998,9 +930,7 @@ async fn progress_requires_a_positive_total() {
 
 #[tokio::test]
 async fn outcome_summary_is_stored_as_json_text() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -1029,9 +959,7 @@ async fn outcome_summary_is_stored_as_json_text() {
 
 #[tokio::test]
 async fn list_by_task_key_orders_by_recency() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     repo.enqueue(&fixtures::task("probe")).await.unwrap();
@@ -1053,9 +981,7 @@ async fn list_by_task_key_orders_by_recency() {
 #[tokio::test]
 async fn update_metadata_rejects_state_and_mutex_columns() {
     // 状态迁移必须走专用方法，互斥键必须由 finish/fail 释放。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let created = repo
@@ -1113,9 +1039,7 @@ async fn update_metadata_rejects_state_and_mutex_columns() {
 
 #[tokio::test]
 async fn update_metadata_of_missing_row_reports_not_found() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
 
     let mut set = sm_db::common::update::UpdateSet::new();

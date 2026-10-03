@@ -17,34 +17,71 @@
 //! | [`filters_narrow_both_the_count_and_the_page`] | 过滤条件对两者一致 |
 
 use sm_db::common::page::PageRequest;
-use sm_db::common::time::now_utc;
 use sm_db::error::DbError;
-use sm_db::repo::{MediaRepository, NewMedia};
+use sm_db::repo::{
+    MediaLibraryRepository, MediaRepository, MovieRepository, NewMedia, NewMediaLibrary, NewMovie,
+};
 use sm_db::testing::TestDb;
 
 /// 造 `count` 条 media，全部挂在同一个 library 下。
 async fn seed_media(repo: &MediaRepository, pool: &sqlx::PgPool, count: i64) -> i32 {
-    let library = sqlx::query_as::<_, (i32,)>(
-        "INSERT INTO media_library (name, created_at, updated_at) VALUES ('lib', $1, $1) RETURNING id",
-    )
-    .bind(now_utc())
-    .fetch_one(pool)
-    .await
-    .expect("insert media_library")
-    .0;
+    // `provider_key` 是 `varchar(64) NOT NULL`。此前这个夹具只插 `name`，
+    // 于是每一次插入都违反 NOT NULL —— 而本 suite 从未在 CI 里跑过
+    // （integration job 只跑 `repo_integration` 与 `gateway_integration`），
+    // 本地无数据库时又静默跳过。
+    let library = MediaLibraryRepository::new(pool.clone())
+        .insert(&NewMediaLibrary {
+            name: "lib".to_owned(),
+            provider_key: "local".to_owned(),
+            provider_config: None,
+            account_key: None,
+        })
+        .await
+        .expect("insert media_library")
+        .id;
 
+    let movies = MovieRepository::new(pool.clone());
     for i in 0..count {
+        let movie_number = format!("MOV-{i:03}");
+        // `media.movie_number` 指向 `movie.movie_number`，所以每次都要先有
+        // movie 行。分页测试只关心 media 的数量与顺序，movie 只需要存在。
+        if movies
+            .find_by_number(&movie_number)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            movies
+                .insert(&NewMovie {
+                    movie_number: movie_number.clone(),
+                    title: movie_number.clone(),
+                    javdb_id: None,
+                    summary: String::new(),
+                    maker_name: None,
+                    director_name: None,
+                    release_date: None,
+                    duration_minutes: 0,
+                    score: 0.0,
+                    score_number: 0,
+                    series_id: None,
+                    cover_image_id: None,
+                    thin_cover_image_id: None,
+                    metadata_source: None,
+                })
+                .await
+                .expect("insert movie");
+        }
         repo.insert(&NewMedia {
             library_id: library,
             file_name: format!("f{i}.mp4"),
             file_size_bytes: 1024,
-            movie_number: Some(format!("MOV-{i:03}")),
+            movie_number: Some(movie_number),
             video_item_id: None,
             storage_ref: None,
             resolution: None,
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: Some(60),
+            duration_seconds: 60,
             video_info: None,
         })
         .await
@@ -55,9 +92,7 @@ async fn seed_media(repo: &MediaRepository, pool: &sqlx::PgPool, count: i64) -> 
 
 #[tokio::test]
 async fn total_is_the_filtered_count_not_the_page_length() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     seed_media(&repo, db.pool(), 7).await;
 
@@ -74,9 +109,7 @@ async fn total_is_the_filtered_count_not_the_page_length() {
 #[tokio::test]
 async fn pages_tile_without_gaps_or_repeats() {
     // OFFSET 算错（0-based / 1-based 混淆）时，这个测试会失败。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let library = seed_media(&repo, db.pool(), 7).await;
 
@@ -118,9 +151,7 @@ async fn pages_tile_without_gaps_or_repeats() {
 async fn a_page_past_the_end_is_empty_but_still_reports_total() {
     // 客户端 fetch_all_pages 靠 total 决定还拉不拉，所以越界页返回
     // total=0 会让它以为数据取完了。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let library = seed_media(&repo, db.pool(), 3).await;
 
@@ -136,9 +167,7 @@ async fn a_page_past_the_end_is_empty_but_still_reports_total() {
 #[tokio::test]
 async fn invalid_page_parameters_are_rejected_before_any_query() {
     // 校验在仓储层：不需要连库就能拒绝，也不会打到数据库。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     seed_media(&repo, db.pool(), 2).await;
 
@@ -161,9 +190,7 @@ async fn count_and_items_see_the_same_snapshot() {
     // READ COMMITTED 下 COUNT 与 SELECT 各取一个快照，并发写入会让两者
     // 看到不同的世界：COUNT 说 7，SELECT 在 offset=6 只取到 1 条。
     // 客户端看到 total=7 却只拿到 6 条，于是反复请求最后一页。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let library = seed_media(&repo, db.pool(), 7).await;
 
@@ -189,9 +216,7 @@ async fn count_and_items_see_the_same_snapshot() {
 async fn in_snapshot_tx_reports_the_requested_isolation_level() {
     // 直接验证 `in_snapshot_tx` 真的设置了 REPEATABLE READ。
     // 假设它没设置的话，上一个测试的结论就不成立。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
 
     let level = sm_db::common::page::in_snapshot_tx(db.pool(), |conn| {
         Box::pin(async move {
@@ -212,9 +237,7 @@ async fn in_snapshot_tx_reports_the_requested_isolation_level() {
 
 #[tokio::test]
 async fn in_snapshot_tx_rolls_back_on_error() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
 
     let result = sm_db::common::page::in_snapshot_tx(db.pool(), |conn| {
         Box::pin(async move {
@@ -244,9 +267,7 @@ async fn in_snapshot_tx_rolls_back_on_error() {
 async fn filters_narrow_both_the_count_and_the_page() {
     // COUNT 与 SELECT 的 WHERE 不一致时，这个测试会失败——
     // 而那种 bug 在「过滤条件恰好命中全部行」时是看不出来的。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let library = seed_media(&repo, db.pool(), 9).await;
 
@@ -280,9 +301,7 @@ async fn page_shape_verification_catches_a_leaked_limit() {
     // `verify_page_shape` 是宏里自动调用的。这里直接测它，
     // 因为「查询漏了 LIMIT」这个 bug 靠正常数据永远测不出来——
     // 数据比 page_size 少时，漏 LIMIT 与不漏结果一样。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let library = seed_media(&repo, db.pool(), 3).await;
 

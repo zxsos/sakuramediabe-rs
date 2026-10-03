@@ -81,10 +81,22 @@ IMPLICIT_COLUMNS = {
 # 隐式列的具体类型与额外属性。
 IMPLICIT_COLUMN_TYPES = {
     # Peewee: class AutoField(IntegerField)，AUTO 在 PG 上落 INTEGER
-    "id": {"type": "int4", "primary_key": True, "auto_increment": True},
+    # 主键必然 NOT NULL —— 显式写出来，不让它落到 UNKNOWN_NULLABLE。
+    "id": {"type": "int4", "primary_key": True, "auto_increment": True, "nullable": False},
     "created_at": {"type": "timestamp", "nullable": True},
     "updated_at": {"type": "timestamp", "nullable": True},
 }
+
+# 「这条列的可空性没能从源码解析出来」的哨兵值。
+#
+# 刻意**不**用 None：那与「Peewee 默认 NOT NULL」在真假判断里无法区分，
+# 而把两者混同正是可空性对拍一直空转的原因（None is False 为假，于是
+# 省略 null= 的列全部免检）。
+#
+# 任何以 UNKNOWN_NULLABLE 为可空性的列都会让对拍失败，直到有人查清上游
+# 到底怎么声明的。这比「猜 NOT NULL 然后静默」安全：前者会问你，后者
+# 只是让一个 Option<String> 混进模型层，等到插入时才炸。
+UNKNOWN_NULLABLE = "unknown"
 
 
 def snake_case(name: str) -> str:
@@ -342,7 +354,7 @@ def parse_model_file(path: str) -> list:
                     "name": col,
                     "type": spec.get("type", "implicit"),
                     "field": col,
-                    "nullable": spec.get("nullable"),
+                    "nullable": spec.get("nullable", UNKNOWN_NULLABLE),
                     "unique": bool(spec.get("primary_key")),
                     "index": False,
                     "default": None,
@@ -372,7 +384,24 @@ def parse_model_file(path: str) -> list:
                         "name": actual,
                         "type": kind,
                         "field": fname,
-                        "nullable": None,
+                        # 默认 False，不是 None。
+                        #
+                        # Peewee 的 Field 默认 null=False，所以省略 null= 的列
+                        # **确实**是 NOT NULL —— 这是完全确定的，不是「解析
+                        # 不出来」。之前这里填 None，而 compare_schema.py 的
+                        # 判定是 `if py_nullable is False and optional`：
+                        # None 不是 False，于是省略 null= 的列全部免检。
+                        #
+                        # 代价是整个可空性对拍形同虚设：actor 表 26 列里 9 列
+                        # 属于这种情况，包括 javdb_id。Rust 侧把它声明成
+                        # Option<String>，归一化时空串变 None，插入必然违反
+                        # NOT NULL —— 而对拍报 0 problems，集成测试还断言
+                        # 这次插入成功。
+                        #
+                        # 真正「解析不出来」的情形用 UNKNOWN_NULLABLE 表达，
+                        # 与 False 区分开：那会让对拍失败并要求有人查清上游，
+                        # 而不是猜一个值蒙混过关。
+                        "nullable": False,
                         "unique": False,
                         "index": False,
                         "default": None,

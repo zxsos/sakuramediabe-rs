@@ -40,13 +40,22 @@ mod fixtures {
     }
 
     /// 建 N 个 actor 行，返回它们的 id。
+    ///
+    /// `javdb_id` 是必填的：上游是
+    /// `CaseSensitiveCharField(max_length=64, unique=True)`，没有
+    /// `null=True`，所以 DDL 是 `javdb_id varchar(64) NOT NULL UNIQUE`。
+    /// 此前这个夹具只插 `name`，于是每一次插入都违反 NOT NULL ——
+    /// 而这些测试从未在 CI 里跑过（integration job 只跑
+    /// `repo_integration` 与 `gateway_integration`），本地无数据库时又
+    /// 静默跳过，所以「插不进演员」这件事一直没人看到。
     pub async fn seed_actors(db: &TestDb, count: usize) -> Vec<i32> {
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
             let row = sqlx::query_as::<_, (i32,)>(
-                "INSERT INTO actor (name, created_at, updated_at) \
-                 VALUES ($1, $2, $2) RETURNING id",
+                "INSERT INTO actor (javdb_id, name, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $3) RETURNING id",
             )
+            .bind(format!("JAVDB-{i}"))
             .bind(format!("演员{i}"))
             .bind(sm_db::common::time::now_utc())
             .fetch_one(db.pool())
@@ -79,9 +88,7 @@ async fn counts(db: &TestDb) -> (i64, i64, i64, i64) {
 
 #[tokio::test]
 async fn import_writes_all_four_tables() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let actors = fixtures::seed_actors(&db, 3).await;
 
     let mut uow = UnitOfWork::begin(db.pool()).await.unwrap();
@@ -114,9 +121,7 @@ async fn import_writes_all_four_tables() {
 #[tokio::test]
 async fn duplicate_actor_ids_do_not_create_duplicate_links() {
     // (movie_id, actor_id) 唯一索引 + ON CONFLICT：调用方不需要去重。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let actors = fixtures::seed_actors(&db, 2).await;
     // 故意重复第一个
     let with_dup = vec![actors[0], actors[1], actors[0]];
@@ -149,9 +154,7 @@ async fn a_failing_actor_link_rolls_back_everything() {
     //
     // 第 4 阶段失败（演员关联插不进去），此时前 3 阶段已经在同一个事务里
     // 写了影片和标签。断言：这四张表都必须是空的。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let actors = fixtures::seed_actors(&db, 1).await;
 
     // 传一个不存在的 actor_id：影片与标签会写入，关联会撞外键。
@@ -184,9 +187,7 @@ async fn a_failing_actor_link_rolls_back_everything() {
 #[tokio::test]
 async fn dropping_without_commit_leaves_nothing() {
     // 全部阶段都成功，但事务没有提交。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let actors = fixtures::seed_actors(&db, 2).await;
 
     {
@@ -208,9 +209,7 @@ async fn dropping_without_commit_leaves_nothing() {
 #[tokio::test]
 async fn tags_are_reused_across_movies() {
     // 标签天然重复：upsert 而不是 insert，撞唯一约束时返回既有行。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
 
     for number in ["ABC-001", "ABC-002"] {
         let mut uow = UnitOfWork::begin(db.pool()).await.unwrap();
@@ -242,9 +241,7 @@ async fn tags_are_reused_across_movies() {
 #[tokio::test]
 async fn blank_tag_name_rejects_the_whole_import() {
     // 空白标签名在第一个阶段就被拒 -> 影片也不该被创建。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
 
     let mut uow = UnitOfWork::begin(db.pool()).await.unwrap();
     let err = uow
@@ -257,17 +254,18 @@ async fn blank_tag_name_rejects_the_whole_import() {
     let (movies, tags, _, movie_tags) = counts(&db).await;
     assert_eq!(
         (movies, tags, movie_tags),
-        (0, 1, 0),
-        "第一个标签已建、影片未建；回滚后应只剩那一个标签被撤销"
+        (0, 0, 0),
+        "回滚后四张表都应为空 —— 空白标签名在第一个阶段就被拒，\
+         而 `import_movie` 的所有写入共享一个事务，所以先建成的那个标签也必须被撤销。\
+         此前这里断言 tags == 1，与同一行里的 `uow.rollback()` 自相矛盾：\
+         那描述的是回滚**之前**的状态。这条断言从未真正执行过。"
     );
 }
 
 #[tokio::test]
 async fn movie_tag_links_are_readable_after_import() {
     // 走仓储读回，确认关联表的列与模型对得上（不是只靠计数）。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
 
     let mut uow = UnitOfWork::begin(db.pool()).await.unwrap();
     let result = uow

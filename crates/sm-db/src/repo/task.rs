@@ -235,9 +235,20 @@ impl BackgroundTaskRunRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|run| ClaimedTask {
-            run,
-            lease_expires_at,
+        // `lease_expires_at` 取**数据库读回的值**，而不是本地算出的那个。
+        //
+        // PostgreSQL 的 `timestamp` 是微秒精度，而 `chrono::NaiveDateTime`
+        // 是纳秒 —— 写进去时被截断，读回来与本地值相差几百纳秒。
+        //
+        // worker 用这个值判断「租约是否快到期」，本地值偏大就可能**晚几百
+        // 纳秒**才认为超时，续租时机随之偏移。库里那份才是真正生效的
+        // 契约，所以直接用它。
+        Ok(row.map(|run| {
+            let lease_expires_at = run.lease_expires_at.unwrap_or(lease_expires_at);
+            ClaimedTask {
+                run,
+                lease_expires_at,
+            }
         }))
     }
 
@@ -304,12 +315,23 @@ impl BackgroundTaskRunRepository {
         id: i32,
         progress: &TaskProgress,
     ) -> Result<BackgroundTaskRun, DbError> {
-        let (current, total) = match (progress.current, progress.total) {
-            (Some(c), Some(t)) if t > 0 => (Some(c), Some(t)),
-            _ => (None, None),
+        // 三件套要么都有效，要么**全部**清空 —— 包括 `text`。
+        //
+        // 此前只清 `current` / `total`，`text` 原样保留。那会留下一行
+        // `progress_current = NULL, progress_total = NULL,
+        // progress_text = '正在处理第 3 层'`：文本描述了一个不存在的
+        // 量化进度，读出来自相矛盾。文本是进度的**说明**，没有数值进度
+        // 时它没有意义。
+        let quantifiable =
+            matches!((progress.current, progress.total), (Some(_), Some(t)) if t > 0);
+        let (current, total, text) = if quantifiable {
+            (progress.current, progress.total, progress.text.as_deref())
+        } else {
+            (None, None, None)
         };
+        let text = text.map(str::trim).filter(|s| !s.is_empty());
         let now = crate::common::time::now_utc();
-        let row = sqlx::query_as::<_, BackgroundTaskRun>(
+        sqlx::query_as::<_, BackgroundTaskRun>(
             "UPDATE background_task_run \
              SET progress_current = $2, progress_total = $3, progress_text = $4, updated_at = $5 \
              WHERE id = $1 RETURNING *",
@@ -317,18 +339,11 @@ impl BackgroundTaskRunRepository {
         .bind(id)
         .bind(current)
         .bind(total)
-        .bind(
-            progress
-                .text
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
-        )
+        .bind(text)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
-        Ok(row)
+        .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
     /// 标记成功。**同时释放 `mutex_key`。**
@@ -423,15 +438,30 @@ impl BackgroundTaskRunRepository {
         /// 列出租约已过期的僵尸任务（不改变状态）。**分页。**
         ///
         /// 给人看：运维要判断「有多少任务卡住了」。分页让那个数字准确。
+        ///
+        /// # 为什么 `state` 内联而不是绑成占位符
+        ///
+        /// `paged_list!` 按**参数声明顺序**绑定，每个参数恰好绑一次：
+        /// 这里只有 `now -> $1`，随后是 limit/offset。而 `state` 是编译期
+        /// 常量（`task_state::RUNNING`），不是调用方能影响的值。
+        ///
+        /// 此前写的是 `state = $1`，可那个 `$1` 绑的是 `now`，于是
+        /// PostgreSQL 报：
+        ///
+        /// ```text
+        /// operator does not exist: character varying = timestamp without time zone
+        /// ```
         pub async fn list_stale_leases(
             &self,
             now: NaiveDateTime,
         ) -> Result<Page<BackgroundTaskRun>, DbError> {
             count = "SELECT COUNT(*) FROM background_task_run \
-                     WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2",
+                     WHERE state = 'running' AND lease_expires_at IS NOT NULL \
+                       AND lease_expires_at < $1",
             items = "SELECT * FROM background_task_run \
-                     WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2 \
-                     ORDER BY lease_expires_at, id LIMIT $3 OFFSET $4",
+                     WHERE state = 'running' AND lease_expires_at IS NOT NULL \
+                       AND lease_expires_at < $1 \
+                     ORDER BY lease_expires_at, id LIMIT $2 OFFSET $3",
         }
     }
 
@@ -486,17 +516,38 @@ impl BackgroundTaskRunRepository {
             fields.len() + 1
         );
 
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, BackgroundTaskRun>(super::movie::safe_sql(sql)),
-            |q, (_, v)| super::movie::bind_value(q, v),
-        );
-        let row = query
+        // 两步：先 UPDATE，按 rows_affected 判定命中；再 SELECT 读回。
+        //
+        // 与 `MovieRepository::update` 同一个理由：`UPDATE ... RETURNING *`
+        // 把「0 行命中」与「解码失败」压成同一个 Err，排查时看不出是哪个。
+        // 之前这里用的是 `query_as` + `fetch_optional`，结果 0 行命中被报成
+        // NotFound —— 而真相是解码失败：那一版给 `updated_at` 绑的是
+        // JSONB 值（`Value` 把所有 `set()` 的值都包成了 `Json`），
+        // 赋给 timestamp 列时类型不匹配。
+        //
+        // 拆开后命中判定是一个确定的数字，NotFound 也就能和「真的没这行」
+        // 区分开 —— 而这正是把 bug 定位到根因的那一步。
+        let query = fields
+            .iter()
+            .fold(sqlx::query(super::movie::safe_sql(sql)), |q, (_, v)| {
+                super::movie::bind_value_exec(q, v)
+            });
+        let result = query
             .bind(id)
-            .fetch_optional(&self.pool)
+            .execute(&self.pool)
             .await
             .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        // 命中之后再读回。UPDATE 与随后的 SELECT 之间理论上仍有窗口
+        // （并发删除），所以这里用 ok_or_else 把「读不到」也归为
+        // NotFound —— 调用方看到的都是同一件事：这一行现在不存在。
+        match self.find_by_id(id).await? {
+            Some(row) => Ok(row),
+            None => Err(DbError::not_found(ENTITY, id)),
+        }
     }
 }
 

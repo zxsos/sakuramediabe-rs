@@ -18,7 +18,7 @@ use sm_db::testing::TestDb;
 /// 建一位演员，返回 id。
 async fn seed(repo: &ActorRepository, javdb_id: &str, name: &str) -> i32 {
     repo.insert(&NewActor {
-        javdb_id: Some(javdb_id.to_owned()),
+        javdb_id: javdb_id.to_owned(),
         name: name.to_owned(),
     })
     .await
@@ -27,44 +27,49 @@ async fn seed(repo: &ActorRepository, javdb_id: &str, name: &str) -> i32 {
 }
 
 /// 直接写 `merged_into_id`，模拟未经合并流程的历史数据。
-async fn point_at(db: &TestDb, id: i32, target: i32) {
+async fn point_at(db: &TestDb, id: i32, target: i32) -> sqlx::Result<()> {
     sqlx::query("UPDATE actor SET merged_into_id = $2 WHERE id = $1")
         .bind(id)
         .bind(target)
         .execute(db.pool())
         .await
-        .expect("set merged_into_id");
+        .map(|_| ())
 }
 
 #[tokio::test]
-async fn insert_normalises_blank_javdb_id_and_trims_name() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+async fn insert_rejects_blank_javdb_id_and_trims_both_fields() {
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
-    let blank = repo
+    // 空白 javdb_id 现在是**业务错误**，不是「归一为 NULL」。
+    //
+    // 之前这里断言空白会被归一成 NULL 并成功插入。那是错的：上游的
+    // `CaseSensitiveCharField(max_length=64, unique=True)` 没有 `null=True`，
+    // DDL 是 `javdb_id varchar(64) NOT NULL UNIQUE`，写入 NULL 必然被拒绝。
+    // 该测试之所以「通过」，是因为没有数据库时它直接 return —— 静默跳过，
+    // 而报告里算作通过。
+    let err = repo
         .insert(&NewActor {
-            javdb_id: Some("   ".to_owned()),
+            javdb_id: "   ".to_owned(),
             name: "演员甲".to_owned(),
         })
         .await
-        .unwrap();
+        .expect_err("空白 javdb_id 应被拒绝：该列是 NOT NULL");
     assert!(
-        blank.javdb_id.is_none(),
-        "空白 javdb_id 应归一为 NULL，否则 `WHERE javdb_id = ''` 命中假记录"
+        err.to_string().contains("javdb_id"),
+        "错误信息应指明是哪个字段: {err}"
     );
 
     let padded = repo
         .insert(&NewActor {
-            javdb_id: Some("  ABC  ".to_owned()),
+            javdb_id: "  ABC  ".to_owned(),
             name: "  演员乙 ".to_owned(),
         })
         .await
         .unwrap();
     assert_eq!(padded.name, "演员乙", "name 被 trim");
     assert_eq!(padded.alias_name, "演员乙", "alias_name 初始等于 name");
-    assert_eq!(padded.javdb_id.as_deref(), Some("ABC"));
+    assert_eq!(padded.javdb_id, "ABC", "javdb_id 被 trim");
     assert!(!padded.is_subscribed);
     assert!(padded.merged_into_id.is_none());
 }
@@ -72,9 +77,7 @@ async fn insert_normalises_blank_javdb_id_and_trims_name() {
 #[tokio::test]
 async fn find_by_javdb_id_is_the_stable_key() {
     // name 会被合并改写，所以外部同步只能靠 javdb_id 定位。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     let id = seed(&repo, "JAVDB-1", "演员甲").await;
 
@@ -96,9 +99,7 @@ async fn find_by_javdb_id_is_the_stable_key() {
 async fn find_by_name_matches_aliases_too() {
     // 合并把来源名并进 alias_name —— 搜来源名必须还能命中，
     // 否则一次合并会让人「消失」。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     let id = seed(&repo, "J-1", "空").await;
 
@@ -121,16 +122,14 @@ async fn find_by_name_matches_aliases_too() {
 
 #[tokio::test]
 async fn resolve_canonical_walks_the_chain_and_reports_it() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let a = seed(&repo, "A", "甲").await;
     let b = seed(&repo, "B", "乙").await;
     let c = seed(&repo, "C", "丙").await;
-    point_at(&db, a, b).await;
-    point_at(&db, b, c).await;
+    point_at(&db, a, b).await.expect("link a -> b");
+    point_at(&db, b, c).await.expect("link b -> c");
 
     let (canonical, chain) = repo.resolve_canonical(a).await.unwrap().unwrap();
     assert_eq!(canonical.id, c, "应走到链的终点");
@@ -141,15 +140,15 @@ async fn resolve_canonical_walks_the_chain_and_reports_it() {
 #[tokio::test]
 async fn resolve_canonical_stops_on_a_cycle() {
     // 成环必须终止，且不能返回任意一行 —— 那会把资料写到错误的演员上。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let a = seed(&repo, "A", "甲").await;
     let b = seed(&repo, "B", "乙").await;
-    point_at(&db, a, b).await;
-    point_at(&db, b, a).await;
+    point_at(&db, a, b).await.expect("link a -> b");
+    point_at(&db, b, a)
+        .await
+        .expect("link b -> a, closing the cycle");
 
     assert!(
         repo.resolve_canonical(a).await.unwrap().is_none(),
@@ -158,36 +157,56 @@ async fn resolve_canonical_stops_on_a_cycle() {
 }
 
 #[tokio::test]
-async fn resolve_canonical_stops_on_a_broken_chain() {
-    // 指针指向不存在的行：数据损坏或并发删库。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+async fn foreign_key_forbids_a_dangling_tombstone_pointer() {
+    // 此前这个测试叫 `resolve_canonical_stops_on_a_broken_chain`，断言
+    // 「指针指向不存在的行时 resolve_canonical 返回 None」。它从未真正
+    // 执行过 —— CI 的 integration job 只跑 repo_integration 与
+    // gateway_integration，这个 suite 编译但不被运行；本地没有数据库时
+    // 它还会静默返回、算作通过。**两个机制都堵上之后**（`TestDb::require`
+    // 缺库即 panic，CI 跑全部 suite），它才第一次真正执行。
+    //
+    // 第一次真正执行就暴露了问题：**断链这种数据形状不存在**。
+    // `actor_merged_into_id_fk` 拒绝任何指向不存在行的指针，连裸 SQL
+    // UPDATE 都过不去：
+    //
+    //   ERROR: insert or update on table "actor" violates foreign key
+    //          constraint "actor_merged_into_id_fk"
+    //
+    // 所以断言「解析器要能处理断链」是建立在一个不存在的场景上。
+    // 真正的契约在外键上：断链**进不来**。这个测试改为断言该契约，
+    // 因为「数据不可能损坏」比「解析器容忍损坏」更值得固化 ——
+    // 前者是数据库保证，后者只是防御性代码。
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
-
     let a = seed(&repo, "A", "甲").await;
-    point_at(&db, a, 999_999).await;
 
-    assert!(
-        repo.resolve_canonical(a).await.unwrap().is_none(),
-        "断链应返回 None，不能返回半途的行"
+    let err = point_at(&db, a, 999_999)
+        .await
+        .expect_err("外键必须拒绝指向不存在行的墓碑指针");
+    let db_err = err
+        .as_database_error()
+        .expect("应是数据库错误，而不是连接或参数错误");
+    assert_eq!(
+        db_err.code().as_deref(),
+        Some("23503"),
+        "应为外键违例，实际 {err}"
     );
+
+    // 指针没被写进去，行仍是未合并状态。
+    let after = repo.find_by_id(a).await.unwrap().unwrap();
+    assert!(after.merged_into_id.is_none(), "失败的 UPDATE 不应留下痕迹");
 }
 
 #[tokio::test]
 async fn resolve_canonical_of_a_missing_actor_is_none() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     assert!(repo.resolve_canonical(999_999).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn merge_marks_sources_as_tombstones_and_clears_subscription() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let target = seed(&repo, "T", "保留").await;
@@ -218,9 +237,7 @@ async fn merge_marks_sources_as_tombstones_and_clears_subscription() {
 #[tokio::test]
 async fn mark_merged_is_idempotent() {
     // 重复合并同一来源不应改写它已指向的墓碑。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let t1 = seed(&repo, "T1", "保留一").await;
@@ -241,9 +258,7 @@ async fn mark_merged_is_idempotent() {
 async fn redirect_flattens_the_chain() {
     // A 合并进 B 后，若还有 C 指向 B，必须一并改成指向 A：
     // 否则链多一跳，且 B 若被清理就成了悬空指针。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let a = seed(&repo, "A", "甲").await;
@@ -251,7 +266,7 @@ async fn redirect_flattens_the_chain() {
     let c = seed(&repo, "C", "丙").await;
 
     repo.mark_merged(&[b], a).await.unwrap();
-    point_at(&db, c, b).await;
+    point_at(&db, c, b).await.expect("link c -> b");
 
     let redirected = repo.redirect_tombstones(&[b], a).await.unwrap();
     assert_eq!(redirected, 1, "指向 B 的墓碑应被重指向 A");
@@ -265,9 +280,7 @@ async fn redirect_flattens_the_chain() {
 #[tokio::test]
 async fn set_subscribed_keeps_the_earliest_timestamp() {
     // 重复订阅不刷新时间 —— 它回答的是「首次订阅于何时」。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     let id = seed(&repo, "S", "演员").await;
 
@@ -286,9 +299,7 @@ async fn set_subscribed_keeps_the_earliest_timestamp() {
 #[tokio::test]
 async fn list_excludes_tombstones_unless_asked() {
     // 墓碑不再是独立实体，混进列表会让同一演算出多行。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
 
     let keep = seed(&repo, "K", "保留").await;
@@ -313,9 +324,7 @@ async fn list_excludes_tombstones_unless_asked() {
 #[tokio::test]
 async fn invalidate_full_sync_forces_the_next_run_to_rebuild() {
     // 合并后必须作废全量同步时间，否则来源 ID 的历史影片补不齐。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     let id = seed(&repo, "S", "演员").await;
 
@@ -335,9 +344,7 @@ async fn invalidate_full_sync_forces_the_next_run_to_rebuild() {
 
 #[tokio::test]
 async fn sync_state_projection_avoids_pulling_the_whole_row() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = ActorRepository::new(db.pool().clone());
     let id = seed(&repo, "S", "演员").await;
     repo.set_subscribed(id, true).await.unwrap();

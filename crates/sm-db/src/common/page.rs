@@ -197,8 +197,21 @@ impl<T: PageArgCopy> PageArg for T {
 
 impl PageArg for &str {
     type Owned = String;
+    /// **`&str` 参数在这里统一 trim。**
+    ///
+    /// 仓储层的其他入口（`UserRepository::find_by_username`、
+    /// `MediaRepository::insert` 的 `file_name`、`ActorRepository::find_by_name`）
+    /// 都对输入做 `.trim()`，而 `paged_list!` 生成的十一个分页方法此前
+    /// 只做 `to_owned()` —— 于是「`  ABC-002  ` 查不到 `ABC-002`」
+    /// 这种不一致只在测试真正执行后才暴露。
+    ///
+    /// 放在这里而不是让每个方法各自处理：这条约定已经存在于仓储层的
+    /// 每一个手写入口，漏掉的应该是**默认行为**，而不是逐个方法的自觉。
+    ///
+    /// 业务上也无例外 —— 番号、库名、标签名都不该带前后空白，而空白
+    /// 串 trim 后变成空串，匹配不到任何行，语义正确。
     fn into_page_arg(self) -> String {
-        self.to_owned()
+        self.trim().to_owned()
     }
 }
 

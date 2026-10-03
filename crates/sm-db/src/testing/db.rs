@@ -64,9 +64,56 @@ pub struct TestDb {
 }
 
 impl TestDb {
+    /// 创建隔离 schema 并应用 DDL。**缺数据库时 panic。**
+    ///
+    /// # 为什么不用「拿不到就跳过」
+    ///
+    /// 此前这里是 `create() -> Option<Self>`，测试写成：
+    ///
+    /// ```ignore
+    /// let Some(db) = TestDb::create().await else {
+    ///     return;   // 算作通过
+    /// };
+    /// ```
+    ///
+    /// 那意味着**没有数据库时全部 151 个集成测试都「通过」**。报告里
+    /// 它们与真正跑过的测试长得一模一样。
+    ///
+    /// 代价是真实缺陷可以长期隐身。本轮就靠这个机制藏了至少六个：
+    ///
+    /// | 缺陷 | 表现 |
+    /// |---|---|
+    /// | `actor.javdb_id` 声明成 `Option` 而列是 NOT NULL | 插入必失败，测试却断言成功 |
+    /// | `seed_media` 硬编码 `library_id: 1` 却从不建那行 | 18 个用例全撞外键 |
+    /// | `seed_image` 插 `image_key` —— 该列不存在 | 一半用例报「列不存在」 |
+    /// | `list_stale_leases` 占位符编号错 | `varchar = timestamp` 类型错 |
+    /// | `update_metadata` 靠 `Drop` 隐式回滚 | 单连接池下死锁，测试挂起 |
+    /// | 回滚后断言 `tags == 1` | 期望自相矛盾 |
+    ///
+    /// 而 CI 的 integration job 当时**只跑 2 个 suite**，另外 6 个
+    /// （99 个测试）编译但从不执行。两层机制叠在一起，缺陷毫无阻力地
+    /// 积累到今天。
+    ///
+    /// 现在：要么真的跑，要么**响亮地失败**。想在无库环境下跑单元测试
+    /// 用 `cargo test --lib`，那条路径不碰数据库。
+    pub async fn require() -> Self {
+        match Self::create().await {
+            Some(db) => db,
+            None => panic!(
+                "集成测试需要 PostgreSQL，但连不上。\n\
+                 设置 SMDB_TEST_DATABASE_URL 指向一个可用的库，或改跑 \
+                 `cargo test --lib`（只跑不碰数据库的单元测试）。\n\
+                 当前读到的: SMDB_TEST_DATABASE_URL={:?} DATABASE_URL={:?}",
+                std::env::var("SMDB_TEST_DATABASE_URL").ok(),
+                std::env::var("DATABASE_URL").ok(),
+            ),
+        }
+    }
+
     /// 创建隔离 schema 并应用 DDL。
     ///
-    /// 拿不到连接时返回 `None` —— 测试应直接 `return`，算作通过。
+    /// 拿不到连接时返回 `None` —— **只在明确想跳过时用**
+    /// （如某个可选的外部依赖探测）。集成测试请用 [`TestDb::require`]。
     pub async fn create() -> Option<Self> {
         let pool = test_pool().await?;
         let url = test_database_url()?;

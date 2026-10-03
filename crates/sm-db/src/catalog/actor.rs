@@ -29,12 +29,27 @@ pub const PROTECTED_ACTOR_FIELDS: [&str; 9] = [
 ];
 
 /// 额外受护栏约束的字段（不在插件可写白名单内，但也禁止裸写）。
+///
+/// **这些是数据库列名**，不是 Peewee 字段名 —— 两者对多数列恰好相同，
+/// 所以差别一直没被发现，直到 `merged_into` / `profile_image_override`
+/// 这两列：Peewee 侧叫 `merged_into` / `profile_image_override`，而
+/// Peewee 的 `ForeignKeyField(Model)` 在不写 `field=` 时落到
+/// `<field>_id`，所以 DDL 里是 `merged_into_id` / `profile_image_override_id`。
+///
+/// 用错名字的后果不是「编译失败」而是「静默错」：
+///
+/// - `is_guarded("merged_into_id")` 返回 `false` —— 任何按**列名**询问的
+///   调用方（护栏、未来的网关）都会得到错误答案；
+/// - 一旦这些字段被纳入 patch，字段名会直接拼进 SQL，于是拼出一个
+///   不存在的列。
+///
+/// `every_guarded_name_is_a_real_column` 这个单测把两者钉在一起。
 pub const GUARDED_ACTOR_FIELDS: [&str; 5] = [
     "field_owners",
     "mutation_revision",
     "display_name_override",
-    "profile_image_override",
-    "merged_into",
+    "profile_image_override_id",
+    "merged_into_id",
 ];
 
 /// `gender` 的合法取值。
@@ -52,8 +67,12 @@ pub const GENDER_ALLOWED: [i32; 2] = [GENDER_FEMALE, GENDER_MALE];
 pub struct Actor {
     pub id: i32,
 
-    /// JavDB ID。空串在 save 时归一为 NULL。
-    pub javdb_id: Option<String>,
+    /// JavDB ID。**NOT NULL**。
+    ///
+    /// 上游是 `CaseSensitiveCharField(max_length=64, unique=True)`，没有
+    /// `null=True`，所以这一列不可空。此前声明成 `Option<String>` 并让
+    /// 空白归一为 `None`，写入必然违反 NOT NULL 约束。
+    pub javdb_id: String,
     pub name: String,
     /// 别名合并后的结果，格式 `"主名 / 别名1 / 别名2"`，去重且主名在首位。
     pub alias_name: String,
@@ -214,7 +233,18 @@ where
                 current_id = id;
                 merged_into = next;
             }
-            None => return Some(current_id),
+            // 断链：指针指向的行不存在。
+            //
+            // 返回 `None` 而不是 `Some(current_id)` —— 与
+            // `ActorRepository::resolve_canonical` 的行为一致。此前两处
+            // 相反（仓储返回 None、这里返回最后一跳），而没有任何测试能
+            // 发现：`foreign_key_forbids_a_dangling_tombstone_pointer`
+            // 证明这种数据形状进不来，其余调用方也没走到这里。
+            //
+            // 「无法确认这是终点」与「这就是终点」必须区分。返回最后一跳
+            // 会让调用方把一个墓碑当成保留记录 —— 那是数据损坏被当成
+            // 正常结果，比报错更难排查。
+            None => return None,
         }
     }
     Some(current_id)
@@ -227,7 +257,7 @@ mod tests {
     fn demo_actor(birthday: Option<&str>) -> Actor {
         Actor {
             id: 1,
-            javdb_id: None,
+            javdb_id: "n".to_owned(),
             name: "n".to_owned(),
             alias_name: String::new(),
             merged_into_id: None,
@@ -276,17 +306,42 @@ mod tests {
 
     #[test]
     fn guarded_fields_extend_beyond_plugin_whitelist() {
-        for field in [
-            "field_owners",
-            "mutation_revision",
-            "display_name_override",
-            "profile_image_override",
-            "merged_into",
-        ] {
+        // 遍历**常量本身**，不要把名字重抄一遍。
+        //
+        // 此前这里硬编码了一份与常量相同的列表，于是两处**同时**是错的
+        // （用的是 Peewee 字段名 `merged_into` 而不是列名
+        // `merged_into_id`），测试照样通过。抄一份列表，就等于把
+        // 「名字对不对」这个断言本身交给了同一份可能错的东西。
+        for field in GUARDED_ACTOR_FIELDS {
             assert!(Actor::is_guarded(field), "field={field}");
             assert!(
                 !Actor::is_protected(field),
                 "{field} 受护栏约束但不在插件白名单内"
+            );
+        }
+    }
+
+    #[test]
+    fn every_guarded_name_is_a_real_column() {
+        // Peewee 字段名与 DDL 列名对多数列恰好相同，所以差别一直没暴露。
+        // 这里逐个对照 DDL，确保常量里每一个名字都是真实存在的列。
+        let ddl = include_str!("../../../../docker/schema.sql");
+        let actor_ddl = ddl
+            .split("CREATE TABLE IF NOT EXISTS actor (")
+            .nth(1)
+            .and_then(|rest| rest.split("\n);").next())
+            .expect("schema.sql 里应有 actor 表");
+
+        for field in GUARDED_ACTOR_FIELDS
+            .iter()
+            .chain(PROTECTED_ACTOR_FIELDS.iter())
+        {
+            assert!(
+                actor_ddl
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(field)),
+                "{field} 不在 actor 表的 DDL 里 —— 护栏与网关会把字段名直接拼进 SQL，\
+                 拼出不存在的列只在运行时才报错"
             );
         }
     }

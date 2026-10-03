@@ -30,13 +30,25 @@ pub struct RankingItem {
     pub period: String,
     /// 名次，从 1 开始。
     pub rank: i32,
-    /// 影片番号，**与 `movie_id` 冗余并存**。
+    /// 影片番号。
     ///
-    /// 榜单数据先于刮削入库是常态，所以番号可先落地；
-    /// `movie_id` 在影片入库后回填。查询番号用这一列，join 用外键。
+    /// 与 `movie_id` 冗余并存：查询番号用这一列，走索引且不必 join。
     pub movie_number: String,
-    /// 指向 `Movie`（JAV 影片）的 `id`。影片未入库时为空。
-    pub movie_id: Option<i32>,
+    /// 指向 `Movie`（JAV 影片）的 `id`。**NOT NULL。**
+    ///
+    /// 上游是
+    /// `movie = ForeignKeyField(Movie, backref="ranking_items", on_delete="CASCADE")`，
+    /// 没有 `null=True`，所以这一列不可空。
+    ///
+    /// 此前这里是 `Option<i32>`，注释写着「榜单数据先于刮削入库是常态，
+    /// 影片未入库时为空，入库后回填」——**那个设计在数据库层面不成立**：
+    /// 列是 NOT NULL，第一次插入就必须带上已存在的 `movie_id`，没有
+    /// 「先插行、以后再回填」这种中间状态。按注释实现会直接撞约束。
+    ///
+    /// 榜单数据确实可能先于刮削到达，但那时正确的做法是**先落 movie 行**
+    /// （哪怕是只有番号的占位行），再插 ranking_item —— 冗余的
+    /// `movie_number` 让这个占位成本很低。
+    pub movie_id: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -49,11 +61,6 @@ impl RankingItem {
     /// 两者都在，`board_identity` 正好对应后者的前缀。
     pub fn board_identity(&self) -> (&str, &str, &str) {
         (&self.source_key, &self.board_key, &self.period)
-    }
-
-    /// 该条目是否已关联到具体影片。
-    pub fn is_linked(&self) -> bool {
-        self.movie_id.is_some()
     }
 
     /// 是否为不限定周期的总榜。
@@ -226,7 +233,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
-    fn ranking(period: &str, movie_id: Option<i32>) -> RankingItem {
+    fn ranking(period: &str, movie_id: i32) -> RankingItem {
         RankingItem {
             id: 1,
             source_key: "javdb".to_owned(),
@@ -287,18 +294,24 @@ mod tests {
     #[test]
     fn period_defaults_to_empty_string_not_null() {
         // period 是 CharField(default="")，空串代表不限定周期。
-        assert!(ranking("", Some(1)).is_all_time());
-        assert!(!ranking("2026-10", Some(1)).is_all_time());
+        assert!(ranking("", 1).is_all_time());
+        assert!(!ranking("2026-10", 1).is_all_time());
     }
 
     #[test]
-    fn ranking_keeps_movie_number_before_movie_exists() {
-        // 榜单数据先于刮削入库，所以 movie_id 可空而 movie_number 必有值。
-        let unlinked = ranking("2026-10", None);
-        assert!(!unlinked.is_linked());
-        assert_eq!(unlinked.movie_number, "ABC-001");
+    fn board_identity_serves_the_list_query_index() {
+        // 曾经存在一个 `is_linked()`，断言「movie_id 可以先空着、
+        // 影片入库后再回填」。那个前提是错的：`movie` 是
+        // `ForeignKeyField(Movie, on_delete="CASCADE")`，没有 `null=True`，
+        // 列是 NOT NULL，不存在「先插行、以后回填」的中间状态。
+        //
+        // 榜单先于刮削到达时，正确做法是先落 movie 占位行再插
+        // ranking_item —— 冗余的 movie_number 让这个成本很低。
+        let item = ranking("2026-10", 7);
+        assert_eq!(item.movie_id, 7, "外键必带值");
+        assert_eq!(item.movie_number, "ABC-001", "冗余番号仍用于免 join 查询");
         assert_eq!(
-            unlinked.board_identity(),
+            item.board_identity(),
             ("javdb", "popular", "2026-10"),
             "board_identity 对应 (source_key, board_key, period) 那个普通索引"
         );

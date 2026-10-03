@@ -115,6 +115,7 @@ pub mod asset;
 pub mod ctx;
 pub mod download;
 pub mod gateway;
+pub mod library;
 pub mod media;
 pub mod movie;
 pub mod playback;
@@ -126,6 +127,7 @@ pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
+pub use library::{MediaLibraryRepository, NewMediaLibrary};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
 pub use playback::{

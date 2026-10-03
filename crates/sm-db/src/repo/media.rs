@@ -49,8 +49,12 @@ pub struct NewMedia {
     /// `media-file-hash-v1:<40 hex>`。
     pub file_hash: Option<String>,
     pub import_source_identity: Option<String>,
-    /// DDL 里是 `integer`，模型是 `i32` —— 与 `Media` 结构体保持一致。
-    pub duration_seconds: Option<i32>,
+    /// `duration_seconds integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    ///
+    /// 0 就是「未知时长」，与列的 DEFAULT 一致。此前声明成 `Option<i32>`
+    /// 且 `insert` 直接 `.bind(new.duration_seconds)`，`None` 会绑成 NULL
+    /// 并违反 NOT NULL。
+    pub duration_seconds: i32,
     /// `JsonTextField`，写入时序列化为文本。
     pub video_info: Option<serde_json::Value>,
 }
@@ -183,7 +187,13 @@ impl MediaRepository {
             .bind(new.movie_number.as_deref().map(str::trim))
             .bind(new.video_item_id)
             .bind(new.library_id)
-            .bind(new.storage_ref.as_deref())
+            // `storage_ref` 是 `text NOT NULL DEFAULT '{}'`（上游
+            // `JsonTextField(default=dict)`，没有 `null=True`）。
+            // 绑 `as_deref()` 会在 None 时写 NULL，直接违反 NOT NULL。
+            // 缺失时写 DEFAULT 对应的 '{}'，与 task.rs 对 `result_summary`
+            // 的处理一致 —— `Option` 在这里表达「调用方没提供」，而不是
+            // 「允许存 NULL」。
+            .bind(new.storage_ref.as_deref().unwrap_or("{}"))
             .bind(new.file_name.trim())
             .bind(new.resolution.as_deref())
             .bind(new.file_size_bytes)
@@ -242,7 +252,7 @@ impl MediaRepository {
                 resolution: None,
                 file_hash: None,
                 import_source_identity: None,
-                duration_seconds: None,
+                duration_seconds: 0,
                 video_info: None,
             };
             probe.check_owner()?;
@@ -415,7 +425,7 @@ mod tests {
             resolution: None,
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: None,
+            duration_seconds: 0,
             video_info: None,
         }
     }

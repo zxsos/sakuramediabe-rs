@@ -1,13 +1,17 @@
 //! 三个仓储的集成测试（L2 验证）。
 //!
-//! # 全部会在没有 PostgreSQL 时跳过
+//! # 没有 PostgreSQL 时会**失败**，不再跳过
 //!
-//! 每个测试开头是 `let Some(db) = TestDb::create().await else { return };`
-//! —— 拿不到连接就直接返回，测试算**通过**。这样 `cargo test` 在没起
-//! 库的环境里仍然是全绿，而起了库就会真的跑。
+//! 每个测试开头是 `let db = TestDb::require().await;` —— 连不上就 panic。
 //!
-//! **代价是「跳过」和「通过」在退出码上无法区分**，所以 CI 里额外有一
-//! 步按 suite 断言通过数，见 `.github/workflows/ci.yml`。
+//! 此前是 `let Some(db) = TestDb::create().await else { return };`，拿不到
+//! 连接就直接返回、测试算**通过**。那个机制让「跳过」与「通过」在报告
+//! 里完全一样，而它至少藏了六个真实缺陷（NOT NULL 违例、缺失的父行、
+//! 不存在的列名、占位符编号错、靠 `Drop` 回滚导致单连接池下死锁、
+//! 自相矛盾的回滚断言）—— 详见 [`TestDb::require`] 的文档。
+//!
+//! 现在要么真的跑，要么响亮地失败。想在无库环境下跑单元测试用
+//! `cargo test --lib`，那条路径不碰数据库。
 //!
 //! # 怎么跑
 //!
@@ -135,7 +139,7 @@ mod fixtures {
             resolution: Some("1080p".to_owned()),
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: Some(120),
+            duration_seconds: 120,
             video_info: None,
         }
     }
@@ -175,9 +179,7 @@ mod fixtures {
 
 #[tokio::test]
 async fn jsonb_columns_roundtrip() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
 
     let created = repo
@@ -207,9 +209,7 @@ async fn jsonb_columns_roundtrip() {
 #[tokio::test]
 async fn jsonb_text_column_tolerates_null_and_roundtrips() {
     // JsonTextField 是 TEXT 列装 JSON —— 与真 jsonb 列是两种东西。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
 
     let mut m = fixtures::media_for_movie(db.pool(), "ABC-002").await;
@@ -225,9 +225,7 @@ async fn jsonb_text_column_tolerates_null_and_roundtrips() {
 
 #[tokio::test]
 async fn null_jsonb_stays_null_rather_than_becoming_empty_object() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
 
     let created = repo.insert(&fixtures::movie("ABC-003")).await.unwrap();
@@ -242,9 +240,7 @@ async fn null_jsonb_stays_null_rather_than_becoming_empty_object() {
 #[tokio::test]
 async fn server_side_defaults_apply_on_bare_insert() {
     // 仓储的 insert 不写这两列，值必须来自 schema 的 DEFAULT。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
 
     let created = repo.insert(&fixtures::movie("ABC-004")).await.unwrap();
@@ -262,9 +258,7 @@ async fn server_side_defaults_apply_on_bare_insert() {
 
 #[tokio::test]
 async fn download_task_defaults_come_from_schema() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
 
     let created = repo
@@ -285,9 +279,7 @@ async fn download_task_defaults_come_from_schema() {
 async fn database_rejects_subscribed_and_blacklisted_together() {
     // 绕过仓储直接写 SQL，确认 CHECK 真的存在于 schema 里。
     // 仓储层会提前拦（返回 422），但数据库必须是最后一道防线。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-005")).await.unwrap();
 
@@ -316,9 +308,7 @@ async fn database_rejects_subscribed_and_blacklisted_together() {
 #[tokio::test]
 async fn repository_precheck_returns_422_before_hitting_the_database() {
     // 同一场景走仓储：应返回 Business(422) 并带原因，而不是 409。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-006")).await.unwrap();
 
@@ -349,9 +339,7 @@ async fn repository_precheck_returns_422_before_hitting_the_database() {
 
 #[tokio::test]
 async fn media_rejects_both_parents_present() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
 
     let mut m = fixtures::media_for_movie(db.pool(), "ABC-007").await;
@@ -369,9 +357,7 @@ async fn media_rejects_both_parents_present() {
 
 #[tokio::test]
 async fn media_rejects_no_parent() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
 
     let mut m = fixtures::media_for_movie(db.pool(), "ABC-008").await;
@@ -382,9 +368,7 @@ async fn media_rejects_no_parent() {
 
 #[tokio::test]
 async fn media_accepts_either_parent() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
 
     // 挂 movie（JAV）
@@ -416,9 +400,7 @@ async fn media_accepts_either_parent() {
 #[tokio::test]
 async fn media_update_prechecks_the_xor_invariant() {
     // 改归属列时也要预判，否则错误会以 FK 冲突形式漏出。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::media_for_movie(db.pool(), "ABC-011").await)
@@ -438,9 +420,7 @@ async fn media_update_prechecks_the_xor_invariant() {
 async fn updated_at_advances_on_every_update() {
     // 这是本仓储层存在的核心理由：上游曾因 peewee 的 default= 只在
     // INSERT 生效，导致五处「最近修改优先」列表静默排成创建顺序。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-012")).await.unwrap();
 
@@ -469,9 +449,7 @@ async fn updated_at_advances_even_when_caller_tries_to_pin_it() {
         .and_hms_opt(0, 0, 0)
         .unwrap();
 
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-013")).await.unwrap();
 
@@ -493,9 +471,7 @@ async fn updated_at_advances_even_when_caller_tries_to_pin_it() {
 #[tokio::test]
 async fn empty_update_is_rejected_instead_of_reporting_not_found() {
     // 空 UPDATE 的 rows_affected = 0，与「行不存在」无法区分。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-014")).await.unwrap();
 
@@ -511,9 +487,7 @@ async fn empty_update_is_rejected_instead_of_reporting_not_found() {
 
 #[tokio::test]
 async fn the_two_state_machines_move_independently() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::download_task(db.pool(), "remote-2").await)
@@ -541,9 +515,7 @@ async fn the_two_state_machines_move_independently() {
 #[tokio::test]
 async fn completed_state_requires_a_source_ref() {
     // 完成态没有产物引用，导入侧无从下手。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::download_task(db.pool(), "remote-3").await)
@@ -560,9 +532,7 @@ async fn completed_state_requires_a_source_ref() {
 #[tokio::test]
 async fn download_done_but_import_failed_is_expressible_and_listable() {
     // 这个组合只有把两个状态机分开才表达得了。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::download_task(db.pool(), "remote-4").await)
@@ -593,9 +563,7 @@ async fn download_done_but_import_failed_is_expressible_and_listable() {
 
 #[tokio::test]
 async fn progress_outside_unit_range_is_rejected() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::download_task(db.pool(), "remote-5").await)
@@ -612,9 +580,7 @@ async fn progress_outside_unit_range_is_rejected() {
 
 #[tokio::test]
 async fn unknown_state_literals_are_rejected() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::download_task(db.pool(), "remote-6").await)
@@ -632,9 +598,7 @@ async fn unknown_state_literals_are_rejected() {
 
 #[tokio::test]
 async fn guard_blocks_plugin_from_writing_host_only_columns() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-016")).await.unwrap();
 
@@ -657,9 +621,7 @@ async fn guard_blocks_plugin_from_writing_host_only_columns() {
 
 #[tokio::test]
 async fn guard_allows_plugin_to_write_protected_fields() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-017")).await.unwrap();
 
@@ -681,9 +643,7 @@ async fn guard_allows_plugin_to_write_protected_fields() {
 
 #[tokio::test]
 async fn field_owner_can_only_be_registered_for_protected_fields() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-018")).await.unwrap();
 
@@ -705,9 +665,7 @@ async fn field_owner_can_only_be_registered_for_protected_fields() {
 
 #[tokio::test]
 async fn field_owner_rejects_malformed_owner_tag() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let created = repo.insert(&fixtures::movie("ABC-019")).await.unwrap();
 
@@ -721,9 +679,7 @@ async fn field_owner_rejects_malformed_owner_tag() {
 
 #[tokio::test]
 async fn thumbnail_failure_is_retryable_and_success_is_terminal() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
     let created = repo
         .insert(&fixtures::media_for_movie(db.pool(), "ABC-020").await)
@@ -760,9 +716,7 @@ async fn thumbnail_failure_is_retryable_and_success_is_terminal() {
 #[tokio::test]
 async fn pending_thumbnail_scan_only_returns_expired_retries() {
     // 索引是 (state, next_retry_at)，所以只有 retry_wait 且到期才被命中。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MediaRepository::new(db.pool().clone());
 
     let now = sm_db::common::time::now_utc();
@@ -806,9 +760,7 @@ async fn pending_thumbnail_scan_only_returns_expired_retries() {
 
 #[tokio::test]
 async fn find_by_number_is_the_business_key() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     repo.insert(&fixtures::movie("ABC-024")).await.unwrap();
 
@@ -821,9 +773,7 @@ async fn find_by_number_is_the_business_key() {
 #[tokio::test]
 async fn javdb_id_blank_is_normalised_to_null() {
     // 空串会让 `WHERE javdb_id = ''` 命中一条「没有编号」的假记录。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
 
     let mut m = fixtures::movie("ABC-025");
@@ -834,9 +784,7 @@ async fn javdb_id_blank_is_normalised_to_null() {
 
 #[tokio::test]
 async fn duplicate_movie_number_hits_the_unique_constraint() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     repo.insert(&fixtures::movie("ABC-026")).await.unwrap();
 
@@ -852,9 +800,7 @@ async fn duplicate_movie_number_hits_the_unique_constraint() {
 
 #[tokio::test]
 async fn update_of_missing_row_reports_not_found() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
 
     let mut set = UpdateSet::new();
@@ -868,9 +814,7 @@ async fn update_of_missing_row_reports_not_found() {
 
 #[tokio::test]
 async fn claim_queued_moves_task_to_submitted() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
 
     assert!(repo.claim_queued().await.unwrap().is_none(), "空队列领不到");
@@ -892,9 +836,7 @@ async fn claim_queued_moves_task_to_submitted() {
 #[tokio::test]
 async fn idempotent_submit_relies_on_the_unique_index() {
     // (client, remote_id) 唯一 -> 重复提交命中约束而非产生第二条。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let payload = || fixtures::download_task(db.pool(), "remote-8");
 

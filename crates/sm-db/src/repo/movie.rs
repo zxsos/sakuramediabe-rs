@@ -45,16 +45,30 @@ pub struct NewMovie {
     pub title: String,
     /// 空串在写入前归一为 `None`（对应上游 `save()` 的 `or None`）。
     pub javdb_id: Option<String>,
-    pub summary: Option<String>,
+    /// `summary text NOT NULL DEFAULT ''` —— **不是 `Option`**。
+    ///
+    /// 此前声明成 `Option<String>`，`None` 会绑成 NULL 并违反 NOT NULL。
+    pub summary: String,
     pub maker_name: Option<String>,
     pub director_name: Option<String>,
     pub release_date: Option<chrono::NaiveDateTime>,
-    pub duration_minutes: Option<i32>,
-    pub score: Option<f64>,
-    pub score_number: Option<i32>,
-    pub series_id: Option<i64>,
-    pub cover_image_id: Option<i64>,
-    pub thin_cover_image_id: Option<i64>,
+    /// `integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub duration_minutes: i32,
+    /// `double precision NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub score: f64,
+    /// `integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub score_number: i32,
+    /// `series_id integer NULL` —— 宽度是 `i32`，与 [`Movie::series_id`] 一致。
+    ///
+    /// 此前这里是 `Option<i64>`，而同一张表的模型层是 `Option<i32>`。
+    /// sqlx 把 i64 绑进 `integer` 列会失败，所以**每次**用它写外键都会报错。
+    /// 这类漂移能活下来是因为 `NewMovie` 在对拍的豁免名单里（它是列的
+    /// 子集，不是表镜像），而豁免顺带免掉了字段类型检查。
+    pub series_id: Option<i32>,
+    /// `integer NULL`，宽度同 [`Movie::cover_image_id`]。
+    pub cover_image_id: Option<i32>,
+    /// `integer NULL`，宽度同 [`Movie::thin_cover_image_id`]。
+    pub thin_cover_image_id: Option<i32>,
     /// JSONB，默认 NULL。
     pub metadata_source: Option<serde_json::Value>,
 }
@@ -168,14 +182,14 @@ impl MovieRepository {
             .bind(movie_number)
             .bind(new.title.trim())
             .bind(javdb_id)
-            // summary 是 NOT NULL DEFAULT ''：None 时补空串，不能发 NULL。
-            .bind(new.summary.as_deref().unwrap_or_default())
+            // summary 是 NOT NULL DEFAULT ''：类型已是 String，绑 trimmed 值。
+            .bind(new.summary.trim())
             .bind(new.maker_name.as_deref().map(str::trim))
             .bind(new.director_name.as_deref().map(str::trim))
             .bind(new.release_date)
-            .bind(new.duration_minutes.unwrap_or(0))
-            .bind(new.score.unwrap_or(0.0))
-            .bind(new.score_number.unwrap_or(0))
+            .bind(new.duration_minutes)
+            .bind(new.score)
+            .bind(new.score_number)
             .bind(new.series_id)
             .bind(new.cover_image_id)
             .bind(new.thin_cover_image_id)
@@ -404,8 +418,15 @@ fn as_bool(value: &crate::common::update::Value<'_>) -> bool {
 ///
 /// 用宏生成保证两份永远同步。编译器会在变体不匹配时报错。
 ///
-/// `$generics` 只在 `QueryAs` 那个版本里传 `O`，因为 `Query` 没有输出
-/// 类型参数 —— 多声明一个会让调用点的类型推断失败。
+/// `$generics` 给的是额外的类型参数：`Query` 没有输出类型，所以传 `[]`；
+/// 而 `QueryAs` 需要一个 `O` 表示返回的行类型。
+///
+/// 目前只有 `Query` 那一个实例存活 —— `task.rs` 的 `update_metadata`
+/// 曾经用 `QueryAs` 版本，但那条路径因为 `RETURNING *` 会把「0 行命中」
+/// 与「解码失败」压成同一个 Err 而改用了 `execute` + `rows_affected`。
+/// 宏保留着，因为下一个需要动态 SET 子句并读回结果的地方会立刻用上；
+/// 只有一个实例时它看起来多余，但删掉之后 `ValueInner` 一旦新增变体，
+/// 两处（这里 + 未来的那处）就要各改一次，而漏掉的那处编译期不报错。
 macro_rules! impl_bind_value {
     ($name:ident, [$($gen:ident),*], $query:ty, $doc:literal) => {
         #[doc = $doc]
@@ -432,12 +453,6 @@ impl_bind_value!(
     [],
     sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
     "把值绑到无返回行的 `query` 上。"
-);
-impl_bind_value!(
-    bind_value,
-    [O],
-    sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>,
-    "把值绑到有返回行的 `query_as` 上。"
 );
 
 /// 把受控的动态 SQL 交给 sqlx 0.9。

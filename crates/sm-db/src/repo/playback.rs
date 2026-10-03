@@ -414,7 +414,7 @@ impl MediaClipRepository {
         )
         .bind(new.start_offset_seconds)
         .bind(new.end_offset_seconds)
-        .bind(new.title.as_deref().map(str::trim).unwrap_or_default())
+        .bind(new.title.trim())
         .bind(new.file_path.trim())
         .bind(new.file_size_bytes)
         .bind(new.duration_seconds)
@@ -479,8 +479,13 @@ pub struct NewMediaClip {
     pub movie_number: Option<String>,
     pub start_offset_seconds: i32,
     pub end_offset_seconds: i32,
-    /// 可空 —— DDL 有 `DEFAULT ''`。
-    pub title: Option<String>,
+    /// `title text NOT NULL DEFAULT ''` —— **不是 `Option`**。
+    ///
+    /// 注释此前写着「可空 —— DDL 有 `DEFAULT ''`」，把「有默认值」误当成
+    /// 「可以为空」。DEFAULT 只决定省略时写什么，不改变列的可空性；
+    /// 声明成 `Option` 时 `None` 会绑成 NULL 并违反 NOT NULL。
+    /// 同一结构里的 `duration_seconds` 已经是 `i32`，这里应当一致。
+    pub title: String,
     /// 产物 mp4 相对 `media_clip_root_path` 的路径。
     pub file_path: String,
     pub file_size_bytes: i64,
@@ -515,7 +520,7 @@ mod tests {
             movie_number: Some("ABC-001".to_owned()),
             start_offset_seconds: start,
             end_offset_seconds: end,
-            title: None,
+            title: String::new(),
             file_path: "clip.mp4".to_owned(),
             file_size_bytes: 1024,
             duration_seconds: end - start,

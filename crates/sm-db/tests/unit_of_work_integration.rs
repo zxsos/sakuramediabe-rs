@@ -30,7 +30,10 @@ use sm_db::common::time::now_utc;
 use sm_db::error::DbError;
 use sm_db::playback::media::image_search_index_status;
 use sm_db::repo::playback::MediaThumbnailRepository;
-use sm_db::repo::{MediaRepository, NewMedia, UnitOfWork};
+use sm_db::repo::{
+    MediaLibraryRepository, MediaRepository, MovieRepository, NewMedia, NewMediaLibrary, NewMovie,
+    UnitOfWork,
+};
 use sm_db::testing::TestDb;
 
 mod fixtures {
@@ -47,31 +50,77 @@ mod fixtures {
             resolution: Some("1080p".to_owned()),
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: Some(120),
+            duration_seconds: 120,
             video_info: None,
         }
     }
 
-    /// 建一条 media_library 行（`media.library_id` 指向它）。
-    pub async fn seed_library(pool: &sqlx::PgPool) -> i32 {
-        sqlx::query_as::<_, (i32,)>(
-            "INSERT INTO media_library (name, created_at, updated_at) \
-             VALUES ('lib', $1, $1) RETURNING id",
-        )
-        .bind(now_utc())
-        .fetch_one(pool)
+    /// 建一条 movie 行（`media.movie_number` 指向它的 `movie_number` 列）。
+    ///
+    /// 幂等：`movie_number` 唯一，重复建会撞约束。
+    pub async fn seed_movie(db: &TestDb, movie_number: &str) {
+        let repo = MovieRepository::new(db.pool().clone());
+        if repo.find_by_number(movie_number).await.unwrap().is_some() {
+            return;
+        }
+        repo.insert(&NewMovie {
+            movie_number: movie_number.to_owned(),
+            title: format!("{movie_number} 影片"),
+            javdb_id: None,
+            summary: String::new(),
+            maker_name: None,
+            director_name: None,
+            release_date: None,
+            duration_minutes: 0,
+            score: 0.0,
+            score_number: 0,
+            series_id: None,
+            cover_image_id: None,
+            thin_cover_image_id: None,
+            metadata_source: None,
+        })
         .await
-        .expect("insert media_library")
-        .0
+        .expect("insert movie");
+    }
+
+    /// 建一条 media_library 行（`media.library_id` 指向它）。
+    ///
+    /// 走 `MediaLibraryRepository`。此前这里写裸 SQL 且**不提供**
+    /// `provider_key`，而那一列是 `varchar(64) NOT NULL` ——
+    /// 于是每次插入都失败：
+    ///
+    /// ```text
+    /// ERROR: null value in column "provider_key" of relation
+    ///        "media_library" violates not-null constraint
+    /// ```
+    ///
+    /// 本 suite 从未在 CI 里跑过（integration job 只跑
+    /// `repo_integration` 与 `gateway_integration`），本地无数据库时又
+    /// 静默跳过，所以「建不了库」这件事一直没人看到。
+    pub async fn seed_library(pool: &sqlx::PgPool) -> i32 {
+        MediaLibraryRepository::new(pool.clone())
+            .insert(&NewMediaLibrary {
+                name: "lib".to_owned(),
+                provider_key: "local".to_owned(),
+                provider_config: None,
+                account_key: None,
+            })
+            .await
+            .expect("insert media_library")
+            .id
     }
 
     /// 建一条 `image` 行（`media_thumbnail.image_id` 指向它）。
-    pub async fn seed_image(pool: &sqlx::PgPool, key: &str) -> i32 {
+    ///
+    /// `image` 表还没有仓储，只能写裸 SQL。列名是 `origin`
+    /// （`varchar(255) NOT NULL UNIQUE`）；此前这里写的是 `image_key`，
+    /// 而那一列从来不存在。
+    pub async fn seed_image(pool: &sqlx::PgPool, origin: &str) -> i32 {
         sqlx::query_as::<_, (i32,)>(
-            "INSERT INTO image (image_key, created_at, updated_at) \
+            "INSERT INTO image (origin, created_at, updated_at) \
              VALUES ($1, $2, $2) RETURNING id",
         )
-        .bind(key)
+        .bind(origin)
         .bind(now_utc())
         .fetch_one(pool)
         .await
@@ -81,8 +130,20 @@ mod fixtures {
 }
 
 /// 造一条待处理的 media，返回它的 id。
+///
+/// `media` 有两个不可回避的外键，两个父行都必须存在：
+///
+/// | 列 | 指向 |
+/// |---|---|
+/// | `library_id` | `media_library.id` |
+/// | `movie_number` | `movie.movie_number` |
+///
+/// 此前只建了 library，缺 movie 父行，于是每次插入都违反
+/// `media_movie_number_fk`。本 suite 从未在 CI 里跑过，本地无数据库时
+/// 又静默跳过。
 async fn seed_media(db: &TestDb) -> i32 {
     let library = fixtures::seed_library(db.pool()).await;
+    fixtures::seed_movie(db, "ABC-001").await;
     let repo = MediaRepository::new(db.pool().clone());
     let mut m = fixtures::media("ABC-001");
     m.library_id = library;
@@ -91,9 +152,7 @@ async fn seed_media(db: &TestDb) -> i32 {
 
 #[tokio::test]
 async fn generate_thumbnail_writes_both_tables() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_id = seed_media(&db).await;
     let image_id = fixtures::seed_image(db.pool(), "thumb-0").await;
 
@@ -137,9 +196,7 @@ async fn a_failure_after_the_artifact_leaves_no_trace() {
     // media 行，再试一次 —— 此时产物能写（media_thumbnail 的外键在
     // 测试库里是 SET NULL 或不存在约束），但 record_thumbnail_success
     // 会因为找不到行而返回 NotFound。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_id = seed_media(&db).await;
     let image_id = fixtures::seed_image(db.pool(), "thumb-0").await;
 
@@ -167,9 +224,22 @@ async fn a_failure_after_the_artifact_leaves_no_trace() {
         .generate_thumbnail(media_id, 90, image_id_2, image_search_index_status::PENDING)
         .await
         .expect_err("状态机那步应该失败");
+    // 错误发生在**第 1 步**，不是第 2 步。
+    //
+    // `generate_thumbnail` 的顺序是「先写 media_thumbnail 产物、再推进
+    // media 状态机」。media 已被删掉，所以第 1 步插 `media_thumbnail`
+    // 就撞 `media_thumbnail_media_id_fk` —— 外键在 orphan 产物落地之前
+    // 就把它挡住了。
+    //
+    // 此前这里断言 `NotFound`，那假设第 2 步才会失败；实际第 1 步就先
+    // 失败了。本 suite 从未在 CI 里跑过，本地无数据库时又静默跳过，
+    // 所以这个顺序假设从未被验证。
+    //
+    // 断言外键违例比断言 `NotFound` 更有价值：它固化的正是「产物不可能
+    // 变成孤儿」这个性质。
     assert!(
-        matches!(err, DbError::NotFound { .. }),
-        "应为 NotFound，实际 {err:?}"
+        matches!(err, DbError::ConstraintViolation { .. }),
+        "应为外键违例（media 已删，产物插不进去），实际 {err:?}"
     );
     // 故意不 commit —— 依赖 drop 回滚，或者显式回滚
     uow.rollback().await.unwrap();
@@ -198,9 +268,7 @@ async fn the_state_machine_never_reaches_succeeded_on_failure() {
     //
     // 如果状态机推进没有被回滚，media 会停在 succeeded —— 而那是终态，
     // 永远不会被重新扫描，于是这条 media 永远不会有缩略图。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_id = seed_media(&db).await;
     let image_id = fixtures::seed_image(db.pool(), "thumb-0").await;
 
@@ -237,9 +305,7 @@ async fn dropping_without_commit_rolls_everything_back() {
     //
     // 这条性质很重要：如果它自动提交，「我以为会回滚」就会变成
     // 「数据已经写进去了」。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_id = seed_media(&db).await;
     let image_id = fixtures::seed_image(db.pool(), "thumb-0").await;
 
@@ -270,9 +336,7 @@ async fn dropping_without_commit_rolls_everything_back() {
 async fn the_repository_methods_still_work_without_a_transaction() {
     // `_in` 变体不能改变原有方法的语义 —— 它们共用私有实现，
     // 所以这里验证「不带事务」的老路径仍然工作。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let media_id = seed_media(&db).await;
     let image_id = fixtures::seed_image(db.pool(), "thumb-0").await;
 
@@ -295,9 +359,7 @@ async fn the_repository_methods_still_work_without_a_transaction() {
 async fn commit_twice_is_rejected_rather_than_silently_ignored() {
     // `commit` 消耗 self，所以编译期就挡住了二次调用。这个测试断言的
     // 是运行时的等价物：事务已结束时报错而不是静默成功。
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
+    let db = TestDb::require().await;
     let uow = UnitOfWork::begin(db.pool()).await.unwrap();
     uow.commit().await.unwrap();
 

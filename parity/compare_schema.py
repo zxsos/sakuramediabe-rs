@@ -38,7 +38,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from schema_contract import collect  # noqa: E402
+from schema_contract import UNKNOWN_NULLABLE, collect  # noqa: E402
 
 RUST_ROOT = os.environ.get(
     "SM_DB_SRC",
@@ -59,6 +59,15 @@ TYPE_MAP = {
     "JsonText": "text/json",
     "Vec<u8>": "bytea",
     "Uuid": "uuid",
+    # 带限定名的写法。表模型用类型别名（`Json`、`NaiveDateTime`），
+    # 而仓储层的插入 DTO 直接写全名（`serde_json::Value`、
+    # `chrono::NaiveDateTime`）—— 同一个类型，两种拼法。
+    #
+    # 不认这两种拼法的话，插入 DTO 的字段会全部报 UNKNOWN_TYPE，而
+    # 那不是类型错误，只是同一个类型的别名。
+    "serde_json::Value": "jsonb",
+    "chrono::NaiveDateTime": "timestamp",
+    "chrono::NaiveDate": "date",
 }
 
 STRUCT_RE = re.compile(r"pub struct (\w+)\s*\{(.*?)\n\}", re.S)
@@ -133,8 +142,33 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "ActorRepository",
         "NewActor",
         "SyncState",
+        # library 批次（library.rs）
+        "MediaLibraryRepository",
+        "NewMediaLibrary",
     }
 )
+
+# 插入 DTO -> 它写入的那张表。
+#
+# 豁免这些 DTO 的理由是「它们是表列的子集」，所以不能要求字段全集。
+# 但**字段类型与可空性必须对得上**：每个字段最终会被绑进一条 INSERT，
+# 类型不匹配会在运行时才报，而 NOT NULL 列被绑 NULL 是必现失败。
+#
+# 之前类型检查和「不是表镜像」一起被免掉了，于是 NewMovie 里藏着
+# `series_id: Option<i64>`（列是 integer）等七处缺陷，对拍报 0 problems。
+#
+# 新增插入 DTO 时必须在这里登记，否则它的字段类型无人校验。
+INSERT_DTO_TARGETS = {
+    "NewMovie": "Movie",
+    "NewMedia": "Media",
+    "NewActor": "Actor",
+    "NewMediaLibrary": "MediaLibrary",
+    "NewTaskRun": "BackgroundTaskRun",
+    "NewUser": "User",
+    "NewRefreshToken": "UserRefreshToken",
+    "NewDownloadTask": "DownloadTask",
+    "NewMediaClip": "MediaClip",
+}
 
 
 def strip_option(rust_type: str):
@@ -164,6 +198,11 @@ def types_compatible(py_type: str, rust_base: str) -> bool:
     if py_type == rust_base:
         return True
     if py_type == "text/json" and rust_base == "text":
+        return True
+    # 插入 DTO 侧用 `serde_json::Value`（映射到 jsonb）比表模型侧的
+    # `String` 更精确：那一列存的是 JSON 文本，用结构化值表达入参，
+    # 由仓储负责序列化。同一个列，两种正确映射。
+    if py_type == "text/json" and rust_base == "jsonb":
         return True
     # int4 列用 i64 读取在 PostgreSQL 上是安全的（只要值不越界），
     # 但仍作为差异报出，避免类型漂移无声积累。
@@ -287,6 +326,35 @@ def main() -> int:
                             % (ref, ref_field, ref_col["type"], raw),
                         )
                     )
+                # fk 列的可空性同样要查。此前这个分支以 `continue` 收尾，
+                # 于是所有外键列都**绕过**了下面的可空性判定 ——
+                # 上一轮补上 fk 类型一致性时只修了类型，漏了这一半。
+                #
+                # RatingItem.movie_id 就是漏网的：Python 侧 NOT NULL，
+                # Rust 侧是 `Option<i32>`，而对拍报 0 problems。
+                #
+                # 判定条件与非 fk 分支一致，但**不能**用 `text/json` 豁免：
+                # 外键列不会是 JSON 文本。
+                fk_nullable = py_cols[col].get("nullable")
+                fk_optional = normalize(rust_fields[col])[1]
+                if fk_nullable is UNKNOWN_NULLABLE:
+                    problems.append(
+                        (
+                            "NULLABILITY_UNKNOWN",
+                            m["table"],
+                            col,
+                            "Python 侧可空性未能解析，需查清上游声明",
+                        )
+                    )
+                elif fk_nullable is False and fk_optional:
+                    problems.append(
+                        (
+                            "NULLABILITY",
+                            m["table"],
+                            col,
+                            "Python NOT NULL，Rust 却是 Option<>（外键列）",
+                        )
+                    )
                 continue
             if py_type in ("implicit", "bare"):
                 continue
@@ -303,7 +371,39 @@ def main() -> int:
                     ("TYPE_MISMATCH", m["table"], col, "Python=%s Rust=%s(%s)" % (py_type, base, raw))
                 )
             py_nullable = py_cols[col].get("nullable")
-            if py_nullable is False and optional:
+            if py_nullable is UNKNOWN_NULLABLE:
+                # 解析不出可空性 —— 报错，不猜。
+                #
+                # 这里是第三个「不知道被当成没问题」的洞，形状与前两个完全
+                # 一致：外键列被 continue 跳过、只遍历 Python 模型导致 Rust
+                # 多出的 struct 无人检查、现在是 `is False` 让 None 免检。
+                #
+                # 三处的共同点都是「检查器在无法判断时选择了沉默」，而每一处
+                # 都藏着一个真实缺陷：37 个外键类型错误、11 个未验证 struct、
+                # 以及 actor.javdb_id 被声明成 Option<String> 而 DDL 是 NOT
+                # NULL —— 插入必然失败，对拍却报 0 problems。
+                problems.append(
+                    (
+                        "NULLABILITY_UNKNOWN",
+                        m["table"],
+                        col,
+                        "Python 侧可空性未能解析，需查清上游声明",
+                    )
+                )
+            elif py_nullable is False and optional and py_type != "text/json":
+                # `text/json`（上游的 `JsonTextField`）排除在外，理由与
+                # `types_compatible` 里的既有立场一致：那一列落的是 TEXT，
+                # 只是内容是 JSON 文本，Rust 用 `Option<String>` 表达
+                # 「调用方没提供这个 JSON 字段」是正确的类型映射。
+                #
+                # 但上游自己有个陷阱：`JsonTextField.db_value` 遇到 None
+                # 会返回 None，而列是 NOT NULL —— 也就是说传 None 会违反
+                # 约束。对应的责任落在仓储层把它们兜成 DEFAULT 值
+                # （task.rs 的 `result_summary`、media.rs 的 `storage_ref`
+                # 都是这么做的），而不是让模型放弃 `Option`。
+                #
+                # 这里豁免的是**可空性**，不是类型：类型仍由
+                # `types_compatible` 的 `text/json` 对 `text` 规则管着。
                 problems.append(
                     ("NULLABILITY", m["table"], col, "Python NOT NULL，Rust 却是 Option<>")
                 )
@@ -341,10 +441,82 @@ def main() -> int:
             )
         )
 
+    # 豁免的是「不是表镜像」这件事，不是「字段类型可以不查」。
+    #
+    # 插入 DTO（`NewMovie` 等）是表列的**子集**，所以不能要求字段全集 ——
+    # 那是豁免的正当理由。但它每个字段最终会被绑进某条 INSERT，所以类型
+    # 必须与目标列一致。
+    #
+    # 之前两者一起被免掉了，代价是 NewMovie 里藏着三处真实缺陷：
+    # `series_id` / `cover_image_id` / `thin_cover_image_id` 是 `i64`，
+    # 而 `movie.series_id` 等列是 `integer`（模型层早已是 i32）；
+    # `summary` / `duration_minutes` / `score` / `score_number` 声明成
+    # `Option`，而那些列是 NOT NULL。任何一次带 None 的 insert 都会失败。
+    #
+    # 这一层只比对「DTO 里确实存在的字段」，缺失的列不报。
+    dto_checked = 0
+    for dto, target in INSERT_DTO_TARGETS.items():
+        d = rust.get(dto)
+        t = next((x for x in models if x["struct"] == target), None)
+        if d is None or t is None:
+            problems.append(
+                (
+                    "DTO_TARGET_UNKNOWN",
+                    target,
+                    dto,
+                    "插入 DTO 或其目标表无法解析，无法校验字段类型",
+                )
+            )
+            continue
+        table_cols = t["columns"]
+        for field, raw in d["fields"]:
+            if field not in table_cols:
+                # DTO 里的非列字段（派生值、关联 id）不在校验范围。
+                continue
+            col = table_cols[field]
+            dto_checked += 1
+            base, optional, _ = normalize(raw)
+            if base is None:
+                problems.append(
+                    ("UNKNOWN_TYPE", t["table"], field, "%s 的 %s 未在映射表中" % (dto, raw))
+                )
+                continue
+            py_type = col["type"]
+            if py_type == "fk":
+                ref = col.get("ref_table")
+                ref_field = col.get("ref_field") or "id"
+                ref_model = next((x for x in models if x["table"] == ref), None)
+                ref_col = (
+                    ref_model["columns"].get(ref_field) if ref_model else None
+                )
+                py_type = (
+                    ref_col["type"]
+                    if ref_col and ref_col["type"] not in ("implicit", "fk", "bare")
+                    else None
+                )
+            if py_type and not types_compatible(py_type, base):
+                problems.append(
+                    (
+                        "DTO_FIELD_TYPE",
+                        t["table"],
+                        field,
+                        "%s 声明 %s，但该列是 %s" % (dto, raw, py_type),
+                    )
+                )
+            elif col.get("nullable") is False and optional and col["type"] != "text/json":
+                problems.append(
+                    (
+                        "DTO_FIELD_NULLABILITY",
+                        t["table"],
+                        field,
+                        "%s 声明 %s，但该列 NOT NULL" % (dto, raw),
+                    )
+                )
+
     if args.summary:
         print(
             "models=%d  rust_structs=%d  checked=%d  unchecked=%d (exempt %d)  "
-            "fk_cols_checked=%d  problems=%d"
+            "fk_cols_checked=%d  dto_fields_checked=%d  problems=%d"
             % (
                 len(models),
                 len(rust),
@@ -352,6 +524,7 @@ def main() -> int:
                 len(unchecked),
                 len(unchecked) - len(unexempt),
                 fk_checked[0],
+                dto_checked,
                 len(problems),
             )
         )
