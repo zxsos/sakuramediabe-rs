@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS image (
 );
 
 CREATE TABLE IF NOT EXISTS image_search_index_state (
-  id integer NOT NULL DEFAULT 1,
+  id integer PRIMARY KEY DEFAULT 1,
   indexed_space_id varchar(255) NOT NULL
 );
 

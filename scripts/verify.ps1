@@ -82,6 +82,12 @@ Step 'schema' { python (Join-Path $parity 'compare_schema.py') }
 Step 'compare' { python (Join-Path $parity 'compare.py') }
 Step 'core' { python (Join-Path $parity 'compare_core.py') }
 
+# 第七道门。存在的原因见 parity/check_paged_wrappers.py 的文档字符串：
+# paged_list! 自己会生成整个方法（含 page 参数），在外面再手写一层包装
+# 会让函数体返回 ()。编译器会报，但指向宏展开处而不是真正的错误位置。
+# 这个错在本次重构里犯了五次，每一次都要等编译失败才发现。
+Step 'paged wrappers' { python (Join-Path $parity 'check_paged_wrappers.py') }
+
 Write-Host ''
 if ($failed.Count -gt 0) {
     Write-Host ('FAILED: ' + ($failed -join ', '))

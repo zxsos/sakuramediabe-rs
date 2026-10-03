@@ -151,10 +151,16 @@ async fn this_table_has_no_plugin_ownership_columns() {
     // 那时候该给 `VideoCollectionRepository` 补上那三个方法与半配置校验。
     // 写一个「断言某方法不存在」的测试做不到，所以反过来断言列不存在。
     let db = TestDb::require().await;
+    // `table_schema = $1` 不可省：`information_schema.columns` 跨全部
+    // schema 可见，而每个测试建自己的 schema —— 不过滤会拿到历史残留的
+    // 同名表，列名重复一份。这里用 `.any()` 所以重复**不会**报错，
+    // 但那掩盖了「查的到底是哪张表」这个问题。
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
-         WHERE table_name = 'video_collection' ORDER BY column_name",
+         WHERE table_schema = $1 AND table_name = 'video_collection' \
+         ORDER BY column_name",
     )
+    .bind(db.schema())
     .fetch_all(db.pool())
     .await
     .unwrap();

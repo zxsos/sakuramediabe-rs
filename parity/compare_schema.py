@@ -157,6 +157,11 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "NewVideoItem",
         "VideoCollectionRepository",
         "NewVideoCollection",
+        "RankingItemRepository",
+        "NewRankingItem",
+        "ImageSearchSessionRepository",
+        "NewImageSearchSession",
+        "ImageSearchIndexStateRepository",
         "MomentCollectionItemRepository",
         "ClipCollectionItemRepository",
         # transfer 批次（transfer.rs）
@@ -281,10 +286,71 @@ def parse_rust() -> dict:
     return out
 
 
+def read_ddl_primary_keys(path: str) -> dict:
+    """{表名: {主键列名}} —— 从**生成的** DDL 里读。
+
+    读的是 `docker/schema.sql`（gen_ddl.py 的产物），不是上游源码。
+    比对「契约 vs DDL」能抓住两类问题：解析器漏了 kwarg（契约本身就错），
+    以及生成器写错了（契约对、DDL 错）。只比「上游 vs DDL」则只能抓后者。
+
+    主键既可能内联在列定义里（`id integer PRIMARY KEY`），也可能是独立的
+    表级约束（`ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY (...)`）。
+    两种都要认 —— 只认内联的那种，会在生成器改用表级约束时全表误报。
+    """
+    out: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            ddl = fh.read()
+    except OSError:
+        return out
+
+    for m in re.finditer(
+        r"CREATE TABLE\s+(?:IF NOT EXISTS\s+)?(\w+)\s*\((.*?)\n\);", ddl, re.S
+    ):
+        table, body = m.group(1), m.group(2)
+        pks = set()
+        for line in body.split("\n"):
+            line = line.strip().rstrip(",")
+            # 内联：`id integer PRIMARY KEY DEFAULT 1`
+            inline = re.match(r'"?(\w+)"?\s+\S+.*\bPRIMARY KEY\b', line)
+            if inline:
+                pks.add(inline.group(1))
+            # 表级：`CONSTRAINT x PRIMARY KEY (a, b)`
+            composite = re.match(
+                r'CONSTRAINT\s+\S+\s+PRIMARY KEY\s*\(([^)]*)\)', line, re.I
+            )
+            if composite:
+                for part in composite.group(1).split(","):
+                    name = part.strip().strip('"')
+                    if name:
+                        pks.add(name)
+        out[table] = pks
+
+    for m in re.finditer(
+        r"ALTER TABLE\s+(\w+)\s+ADD CONSTRAINT\s+\S+\s+PRIMARY KEY\s*\(([^)]*)\)",
+        ddl,
+        re.I,
+    ):
+        table = m.group(1)
+        pks = out.setdefault(table, set())
+        for part in m.group(2).split(","):
+            name = part.strip().strip('"')
+            if name:
+                pks.add(name)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--summary", action="store_true")
     args = ap.parse_args()
+
+    ddl_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "docker",
+        "schema.sql",
+    )
+    ddl_primary_keys = read_ddl_primary_keys(ddl_path)
 
     models = collect()
     rust = parse_rust()
@@ -305,6 +371,47 @@ def main() -> int:
         checked += 1
         rust_fields = {n: t for n, t in r["fields"]}
         py_cols = m["columns"]
+
+        # ---- 主键：契约声明 vs 实际 DDL ----
+        #
+        # 这一段是被一个真实缺陷逼出来的：
+        # `image_search_index_state` 上游写的是
+        # `id = peewee.IntegerField(primary_key=True, default=1)`，而
+        # `schema_contract.py` 的 kwargs 白名单里**没有** `primary_key`，
+        # 于是它被静默忽略 —— 契约说「不是主键」，`gen_ddl.py` 就照着
+        # 生成了没有 PRIMARY KEY 的表。
+        #
+        # 后果不只是 DDL 少一句。那张表成了全库唯一一张既无主键也无唯一
+        # 约束的表，于是 `ON CONFLICT (id)` 报
+        # `42P10 there is no unique or exclusion constraint matching the
+        # ON CONFLICT specification`，而「单例」这个约定在数据库层面
+        # **没有任何保障** —— 插两行不会有任何东西阻止。
+        #
+        # 为什么此前对拍没抓到：**compare_schema.py 从来不比较主键**。
+        # 它比可空性、比类型、比外键，唯独不比「哪些列是主键」。
+        #
+        # 这里比的是**契约 vs 生成的 DDL**，而不是「上游 vs DDL」——
+        # 前者能抓住「解析器漏了 kwarg」，后者只能抓住「生成器写错了」。
+        # 解析器漏 kwarg 这个形状本仓库已经出现四次（外键列被 continue
+        # 跳过、只遍历 Python 模型、`is False` 让 None 免检、现在是
+        # primary_key 不在白名单），每次都是「检查器在无法判断时沉默」。
+        ddl_pks = ddl_primary_keys.get(m["table"], set())
+        contract_pks = {
+            name for name, spec in py_cols.items() if spec.get("primary_key")
+        }
+        if contract_pks != ddl_pks:
+            problems.append(
+                (
+                    "PRIMARY_KEY_MISMATCH",
+                    m["table"],
+                    ",".join(sorted(contract_pks)) or "-",
+                    "契约声明主键 %s，DDL 里是 %s"
+                    % (
+                        ",".join(sorted(contract_pks)) or "（无）",
+                        ",".join(sorted(ddl_pks)) or "（无）",
+                    ),
+                )
+            )
 
         for col in py_cols:
             if col not in rust_fields:

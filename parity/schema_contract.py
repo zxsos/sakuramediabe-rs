@@ -402,6 +402,7 @@ def parse_model_file(path: str) -> list:
                         # 与 False 区分开：那会让对拍失败并要求有人查清上游，
                         # 而不是猜一个值蒙混过关。
                         "nullable": False,
+                        "primary_key": False,
                         "unique": False,
                         "index": False,
                         "default": None,
@@ -414,6 +415,27 @@ def parse_model_file(path: str) -> list:
                     for kw in stmt.value.keywords:
                         if kw.arg == "null":
                             entry["nullable"] = literal(kw.value)
+                        elif kw.arg == "primary_key":
+                            # **这个分支此前不存在。**
+                            #
+                            # 上游 `image_search_index_state` 显式声明
+                            # `id = peewee.IntegerField(primary_key=True, default=1)`。
+                            # `primary_key=True` 不在下面的白名单里，于是被
+                            # **静默忽略** —— 契约里那列的 `primary_key` 是
+                            # `None`，`gen_ddl.py:90` 的 `if col.get("primary_key")`
+                            # 判假，于是 DDL 里**没有 PRIMARY KEY**。
+                            #
+                            # 后果不只是 DDL 少一句：那张表变成了全库唯一
+                            # 一张既无主键也无唯一约束的表，于是
+                            # `ON CONFLICT (id)` 报
+                            # `42P10 there is no unique or exclusion constraint
+                            # matching the ON CONFLICT specification`，
+                            # 而「单例」这个约定**没有任何数据库层面的保障**。
+                            #
+                            # 这是本仓库第四次遇到同一形状的缺陷：解析器在
+                            # 无法判断时选择了沉默。不在白名单里的 kwarg
+                            # 应当**可见**，而不是被当成「没这回事」。
+                            entry["primary_key"] = bool(literal(kw.value))
                         elif kw.arg == "unique":
                             entry["unique"] = bool(literal(kw.value))
                         elif kw.arg == "index":

@@ -143,6 +143,7 @@ pub mod actor;
 pub mod asset;
 pub mod collection;
 pub mod ctx;
+pub mod discovery;
 pub mod download;
 pub mod gateway;
 pub mod image;
@@ -164,6 +165,10 @@ pub use collection::{
     MomentCollectionRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository,
 };
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
+pub use discovery::{
+    ImageSearchIndexStateRepository, ImageSearchSessionRepository, NewImageSearchSession,
+    NewRankingItem, RankingItemRepository,
+};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
 pub use image::{ImageRepository, NewImage};
