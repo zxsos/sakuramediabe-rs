@@ -79,7 +79,10 @@ async fn a_duplicate_name_is_a_conflict_carrying_the_name() {
     let err = svc.create(&name, None).await.expect_err("重名应被拒");
     assert_error(&err, 409, "playlist_name_conflict");
     // details 必须带上是哪个名字 —— 客户端据此定位到表单字段。
-    assert_eq!(err.api.details.as_ref().unwrap().get("name"), Some(&serde_json::json!(name.as_str())));
+    assert_eq!(
+        err.api.details.as_ref().unwrap().get("name"),
+        Some(&serde_json::json!(name.as_str()))
+    );
 }
 
 #[tokio::test]
@@ -132,10 +135,7 @@ async fn a_system_playlist_cannot_be_renamed_deleted_or_given_members() {
     );
 
     // 删除
-    let err = svc
-        .delete(system.id)
-        .await
-        .expect_err("系统列表不可删");
+    let err = svc.delete(system.id).await.expect_err("系统列表不可删");
     assert_error(&err, 409, "playlist_managed_by_system");
 
     // 加成员 —— 这一条最容易漏：用户不能手动改「最近播放」，但播放行为
@@ -237,9 +237,15 @@ async fn a_missing_playlist_is_a_404_with_the_id_in_details() {
 
     for err in [
         svc.delete(ghost).await.expect_err(""),
-        svc.update(ghost, PlaylistUpdate { name: Some("x".to_owned()), description: None })
-            .await
-            .expect_err(""),
+        svc.update(
+            ghost,
+            PlaylistUpdate {
+                name: Some("x".to_owned()),
+                description: None,
+            },
+        )
+        .await
+        .expect_err(""),
         svc.add_movie(ghost, "whatever").await.expect_err(""),
         svc.remove_movie(ghost, "whatever").await.expect_err(""),
     ] {
@@ -338,8 +344,14 @@ async fn recently_played_is_a_singleton_created_on_first_use() {
     let svc = PlaylistService::new(db.pool());
 
     let first = svc.recently_played().await.unwrap();
-    assert_eq!(first.kind, sm_db::collections::PLAYLIST_KIND_RECENTLY_PLAYED);
-    assert_eq!(first.name, sm_db::collections::RECENTLY_PLAYED_PLAYLIST_NAME);
+    assert_eq!(
+        first.kind,
+        sm_db::collections::PLAYLIST_KIND_RECENTLY_PLAYED
+    );
+    assert_eq!(
+        first.name,
+        sm_db::collections::RECENTLY_PLAYED_PLAYLIST_NAME
+    );
     assert!(first.is_system());
 
     // 再取一次 —— 同一个 id，不是新建。
@@ -347,13 +359,11 @@ async fn recently_played_is_a_singleton_created_on_first_use() {
     assert_eq!(first.id, second.id, "系统最近播放是单例");
 
     // 全表只有一个 recently_played。
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM playlist WHERE kind = $1",
-    )
-    .bind(sm_db::collections::PLAYLIST_KIND_RECENTLY_PLAYED)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playlist WHERE kind = $1")
+        .bind(sm_db::collections::PLAYLIST_KIND_RECENTLY_PLAYED)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(count, 1, "不允许出现第二个实例");
 }
 

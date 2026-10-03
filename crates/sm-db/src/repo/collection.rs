@@ -369,6 +369,54 @@ macro_rules! impl_collection_repo {
                 Ok(result.rows_affected() > 0)
             }
 
+            /// 改名，返回是否真的改了。空白名按业务错误拒绝。
+            ///
+            /// `name` 是唯一索引，所以重名会撞约束 —— 唯一性判断留给
+            /// service 层（它能区分「系统保留名」与「已被占用」，仓储不能）。
+            pub async fn rename(&self, id: i32, name: &str) -> Result<bool, DbError> {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(DbError::business(COLLECTION_ENTITY, "name 不能为空"));
+                }
+                let result = sqlx::query(concat!(
+                    "UPDATE ",
+                    $table,
+                    " SET name = $2, updated_at = $3 WHERE id = $1",
+                ))
+                .bind(id)
+                .bind(name)
+                .bind(crate::common::time::now_utc())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+                Ok(result.rows_affected() > 0)
+            }
+
+            /// 改描述，返回是否真的改了。
+            ///
+            /// 与 [`Self::rename`] 分开而不是一个 `update` 入口 —— 上游的
+            /// `update_playlist` 是「局部可更新，未传的字段保持原值」。一个
+            /// 全字段写入口会把「只改描述」变成「连名字一起重写」，在并发下
+            /// 覆盖别人的改名。
+            pub async fn set_description(
+                &self,
+                id: i32,
+                description: &str,
+            ) -> Result<bool, DbError> {
+                let result = sqlx::query(concat!(
+                    "UPDATE ",
+                    $table,
+                    " SET description = $2, updated_at = $3 WHERE id = $1",
+                ))
+                .bind(id)
+                .bind(description.trim())
+                .bind(crate::common::time::now_utc())
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+                Ok(result.rows_affected() > 0)
+            }
+
             /// 删合集。**连带删除全部成员行**（`ON DELETE CASCADE`）。
             pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
                 let result = sqlx::query(concat!("DELETE FROM ", $table, " WHERE id = $1"))
@@ -820,43 +868,6 @@ impl PlaylistRepository {
                 .fetch_optional(&self.pool)
                 .await?,
         )
-    }
-
-    /// 改描述，返回是否真的改了。
-    ///
-    /// 与 [`Self::rename`] 分开而不是一个 `update` —— 上游
-    /// `update_playlist` 是「局部可更新，未传的字段保持原值」。一个全字段
-    /// 写入口会把「只改描述」变成「连名字一起重写」，在并发下覆盖别人的
-    /// 改名。
-    pub async fn set_description(&self, id: i32, description: &str) -> Result<bool, DbError> {
-        let result =
-            sqlx::query("UPDATE playlist SET description = $2, updated_at = $3 WHERE id = $1")
-                .bind(id)
-                .bind(description.trim())
-                .bind(crate::common::time::now_utc())
-                .execute(&self.pool)
-                .await
-                .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// 改名，返回是否真的改了。空白名按业务错误拒绝。
-    ///
-    /// `name` 是唯一索引，所以重名会撞约束 —— 唯一性判断留给 service 层
-    /// （它能区分「保留名」与「已被占用」，而仓储不能）。
-    pub async fn rename(&self, id: i32, name: &str) -> Result<bool, DbError> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(DbError::business(COLLECTION_ENTITY, "name 不能为空"));
-        }
-        let result = sqlx::query("UPDATE playlist SET name = $2, updated_at = $3 WHERE id = $1")
-            .bind(id)
-            .bind(name)
-            .bind(crate::common::time::now_utc())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
-        Ok(result.rows_affected() > 0)
     }
 }
 

@@ -110,6 +110,47 @@ impl ServiceError {
     }
 }
 
+/// 编程错误 —— 上游在这一类上抛 `ValueError` 而不是 `ApiError`。
+///
+/// # 为什么单独一类
+///
+/// 上游 `plugin_collection_service._validate_key` 与 `_normalize_name` 抛
+/// `ValueError`，而同一文件里 `_ensure_collection` 抛 `ApiError(409, ...)`。
+/// 两者都处理「参数不对」，但**归属不同**：
+///
+/// - `ApiError` —— 调用方的输入有问题，HTTP 层该回 4xx
+/// - `ValueError` —— **我们自己的代码**调用姿势不对（插件 facade 传了空
+///   key），HTTP 层该回 500，因为这不是用户的错
+///
+/// 把两者都映射成 422 会让「服务端自己传错参数」伪装成「用户输入无效」。
+/// 所以这里单列一类，状态码 500，与上游的异常类型对应。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgrammerError(pub String);
+
+impl ProgrammerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for ProgrammerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProgrammerError {}
+
+impl From<ProgrammerError> for ServiceError {
+    /// 500 而不是 4xx —— 见类型文档。
+    fn from(value: ProgrammerError) -> Self {
+        Self {
+            status: 500,
+            api: Box::new(ApiError::new("programmer_error", value.0)),
+        }
+    }
+}
+
 /// 构造一个单键 details。
 ///
 /// 上游大量使用单键 details（`{"name": ...}`、`{"movie_number": ...}`），
@@ -118,6 +159,16 @@ pub fn details_of(key: &str, value: impl Into<Value>) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert(key.to_owned(), value.into());
     map
+}
+
+impl From<sqlx::Error> for ServiceError {
+    /// 500。仓储层的 SQL 错误一律是服务端问题，不是调用方输入有问题。
+    fn from(value: sqlx::Error) -> Self {
+        Self {
+            status: 500,
+            api: Box::new(ApiError::new("internal_error", value.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
