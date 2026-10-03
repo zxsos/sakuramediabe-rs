@@ -97,6 +97,16 @@ impl ActorRepository {
         )
     }
 
+    /// 按主键查询，未命中返回 [`DbError::NotFound`]。
+    ///
+    /// 与 [`Self::find_by_id`] 的区别是错误类型：合并流程里「演员不存在」
+    /// 是要报给调用方的 404，而不是让它去解 `Option`。
+    pub async fn require_by_id(&self, id: i32) -> Result<Actor, DbError> {
+        self.find_by_id(id)
+            .await?
+            .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
     /// 按 `javdb_id` 查询。
     ///
     /// 这是演员与外部数据源之间的**唯一**稳定标识 —— `name` 会被合并

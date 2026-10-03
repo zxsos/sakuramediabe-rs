@@ -32,12 +32,15 @@
 //!
 //! | 优先级 | 缺口 | 阻塞了什么 |
 //! |---|---|---|
-//! | P1 | [`Actor`] 无仓储 | 与 `Movie` 完全对称的主数据（9 个受保护字段 + 合并链 + 字段主权），却连 `find_by_javdb_id` 都没有 |
-//! | P1 | `Image` / `Tag` / `MovieActor` / `MovieTag` / `Subtitle` 无仓储 | `asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
-//! | P1 | [`MediaLibrary`] 无仓储 | `media.library_id` 指向它，但库管理端点（增删改查 provider 配置）无落点。写 `media` 前必须先有库 |
+//! | P1 | `Image` / `MoviePlotImage` / `Subtitle` 无仓储 | `asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
+//! | P1 | [`crate::playback::media::MediaLibrary`] 无仓储 | `media.library_id` 指向它，但库管理端点（增删改查 provider 配置）无落点。写 `media` 前必须先有库 |
+//! | P1 | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但受保护字段还没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写 |
 //! | P2 | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //! | P2 | `DownloadSubmissionRecord` 无仓储 | `download.rs` 的注释把幂等提交建立在 `(client, remote_id)` 唯一索引上，但「先查后插」要查的正是这张表 |
 //! | P2 | 合集族 6 张表 / 其余 5 张传输表 | `PluginOwned` trait 与 `playback_order_key()` 已为仓储预留形状，一个方法都没有 |
+//!
+//! 上一批已补上 [`actor`]（含墓碑链）、[`asset`] 的 `Tag` / `MovieActor` / `MovieTag`，
+//! 因此 `Tag` 与两张关联表不再在缺口里。
 //!
 //! # 分页：11 个 list 方法已覆盖，3 个刻意不分页
 //!
