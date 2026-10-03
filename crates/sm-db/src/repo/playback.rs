@@ -21,7 +21,9 @@
 
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::error::DbError;
+use crate::paged_list;
 use crate::playback::media::{
     image_search_index_status, MediaClip, MediaPoint, MediaProgress, MediaThumbnail,
 };
@@ -92,14 +94,18 @@ impl MediaThumbnailRepository {
         .map_err(|e| DbError::from(e).with_entity(THUMBNAIL_ENTITY))
     }
 
-    /// 列出某条 Media 的全部缩略图，按时刻点升序。
-    pub async fn list_by_media(&self, media_id: i32) -> Result<Vec<MediaThumbnail>, DbError> {
-        Ok(sqlx::query_as::<_, MediaThumbnail>(
-            "SELECT * FROM media_thumbnail WHERE media_id = $1 ORDER BY \"offset\"",
-        )
-        .bind(media_id)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出某条 Media 的全部缩略图，按时刻点升序。**分页。**
+        ///
+        /// 一部长片可能有几十个时刻点，所以分页。
+        pub async fn list_by_media(
+            &self,
+            media_id: i32,
+        ) -> Result<Page<MediaThumbnail>, DbError> {
+            count = "SELECT COUNT(*) FROM media_thumbnail WHERE media_id = $1",
+            items = "SELECT * FROM media_thumbnail WHERE media_id = $1 \
+                     ORDER BY \"offset\" LIMIT $2 OFFSET $3",
+        }
     }
 
     /// 按 `image_search_index_status` 取出待处理的缩略图。
@@ -318,27 +324,25 @@ impl MediaPointRepository {
         .map_err(|e| DbError::from(e).with_entity(POINT_ENTITY))
     }
 
-    /// 列出某条 Media 的时刻点，按时刻升序。
-    pub async fn list_by_media(&self, media_id: i32) -> Result<Vec<MediaPoint>, DbError> {
-        Ok(sqlx::query_as::<_, MediaPoint>(
-            "SELECT * FROM media_point WHERE media_id = $1 ORDER BY offset_seconds, id",
-        )
-        .bind(media_id)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出某条 Media 的时刻点，按时刻升序。**分页。**
+        pub async fn list_by_media(
+            &self,
+            media_id: i32,
+        ) -> Result<Page<MediaPoint>, DbError> {
+            count = "SELECT COUNT(*) FROM media_point WHERE media_id = $1",
+            items = "SELECT * FROM media_point WHERE media_id = $1 \
+                     ORDER BY offset_seconds, id LIMIT $2 OFFSET $3",
+        }
     }
 
-    /// 列出**没有来源 Media** 的时刻点（孤儿）。
-    ///
-    /// 来源被删后这些行仍在，按 `on_delete = SET NULL` 的设计它们
-    /// 仍可展示。需要给用户一个「清理这些快照」的入口。
-    pub async fn list_orphaned(&self, limit: i64) -> Result<Vec<MediaPoint>, DbError> {
-        Ok(sqlx::query_as::<_, MediaPoint>(
-            "SELECT * FROM media_point WHERE media_id IS NULL ORDER BY id LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出**没有来源 Media** 的时刻点（孤儿）。**分页。**
+        pub async fn list_orphaned(&self) -> Result<Page<MediaPoint>, DbError> {
+            count = "SELECT COUNT(*) FROM media_point WHERE media_id IS NULL",
+            items = "SELECT * FROM media_point WHERE media_id IS NULL \
+                     ORDER BY id LIMIT $1 OFFSET $2",
+        }
     }
 
     /// 删时刻点。返回是否真的删掉了一行。
@@ -404,53 +408,49 @@ impl MediaClipRepository {
         .map_err(|e| DbError::from(e).with_entity(CLIP_ENTITY))
     }
 
-    /// 列出某条 Media 的片段。
-    pub async fn list_by_media(&self, media_id: i32) -> Result<Vec<MediaClip>, DbError> {
-        Ok(sqlx::query_as::<_, MediaClip>(
-            "SELECT * FROM media_clip WHERE media_id = $1 ORDER BY start_offset_seconds, id",
-        )
-        .bind(media_id)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出某条 Media 的片段。**分页。**
+        pub async fn list_by_media(
+            &self,
+            media_id: i32,
+        ) -> Result<Page<MediaClip>, DbError> {
+            count = "SELECT COUNT(*) FROM media_clip WHERE media_id = $1",
+            items = "SELECT * FROM media_clip WHERE media_id = $1 \
+                     ORDER BY start_offset_seconds, id LIMIT $2 OFFSET $3",
+        }
     }
 
-    /// 按影片番号列出片段。
-    ///
-    /// 走 `media_clip_movie_number_idx`。**来源被删的片段也会出现** ——
-    /// 快照列的意义就是让它们仍能归属到某部影片。
-    pub async fn list_by_movie_number(
-        &self,
-        movie_number: &str,
-        limit: i64,
-    ) -> Result<Vec<MediaClip>, DbError> {
-        Ok(sqlx::query_as::<_, MediaClip>(
-            "SELECT * FROM media_clip WHERE movie_number = $1 \
-             ORDER BY start_offset_seconds, id LIMIT $2",
-        )
-        .bind(movie_number.trim())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 按影片番号列出片段。**分页。**
+        ///
+        /// 走 `media_clip_movie_number_idx`。**来源被删的片段也会出现** ——
+        /// 快照列的意义就是让它们仍能归属到某部影片。
+        pub async fn list_by_movie_number(
+            &self,
+            movie_number: &str,
+        ) -> Result<Page<MediaClip>, DbError> {
+            count = "SELECT COUNT(*) FROM media_clip WHERE movie_number = $1",
+            items = "SELECT * FROM media_clip WHERE movie_number = $1 \
+                     ORDER BY start_offset_seconds, id LIMIT $2 OFFSET $3",
+        }
     }
 
-    /// 列出仍然挂在来源上的片段。
-    pub async fn list_attached(&self, limit: i64) -> Result<Vec<MediaClip>, DbError> {
-        Ok(sqlx::query_as::<_, MediaClip>(
-            "SELECT * FROM media_clip WHERE media_id IS NOT NULL ORDER BY id LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出仍然挂在来源上的片段。**分页。**
+        pub async fn list_attached(&self) -> Result<Page<MediaClip>, DbError> {
+            count = "SELECT COUNT(*) FROM media_clip WHERE media_id IS NOT NULL",
+            items = "SELECT * FROM media_clip WHERE media_id IS NOT NULL \
+                     ORDER BY id LIMIT $1 OFFSET $2",
+        }
     }
 
-    /// 列出「独立资产」片段（来源已删除，文件与记录都保留）。
-    pub async fn list_detached(&self, limit: i64) -> Result<Vec<MediaClip>, DbError> {
-        Ok(sqlx::query_as::<_, MediaClip>(
-            "SELECT * FROM media_clip WHERE media_id IS NULL ORDER BY id LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出「独立资产」片段（来源已删除，文件与记录都保留）。**分页。**
+        pub async fn list_detached(&self) -> Result<Page<MediaClip>, DbError> {
+            count = "SELECT COUNT(*) FROM media_clip WHERE media_id IS NULL",
+            items = "SELECT * FROM media_clip WHERE media_id IS NULL \
+                     ORDER BY id LIMIT $1 OFFSET $2",
+        }
     }
 }
 

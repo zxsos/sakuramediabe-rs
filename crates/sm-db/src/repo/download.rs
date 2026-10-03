@@ -24,8 +24,10 @@
 
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::transfers::downloads::{download_state, import_status, DownloadTask};
 
 use super::movie::{bind_value_exec, safe_sql};
@@ -238,19 +240,21 @@ impl DownloadTaskRepository {
         Ok(row)
     }
 
-    /// 列出「下载完成但导入失败」的任务。
-    ///
-    /// 这个组合只有把两个状态机分开建模才表达得了，是最需要人工介入的
-    /// 一类卡住。
-    pub async fn list_stuck_after_download(&self) -> Result<Vec<DownloadTask>, DbError> {
-        let rows = sqlx::query_as::<_, DownloadTask>(
-            "SELECT * FROM download_task WHERE state = $1 AND import_status = $2 ORDER BY updated_at",
-        )
-        .bind(download_state::COMPLETED)
-        .bind(import_status::FAILED)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+    paged_list! {
+        /// 列出「下载完成但导入失败」的任务。**分页。**
+        ///
+        /// 分页让告警能报出准确数量，而不是「至少 N 条」。
+        pub async fn list_stuck_after_download(
+            &self,
+            state: &str,
+            import_status_value: &str,
+        ) -> Result<Page<DownloadTask>, DbError> {
+            count = "SELECT COUNT(*) FROM download_task \
+                     WHERE state = $1 AND import_status = $2",
+            items = "SELECT * FROM download_task \
+                     WHERE state = $1 AND import_status = $2 \
+                     ORDER BY updated_at LIMIT $3 OFFSET $4",
+        }
     }
 
     /// 通用更新。仅供本模块内部使用 —— 它不区分状态机，

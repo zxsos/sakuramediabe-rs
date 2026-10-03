@@ -117,6 +117,8 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "MediaPointRepository",
         "MediaClipRepository",
         "NewMediaClip",
+        # 分页值对象：校验过的请求参数，不是任何表的列集合
+        "PageRequest",
     }
 )
 

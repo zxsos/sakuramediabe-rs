@@ -51,6 +51,7 @@
 //! | 7 | 字段护栏 | 插件写 `field_owners` 被拒 |
 
 use sm_db::common::guard::WriteSource;
+use sm_db::common::page::PageRequest;
 use sm_db::common::update::UpdateSet;
 use sm_db::error::DbError;
 use sm_db::repo::{DownloadTaskRepository, MediaRepository, MovieRepository};
@@ -581,9 +582,13 @@ async fn download_done_but_import_failed_is_expressible_and_listable() {
     assert!(stuck.fully_settled());
     assert!(stuck.is_stuck_after_download());
 
-    let listed = repo.list_stuck_after_download().await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].id, created.id);
+    let listed = repo
+        .list_stuck_after_download("completed", "failed", PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.total, 1);
+    assert_eq!(listed.items[0].id, created.id);
 }
 
 #[tokio::test]

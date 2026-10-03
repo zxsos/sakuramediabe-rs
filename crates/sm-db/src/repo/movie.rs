@@ -15,8 +15,10 @@ use sqlx::{PgPool, Postgres};
 
 use crate::catalog::movie::{field_owner, Movie, MovieSeries, PROTECTED_MOVIE_FIELDS};
 use crate::common::guard::{FieldGuard, WriteSource};
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "Movie";
@@ -262,21 +264,41 @@ impl MovieRepository {
         Ok(())
     }
 
-    /// 按订阅状态列出。
+    paged_list! {
+        /// 按订阅布尔值列出。**分页。**
+        ///
+        /// `total` 是该状态下的**全部**影片数，不是本页条数 —— 订阅列表页
+        /// 要显示「共 N 部」，客户端 `fetch_all_pages` 也要靠它决定拉几页。
+        ///
+        /// 两条查询跑在同一个 REPEATABLE READ 快照里，否则并发订阅/退订时
+        /// 两者会看到不同的世界，见 [`crate::common::page`] 模块文档。
+        ///
+        /// `NULLS LAST`：`subscribed_at` 对未订阅的影片是 NULL，按它倒序时
+        /// 不写这个子句，PostgreSQL 会把 NULL 排在**最前** —— 未订阅的会
+        /// 出现在列表顶部。
+        pub async fn list_by_subscription(
+            &self,
+            subscribed: bool,
+        ) -> Result<Page<Movie>, DbError> {
+            count = "SELECT COUNT(*) FROM movie WHERE is_subscribed = $1",
+            items = "SELECT * FROM movie WHERE is_subscribed = $1 \
+                     ORDER BY subscribed_at DESC NULLS LAST, id \
+                     LIMIT $2 OFFSET $3",
+        }
+    }
+
+    /// 按订阅状态列出。**分页。**
+    ///
+    /// 薄包装：把 [`SubscriptionState`] 翻成布尔再交给
+    /// [`list_by_subscription`](Self::list_by_subscription)。宏只能生成
+    /// 「参数原样 bind」的方法，所以类型转换必须留在外面 —— 否则调用方
+    /// 可能传一个裸 `bool` 而绕过这个枚举。
     pub async fn list_by_subscription_state(
         &self,
         state: SubscriptionState,
-        limit: i64,
-    ) -> Result<Vec<Movie>, DbError> {
-        let state = state.as_str();
-        let rows = sqlx::query_as::<_, Movie>(
-            "SELECT * FROM movie WHERE is_subscribed = $1 ORDER BY subscribed_at DESC NULLS LAST, id LIMIT $2",
-        )
-        .bind(state == SubscriptionState::Subscribed.as_str())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        page: PageRequest,
+    ) -> Result<Page<Movie>, DbError> {
+        self.list_by_subscription(state.as_bool(), page).await
     }
 
     /// 认领一条待刮削的影片。
@@ -348,15 +370,13 @@ pub enum SubscriptionState {
 
 impl SubscriptionState {
     /// 该状态对应的 `is_subscribed` 布尔值。
+    ///
+    /// 列本身是 boolean，所以只保留这一个转换。
+    /// 曾经还有一个 `as_str() -> "true" / "false"`，用来把状态转成字符串
+    /// 再跟 `"true"` 比较 —— 那绕了一圈布尔，而列要的是 `bool`。
+    /// 现在查询直接绑 `as_bool()`。
     pub fn as_bool(&self) -> bool {
         matches!(self, Self::Subscribed)
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Subscribed => "true",
-            Self::NotSubscribed => "false",
-        }
     }
 }
 

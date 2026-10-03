@@ -29,8 +29,10 @@
 use chrono::NaiveDateTime;
 use sqlx::{PgPool, Postgres, Transaction};
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::system::user::{RefreshTokenStatus, User, UserRefreshToken};
 
 /// 实体名，用于错误分类。
@@ -435,17 +437,23 @@ impl UserRefreshTokenRepository {
         Ok(result.rows_affected())
     }
 
-    /// 列出某个用户的活跃令牌（审计用）。
-    ///
-    /// 单用户下返回全部活跃令牌。分页留给 service 层 ——
-    /// 活跃令牌数量天然有界（每个设备一个），不需要仓储层分页。
-    pub async fn list_active(&self) -> Result<Vec<UserRefreshToken>, DbError> {
-        Ok(sqlx::query_as::<_, UserRefreshToken>(
-            "SELECT * FROM user_refresh_tokens WHERE status = $1 ORDER BY created_at, id",
-        )
-        .bind(RefreshTokenStatus::Active.as_str())
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出活跃令牌（「你的登录设备」列表）。**分页。**
+        ///
+        /// 单用户下返回该用户全部活跃令牌。
+        ///
+        /// 分页的理由不是「数量可能很多」——活跃令牌每个设备一条，通常
+        /// 是个位数——而是**统一**：这是一个列表端点，客户端会按分页协议
+        /// 消费它。给它一个不分页的特例，等于让这个端点成为唯一一个
+        /// 形状不同的。
+        pub async fn list_active(
+            &self,
+            status: &str,
+        ) -> Result<Page<UserRefreshToken>, DbError> {
+            count = "SELECT COUNT(*) FROM user_refresh_tokens WHERE status = $1",
+            items = "SELECT * FROM user_refresh_tokens WHERE status = $1 \
+                     ORDER BY created_at, id LIMIT $2 OFFSET $3",
+        }
     }
 }
 

@@ -14,10 +14,12 @@
 
 pub mod guard;
 pub mod json_text;
+pub mod page;
 pub mod time;
 pub mod update;
 
 pub use guard::{FieldGuard, WriteSource};
 pub use json_text::{decode as decode_json_text, encode as encode_json_text};
+pub use page::{Page, PageRequest};
 pub use time::now_utc;
 pub use update::{UpdateSet, Value as UpdateValue};

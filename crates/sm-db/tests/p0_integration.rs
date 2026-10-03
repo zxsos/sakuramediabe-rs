@@ -13,6 +13,7 @@
 //!
 //! 没有数据库时全部跳过（`TestDb::create()` 返回 `None`）。
 
+use sm_db::common::page::PageRequest;
 use sm_db::common::time::now_utc;
 use sm_db::error::DbError;
 use sm_db::repo::{
@@ -410,14 +411,21 @@ async fn concurrent_rotation_of_the_same_token_admits_exactly_one_winner() {
     };
 
     // 库里只应多出一个新令牌
-    let active = repo.list_active().await.unwrap();
+    let active = repo
+        .list_active(
+            RefreshTokenStatus::Active.as_str(),
+            PageRequest::new(1, 50).unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        active.len(),
+        active.items.len(),
         1,
         "不应产生两个有效令牌，实际 {}",
-        active.len()
+        active.items.len()
     );
-    assert_eq!(active[0].token_id, winner_token_id);
+    assert_eq!(active.total, 1);
+    assert_eq!(active.items[0].token_id, winner_token_id);
     // 落败的那一个新令牌不该存在
     let loser_id = if winner_token_id == "t2" { "t3" } else { "t2" };
     assert!(
@@ -463,8 +471,15 @@ async fn revoke_all_active_leaves_revoked_ones_untouched() {
     let count = repo.revoke_all_active(now_utc()).await.unwrap();
     assert_eq!(count, 1, "只该吊销仍 active 的那个");
 
-    let all = repo.list_active().await.unwrap();
-    assert!(all.is_empty(), "不应再有 active 令牌");
+    let all = repo
+        .list_active(
+            RefreshTokenStatus::Active.as_str(),
+            PageRequest::new(1, 50).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(all.items.is_empty(), "不应再有 active 令牌");
+    assert_eq!(all.total, 0, "确实没有活跃令牌了");
 }
 
 #[tokio::test]
@@ -487,7 +502,18 @@ async fn purge_expired_removes_by_expiry_regardless_of_status() {
 
     let removed = repo.purge_expired(now_utc()).await.unwrap();
     assert_eq!(removed, 2, "两个过期行都应被删");
-    assert_eq!(repo.list_active().await.unwrap().len(), 1, "只剩未过期那个");
+    assert_eq!(
+        repo.list_active(
+            RefreshTokenStatus::Active.as_str(),
+            PageRequest::new(1, 50).unwrap(),
+        )
+        .await
+        .unwrap()
+        .items
+        .len(),
+        1,
+        "只剩未过期那个"
+    );
 }
 
 #[tokio::test]
@@ -700,14 +726,22 @@ async fn lease_expiry_makes_a_task_claimable_again() {
         .unwrap();
 
     // 租约未到期 —— 不可回收
-    let still_held = repo.list_stale_leases(now_utc()).await.unwrap();
-    assert!(still_held.is_empty(), "租约有效期内不该被回收");
+    let still_held = repo
+        .list_stale_leases(now_utc(), PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert!(still_held.items.is_empty(), "租约有效期内不该被回收");
+    assert_eq!(still_held.total, 0);
 
     // 租约到期（用未来时刻模拟时间流逝）
     let future = now_utc() + chrono::Duration::minutes(10);
-    let stale = repo.list_stale_leases(future).await.unwrap();
-    assert_eq!(stale.len(), 1);
-    assert!(stale[0].is_stale_lease(future));
+    let stale = repo
+        .list_stale_leases(future, PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(stale.items.len(), 1);
+    assert_eq!(stale.total, 1);
+    assert!(stale.items[0].is_stale_lease(future));
 
     let reclaimed = repo.reclaim_stale(future).await.unwrap();
     assert_eq!(reclaimed, 1);
@@ -1004,9 +1038,16 @@ async fn list_by_task_key_orders_by_recency() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     repo.enqueue(&fixtures::task("probe")).await.unwrap();
 
-    let runs = repo.list_by_task_key("probe", 10).await.unwrap();
-    assert_eq!(runs.len(), 2);
-    assert!(runs[0].id > runs[1].id, "应按 created_at 倒序（最新在前）");
+    let runs = repo
+        .list_by_task_key("probe", PageRequest::new(1, 10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(runs.items.len(), 2);
+    assert_eq!(runs.total, 2);
+    assert!(
+        runs.items[0].id > runs.items[1].id,
+        "应按 created_at 倒序（最新在前）"
+    );
 }
 
 #[tokio::test]

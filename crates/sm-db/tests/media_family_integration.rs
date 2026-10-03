@@ -9,6 +9,7 @@
 //! | `media_progress` | `(media_id)` | 反复保存 = 一行，进度可覆盖 |
 //! | `media_clip` | `(media_id, start, end)`，可空 | 同区间重复插入撞约束；`media_id=NULL` 的多个可共存 |
 
+use sm_db::common::page::PageRequest;
 use sm_db::common::time::now_utc;
 use sm_db::error::DbError;
 use sm_db::playback::media::image_search_index_status;
@@ -129,9 +130,13 @@ async fn thumbnail_upsert_lands_the_artifact_the_state_machine_claimed() {
     );
 
     // 库里确实有这一行
-    let listed = thumbs.list_by_media(media_id).await.unwrap();
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].id, thumb.id);
+    let listed = thumbs
+        .list_by_media(media_id, PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].id, thumb.id);
+    assert_eq!(listed.total, 1);
 }
 
 #[tokio::test]
@@ -169,7 +174,15 @@ async fn thumbnail_upsert_at_the_same_offset_overwrites_rather_than_duplicating(
     // 同一行被覆盖
     assert_eq!(first.id, second.id, "同一时刻点应是同一行");
     assert_eq!(second.image_id, better_image, "图应被换成重试后的版本");
-    assert_eq!(thumbs.list_by_media(media_id).await.unwrap().len(), 1);
+    assert_eq!(
+        thumbs
+            .list_by_media(media_id, PageRequest::new(1, 50).unwrap())
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -226,7 +239,12 @@ async fn thumbnail_upsert_rejects_an_unknown_index_status() {
         .expect_err("未知状态应被拒");
     assert!(matches!(err, DbError::Business { .. }), "实际 {err:?}");
     // 未写入
-    assert!(thumbs.list_by_media(media_id).await.unwrap().is_empty());
+    assert!(thumbs
+        .list_by_media(media_id, PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
 }
 
 #[tokio::test]
@@ -464,10 +482,14 @@ async fn point_insert_and_list_by_media() {
         .await
         .unwrap();
 
-    let listed = points.list_by_media(media_id).await.unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].offset_seconds, 100, "应按时刻升序");
-    assert_eq!(listed[1].offset_seconds, 200);
+    let listed = points
+        .list_by_media(media_id, PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 2);
+    assert_eq!(listed.total, 2);
+    assert_eq!(listed.items[0].offset_seconds, 100, "应按时刻升序");
+    assert_eq!(listed.items[1].offset_seconds, 200);
 }
 
 #[tokio::test]
@@ -494,12 +516,15 @@ async fn point_survives_its_source_media_being_deleted() {
         .unwrap();
 
     // 时刻点还在，但 media_id 变 NULL
-    let orphans = points.list_orphaned(10).await.unwrap();
-    assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0].id, point.id);
-    assert!(orphans[0].media_id.is_none(), "media_id 应被置空");
+    let orphans = points
+        .list_orphaned(PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(orphans.items.len(), 1);
+    assert_eq!(orphans.items[0].id, point.id);
+    assert!(orphans.items[0].media_id.is_none(), "media_id 应被置空");
     assert_eq!(
-        orphans[0].movie_number.as_deref(),
+        orphans.items[0].movie_number.as_deref(),
         Some("ABC-001"),
         "快照列让归属与展示仍可用"
     );
@@ -544,9 +569,12 @@ async fn clip_insert_and_list() {
     assert_eq!(c1.length_seconds(), 30);
     assert_eq!(c2.length_seconds(), 30);
 
-    let listed = clips.list_by_media(media_id).await.unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].start_offset_seconds, 0);
+    let listed = clips
+        .list_by_media(media_id, PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(listed.items.len(), 2);
+    assert_eq!(listed.items[0].start_offset_seconds, 0);
 }
 
 #[tokio::test]
@@ -607,9 +635,18 @@ async fn detached_clips_coexist_because_null_does_not_join_unique_constraints() 
         c.file_path = format!("orphan-{i}.mp4");
         clips.insert(&c).await.unwrap();
     }
-    let detached = clips.list_detached(10).await.unwrap();
-    assert_eq!(detached.len(), 3, "NULL 不参与唯一约束，三个应共存");
-    assert!(clips.list_attached(10).await.unwrap().is_empty());
+    let detached = clips
+        .list_detached(PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(detached.items.len(), 3, "NULL 不参与唯一约束，三个应共存");
+    assert_eq!(detached.total, 3);
+    assert!(clips
+        .list_attached(PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap()
+        .items
+        .is_empty());
 }
 
 #[tokio::test]
@@ -633,13 +670,19 @@ async fn clip_snapshot_column_survives_source_deletion() {
         .await
         .unwrap();
 
-    let orphans = clips.list_detached(10).await.unwrap();
-    assert_eq!(orphans.len(), 1);
-    assert_eq!(orphans[0].id, clip.id);
-    assert!(orphans[0].media_id.is_none(), "media_id 应被置空");
+    let orphans = clips
+        .list_detached(PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(orphans.items.len(), 1);
+    assert_eq!(orphans.items[0].id, clip.id);
+    assert!(orphans.items[0].media_id.is_none(), "media_id 应被置空");
     // 快照仍能归属到影片
-    let by_movie = clips.list_by_movie_number("ABC-001", 10).await.unwrap();
-    assert_eq!(by_movie.len(), 1);
+    let by_movie = clips
+        .list_by_movie_number("ABC-001", PageRequest::new(1, 50).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(by_movie.items.len(), 1);
 }
 
 // ================================================================ 业务键查询
@@ -696,20 +739,25 @@ async fn list_by_library_and_movie_number() {
             .unwrap();
     }
 
-    let all = media_repo.list_by_library(lib, 50).await.unwrap();
-    assert_eq!(all.len(), 3);
+    let page = PageRequest::new(1, 50).unwrap();
+    let all = media_repo.list_by_library(lib, page).await.unwrap();
+    assert_eq!(all.items.len(), 3);
+    assert_eq!(all.total, 3, "total 是全量而不是本页条数");
     let jav = media_repo
-        .list_by_movie_number("ABC-001", 50)
+        .list_by_movie_number("ABC-001", page)
         .await
         .unwrap();
-    assert_eq!(jav.len(), 2, "同一部影片的两份媒体");
+    assert_eq!(jav.items.len(), 2, "同一部影片的两份媒体");
+    assert_eq!(jav.total, 2);
     // 空白应被 trim
     assert_eq!(
         media_repo
-            .list_by_movie_number("  ABC-002  ", 50)
+            .list_by_movie_number("  ABC-002  ", page)
             .await
             .unwrap()
+            .items
             .len(),
-        1
+        1,
+        "空白应被 trim"
     );
 }

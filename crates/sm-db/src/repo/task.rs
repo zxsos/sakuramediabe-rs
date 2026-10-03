@@ -42,8 +42,10 @@
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::system::activity::{task_state, BackgroundTaskRun};
 
 /// 实体名，用于错误分类。
@@ -396,6 +398,10 @@ impl BackgroundTaskRunRepository {
     }
 
     /// 列出可领取的任务（不改变状态）。用于诊断与「队列有多深」的回答。
+    ///
+    /// **刻意不分页。** 与 [`list_pending_thumbnails`](crate::repo::media::MediaRepository::list_pending_thumbnails)
+    /// 同理：这是 worker 循环的队列扫描，语义是「给我 N 条待办」。
+    /// 分页会让 worker 反复取第 1 页，而队列持续增长。
     pub async fn list_claimable(
         &self,
         now: NaiveDateTime,
@@ -413,38 +419,35 @@ impl BackgroundTaskRunRepository {
         .await?)
     }
 
-    /// 列出租约已过期的僵尸任务（不改变状态）。
-    pub async fn list_stale_leases(
-        &self,
-        now: NaiveDateTime,
-    ) -> Result<Vec<BackgroundTaskRun>, DbError> {
-        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
-            "SELECT * FROM background_task_run \
-             WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2 \
-             ORDER BY lease_expires_at, id",
-        )
-        .bind(task_state::RUNNING)
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出租约已过期的僵尸任务（不改变状态）。**分页。**
+        ///
+        /// 给人看：运维要判断「有多少任务卡住了」。分页让那个数字准确。
+        pub async fn list_stale_leases(
+            &self,
+            now: NaiveDateTime,
+        ) -> Result<Page<BackgroundTaskRun>, DbError> {
+            count = "SELECT COUNT(*) FROM background_task_run \
+                     WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2",
+            items = "SELECT * FROM background_task_run \
+                     WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2 \
+                     ORDER BY lease_expires_at, id LIMIT $3 OFFSET $4",
+        }
     }
 
-    /// 按 `task_key` 列出最近若干次运行。
-    ///
-    /// 索引是 `(task_key, created_at)`，所以按 created_at 倒序可走索引。
-    pub async fn list_by_task_key(
-        &self,
-        task_key: &str,
-        limit: i64,
-    ) -> Result<Vec<BackgroundTaskRun>, DbError> {
-        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
-            "SELECT * FROM background_task_run \
-             WHERE task_key = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
-        )
-        .bind(task_key.trim())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 按 `task_key` 列出运行历史。**分页。**
+        ///
+        /// 索引是 `(task_key, created_at)`，所以按 created_at 倒序可走索引。
+        /// 「这个定时任务最近跑了多少次、每次结果如何」是用户可见的查询。
+        pub async fn list_by_task_key(
+            &self,
+            task_key: &str,
+        ) -> Result<Page<BackgroundTaskRun>, DbError> {
+            count = "SELECT COUNT(*) FROM background_task_run WHERE task_key = $1",
+            items = "SELECT * FROM background_task_run \
+                     WHERE task_key = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
+        }
     }
 
     /// 通用更新（改 `task_name` / `scheduled_at` 等非状态字段）。

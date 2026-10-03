@@ -21,8 +21,10 @@
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::playback::media::{thumbnail_state, Media};
 
 use super::movie::{bind_value_exec, safe_sql};
@@ -106,6 +108,9 @@ impl MediaRepository {
     /// 文件被导入到两个库），真出现多条说明导入逻辑有问题，但仓储不该
     /// 因此拒绝回答「有哪几条」—— 那会让调用方既拿不到数据、又拿不到
     /// 错误。
+    ///
+    /// **不分页**：这是去重检查而不是列表，调用方要的是「有哪几条」这个
+    /// 完整答案。分页会让它拿到一个不完整的结论而误判「没有重复」。
     pub async fn find_by_file_hash(&self, hash: &str) -> Result<Vec<Media>, DbError> {
         Ok(
             sqlx::query_as::<_, Media>("SELECT * FROM media WHERE file_hash = $1 ORDER BY id")
@@ -115,36 +120,31 @@ impl MediaRepository {
         )
     }
 
-    /// 列出某个库的全部媒体。
-    pub async fn list_by_library(
-        &self,
-        library_id: i32,
-        limit: i64,
-    ) -> Result<Vec<Media>, DbError> {
-        Ok(sqlx::query_as::<_, Media>(
-            "SELECT * FROM media WHERE library_id = $1 ORDER BY id LIMIT $2",
-        )
-        .bind(library_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 列出某个库的全部媒体。**分页。**
+        ///
+        /// 库可以装上万部影片，所以分页不是可选项。
+        pub async fn list_by_library(
+            &self,
+            library_id: i32,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE library_id = $1",
+            items = "SELECT * FROM media WHERE library_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
     }
 
-    /// 按影片番号列出媒体。
-    ///
-    /// 这是「JAV 影片详情页列出所有正片」的主查询。
-    pub async fn list_by_movie_number(
-        &self,
-        movie_number: &str,
-        limit: i64,
-    ) -> Result<Vec<Media>, DbError> {
-        Ok(sqlx::query_as::<_, Media>(
-            "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2",
-        )
-        .bind(movie_number.trim())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
+    paged_list! {
+        /// 按影片番号列出媒体。**分页。**
+        ///
+        /// 「JAV 影片详情页列出所有正片」的主查询。一部影片可能有多个版本
+        /// （不同分辨率、不同来源），但数量有界。
+        pub async fn list_by_movie_number(
+            &self,
+            movie_number: &str,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE movie_number = $1",
+            items = "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
     }
 
     /// 按主键查询。
@@ -275,6 +275,15 @@ impl MediaRepository {
     /// 索引是 `(thumbnail_generation_state, thumbnail_next_retry_at)`，
     /// 所以只有 `retry_wait` 且已到期的行会被这个查询命中 —— 与
     /// [`thumbnail_state::is_retryable`] 的口径一致。
+    ///
+    /// **刻意不分页。** 这是 worker 循环驱动的队列扫描，语义是
+    /// 「给我 N 条待办」而不是「第 N 页待办」：
+    ///
+    /// - 分页会让 worker 反复取第 1 页，而队列是持续增长的
+    /// - `total` 对它毫无用处——没人要显示「共 N 个待办」
+    /// - 队列深度由 `limit` 与 `updated_at` 退避共同控制，不需要总数
+    ///
+    /// 真正需要分页的是给人看的列表（见 [`list_by_library`](Self::list_by_library)）。
     pub async fn list_pending_thumbnails(&self, limit: i64) -> Result<Vec<Media>, DbError> {
         let now = crate::common::time::now_utc();
         let rows = sqlx::query_as::<_, Media>(

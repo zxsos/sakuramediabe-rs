@@ -32,7 +32,6 @@
 //!
 //! | 优先级 | 缺口 | 阻塞了什么 |
 //! |---|---|---|
-//! | P0 | 任何表都没有分页与计数 | `sm-core::pagination::Paginated` 需要 `offset` 与 `total`，而所有 list 方法只有 `limit`。**这是横切缺口**，不是单表缺口 |
 //! | P1 | [`Actor`] 无仓储 | 与 `Movie` 完全对称的主数据（9 个受保护字段 + 合并链 + 字段主权），却连 `find_by_javdb_id` 都没有 |
 //! | P1 | `Image` / `Tag` / `MovieActor` / `MovieTag` / `Subtitle` 无仓储 | `asset.rs` 自己指出影片资产要按 `origin` 前缀查（有 `text_pattern_ops` 索引）—— **索引是为某个查询建的，而该查询不存在** |
 //! | P1 | [`MediaLibrary`] 无仓储 | `media.library_id` 指向它，但库管理端点（增删改查 provider 配置）无落点。写 `media` 前必须先有库 |
@@ -40,12 +39,25 @@
 //! | P2 | `DownloadSubmissionRecord` 无仓储 | `download.rs` 的注释把幂等提交建立在 `(client, remote_id)` 唯一索引上，但「先查后插」要查的正是这张表 |
 //! | P2 | 合集族 6 张表 / 其余 5 张传输表 | `PluginOwned` trait 与 `playback_order_key()` 已为仓储预留形状，一个方法都没有 |
 //!
-//! 结构性缺失仍有一条：**零 `delete`**，只有 `media_point` 与 `media_progress`
-//! 两处局部例外（`clear` / `delete`），其余表的删除路径只存在于注释里。
+//! # 分页：11 个 list 方法已覆盖，3 个刻意不分页
 //!
-//! 事务已不再是缺失 —— [`user::UserRefreshTokenRepository::rotate`]
-//! 开了第一个。但它把事务**关在方法内部**，跨仓储组合写入（例如
-//! 「插 Movie + 3 条 MovieActor + upsert Tag」）仍无处表达原子性。
+//! | 方法 | 为什么不分页 |
+//! |---|---|
+//! | [`media::MediaRepository::find_by_file_hash`] | 去重检查，调用方要完整答案；分页会让它拿到不完整结论而误判「没有重复」 |
+//! | [`media::MediaRepository::list_pending_thumbnails`] | worker 循环的队列扫描，语义是「给我 N 条待办」 |
+//! | [`task::BackgroundTaskRunRepository::list_claimable`] | 同上 |
+//!
+//! 区分标准是**调用方是人还是 worker**。人看列表需要翻页与总数，
+//! worker 循环需要「下一批待办」—— 给它 `page=1` 只会让它反复取第一页。
+//!
+//! # 两条结构性缺失
+//!
+//! **零 `delete`**：只有 `media_point` 与 `media_progress` 两处局部例外
+//! （`delete` / `clear`），其余表的删除路径只存在于注释里。
+//!
+//! **事务关在方法内**：[`user::UserRefreshTokenRepository::rotate`] 开了
+//! 第一个事务，但它不对外暴露 `&mut Transaction`，所以跨仓储组合写入
+//! （「插 Movie + 3 条 MovieActor + upsert Tag」）仍无处表达原子性。
 //!
 //! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
