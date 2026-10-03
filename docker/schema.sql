@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS background_task_run (
   progress_current integer NULL,
   progress_total integer NULL,
   progress_text varchar(255) NULL,
-  result_summary text NOT NULL,
+  result_summary text NOT NULL DEFAULT '{}',
   result_text text NULL,
   error_message text NULL,
   started_at timestamp NULL,
@@ -88,9 +88,9 @@ CREATE TABLE IF NOT EXISTS daily_recommendation_item (
   movie_id integer NOT NULL UNIQUE,
   rank integer NOT NULL UNIQUE,
   score double precision NOT NULL DEFAULT 0.0,
-  reason_codes text NOT NULL,
-  reason_texts text NOT NULL,
-  signal_scores text NOT NULL,
+  reason_codes text NOT NULL DEFAULT '[]',
+  reason_texts text NOT NULL DEFAULT '[]',
+  signal_scores text NOT NULL DEFAULT '{}',
   generated_at timestamp NOT NULL
 );
 
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS download_client (
   created_at timestamp NULL,
   updated_at timestamp NULL,
   name varchar(255) NOT NULL UNIQUE,
-  provider_config text NOT NULL,
+  provider_config text NOT NULL DEFAULT '{}',
   library_id integer NOT NULL
 );
 
@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS media (
   movie_number varchar(255) NULL,
   video_item_id integer NULL,
   library_id integer NOT NULL,
-  storage_ref text NOT NULL,
+  storage_ref text NOT NULL DEFAULT '{}',
   file_name varchar(1024) NOT NULL DEFAULT '',
   resolution varchar(32) NULL,
   file_size_bytes bigint NOT NULL DEFAULT 0,
@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS media_library (
   updated_at timestamp NULL,
   name varchar(255) NOT NULL UNIQUE,
   provider_key varchar(255) NOT NULL,
-  provider_config text NOT NULL,
+  provider_config text NOT NULL DEFAULT '{}',
   account_key varchar(255) NULL
 );
 
@@ -262,7 +262,7 @@ CREATE TABLE IF NOT EXISTS media_thumbnail (
   updated_at timestamp NULL,
   media_id integer NOT NULL,
   image_id integer NOT NULL,
-  offset integer NOT NULL,
+  "offset" integer NOT NULL,
   image_search_index_status integer NOT NULL
 );
 
@@ -496,52 +496,52 @@ CREATE TABLE IF NOT EXISTS video_item (
 
 -- 外键
 
-ALTER TABLE actor ADD CONSTRAINT actor_merged_into_id_fk FOREIGN KEY (merged_into_id) REFERENCES actor (merged_into_id) ON DELETE SET NULL;
-ALTER TABLE actor ADD CONSTRAINT actor_profile_image_id_fk FOREIGN KEY (profile_image_id) REFERENCES image (profile_image_id) ON DELETE SET NULL;
-ALTER TABLE actor ADD CONSTRAINT actor_profile_image_override_id_fk FOREIGN KEY (profile_image_override_id) REFERENCES image (profile_image_override_id) ON DELETE SET NULL;
-ALTER TABLE clip_collection_item ADD CONSTRAINT clip_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES clip_collection (collection_id) ON DELETE CASCADE;
-ALTER TABLE clip_collection_item ADD CONSTRAINT clip_collection_item_clip_id_fk FOREIGN KEY (clip_id) REFERENCES media_clip (clip_id) ON DELETE CASCADE;
-ALTER TABLE daily_recommendation_item ADD CONSTRAINT daily_recommendation_item_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE download_client ADD CONSTRAINT download_client_library_id_fk FOREIGN KEY (library_id) REFERENCES media_library (library_id) ON DELETE CASCADE;
-ALTER TABLE download_task ADD CONSTRAINT download_task_client_id_fk FOREIGN KEY (client_id) REFERENCES download_client (client_id) ON DELETE CASCADE;
-ALTER TABLE download_task ADD CONSTRAINT download_task_import_task_run_id_fk FOREIGN KEY (import_task_run_id) REFERENCES background_task_run (import_task_run_id) ON DELETE SET NULL;
-ALTER TABLE indexer_download_client ADD CONSTRAINT indexer_download_client_indexer_id_fk FOREIGN KEY (indexer_id) REFERENCES indexer (indexer_id) ON DELETE CASCADE;
-ALTER TABLE indexer_download_client ADD CONSTRAINT indexer_download_client_download_client_id_fk FOREIGN KEY (download_client_id) REFERENCES download_client (download_client_id) ON DELETE CASCADE;
+ALTER TABLE actor ADD CONSTRAINT actor_merged_into_id_fk FOREIGN KEY (merged_into_id) REFERENCES actor (id) ON DELETE SET NULL;
+ALTER TABLE actor ADD CONSTRAINT actor_profile_image_id_fk FOREIGN KEY (profile_image_id) REFERENCES image (id) ON DELETE SET NULL;
+ALTER TABLE actor ADD CONSTRAINT actor_profile_image_override_id_fk FOREIGN KEY (profile_image_override_id) REFERENCES image (id) ON DELETE SET NULL;
+ALTER TABLE clip_collection_item ADD CONSTRAINT clip_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES clip_collection (id) ON DELETE CASCADE;
+ALTER TABLE clip_collection_item ADD CONSTRAINT clip_collection_item_clip_id_fk FOREIGN KEY (clip_id) REFERENCES media_clip (id) ON DELETE CASCADE;
+ALTER TABLE daily_recommendation_item ADD CONSTRAINT daily_recommendation_item_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE download_client ADD CONSTRAINT download_client_library_id_fk FOREIGN KEY (library_id) REFERENCES media_library (id) ON DELETE CASCADE;
+ALTER TABLE download_task ADD CONSTRAINT download_task_client_id_fk FOREIGN KEY (client_id) REFERENCES download_client (id) ON DELETE CASCADE;
+ALTER TABLE download_task ADD CONSTRAINT download_task_import_task_run_id_fk FOREIGN KEY (import_task_run_id) REFERENCES background_task_run (id) ON DELETE SET NULL;
+ALTER TABLE indexer_download_client ADD CONSTRAINT indexer_download_client_indexer_id_fk FOREIGN KEY (indexer_id) REFERENCES indexer (id) ON DELETE CASCADE;
+ALTER TABLE indexer_download_client ADD CONSTRAINT indexer_download_client_download_client_id_fk FOREIGN KEY (download_client_id) REFERENCES download_client (id) ON DELETE CASCADE;
 ALTER TABLE media ADD CONSTRAINT media_movie_number_fk FOREIGN KEY (movie_number) REFERENCES movie (movie_number) ON DELETE CASCADE;
-ALTER TABLE media ADD CONSTRAINT media_video_item_id_fk FOREIGN KEY (video_item_id) REFERENCES video_item (video_item_id) ON DELETE CASCADE;
-ALTER TABLE media ADD CONSTRAINT media_library_id_fk FOREIGN KEY (library_id) REFERENCES media_library (library_id) ON DELETE CASCADE;
-ALTER TABLE media_clip ADD CONSTRAINT media_clip_media_id_fk FOREIGN KEY (media_id) REFERENCES media (media_id) ON DELETE SET NULL;
-ALTER TABLE media_point ADD CONSTRAINT media_point_media_id_fk FOREIGN KEY (media_id) REFERENCES media (media_id) ON DELETE SET NULL;
-ALTER TABLE media_point ADD CONSTRAINT media_point_thumbnail_id_fk FOREIGN KEY (thumbnail_id) REFERENCES media_thumbnail (thumbnail_id) ON DELETE SET NULL;
-ALTER TABLE media_point ADD CONSTRAINT media_point_image_id_fk FOREIGN KEY (image_id) REFERENCES image (image_id) ON DELETE RESTRICT;
-ALTER TABLE media_progress ADD CONSTRAINT media_progress_media_id_fk FOREIGN KEY (media_id) REFERENCES media (media_id) ON DELETE CASCADE;
-ALTER TABLE media_thumbnail ADD CONSTRAINT media_thumbnail_media_id_fk FOREIGN KEY (media_id) REFERENCES media (media_id) ON DELETE CASCADE;
-ALTER TABLE media_thumbnail ADD CONSTRAINT media_thumbnail_image_id_fk FOREIGN KEY (image_id) REFERENCES image (image_id) ON DELETE CASCADE;
-ALTER TABLE moment_collection_item ADD CONSTRAINT moment_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES moment_collection (collection_id) ON DELETE CASCADE;
-ALTER TABLE moment_collection_item ADD CONSTRAINT moment_collection_item_point_id_fk FOREIGN KEY (point_id) REFERENCES media_point (point_id) ON DELETE CASCADE;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_media_id_fk FOREIGN KEY (media_id) REFERENCES media (media_id) ON DELETE CASCADE;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_thumbnail_id_fk FOREIGN KEY (thumbnail_id) REFERENCES media_thumbnail (thumbnail_id) ON DELETE CASCADE;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_seed_point_id_fk FOREIGN KEY (seed_point_id) REFERENCES media_point (seed_point_id) ON DELETE SET NULL;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_seed_thumbnail_id_fk FOREIGN KEY (seed_thumbnail_id) REFERENCES media_thumbnail (seed_thumbnail_id) ON DELETE SET NULL;
-ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_source_movie_id_fk FOREIGN KEY (source_movie_id) REFERENCES movie (source_movie_id) ON DELETE SET NULL;
-ALTER TABLE movie ADD CONSTRAINT movie_cover_image_id_fk FOREIGN KEY (cover_image_id) REFERENCES image (cover_image_id) ON DELETE SET NULL;
-ALTER TABLE movie ADD CONSTRAINT movie_thin_cover_image_id_fk FOREIGN KEY (thin_cover_image_id) REFERENCES image (thin_cover_image_id) ON DELETE SET NULL;
-ALTER TABLE movie ADD CONSTRAINT movie_series_id_fk FOREIGN KEY (series_id) REFERENCES movie_series (series_id) ON DELETE SET NULL;
-ALTER TABLE movie_actor ADD CONSTRAINT movie_actor_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE movie_actor ADD CONSTRAINT movie_actor_actor_id_fk FOREIGN KEY (actor_id) REFERENCES actor (actor_id) ON DELETE CASCADE;
-ALTER TABLE movie_plot_image ADD CONSTRAINT movie_plot_image_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE movie_plot_image ADD CONSTRAINT movie_plot_image_image_id_fk FOREIGN KEY (image_id) REFERENCES image (image_id) ON DELETE CASCADE;
-ALTER TABLE movie_tag ADD CONSTRAINT movie_tag_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE movie_tag ADD CONSTRAINT movie_tag_tag_id_fk FOREIGN KEY (tag_id) REFERENCES tag (tag_id) ON DELETE CASCADE;
-ALTER TABLE playlist_movie ADD CONSTRAINT playlist_movie_playlist_id_fk FOREIGN KEY (playlist_id) REFERENCES playlist (playlist_id) ON DELETE CASCADE;
-ALTER TABLE playlist_movie ADD CONSTRAINT playlist_movie_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE ranking_item ADD CONSTRAINT ranking_item_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE subtitle ADD CONSTRAINT subtitle_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (movie_id) ON DELETE CASCADE;
-ALTER TABLE system_notification ADD CONSTRAINT system_notification_related_task_run_id_fk FOREIGN KEY (related_task_run_id) REFERENCES background_task_run (related_task_run_id) ON DELETE SET NULL;
-ALTER TABLE video_collection_item ADD CONSTRAINT video_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES video_collection (collection_id) ON DELETE CASCADE;
-ALTER TABLE video_collection_item ADD CONSTRAINT video_collection_item_video_item_id_fk FOREIGN KEY (video_item_id) REFERENCES video_item (video_item_id) ON DELETE CASCADE;
-ALTER TABLE video_item ADD CONSTRAINT video_item_cover_image_id_fk FOREIGN KEY (cover_image_id) REFERENCES image (cover_image_id) ON DELETE SET NULL;
+ALTER TABLE media ADD CONSTRAINT media_video_item_id_fk FOREIGN KEY (video_item_id) REFERENCES video_item (id) ON DELETE CASCADE;
+ALTER TABLE media ADD CONSTRAINT media_library_id_fk FOREIGN KEY (library_id) REFERENCES media_library (id) ON DELETE CASCADE;
+ALTER TABLE media_clip ADD CONSTRAINT media_clip_media_id_fk FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE SET NULL;
+ALTER TABLE media_point ADD CONSTRAINT media_point_media_id_fk FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE SET NULL;
+ALTER TABLE media_point ADD CONSTRAINT media_point_thumbnail_id_fk FOREIGN KEY (thumbnail_id) REFERENCES media_thumbnail (id) ON DELETE SET NULL;
+ALTER TABLE media_point ADD CONSTRAINT media_point_image_id_fk FOREIGN KEY (image_id) REFERENCES image (id) ON DELETE RESTRICT;
+ALTER TABLE media_progress ADD CONSTRAINT media_progress_media_id_fk FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE CASCADE;
+ALTER TABLE media_thumbnail ADD CONSTRAINT media_thumbnail_media_id_fk FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE CASCADE;
+ALTER TABLE media_thumbnail ADD CONSTRAINT media_thumbnail_image_id_fk FOREIGN KEY (image_id) REFERENCES image (id) ON DELETE CASCADE;
+ALTER TABLE moment_collection_item ADD CONSTRAINT moment_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES moment_collection (id) ON DELETE CASCADE;
+ALTER TABLE moment_collection_item ADD CONSTRAINT moment_collection_item_point_id_fk FOREIGN KEY (point_id) REFERENCES media_point (id) ON DELETE CASCADE;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_media_id_fk FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE CASCADE;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_thumbnail_id_fk FOREIGN KEY (thumbnail_id) REFERENCES media_thumbnail (id) ON DELETE CASCADE;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_seed_point_id_fk FOREIGN KEY (seed_point_id) REFERENCES media_point (id) ON DELETE SET NULL;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_seed_thumbnail_id_fk FOREIGN KEY (seed_thumbnail_id) REFERENCES media_thumbnail (id) ON DELETE SET NULL;
+ALTER TABLE moment_recommendation ADD CONSTRAINT moment_recommendation_source_movie_id_fk FOREIGN KEY (source_movie_id) REFERENCES movie (id) ON DELETE SET NULL;
+ALTER TABLE movie ADD CONSTRAINT movie_cover_image_id_fk FOREIGN KEY (cover_image_id) REFERENCES image (id) ON DELETE SET NULL;
+ALTER TABLE movie ADD CONSTRAINT movie_thin_cover_image_id_fk FOREIGN KEY (thin_cover_image_id) REFERENCES image (id) ON DELETE SET NULL;
+ALTER TABLE movie ADD CONSTRAINT movie_series_id_fk FOREIGN KEY (series_id) REFERENCES movie_series (id) ON DELETE SET NULL;
+ALTER TABLE movie_actor ADD CONSTRAINT movie_actor_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE movie_actor ADD CONSTRAINT movie_actor_actor_id_fk FOREIGN KEY (actor_id) REFERENCES actor (id) ON DELETE CASCADE;
+ALTER TABLE movie_plot_image ADD CONSTRAINT movie_plot_image_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE movie_plot_image ADD CONSTRAINT movie_plot_image_image_id_fk FOREIGN KEY (image_id) REFERENCES image (id) ON DELETE CASCADE;
+ALTER TABLE movie_tag ADD CONSTRAINT movie_tag_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE movie_tag ADD CONSTRAINT movie_tag_tag_id_fk FOREIGN KEY (tag_id) REFERENCES tag (id) ON DELETE CASCADE;
+ALTER TABLE playlist_movie ADD CONSTRAINT playlist_movie_playlist_id_fk FOREIGN KEY (playlist_id) REFERENCES playlist (id) ON DELETE CASCADE;
+ALTER TABLE playlist_movie ADD CONSTRAINT playlist_movie_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE ranking_item ADD CONSTRAINT ranking_item_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE subtitle ADD CONSTRAINT subtitle_movie_id_fk FOREIGN KEY (movie_id) REFERENCES movie (id) ON DELETE CASCADE;
+ALTER TABLE system_notification ADD CONSTRAINT system_notification_related_task_run_id_fk FOREIGN KEY (related_task_run_id) REFERENCES background_task_run (id) ON DELETE SET NULL;
+ALTER TABLE video_collection_item ADD CONSTRAINT video_collection_item_collection_id_fk FOREIGN KEY (collection_id) REFERENCES video_collection (id) ON DELETE CASCADE;
+ALTER TABLE video_collection_item ADD CONSTRAINT video_collection_item_video_item_id_fk FOREIGN KEY (video_item_id) REFERENCES video_item (id) ON DELETE CASCADE;
+ALTER TABLE video_item ADD CONSTRAINT video_item_cover_image_id_fk FOREIGN KEY (cover_image_id) REFERENCES image (id) ON DELETE SET NULL;
 
 -- 索引
 
@@ -585,9 +585,9 @@ CREATE INDEX IF NOT EXISTS media_library_name_idx ON media_library (name);
 CREATE INDEX IF NOT EXISTS media_library_provider_key_idx ON media_library (provider_key);
 CREATE INDEX IF NOT EXISTS media_point_offset_seconds_idx ON media_point (offset_seconds);
 CREATE UNIQUE INDEX IF NOT EXISTS media_progress_media_id_uniq ON media_progress (media_id);
-CREATE UNIQUE INDEX IF NOT EXISTS media_thumbnail_media_id_offset_uniq ON media_thumbnail (media_id, offset);
+CREATE UNIQUE INDEX IF NOT EXISTS media_thumbnail_media_id_offset_uniq ON media_thumbnail (media_id, "offset");
 CREATE INDEX IF NOT EXISTS media_thumbnail_image_search_index_status_id_idx ON media_thumbnail (image_search_index_status, id);
-CREATE INDEX IF NOT EXISTS media_thumbnail_offset_idx ON media_thumbnail (offset);
+CREATE INDEX IF NOT EXISTS media_thumbnail_offset_idx ON media_thumbnail ("offset");
 CREATE UNIQUE INDEX IF NOT EXISTS moment_collection_owner_plugin_id_plugin_key_uniq ON moment_collection (owner_plugin_id, plugin_key);
 CREATE UNIQUE INDEX IF NOT EXISTS moment_collection_item_collection_id_point_id_uniq ON moment_collection_item (collection_id, point_id);
 CREATE INDEX IF NOT EXISTS moment_collection_item_position_idx ON moment_collection_item (position);

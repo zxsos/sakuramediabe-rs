@@ -28,7 +28,7 @@ use crate::common::update::UpdateSet;
 use crate::error::DbError;
 use crate::transfers::downloads::{download_state, import_status, DownloadTask};
 
-use super::movie::{bind_value, safe_sql};
+use super::movie::{bind_value_exec, safe_sql};
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "DownloadTask";
@@ -85,6 +85,13 @@ impl DownloadTaskRepository {
     ///
     /// 唯一索引 `(client, remote_id)` 让重复提交命中约束而非产生第二条
     /// —— 这是幂等提交的基础，所以**先查后插**在这里是安全的。
+    /// 按主键查询，未命中返回 [`DbError::NotFound`]。
+    pub async fn require_by_id(&self, id: i32) -> Result<DownloadTask, DbError> {
+        self.find_by_id(id)
+            .await?
+            .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
     pub async fn find_by_remote(
         &self,
         client_id: i32,
@@ -244,21 +251,25 @@ impl DownloadTaskRepository {
     /// 所以**不导出**。
     async fn persist(&self, id: i32, mut set: UpdateSet<'_>) -> Result<DownloadTask, DbError> {
         set.touch();
-        let assignments = set.assignments(2);
+        // 字段从 $1 起、id 放最后 —— 与 SET/WHERE 的书写顺序一致。
+        let assignments = set.assignments(1);
         let fields = set.finish(ENTITY)?;
-        let sql = format!("UPDATE download_task SET {assignments} WHERE id = $1");
-
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, DownloadTask>(safe_sql(sql)).bind(id),
-            |query, (_, value)| bind_value(query, value),
+        let sql = format!(
+            "UPDATE download_task SET {assignments} WHERE id = ${}",
+            fields.len() + 1
         );
 
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
     }
 }
 

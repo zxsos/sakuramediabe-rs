@@ -88,7 +88,10 @@ pub struct Media {
     pub movie_number: Option<String>,
     /// 指向 `VideoItem.id`。
     pub video_item_id: Option<i32>,
-    pub library_id: i64,
+    /// DDL 是 integer（与 media_library.id 同宽），所以是 i32 而非 i64。
+    /// 写成 i64 时对拍查不出来（它只看列名/可空性/规范化类型名的映射），
+    /// 只有集成测试真解码才会报 ColumnDecode。
+    pub library_id: i32,
 
     /// 不透明存储引用，结构由 provider 定义。`JsonTextField`。
     pub storage_ref: Option<String>,

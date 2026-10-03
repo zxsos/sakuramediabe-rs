@@ -29,11 +29,12 @@
 use sm_db::common::guard::WriteSource;
 use sm_db::common::update::UpdateSet;
 use sm_db::error::DbError;
-use sm_db::repo::{DownloadTaskRepository, MediaRepository, MovieRepository, NewDownloadTask};
+use sm_db::repo::{DownloadTaskRepository, MediaRepository, MovieRepository};
 use sm_db::testing::TestDb;
 
 mod fixtures {
     use sm_db::repo::NewMovie;
+    use sqlx::{PgPool, Row};
 
     pub fn movie(number: &str) -> NewMovie {
         NewMovie {
@@ -43,19 +44,85 @@ mod fixtures {
         }
     }
 
-    pub fn media_for_movie(number: &str) -> sm_db::repo::media::NewMedia {
+    /// 建一个 media_library 并返回它的 id。
+    ///
+    /// 必须显式建：`media.library_id` 与 `download_client.library_id` 都是
+    /// NOT NULL 外键，测试库里没有现成的库行。这正是外键约束在起作用。
+    pub async fn library(pool: &PgPool) -> i32 {
+        sqlx::query(
+            "INSERT INTO media_library (name, provider_key, provider_config, created_at, updated_at)
+             VALUES ('test-lib', 'test', '', now(), now())
+             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+             RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .map(|r| r.get::<i32, _>(0))
+        .expect("media_library insert")
+    }
+
+    /// 建一个 download_client 并返回它的 id（`download_task.client_id` 指向它）。
+    pub async fn download_client(pool: &PgPool) -> i32 {
+        let library_id = library(pool).await;
+        sqlx::query(
+            "INSERT INTO download_client (name, provider_config, library_id, created_at, updated_at)
+             VALUES ('test-client', '', $1, now(), now())
+             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+             RETURNING id",
+        )
+        .bind(library_id)
+        .fetch_one(pool)
+        .await
+        .map(|r| r.get::<i32, _>(0))
+        .expect("download_client insert")
+    }
+
+    /// 造一条挂到指定库下的 Media。
+    ///
+    /// `media.movie_number` 有外键指向 `movie.movie_number`（**字符串**，
+    /// 不是 id），所以必须先把影片建出来 —— 顺序反了就是
+    /// `media_movie_number_fk` 违反。这条外键也正是「影片删除会级联
+    /// 删除媒体」的实现方式。
+    pub async fn media_for_movie(pool: &PgPool, number: &str) -> sm_db::repo::media::NewMedia {
+        let library_id = library(pool).await;
+
+        // 先确保影片存在（ON CONFLICT 让同一测试里多次调用也安全）。
+        sqlx::query(
+            "INSERT INTO movie (movie_number, title, summary, created_at, updated_at)
+             VALUES ($1, $2, '', now(), now())
+             ON CONFLICT (movie_number) DO UPDATE SET movie_number = EXCLUDED.movie_number",
+        )
+        .bind(number)
+        .bind(format!("{number} 标题"))
+        .execute(pool)
+        .await
+        .expect("movie insert for media fixture");
+
         sm_db::repo::media::NewMedia {
-            library_id: 1,
+            library_id,
             file_name: format!("{number}.mp4"),
             file_size_bytes: 1024,
             movie_number: Some(number.to_owned()),
             video_item_id: None,
-            storage_ref: None,
+            // storage_ref 是 JsonTextField(default=dict) -> NOT NULL DEFAULT '{}'，
+            // 显式给值更贴近真实写入路径。
+            storage_ref: Some("{}".to_owned()),
             resolution: Some("1080p".to_owned()),
             file_hash: None,
             import_source_identity: None,
             duration_seconds: Some(120),
             video_info: None,
+        }
+    }
+
+    /// 造一条 DownloadTask（自动建好 client 前置行）。
+    pub async fn download_task(pool: &PgPool, remote_id: &str) -> sm_db::repo::NewDownloadTask {
+        let client_id = download_client(pool).await;
+        sm_db::repo::NewDownloadTask {
+            client_id,
+            remote_id: remote_id.to_owned(),
+            name: "任务".to_owned(),
+            movie_number: None,
         }
     }
 }
@@ -101,7 +168,7 @@ async fn jsonb_text_column_tolerates_null_and_roundtrips() {
     };
     let repo = MediaRepository::new(db.pool().clone());
 
-    let mut m = fixtures::media_for_movie("ABC-002");
+    let mut m = fixtures::media_for_movie(db.pool(), "ABC-002").await;
     m.video_info = Some(serde_json::json!({"codec": "h264", "bitrate": 4500}));
     let created = repo.insert(&m).await.expect("插入失败");
 
@@ -157,12 +224,7 @@ async fn download_task_defaults_come_from_schema() {
     let repo = DownloadTaskRepository::new(db.pool().clone());
 
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-1".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-1").await)
         .await
         .expect("插入失败");
 
@@ -248,7 +310,7 @@ async fn media_rejects_both_parents_present() {
     };
     let repo = MediaRepository::new(db.pool().clone());
 
-    let mut m = fixtures::media_for_movie("ABC-007");
+    let mut m = fixtures::media_for_movie(db.pool(), "ABC-007").await;
     m.video_item_id = Some(1); // 两者都非空
     let err = repo.insert(&m).await.expect_err("XOR 不变量必须拒绝");
 
@@ -268,7 +330,7 @@ async fn media_rejects_no_parent() {
     };
     let repo = MediaRepository::new(db.pool().clone());
 
-    let mut m = fixtures::media_for_movie("ABC-008");
+    let mut m = fixtures::media_for_movie(db.pool(), "ABC-008").await;
     m.movie_number = None; // 两者都空
     m.video_item_id = None;
     assert!(repo.insert(&m).await.is_err(), "无归属的 Media 必须被拒绝");
@@ -283,14 +345,14 @@ async fn media_accepts_either_parent() {
 
     // 挂 movie（JAV）
     let jav = repo
-        .insert(&fixtures::media_for_movie("ABC-009"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-009").await)
         .await
         .expect("movie 归属应被接受");
     assert!(jav.satisfies_owner_constraint());
     assert!(jav.movie_number.is_some());
 
     // 挂 video_item（非 JAV）
-    let mut non_jav = fixtures::media_for_movie("ABC-010");
+    let mut non_jav = fixtures::media_for_movie(db.pool(), "ABC-010").await;
     non_jav.movie_number = None;
     non_jav.video_item_id = Some(42);
     let created = repo
@@ -309,7 +371,7 @@ async fn media_update_prechecks_the_xor_invariant() {
     };
     let repo = MediaRepository::new(db.pool().clone());
     let created = repo
-        .insert(&fixtures::media_for_movie("ABC-011"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-011").await)
         .await
         .unwrap();
 
@@ -404,12 +466,7 @@ async fn the_two_state_machines_move_independently() {
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-2".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: Some("ABC-015".to_owned()),
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-2").await)
         .await
         .unwrap();
 
@@ -439,12 +496,7 @@ async fn completed_state_requires_a_source_ref() {
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-3".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-3").await)
         .await
         .unwrap();
 
@@ -463,12 +515,7 @@ async fn download_done_but_import_failed_is_expressible_and_listable() {
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-4".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-4").await)
         .await
         .unwrap();
 
@@ -497,12 +544,7 @@ async fn progress_outside_unit_range_is_rejected() {
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-5".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-5").await)
         .await
         .unwrap();
 
@@ -521,12 +563,7 @@ async fn unknown_state_literals_are_rejected() {
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-6".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-6").await)
         .await
         .unwrap();
 
@@ -635,7 +672,7 @@ async fn thumbnail_failure_is_retryable_and_success_is_terminal() {
     };
     let repo = MediaRepository::new(db.pool().clone());
     let created = repo
-        .insert(&fixtures::media_for_movie("ABC-020"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-020").await)
         .await
         .unwrap();
 
@@ -678,7 +715,7 @@ async fn pending_thumbnail_scan_only_returns_expired_retries() {
 
     // 到期重试
     let expired = repo
-        .insert(&fixtures::media_for_movie("ABC-021"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-021").await)
         .await
         .unwrap();
     repo.record_thumbnail_failure(expired.id, "boom", now - chrono::Duration::minutes(1))
@@ -687,7 +724,7 @@ async fn pending_thumbnail_scan_only_returns_expired_retries() {
 
     // 未到期重试
     let pending = repo
-        .insert(&fixtures::media_for_movie("ABC-022"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-022").await)
         .await
         .unwrap();
     repo.record_thumbnail_failure(pending.id, "boom", now + chrono::Duration::hours(1))
@@ -696,7 +733,7 @@ async fn pending_thumbnail_scan_only_returns_expired_retries() {
 
     // 仍是 pending 态（从未失败过）
     let fresh = repo
-        .insert(&fixtures::media_for_movie("ABC-023"))
+        .insert(&fixtures::media_for_movie(db.pool(), "ABC-023").await)
         .await
         .unwrap();
 
@@ -785,12 +822,7 @@ async fn claim_queued_moves_task_to_submitted() {
     assert!(repo.claim_queued().await.unwrap().is_none(), "空队列领不到");
 
     let created = repo
-        .insert(&NewDownloadTask {
-            client_id: 1,
-            remote_id: "remote-7".to_owned(),
-            name: "任务".to_owned(),
-            movie_number: None,
-        })
+        .insert(&fixtures::download_task(db.pool(), "remote-7").await)
         .await
         .unwrap();
     assert_eq!(created.state, "queued");
@@ -810,16 +842,11 @@ async fn idempotent_submit_relies_on_the_unique_index() {
         return;
     };
     let repo = DownloadTaskRepository::new(db.pool().clone());
-    let payload = || NewDownloadTask {
-        client_id: 1,
-        remote_id: "remote-8".to_owned(),
-        name: "任务".to_owned(),
-        movie_number: None,
-    };
+    let payload = || fixtures::download_task(db.pool(), "remote-8");
 
-    repo.insert(&payload()).await.unwrap();
+    repo.insert(&payload().await).await.unwrap();
     let err = repo
-        .insert(&payload())
+        .insert(&payload().await)
         .await
         .expect_err("重复提交应命中唯一索引");
     assert!(

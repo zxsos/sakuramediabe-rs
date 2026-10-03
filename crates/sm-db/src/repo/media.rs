@@ -25,7 +25,7 @@ use crate::common::update::UpdateSet;
 use crate::error::DbError;
 use crate::playback::media::{thumbnail_state, Media};
 
-use super::movie::{bind_value, safe_sql};
+use super::movie::{bind_value_exec, safe_sql};
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "Media";
@@ -188,21 +188,26 @@ impl MediaRepository {
         }
 
         set.touch();
-        let assignments = set.assignments(2);
+        // 字段从 $1 起、id 放最后 —— 与 SET/WHERE 的书写顺序一致，
+        // 读者不需要在脑子里做逆序映射。
+        let assignments = set.assignments(1);
         let fields = set.finish(ENTITY)?;
-        let sql = format!("UPDATE media SET {assignments} WHERE id = $1");
-
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, Media>(safe_sql(sql)).bind(id),
-            |query, (_, value)| bind_value(query, value),
+        let sql = format!(
+            "UPDATE media SET {assignments} WHERE id = ${}",
+            fields.len() + 1
         );
 
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
     }
 
     /// 列出待生成缩略图的媒体。
