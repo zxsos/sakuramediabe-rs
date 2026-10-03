@@ -252,6 +252,13 @@ def parse_rust() -> dict:
 
             # 宏生成 / 宏声明的类型没有可见的 `pub struct`，只能靠显式
             # 导出的清单参与对拍。少了这一步，三张合集表会游离在检查之外。
+            #
+            # 但清单里**只有列名，没有类型** —— 所以这些列的名字参与检查，
+            # 类型不参与。下面用 COLUMNS_CONST 标记，判定处会跳过。
+            #
+            # 这不是「类型由别处保证」，是一个真实的盲区：`ordered_collection_item!`
+            # 曾把三个外键列声明成 i64（DDL 是 integer），对拍报 0 problems
+            # 整整几轮，因为这里没有类型可比。
             for dm in DECLARE_RE.finditer(text):
                 sname = dm.group(1).split("::")[-1]
                 table = dm.group(2)
