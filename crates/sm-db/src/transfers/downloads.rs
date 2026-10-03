@@ -216,10 +216,21 @@ pub struct DownloadResourceBlacklist {
     pub updated_at: Option<NaiveDateTime>,
 }
 
+/// 校验是否为合法的 40 位 hex（v1 info hash）。
+///
+/// **模块级而非挂在某张表上**：`info_hash` 的规范化规则被
+/// `download_resource_blacklist` 与 `download_submission_record` 共用 ——
+/// 后者要与前者比对才能知道「这个资源是不是被拉黑过」。挂在其中一张表
+/// 上会让另一张表的调用方写出一句读不通的话
+/// （`Blacklist::is_valid_info_hash(某次提交的 hash)`）。
+pub fn is_valid_info_hash(hash: &str) -> bool {
+    hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl DownloadResourceBlacklist {
     /// 校验是否为合法的 40 位 hex。
     pub fn is_valid_info_hash(hash: &str) -> bool {
-        hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        is_valid_info_hash(hash)
     }
 }
 
