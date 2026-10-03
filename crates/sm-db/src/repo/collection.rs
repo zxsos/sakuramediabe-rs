@@ -41,7 +41,10 @@
 
 use sqlx::PgPool;
 
-use crate::collections::{ClipCollection, MomentCollection, Playlist, PluginOwned};
+use crate::collections::{
+    ClipCollection, ClipCollectionItem, MomentCollection, MomentCollectionItem, Playlist,
+    PlaylistMovie, PluginOwned,
+};
 use crate::common::page::{Page, PageRequest};
 use crate::error::DbError;
 use crate::paged_list;
@@ -51,6 +54,10 @@ use super::ctx::Ctx;
 /// 三个合集共用一个错误实体名 —— 它们在 API 层是同一种资源，
 /// 报错时说「Playlist」比说「ClipCollection」更贴近调用方的心智模型。
 const COLLECTION_ENTITY: &str = "Collection";
+
+/// `playlist_movie` 单独一个错误实体名 —— 它是「列表 × 影片」的关联行，
+/// 与三个合集本体不是同一种资源，混用会让排障时分不清是哪张表出错。
+const PLAYLIST_MOVIE_ENTITY: &str = "PlaylistMovie";
 /// 新建一个合集。
 #[derive(Debug, Clone)]
 pub struct NewCollection<C> {
@@ -160,7 +167,8 @@ impl<C> NewCollection<C> {
 macro_rules! impl_collection_repo {
     (
         $repo:ident, $model:ty, $table:literal, $new:ty,
-        $kind_cols:literal, $kind_placeholder:literal, $kind_bind:expr
+        $kind_cols:literal, $kind_placeholder:literal, $values_tail:literal,
+        $kind_bind:expr
     ) => {
         #[doc = concat!("`", $table, "` 表仓储。")]
         #[derive(Debug, Clone)]
@@ -260,10 +268,31 @@ macro_rules! impl_collection_repo {
             /// 之间不冲突，而 `(A, NULL)` 与 `(B, NULL)` **也不**冲突，
             /// 于是两个不同的插件可以用同一个 key 而互不报错。那是半配置
             /// 状态造出的真实漏洞，入口处拒掉。
+            ///
+            /// # `$values_tail` 为什么必须随 `kind` 而变
+            ///
+            /// 两种形态都绑**六个**值，第五个是 `$kind_bind`：
+            ///
+            /// | 形态 | 第五个绑定 | `VALUES` 尾部 |
+            /// |---|---|---|
+            /// | 有 `kind` 列 | `kind`（`Option<&str>`） | `, $6, $6)` |
+            /// | 无 `kind` 列 | `now`（`NaiveDateTime`） | `, $5, $6)` |
+            ///
+            /// 早先的版本让第五个绑定恒为 `kind`，并统一写 `, $5, $5)`。
+            /// 对没有 `kind` 列的两个合集，`$5` 就落进了 `created_at`
+            /// —— 而它绑的是 `Option<&str>`，于是 PostgreSQL 报：
+            ///
+            /// ```text
+            /// column "created_at" is of type timestamp without time zone
+            /// but expression is of type text
+            /// ```
+            ///
+            /// 这个缺陷从父表仓储落地起就存在，且从未被触发过 ——
+            /// 合集族此前**没有任何测试**。
             pub async fn insert(&self, new: &$new) -> Result<$model, DbError> {
                 let (owner, key) = new.owner_pair()?;
                 let now = crate::common::time::now_utc();
-                let kind = $kind_bind(new);
+                let fifth = $kind_bind(new);
                 sqlx::query_as::<_, $model>(concat!(
                     "INSERT INTO ",
                     $table,
@@ -272,13 +301,13 @@ macro_rules! impl_collection_repo {
                     ", created_at, updated_at) ",
                     "VALUES ($1, $2, $3, $4",
                     $kind_placeholder,
-                    ", $5, $5) RETURNING *",
+                    $values_tail,
                 ))
                 .bind(new.name.trim())
                 .bind(new.description.trim())
                 .bind(owner)
                 .bind(key)
-                .bind(kind)
+                .bind(fifth)
                 .bind(now)
                 .fetch_one(&self.pool)
                 .await
@@ -286,6 +315,10 @@ macro_rules! impl_collection_repo {
             }
 
             /// 事务内变体，供 [`Ctx`] 编排多表写入时使用。
+            ///
+            /// 与 [`Self::insert`] 共用同一套占位符编号 —— 两条路径各自
+            /// 抄一份 SQL 是最容易让它们悄悄分叉的地方，所以编号规则写在
+            /// 宏参数里。
             pub async fn insert_in(
                 &self,
                 ctx: &mut Ctx<'_>,
@@ -293,7 +326,7 @@ macro_rules! impl_collection_repo {
             ) -> Result<$model, DbError> {
                 let (owner, key) = new.owner_pair()?;
                 let now = crate::common::time::now_utc();
-                let kind = $kind_bind(new);
+                let fifth = $kind_bind(new);
                 sqlx::query_as::<_, $model>(concat!(
                     "INSERT INTO ",
                     $table,
@@ -302,13 +335,13 @@ macro_rules! impl_collection_repo {
                     ", created_at, updated_at) ",
                     "VALUES ($1, $2, $3, $4",
                     $kind_placeholder,
-                    ", $5, $5) RETURNING *",
+                    $values_tail,
                 ))
                 .bind(new.name.trim())
                 .bind(new.description.trim())
                 .bind(owner)
                 .bind(key)
-                .bind(kind)
+                .bind(fifth)
                 .bind(now)
                 .fetch_one(ctx.conn().await?.as_conn())
                 .await
@@ -326,21 +359,47 @@ macro_rules! impl_collection_repo {
         }
     };
 }
-/// `Playlist.kind` 在两个时刻/片段合集里不存在，所以那两个仓储传一个
-/// 取值为 `Option<&str>` 的恒定 `None` 表达式 —— 占位符照常占位，绑的是
-/// NULL，而那两列不存在、这段 SQL 根本不会被用到。
+/// 时刻/片段合集**没有** `kind` 列，所以第五个绑定是 `now` 而不是 `kind`。
 ///
-/// 写成 `""` 的话，SQL 会试图往一个**不存在的列**插值。
-fn no_kind<C>(_new: &NewCollection<C>) -> Option<&'static str> {
-    None
+/// 返回 `NaiveDateTime` 而**不是** `None` —— 第五个绑定在两种形态下占据
+/// 的位置不同：
+///
+/// | 形态 | `$5` 是 | `$6` 是 |
+/// |---|---|---|
+/// | 有 `kind` 列 | `kind` | `now`（created_at 与 updated_at 共用） |
+/// | 无 `kind` 列 | `now`（created_at） | `now`（updated_at） |
+///
+/// 早先的版本让这个函数返回 `None`，而 `VALUES` 尾部恒为 `, $5, $5)` ——
+/// 于是 `None` 落进了 `created_at`（timestamp），PostgreSQL 报
+/// `column "created_at" is of type timestamp without time zone but
+/// expression is of type text`。
+///
+/// 合集族的父表仓储在此之前从未被执行过 —— 这就是它藏了多久的原因。
+fn no_kind<C>(_new: &NewCollection<C>) -> chrono::NaiveDateTime {
+    crate::common::time::now_utc()
 }
 
-/// `Playlist` 的 `kind` 取值：未指定时留 `None`，让列的 DEFAULT 生效。
+/// `Playlist` 的 `kind` 取值。
 ///
-/// 空白串按「没指定」处理 —— `kind` 是 `varchar(64)` 而非枚举，写进空串
-/// 会让 `Playlist::is_system()` 判 false，而那显然不是调用方的意图。
-fn playlist_kind(new: &NewCollection<Playlist>) -> Option<&str> {
-    new.kind.as_deref().map(str::trim).filter(|s| !s.is_empty())
+/// **未指定时回落成 [`Playlist::default_kind`]，而不是 `None`。**
+///
+/// `playlist.kind` 是 `varchar(64) NOT NULL` 且**没有 DEFAULT**，所以绑
+/// `None` 就是绑 NULL，直接违反约束：
+///
+/// ```text
+/// ConstraintViolation { entity: "Collection", constraint: "not_null_violation" }
+/// ```
+///
+/// 模型上早就写着 `Playlist::default_kind()`，而仓储没有调用它 ——
+/// 注释里反而写着「留 `None`，让列的 DEFAULT 生效」，而那个 DEFAULT
+/// 并不存在。合集族此前没有任何测试，所以这条路径从未被执行。
+fn playlist_kind(new: &NewCollection<Playlist>) -> String {
+    new.kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| Playlist::default_kind())
+        .to_owned()
 }
 
 impl_collection_repo!(
@@ -350,6 +409,7 @@ impl_collection_repo!(
     NewCollection<Playlist>,
     ", kind",
     ", $5",
+    ", $6, $6) RETURNING *",
     playlist_kind
 );
 
@@ -360,6 +420,7 @@ impl_collection_repo!(
     NewCollection<MomentCollection>,
     "",
     "",
+    ", $5, $6) RETURNING *",
     no_kind::<MomentCollection>
 );
 
@@ -370,6 +431,7 @@ impl_collection_repo!(
     NewCollection<ClipCollection>,
     "",
     "",
+    ", $5, $6) RETURNING *",
     no_kind::<ClipCollection>
 );
 /// 三个合集的分页方法**手写**而不放进宏。
@@ -423,7 +485,7 @@ impl_paged!(
     Playlist,
     "SELECT COUNT(*) FROM playlist",
     "SELECT * FROM playlist ORDER BY name LIMIT $1 OFFSET $2",
-    "SELECT COUNT(*) FROM playlist WHERE owner_plugin_id = $1",
+    "SELECT COUNT(*) FROM playlist WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL",
     "SELECT * FROM playlist WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL \
      ORDER BY name LIMIT $2 OFFSET $3"
 );
@@ -433,7 +495,7 @@ impl_paged!(
     MomentCollection,
     "SELECT COUNT(*) FROM moment_collection",
     "SELECT * FROM moment_collection ORDER BY name LIMIT $1 OFFSET $2",
-    "SELECT COUNT(*) FROM moment_collection WHERE owner_plugin_id = $1",
+    "SELECT COUNT(*) FROM moment_collection WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL",
     "SELECT * FROM moment_collection WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL \
      ORDER BY name LIMIT $2 OFFSET $3"
 );
@@ -443,7 +505,334 @@ impl_paged!(
     ClipCollection,
     "SELECT COUNT(*) FROM clip_collection",
     "SELECT * FROM clip_collection ORDER BY name LIMIT $1 OFFSET $2",
-    "SELECT COUNT(*) FROM clip_collection WHERE owner_plugin_id = $1",
+    "SELECT COUNT(*) FROM clip_collection WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL",
     "SELECT * FROM clip_collection WHERE owner_plugin_id = $1 AND plugin_key IS NOT NULL \
      ORDER BY name LIMIT $2 OFFSET $3"
 );
+
+// ================================================================ 成员表
+
+/// 生成两张「有序合集成员表」的仓储。
+///
+/// `moment_collection_item` 与 `clip_collection_item` 只差两样：表名，与
+/// 成员外键的列名。七个方法因此**必然**一致 —— 追加、按序列出、解绑、
+/// 清空、插入到指定位置、替换全部。
+///
+/// # `position` 不在唯一索引里
+///
+/// 唯一索引是 `(collection_id, <成员>)`，**不含 `position`**。所以数据库
+/// 保证的是「同一成员不会在同一个合集里出现两次」，而**不**保证
+/// 「不同成员的 position 互不相同」。两个成员完全可以同处一个 position。
+///
+/// 这一点决定下面两个方法的行为：
+///
+/// - `append` 用 `max(position) + 1` 算新位置。并发调用会算出同一个值
+///   —— 结果仍确定（并列按 `id` 排），但不是「一个接一个」。要严格有序
+///   就用 `replace_all` 或 `insert_at`，它们写调用方给的确定值。
+/// - `unlink` **不重排**留下的空位。删中间一个就为补洞而重写全部
+///   `position`，代价是 O(n) 次写，且会让并发读者看到中间状态。缺口在
+///   播放时不可见（`ORDER BY position, id` 仍给出确定顺序）。
+macro_rules! impl_ordered_member_repo {
+    (
+        $repo:ident, $model:ty, $table:literal, $member:literal, $entity:literal
+    ) => {
+        #[doc = concat!("`", $table, "` 表仓储：有序合集成员。")]
+        #[derive(Debug, Clone)]
+        pub struct $repo {
+            pool: PgPool,
+        }
+
+        impl $repo {
+            pub fn new(pool: PgPool) -> Self {
+                Self { pool }
+            }
+
+            pub fn pool(&self) -> &PgPool {
+                &self.pool
+            }
+
+            /// 追加到末尾。位置为当前最大值加一。
+            ///
+            /// **不**声称并发安全：两个并发 `append` 会算出同一个位置。
+            /// 结果仍确定（并列按 `id` 排），但不是「一个接一个」。
+            /// 需要严格有序时用 `replace_all`。
+            pub async fn append(
+                &self,
+                collection_id: i32,
+                member_id: i32,
+            ) -> Result<$model, DbError> {
+                let now = crate::common::time::now_utc();
+                sqlx::query_as::<_, $model>(concat!(
+                    "INSERT INTO ",
+                    $table,
+                    " (collection_id, ",
+                    $member,
+                    ", position, created_at, updated_at) ",
+                    "VALUES ($1, $2, ",
+                    "  COALESCE((SELECT max(position) FROM ",
+                    $table,
+                    "              WHERE collection_id = $1), -1) + 1, ",
+                    "  $3, $3) ",
+                    "RETURNING *",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .bind(now)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity($entity))
+            }
+            /// 插到指定位置。**不**检查该位置是否已被占用。
+            ///
+            /// 唯一索引不含 `position`，所以数据库不会拦重复位置 ——
+            /// 那是**调用方**要保证的事（拖拽排序会算出目标位置）。
+            pub async fn insert_at(
+                &self,
+                collection_id: i32,
+                member_id: i32,
+                position: i32,
+            ) -> Result<$model, DbError> {
+                let now = crate::common::time::now_utc();
+                sqlx::query_as::<_, $model>(concat!(
+                    "INSERT INTO ",
+                    $table,
+                    " (collection_id, ",
+                    $member,
+                    ", position, created_at, updated_at) ",
+                    "VALUES ($1, $2, $3, $4, $4) RETURNING *",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .bind(position)
+                .bind(now)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity($entity))
+            }
+
+            /// 事务内变体，供 [`Ctx`] 编排多表写入时使用。
+            pub async fn insert_at_in(
+                &self,
+                ctx: &mut Ctx<'_>,
+                collection_id: i32,
+                member_id: i32,
+                position: i32,
+            ) -> Result<$model, DbError> {
+                let now = crate::common::time::now_utc();
+                sqlx::query_as::<_, $model>(concat!(
+                    "INSERT INTO ",
+                    $table,
+                    " (collection_id, ",
+                    $member,
+                    ", position, created_at, updated_at) ",
+                    "VALUES ($1, $2, $3, $4, $4) RETURNING *",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .bind(position)
+                .bind(now)
+                .fetch_one(ctx.conn().await?.as_conn())
+                .await
+                .map_err(|e| DbError::from(e).with_entity($entity))
+            }
+
+            /// 按播放顺序列出某个合集的全部成员。**刻意不分页。**
+            ///
+            /// 一次「读出整个合集去播」的查询，分页只会让 worker 反复取
+            /// 第 1 页。`ORDER BY position, id` —— `id` 作次级键是必要的：
+            /// 位置可以并列（唯一索引不含它），只按 `position` 排序时并列
+            /// 之间的顺序不确定，会导致播放列表抖动。
+            ///
+            /// 与 `PlaylistMovieRepository::list_by_playlist` 的区别：
+            /// 那张表没有 `position`，顺序只能靠加入先后。
+            pub async fn list_by_collection(
+                &self,
+                collection_id: i32,
+            ) -> Result<Vec<$model>, DbError> {
+                Ok(sqlx::query_as::<_, $model>(concat!(
+                    "SELECT * FROM ",
+                    $table,
+                    " WHERE collection_id = $1 ORDER BY position, id",
+                ))
+                .bind(collection_id)
+                .fetch_all(&self.pool)
+                .await?)
+            }
+            /// 解绑一个成员。返回是否真的删掉了一行。
+            ///
+            /// **不重排**留下的 `position` 空位 —— 见宏的文档。
+            pub async fn unlink(
+                &self,
+                collection_id: i32,
+                member_id: i32,
+            ) -> Result<bool, DbError> {
+                let result = sqlx::query(concat!(
+                    "DELETE FROM ",
+                    $table,
+                    " WHERE collection_id = $1 AND ",
+                    $member,
+                    " = $2",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .execute(&self.pool)
+                .await?;
+                Ok(result.rows_affected() > 0)
+            }
+
+            /// 清空某个合集。返回删掉了几行。
+            ///
+            /// 删合集本身会 CASCADE 掉这些行；这个方法给的是「保留合集、
+            /// 只清成员」—— 那是编辑页「全选取消」的操作。
+            pub async fn clear(&self, collection_id: i32) -> Result<u64, DbError> {
+                let result =
+                    sqlx::query(concat!("DELETE FROM ", $table, " WHERE collection_id = $1"))
+                        .bind(collection_id)
+                        .execute(&self.pool)
+                        .await?;
+                Ok(result.rows_affected())
+            }
+
+            /// 事务内清空，供 [`Ctx`] 编排「清空 + 按序插入」时使用。
+            pub async fn clear_in(
+                &self,
+                ctx: &mut Ctx<'_>,
+                collection_id: i32,
+            ) -> Result<u64, DbError> {
+                let result =
+                    sqlx::query(concat!("DELETE FROM ", $table, " WHERE collection_id = $1",))
+                        .bind(collection_id)
+                        .execute(ctx.conn().await?.as_conn())
+                        .await?;
+                Ok(result.rows_affected())
+            }
+
+            /// 把某个合集的成员**替换**为给定顺序的一组。
+            ///
+            /// 语义是「这个合集的成员就是这些，顺序如此」—— 适合拖拽排序
+            /// 与编辑页保存。返回本次写入的行数。
+            ///
+            /// 先清后插，**不**逐条 diff：diff 能省下未变动行的写，但要让
+            /// 「哪些行变了」这个判断正确，得先把当前集合完整读出比较，
+            /// 而那与「清后插」的成本同量级。换来的是顺序**一定**等于
+            /// 入参 —— diff 版本在并发插入下会漏掉新行。
+            ///
+            /// **不是**一个事务内的操作。调用方要原子性就用 `clear_in` 与
+            /// `insert_at_in` 自己编排 —— 两者共享同一个 `Ctx`，所以
+            /// 「清空 + 按序插入」能包在一个事务里。
+            pub async fn replace_all(
+                &self,
+                collection_id: i32,
+                member_ids: &[i32],
+            ) -> Result<u64, DbError> {
+                let removed = self.clear(collection_id).await?;
+                for (index, member_id) in member_ids.iter().enumerate() {
+                    self.insert_at(collection_id, *member_id, index as i32)
+                        .await?;
+                }
+                Ok(removed + member_ids.len() as u64)
+            }
+        }
+    };
+}
+impl_ordered_member_repo!(
+    MomentCollectionItemRepository,
+    MomentCollectionItem,
+    "moment_collection_item",
+    "point_id",
+    "MomentCollectionItem"
+);
+
+impl_ordered_member_repo!(
+    ClipCollectionItemRepository,
+    ClipCollectionItem,
+    "clip_collection_item",
+    "clip_id",
+    "ClipCollectionItem"
+);
+
+/// `playlist_movie` 表仓储：JAV 播放列表的成员。
+///
+/// **本表没有 `position`** —— 唯一索引是 `(playlist_id, movie_id)`。
+/// 播放顺序只能靠 `id`，即加入播放列表的先后。模型上的
+/// [`PlaylistMovie::playback_order_key`] 直接返回 `id` 就是这个意思。
+///
+/// 所以这里**没有** `append` / `insert_at` / `replace_all` 那套位置语义，
+/// 只有「加进去」与「移出来」。要改播放顺序，只能重建整个成员列表 ——
+/// 而那正是 `replace_all` 在做的事，只是不带位置列。
+#[derive(Debug, Clone)]
+pub struct PlaylistMovieRepository {
+    pool: PgPool,
+}
+
+impl PlaylistMovieRepository {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// 加入播放列表。**幂等。**
+    ///
+    /// 唯一索引 `(playlist_id, movie_id)` 让重复加入可以走
+    /// `ON CONFLICT DO NOTHING`，返回「本次是否真的新增了一行」。
+    ///
+    /// 幂等而不是报错，是因为调用方天然会重复提交：UI 上连点两下「加入」、
+    /// 播放列表页面重复挂载、导入脚本重跑。拿约束违例当业务结果没有意义。
+    pub async fn add(&self, playlist_id: i32, movie_id: i32) -> Result<bool, DbError> {
+        let now = crate::common::time::now_utc();
+        let result = sqlx::query(
+            "INSERT INTO playlist_movie (playlist_id, movie_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $3) ON CONFLICT (playlist_id, movie_id) DO NOTHING",
+        )
+        .bind(playlist_id)
+        .bind(movie_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(PLAYLIST_MOVIE_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 移出播放列表。返回是否真的删掉了一行。
+    pub async fn remove(&self, playlist_id: i32, movie_id: i32) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("DELETE FROM playlist_movie WHERE playlist_id = $1 AND movie_id = $2")
+                .bind(playlist_id)
+                .bind(movie_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 按加入顺序列出某个播放列表的全部影片。**刻意不分页。**
+    ///
+    /// `ORDER BY id` 而不是 `created_at`：本表的「顺序」就是加入先后，
+    /// 而 `id` 是它的精确表达。同一毫秒内加入的两部影片，
+    /// `created_at` 会并列（排序不确定，播放列表抖动），`id` 不会。
+    pub async fn list_by_playlist(&self, playlist_id: i32) -> Result<Vec<PlaylistMovie>, DbError> {
+        Ok(sqlx::query_as::<_, PlaylistMovie>(
+            "SELECT * FROM playlist_movie WHERE playlist_id = $1 ORDER BY id",
+        )
+        .bind(playlist_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    paged_list! {
+        /// 列出某个影片出现在哪些播放列表里。**分页。**
+        ///
+        /// 「这部影片被哪些列表收录了」——影片详情页用。走唯一索引
+        /// `(playlist_id, movie_id)` 的**后缀**。
+        pub async fn list_by_movie(
+            &self,
+            movie_id: i32,
+        ) -> Result<Page<PlaylistMovie>, DbError> {
+            count = "SELECT COUNT(*) FROM playlist_movie WHERE movie_id = $1",
+            items = "SELECT * FROM playlist_movie WHERE movie_id = $1 \
+                     ORDER BY playlist_id LIMIT $2 OFFSET $3",
+        }
+    }
+}

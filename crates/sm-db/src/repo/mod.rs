@@ -142,7 +142,8 @@ pub mod user;
 pub use actor::{ActorRepository, NewActor, SyncState};
 pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 pub use collection::{
-    ClipCollectionRepository, MomentCollectionRepository, NewCollection, PlaylistRepository,
+    ClipCollectionItemRepository, ClipCollectionRepository, MomentCollectionItemRepository,
+    MomentCollectionRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository,
 };
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};

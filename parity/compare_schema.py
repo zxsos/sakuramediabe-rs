@@ -150,6 +150,9 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "MomentCollectionRepository",
         "ClipCollectionRepository",
         "NewCollection",
+        "PlaylistMovieRepository",
+        "MomentCollectionItemRepository",
+        "ClipCollectionItemRepository",
         # transfer 批次（transfer.rs）
         "DownloadClientRepository",
         "IndexerRepository",
