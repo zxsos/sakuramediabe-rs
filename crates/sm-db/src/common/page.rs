@@ -188,6 +188,21 @@ impl PageArgCopy for u32 {}
 impl PageArgCopy for f64 {}
 impl PageArgCopy for chrono::NaiveDateTime {}
 
+/// `Option<T>` 也是可按值复制的 —— 「可选过滤条件」是分页的常见形态。
+///
+/// `since: Option<NaiveDateTime>` 意为「不传下界」。绑 `None` 时 SQL 写
+/// `($1::timestamp IS NULL OR release_date >= $1)`，过滤条件自然失效。
+///
+/// 这不是可有可无的便利：`paged_list!` 保证 `count` 与 `items` 的 SQL 写在
+/// 同一次编辑里，而**手写分页就会丢掉这个保证** —— 上一轮就有一个 `count`
+/// 漏了 `AND plugin_key IS NOT NULL` 而 `items` 有，于是 `total` 与
+/// `items.len()` 描述的不是同一个集合。
+///
+/// 与 `impl PageArg for &str` **不冲突**：`&str` 不是 `PageArgCopy`（它有
+/// 自己的 `PageArg` 实现以获得 `String`），所以 `Option<&str>` 走的是本
+/// blanket impl，而 `&str` 本身仍走 trim 那条路。
+impl<T: PageArgCopy> PageArgCopy for Option<T> {}
+
 impl<T: PageArgCopy> PageArg for T {
     type Owned = T;
     fn into_page_arg(self) -> T {

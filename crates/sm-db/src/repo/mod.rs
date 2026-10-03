@@ -139,6 +139,7 @@ pub mod collection;
 pub mod ctx;
 pub mod download;
 pub mod gateway;
+pub mod image;
 pub mod library;
 pub mod media;
 pub mod movie;
@@ -147,6 +148,7 @@ pub mod submission;
 pub mod task;
 pub mod transfer;
 pub mod user;
+pub mod video_item;
 
 pub use actor::{ActorRepository, NewActor, SyncState};
 pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
@@ -157,6 +159,7 @@ pub use collection::{
 pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
+pub use image::{ImageRepository, NewImage};
 pub use library::{MediaLibraryRepository, NewMediaLibrary};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
@@ -171,3 +174,4 @@ pub use transfer::{
     IndexerRepository, NewDownloadClient, NewIndexer,
 };
 pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, UserRepository};
+pub use video_item::{NewVideoItem, VideoItemRepository};
