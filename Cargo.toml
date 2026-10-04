@@ -1,0 +1,38 @@
+[package]
+name = "plugin-ref-local"
+version = "0.1.0"
+description = "参考插件：以本地目录为后端的 StorageProvider gRPC 实现 —— 打通插件 ABI 数据面并量化开销"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
+#
+# TODO(tag)：契约层发布 tag 后改成 `tag = "v0.1.0"`。按 branch 会让本插件与
+# 宿主静默漂移到不同版本的契约，症状是注册不上而不报错。
+sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", branch = "main" }
+
+async-trait = "0.1"
+# BoxStream：默认实现层把流式 rpc 的返回类型固定成它（见 sm-plugin-api::provider）。
+futures = "0.3"
+tonic = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["full"] }
+# net：一把 help 我们自己建起 server 用的 TcpListenerStream（起真实 server 需要内核分配的端口）。
+tokio-stream = { version = "0.1", features = ["net"] }
+chrono = "0.4"
+percent-encoding = "2"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde_json = "1"
+
+# 参考插件的**可执行文件**：宿主按生命周期协议拉起的那个进程
+# （见 sakuramediabe-rs 的 docs/adr/2026-10-05-plugin-lifecycle.md）。
+[[bin]]
+name = "plugin-ref-local"
+path = "src/bin/plugin-ref-local.rs"
