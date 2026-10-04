@@ -1,0 +1,352 @@
+syntax = "proto3";
+
+package sakuramedia.v1;
+
+import "google/protobuf/struct.proto";
+
+// ══════════════════════════════════════════════════════════════════
+// 句柄与配置
+// ══════════════════════════════════════════════════════════════════
+
+// 媒体库句柄。provider_config 是不透明 JSON，由 provider 自己解释。
+message LibraryHandle {
+  int64 library_id = 1;
+  string provider_key = 2;
+  google.protobuf.Struct provider_config = 3;
+  // 账号标识；115 这类多账号存储用它区分 cookie 归属。
+  optional string account_key = 4;
+}
+
+// 单个媒体文件句柄。
+message MediaHandle {
+  int64 media_id = 1;
+  LibraryHandle library = 2;
+  // 不透明存储引用，宿主只保存与回传。
+  google.protobuf.Struct storage_ref = 3;
+  string file_name = 4;
+  int64 file_size_bytes = 5;
+  int64 duration_seconds = 6;
+}
+
+message DownloadClientHandle {
+  int64 client_id = 1;
+  LibraryHandle library = 2;
+  google.protobuf.Struct provider_config = 3;
+}
+
+// 媒体库配置字段。input 三选一，对应 Python 的 Literal["text","secret","path"]。
+message ConfigField {
+  string key = 1;
+  string label = 2;
+  enum Input {
+    INPUT_UNSPECIFIED = 0;
+    INPUT_TEXT = 1;
+    INPUT_SECRET = 2;
+    INPUT_PATH = 3;
+  }
+  Input input = 3;
+  bool required = 4;
+  optional string description = 5;
+  bool multiline = 6;
+  bool read_only = 7;
+  optional string hint = 8;
+}
+
+// 播放交付方式。redirect = 302 直连存储；proxy = 经后端流式转发。
+// bundle 声明的第一项是默认方式。
+enum PlaybackDelivery {
+  PLAYBACK_DELIVERY_UNSPECIFIED = 0;
+  PLAYBACK_DELIVERY_REDIRECT = 1;
+  PLAYBACK_DELIVERY_PROXY = 2;
+}
+
+// 合并播放的封装格式。
+enum MergedPlaybackFormat {
+  MERGED_PLAYBACK_FORMAT_UNSPECIFIED = 0;
+  MERGED_PLAYBACK_FORMAT_MP4 = 1;
+  MERGED_PLAYBACK_FORMAT_HLS = 2;
+}
+
+enum DiagnosticCheckStatus {
+  DIAGNOSTIC_CHECK_STATUS_UNSPECIFIED = 0;
+  DIAGNOSTIC_CHECK_STATUS_OK = 1;
+  DIAGNOSTIC_CHECK_STATUS_WARNING = 2;
+  DIAGNOSTIC_CHECK_STATUS_FAILED = 3;
+  DIAGNOSTIC_CHECK_STATUS_SKIPPED = 4;
+}
+
+enum DiagnosticStatus {
+  DIAGNOSTIC_STATUS_UNSPECIFIED = 0;
+  DIAGNOSTIC_STATUS_OK = 1;
+  DIAGNOSTIC_STATUS_WARNING = 2;
+  DIAGNOSTIC_STATUS_FAILED = 3;
+}
+
+message DiagnosticCheck {
+  string key = 1;
+  DiagnosticCheckStatus status = 2;
+  string code = 3;
+  string message = 4;
+  optional google.protobuf.Struct details = 5;
+}
+
+message DiagnosticReport {
+  DiagnosticStatus status = 1;
+  repeated DiagnosticCheck checks = 2;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 浏览 / 导入
+// ══════════════════════════════════════════════════════════════════
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_FILE = 1;
+  ENTRY_TYPE_DIRECTORY = 2;
+}
+
+// 浏览结果项。source_ref 是 provider 私有的不透明引用。
+message BrowseEntry {
+  google.protobuf.Struct source_ref = 1;
+  string name = 2;
+  EntryType entry_type = 3;
+  optional int64 size_bytes = 4;
+  optional string modified_at = 5;  // RFC 3339
+  bool is_video = 6;
+}
+
+message BrowsePage {
+  repeated BrowseEntry entries = 1;
+  optional string next_cursor = 2;
+}
+
+message ImportFile {
+  google.protobuf.Struct source_ref = 1;
+  string name = 2;
+  string relative_path = 3;
+  int64 size_bytes = 4;
+  bool is_video = 5;
+}
+
+// 导入文件内容。deletion_receipt 用于 delete_after_commit。
+message ImportFileContent {
+  bytes content = 1;
+  google.protobuf.Struct deletion_receipt = 2;
+}
+
+message ImportPlacement {
+  string relative_path = 1;
+}
+
+// 已暂存的媒体。receipt 是 finalize/abort 的凭据。
+message StagedMedia {
+  google.protobuf.Struct storage_ref = 1;
+  google.protobuf.Struct receipt = 2;
+  int64 size_bytes = 3;
+  optional int64 duration_seconds = 4;
+  optional google.protobuf.Struct video_info = 5;
+  // provider 观察到的尺寸；宿主会校验并规范化为 "WxH"。
+  optional string resolution = 6;
+}
+
+enum SourceDisposition {
+  SOURCE_DISPOSITION_UNSPECIFIED = 0;
+  SOURCE_DISPOSITION_KEEP = 1;
+  SOURCE_DISPOSITION_DELETE_AFTER_COMMIT = 2;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 缩略图 / 切片
+// ══════════════════════════════════════════════════════════════════
+
+message ThumbnailArtifact {
+  int32 offset_seconds = 1;
+  string relative_path = 2;
+}
+
+message ThumbnailGeneration {
+  int32 expected_count = 1;
+  repeated ThumbnailArtifact artifacts = 2;
+}
+
+message ClipArtifact {
+  string relative_path = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 存储转存
+// ══════════════════════════════════════════════════════════════════
+
+// 转存来源的元信息，可安全暴露给目标 provider。
+message MediaTransferSourceInfo {
+  string file_name = 1;
+  int64 size_bytes = 2;
+}
+
+// 显式会话句柄，替代 Python 的 AbstractContextManager。
+// 生命周期：Open → (Read/Seek/AssertUnchanged)* → Close。
+// 宿主保证 close 一定被调用，并在 close 时做最终一致性校验。
+message TransferSourceSession {
+  string session_id = 1;
+  MediaTransferSourceInfo info = 2;
+}
+
+message TransferReadRequest {
+  string session_id = 1;
+  int64 offset = 2;
+  int32 length = 3;
+}
+
+message TransferReadResponse {
+  bytes data = 1;
+  bool eof = 2;
+}
+
+message TransferAssertRequest {
+  string session_id = 1;
+}
+
+message TransferAssertResponse {
+  // false 表示源已变化，宿主应中止转存。
+  bool unchanged = 1;
+  optional string detail = 2;
+}
+
+enum StagedTransferStatus {
+  STAGED_TRANSFER_STATUS_UNSPECIFIED = 0;
+  STAGED_TRANSFER_STATUS_STAGED = 1;
+  // 优化转存不可用；宿主跳过该项，不会退回普通下载再上传。
+  STAGED_TRANSFER_STATUS_NOT_AVAILABLE = 2;
+}
+
+message StagedMediaTransfer {
+  StagedTransferStatus status = 1;
+  optional google.protobuf.Struct storage_ref = 2;
+  optional google.protobuf.Struct receipt = 3;
+  optional string file_name = 4;
+  optional int64 size_bytes = 5;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 下载
+// ══════════════════════════════════════════════════════════════════
+
+message DownloadSubmission {
+  string source_uri = 1;
+  string display_name = 2;
+}
+
+// 远端下载任务状态，对应 Python 的 Literal 四态。
+enum RemoteTaskState {
+  REMOTE_TASK_STATE_UNSPECIFIED = 0;
+  REMOTE_TASK_STATE_QUEUED = 1;
+  REMOTE_TASK_STATE_DOWNLOADING = 2;
+  REMOTE_TASK_STATE_COMPLETED = 3;
+  REMOTE_TASK_STATE_FAILED = 4;
+}
+
+message RemoteDownloadTask {
+  string remote_id = 1;
+  string name = 2;
+  RemoteTaskState state = 3;
+  // 0.0 - 1.0
+  double progress = 4;
+  // 仅当 state == COMPLETED 时必须非空；其余状态必须为 null。
+  optional google.protobuf.Struct completed_source_ref = 5;
+  optional string error_message = 6;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 诊断（prepare_library / prepare_client / test_client）
+// ══════════════════════════════════════════════════════════════════
+
+message PrepareLibraryRequest {
+  google.protobuf.Struct submitted_config = 1;
+  optional LibraryHandle previous = 2;
+}
+
+message PrepareLibraryResponse {
+  google.protobuf.Struct provider_config = 1;
+  optional string account_key = 2;
+}
+
+message PrepareClientRequest {
+  google.protobuf.Struct submitted_config = 1;
+  LibraryHandle library = 2;
+  optional DownloadClientHandle previous = 3;
+}
+
+message PrepareClientResponse {
+  google.protobuf.Struct provider_config = 1;
+}
+
+message TestClientRequest {
+  google.protobuf.Struct submitted_config = 1;
+  LibraryHandle library = 2;
+}
+
+message TestClientResponse {
+  DiagnosticReport report = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 存储容量（可选能力）
+// ══════════════════════════════════════════════════════════════════
+
+// 115 等账号级存储返回整个账号的空间；本地磁盘返回挂载文件系统。
+message StorageSpaceUsage {
+  optional int64 total_bytes = 1;
+  optional int64 used_bytes = 2;
+  optional int64 free_bytes = 3;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 结构化错误
+// ══════════════════════════════════════════════════════════════════
+
+// provider 可预期的失败。对应 Python 的 ProviderOperationError。
+//
+// `code` 是对外契约，宿主会原样透传给客户端，插件新增 code 时
+// 必须先在文档登记，否则客户端可能无法处理。
+enum ProviderErrorCode {
+  PROVIDER_ERROR_CODE_UNSPECIFIED = 0;
+  PROVIDER_ERROR_CODE_INVALID_CONFIG = 1;
+  PROVIDER_ERROR_CODE_AUTHENTICATION_FAILED = 2;
+  PROVIDER_ERROR_CODE_SOURCE_NOT_FOUND = 3;
+  PROVIDER_ERROR_CODE_TASK_NOT_MANAGED = 4;
+  PROVIDER_ERROR_CODE_SOURCE_BLACKLISTED = 5;
+  PROVIDER_ERROR_CODE_UNSUPPORTED = 6;
+  PROVIDER_ERROR_CODE_UNAVAILABLE = 7;
+}
+
+message ProviderError {
+  string provider_key = 1;
+  string operation = 2;
+  ProviderErrorCode code = 3;
+  // 对外展示的安全文案，不得包含 Cookie、密码或内部路径。
+  string safe_message = 4;
+  bool retryable = 5;
+}
+
+// ── 下载 RPC 的请求 / 响应 ──────────────────────────────────
+
+message SubmitRequest {
+  DownloadSubmission submission = 1;
+}
+
+message SubmitResponse {
+  RemoteDownloadTask task = 1;
+}
+
+message ListTasksRequest {}
+
+message ListTasksResponse {
+  repeated RemoteDownloadTask tasks = 1;
+}
+
+message DeleteTaskRequest {
+  string remote_id = 1;
+  bool delete_files = 2;
+}
+
+message DeleteTaskResponse {}

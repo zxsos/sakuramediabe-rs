@@ -1,0 +1,33 @@
+[package]
+name = "sm-plugin-api"
+version = "0.1.0"
+description = "SakuraMedia 插件 gRPC 契约（prost/tonic 生成）+ 插件侧默认实现层"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库，**不能**出现 `*.workspace = true`：本 crate 所在的 workspace
+# 就是本仓库根，继承字段在下游依赖者手里会解析失败。
+# 见原仓库 docs/plugin-api-split.md「拆的时候必须改的两处」。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约层被宿主与所有插件共用，这里的每一条都会成为下游的最小依赖集。
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+# vendored protoc：换环境的 CI 与离线 NAS 都不必另装 protoc。
+protoc-bin-vendored = "3"
+# 默认实现层把流式 rpc 的关联类型固定为 `BoxStream`（见 src/provider.rs）。
+futures = "0.3"
+
+[dev-dependencies]
+# 默认实现层的单测要直接 await 生成的 server trait。
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
