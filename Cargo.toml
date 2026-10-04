@@ -1,0 +1,47 @@
+[package]
+name = "plugin-javbus-metadata"
+version = "0.1.0"
+description = "JavBus 元数据插件：catalog.metadata_source 扩展点（按番号补缺）的 Rust 实现"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
+#
+# TODO(tag)：契约层发布 tag 后改成 `tag = "v0.1.0"`。按 branch 会让本插件与
+# 宿主静默漂移到不同版本的契约，症状是注册不上而不报错。
+sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", branch = "main" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# 相对 URL 按详情页基址解析（上游 urljoin）。
+url = "2"
+# 请求目录名：`<delivery_dir>/<uuid>/<文件>`。
+uuid = { version = "1", features = ["v4", "serde"] }
+# 发行日期的严格性校验（上游 date.fromisoformat）。
+chrono = { version = "0.4", features = ["serde"] }
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde_json = "1"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它
+# （见 sakuramediabe-rs 的 docs/adr/2026-10-05-plugin-lifecycle.md 第 5 节）。
+[[bin]]
+name = "sakuramedia_javbus_metadata"
+path = "src/bin/sakuramedia_javbus_metadata.rs"
+
+[dev-dependencies]
+# 页面与图片交给本地假服务，测试不许联网。
+wiremock = "0.6"
