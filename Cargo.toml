@@ -16,7 +16,7 @@ unsafe_code = "forbid"
 #
 # TODO(tag)：契约层发布 tag 后改成 `tag = "v0.1.0"`。按 branch 会让本插件与
 # 宿主静默漂移到不同版本的契约，症状是注册不上而不报错。
-sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", branch = "main" }
+sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
 
 tonic = "0.14"
 # BoxStream：RunJob 的流式返回类型被生成代码固定成它。
