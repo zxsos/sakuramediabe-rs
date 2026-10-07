@@ -23,6 +23,17 @@ prost-types = "0.14"
 protoc-bin-vendored = "3"
 # 默认实现层把流式 rpc 的关联类型固定为 `BoxStream`（见 src/provider.rs）。
 futures = "0.3"
+# 交付校验要判 `release_date` 是不是严格的 YYYY-MM-DD（proto 写在字段上的原话），
+# 以及清理失败时记 warn。这两样跟着校验规则一起住在契约仓 —— 规则搬走、
+# 依赖留下会让下一次搬迁漏掉一半。
+#
+# 版本与宿主仓 `[workspace.dependencies]` 保持一致（契约层被两侧共用，
+# 版本漂移会让插件的依赖树与宿主不同）。
+chrono = { version = "0.4", features = ["serde"] }
+# `json_struct`：宿主侧是 `serde_json::Value`、插件侧是 `google.protobuf.Struct`，
+# 互转规则只有一份，放在契约仓（见 src/json_struct.rs）。
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
 
 [dev-dependencies]
 # 默认实现层的单测要直接 await 生成的 server trait。

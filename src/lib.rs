@@ -24,10 +24,35 @@ pub mod v1 {
 /// 见 [`provider`] 的模块文档（gRPC 报告的 P1-4）。
 pub mod provider;
 
+/// 结构化错误的过线方式（见模块文档：为什么用 `Status::details`）。
+pub mod error;
+
+/// `serde_json::Value` 与 `google.protobuf.Struct` 的互转。**两侧都要用**，
+/// 所以规则只有一份（见模块文档）。
+pub mod json_struct;
+
+/// 元数据交付校验。
+///
+/// **插件与宿主双方**都要遵守的规则，所以放在契约仓而不是宿主实现里：
+/// 作者在插件自己的测试里就能验一遍交出去的文件。见模块文档。
+pub mod movie_delivery;
+
 pub use provider::{DownloadProviderExt, StorageProviderExt};
 
 /// 契约包名，供代码生成与文档引用。
 pub const PACKAGE: &str = "sakuramedia.v1";
 
 /// 插件 ABI 主版本。不兼容变更时递增，宿主据此拒绝加载旧插件。
-pub const ABI_MAJOR: i32 = 1;
+///
+/// # 2 —— `GenerateThumbnails` 的流换了消息类型（P1-1）
+///
+/// 旧契约是 `returns (stream ProgressEvent)`，新契约是
+/// `returns (stream GenerateThumbnailsResponse)`（`oneof { progress, done }`）。
+/// rpc 的方法名与路径**没变**，但线格式不兼容：旧二进制发来的帧在新宿主上会以
+/// 「解码失败」收场，而那个错误指向不了真正的原因（两仓契约不同步）。
+///
+/// 所以这是**不兼容变更**，必须递增 —— 让宿主在**注册阶段**就拒掉旧二进制，
+/// 而不是等到调用缩略图时才报一个指错方向的错。
+///
+/// 后果与修复步骤见 `docs/tasks/proto-p1-gaps.md` §二。
+pub const ABI_MAJOR: i32 = 2;

@@ -151,11 +151,16 @@ pub trait StorageProviderExt: Send + Sync + 'static {
         Err(unimplemented("plan_playback"))
     }
 
-    /// ⑪ 生成缩略图（server streaming）。
+    /// ⑪ 生成缩略图（server streaming：进度事件 + **终态产物清单**）。
+    ///
+    /// 流里最后一条**必须**是 `payload = done`（`ThumbnailGeneration`）——
+    /// 宿主拿不到它就无法落库，会按「provider 违约」处理。
+    /// 见 `proto/storage.proto` 里 `GenerateThumbnailsResponse` 的注释。
     async fn generate_thumbnails(
         &self,
         _request: Request<v1::GenerateThumbnailsRequest>,
-    ) -> Result<Response<BoxStream<'static, Result<v1::ProgressEvent, Status>>>, Status> {
+    ) -> Result<Response<BoxStream<'static, Result<v1::GenerateThumbnailsResponse, Status>>>, Status>
+    {
         Err(unimplemented("generate_thumbnails"))
     }
 
@@ -396,7 +401,11 @@ pub trait DownloadProviderExt: Send + Sync + 'static {
 #[tonic::async_trait]
 impl<T: StorageProviderExt> v1::storage_provider_server::StorageProvider for T {
     type ScanImportSourceStream = BoxStream<'static, Result<v1::ImportFileEntry, Status>>;
-    type GenerateThumbnailsStream = BoxStream<'static, Result<v1::ProgressEvent, Status>>;
+    // P1-1 修订后：流里既要进度也要**终态产物清单**，所以是
+    // `GenerateThumbnailsResponse`（含 `oneof {progress, done}`），不是裸的
+    // `ProgressEvent`。见 `proto/storage.proto` 里那条消息上的注释。
+    type GenerateThumbnailsStream =
+        BoxStream<'static, Result<v1::GenerateThumbnailsResponse, Status>>;
     type ReadTransferSourceStream = BoxStream<'static, Result<v1::TransferReadResponse, Status>>;
 
     async fn browse(
