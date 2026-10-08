@@ -384,6 +384,58 @@ message ListMovieNumbersResponse { repeated string movie_numbers = 1; }
 message SyncRankingSourcesRequest {}
 message SyncRankingSourcesResponse { int32 synced_count = 1; }
 
+// ── JavDB 榜单（只读）────────────────────────────────────────────
+//
+// 上游 `PluginContext.build_javdb_provider(username, password)` 的 gRPC 形态。
+//
+// 榜单插件**不持有** JavDB 客户端与登录态 —— 那是宿主的出网能力（UA、签名头、
+// 代理策略、账号都由宿主一处管），插件只问「这个榜、这个周期有哪些番号」。
+// 插件把自己的账号配置透传进来，宿主**不保管**任何账号。
+//
+// 三种查询形状与上游 `JavdbProvider` 的三个方法一一对应
+// （`javdb.py:483` / `:611` / `:546`）—— 它们打的是三个不同端点、参数名也不同，
+// 所以用 `oneof` 表达，而不是三个「长得一样只换了名字」的 rpc。
+
+message JavdbPlaybackRankQuery {
+  // all（热播）| high_score（高评分）
+  string filter_by = 1;
+  // daily | weekly | monthly
+  string period = 2;
+}
+
+message JavdbVideoTypeRankQuery {
+  // 0（有码）| 1（无码）| 3（FC2）
+  string video_type = 1;
+  // daily | weekly | monthly
+  string period = 2;
+}
+
+message JavdbTopQuery {
+  // all | year | video_type
+  string top_type = 1;
+  // top_type=year 传年份；top_type=video_type 传 0/1/3；top_type=all 传空串
+  string type_value = 2;
+  // 抓取页数上限；缺省用上游的 5（每页 50 条，5 页满 250）
+  optional int32 max_pages = 3;
+}
+
+message GetJavdbRankNumbersRequest {
+  // 账号。**只有 TOP250（`JavdbTopQuery`）需要** —— 另两个榜未登录即可取，
+  // 传了也不会被使用。
+  optional string username = 1;
+  optional string password = 2;
+  oneof query {
+    JavdbPlaybackRankQuery playback = 3;
+    JavdbVideoTypeRankQuery video_type_rank = 4;
+    JavdbTopQuery top = 5;
+  }
+}
+
+message GetJavdbRankNumbersResponse {
+  // 番号列表，**顺序即排名**（与 `FetchRankingResponse` 同一语义）。
+  repeated string movie_numbers = 1;
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Service 定义（由宿主实现，插件作为客户端调用）
 // ══════════════════════════════════════════════════════════════════
@@ -446,4 +498,7 @@ service PluginHost {
   rpc ImportMovieByNumber(ImportMovieByNumberRequest) returns (ImportMovieByNumberResponse);
   rpc ListExistingMovieNumbers(ListMovieNumbersRequest) returns (ListMovieNumbersResponse);
   rpc SyncRankingSources(SyncRankingSourcesRequest) returns (SyncRankingSourcesResponse);
+
+  // ── JavDB 榜单（只读）──
+  rpc GetJavdbRankNumbers(GetJavdbRankNumbersRequest) returns (GetJavdbRankNumbersResponse);
 }
