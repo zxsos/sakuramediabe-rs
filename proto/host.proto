@@ -382,7 +382,46 @@ message ListMovieNumbersRequest {}
 message ListMovieNumbersResponse { repeated string movie_numbers = 1; }
 
 message SyncRankingSourcesRequest {}
-message SyncRankingSourcesResponse { int32 synced_count = 1; }
+
+// 同步本插件声明的**全部**排行源的统计（上游 `ranking_service.py:501` 的
+// `sync_all_rankings` 返回的那个 dict）。
+message SyncRankingSourcesResponse {
+  // 成功同步的**目标**数（一个目标 = 一个 榜单 × 周期）。
+  int32 synced_count = 1;
+  // 本次收敛出的目标总数。
+  int32 total_targets = 2;
+  // 失败的目标数 —— 单个目标失败**不中断**整批（上游 per-target try/except）。
+  int32 failed_targets = 3;
+  int32 fetched_numbers = 4;
+  int32 imported_movies = 5;
+  int32 local_hit_movies = 6;
+  int32 skipped_movies = 7;
+  int32 stored_items = 8;
+}
+
+// 手动同步单个榜单（上游 `PluginContext.sync_ranking_board`，
+// `context.py:1488`）。`source_key` 必须是**本插件**声明的源 ——
+// 上游对不属于自己的源直接 `ValueError`（`context.py:1500`）。
+message SyncRankingBoardRequest {
+  string source_key = 1;
+  string board_key = 2;
+  // 空串 = 该榜的默认周期（与读侧 `period` 同语义，见
+  // `RankingCatalogService::period_or_all`）。
+  string period = 3;
+}
+
+// 上游 `sync_board_period` 返回的那个 dict（`ranking_service.py:453`）。
+message SyncRankingBoardResponse {
+  string source_key = 1;
+  string board_key = 2;
+  // 解析后的周期（请求给空串时这里回默认周期）。
+  string period = 3;
+  int32 fetched_numbers = 4;
+  int32 imported_movies = 5;
+  int32 local_hit_movies = 6;
+  int32 skipped_movies = 7;
+  int32 stored_items = 8;
+}
 
 // ── JavDB 榜单（只读）────────────────────────────────────────────
 //
@@ -497,7 +536,9 @@ service PluginHost {
   // ── 杂项 ──
   rpc ImportMovieByNumber(ImportMovieByNumberRequest) returns (ImportMovieByNumberResponse);
   rpc ListExistingMovieNumbers(ListMovieNumbersRequest) returns (ListMovieNumbersResponse);
+  // ── 排行榜同步（写侧）──
   rpc SyncRankingSources(SyncRankingSourcesRequest) returns (SyncRankingSourcesResponse);
+  rpc SyncRankingBoard(SyncRankingBoardRequest) returns (SyncRankingBoardResponse);
 
   // ── JavDB 榜单（只读）──
   rpc GetJavdbRankNumbers(GetJavdbRankNumbersRequest) returns (GetJavdbRankNumbersResponse);
