@@ -3,7 +3,7 @@
 SakuraMedia 插件体系的**契约层**：`proto/` 下四个文件经 prost/tonic 生成的
 Rust 类型，外加一层给插件用的默认实现。
 
-从 [`sakuramediabe-rs`](https://cnb.cool/zxsos1/sakuramediabe-rs) 拆出来的原因在
+从 [`sakuramediabe-rs`](https://github.com/zxsos/sakuramediabe-rs) 拆出来的原因在
 那个仓库的 `docs/plugin-api-split.md`：插件要各自成仓，而插件只该依赖契约；
 契约若留在后端仓库里，每个插件仓都得依赖整个后端。拆出来之后，
 
@@ -26,7 +26,7 @@ Rust 类型，外加一层给插件用的默认实现。
 ## 依赖方式
 
 ```toml
-sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
 ```
 
 **按 tag，不要按 branch**：用 branch 会让宿主与插件静默漂移到不同版本的契约，
