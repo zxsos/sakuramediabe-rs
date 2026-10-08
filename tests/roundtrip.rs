@@ -12,9 +12,9 @@ use plugin_ref_local::fixture::{
 };
 use plugin_ref_local::{connect, spawn, string_ref, LocalRefProvider};
 use sm_plugin_api::v1::{
-    storage_provider_client::StorageProviderClient, BrowseRequest, EntryType,
-    GenerateThumbnailsRequest, PlanPlaybackRequest, PlaybackDelivery, ReadImportFileRequest,
-    ScanImportSourceRequest,
+    generate_thumbnails_response, storage_provider_client::StorageProviderClient, BrowseRequest,
+    EntryType, GenerateThumbnailsRequest, PlanPlaybackRequest, PlaybackDelivery,
+    ReadImportFileRequest, ScanImportSourceRequest, ThumbnailGeneration,
 };
 use tokio_stream::StreamExt;
 
@@ -271,37 +271,64 @@ async fn generate_thumbnails_streams_progress_in_order() {
         .expect("GenerateThumbnails")
         .into_inner();
 
-    let mut seen = Vec::new();
-    while let Some(event) = stream.next().await {
-        let event = event.expect("进度事件不应出错");
-        seen.push(event);
+    // 分成两类收：进度事件与**终态产物清单**（P1-1 修订后才有的后者）。
+    let mut progress = Vec::new();
+    let mut done: Option<ThumbnailGeneration> = None;
+    while let Some(frame) = stream.next().await {
+        let frame = frame.expect("流不应出错");
+        match frame.payload {
+            Some(generate_thumbnails_response::Payload::Progress(event)) => progress.push(event),
+            Some(generate_thumbnails_response::Payload::Done(generation)) => {
+                assert!(done.is_none(), "`done` 只能出现一次");
+                done = Some(generation);
+            }
+            None => panic!("`GenerateThumbnailsResponse.payload` 必须有值"),
+        }
     }
     // 不靠超时判定结束：上面这行在流正常关闭时返回 None。
 
     assert_eq!(
-        seen.len(),
+        progress.len(),
         usize::try_from(expected_total).expect("数量为小正整数"),
         "进度事件数量必须完整"
     );
-    for (index, event) in seen.iter().enumerate() {
+    for (index, event) in progress.iter().enumerate() {
         let step = i32::try_from(index + 1).expect("步进");
         assert_eq!(event.current, step, "进度顺序不能乱");
         assert_eq!(event.total, expected_total);
         assert!(event.text.contains(&format!("{step}/{expected_total}")));
     }
 
-    // 产物确实落盘了 —— 但宿主从流里拿不到任何产物的名字：
-    // `ThumbnailGeneration` 没有返回通道（报告 §4.3）。
-    let mut artifacts = tokio::fs::read_dir(&workspace)
-        .await
-        .expect("读取缩略图工作目录");
-    let mut written = 0;
-    while let Some(entry) = artifacts.next_entry().await.expect("读目录项") {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        assert!(name.starts_with("movie-01-"), "意外产物：{name}");
-        written += 1;
+    // ★ 流必须以 `done` 收尾 —— 宿主**凭这一条**落库。
+    // 修订前宿主只能扫磁盘猜产物名字（`ThumbnailGeneration` 没有通道）。
+    let generation = done.expect("流必须以 `done` 收尾");
+    assert_eq!(generation.expected_count, expected_total);
+    assert_eq!(
+        generation.artifacts.len(),
+        usize::try_from(expected_total).expect("数量"),
+        "产物清单必须与生成的数量一致"
+    );
+    // 偏移要单调递增且落在区间内（第 i 张落在 i/(total+1) 处）。
+    let mut previous = -1;
+    for artifact in &generation.artifacts {
+        assert!(
+            artifact.offset_seconds > previous,
+            "偏移必须严格递增：{previous} -> {}",
+            artifact.offset_seconds
+        );
+        assert!(
+            artifact.offset_seconds > 0 && i64::from(artifact.offset_seconds) < duration_seconds,
+            "偏移要落在 (0, duration) 内，不取首尾帧：{}",
+            artifact.offset_seconds
+        );
+        previous = artifact.offset_seconds;
+        // `relative_path` 必须能直接拼到 workspace 上找到文件。
+        assert!(
+            workspace.join(&artifact.relative_path).is_file(),
+            "产物 {} 应当真的在 workspace 里",
+            artifact.relative_path
+        );
     }
-    assert_eq!(written, expected_total);
 }
 
 #[tokio::test]
@@ -325,7 +352,10 @@ async fn cancelling_a_stream_does_not_break_the_server() {
         .into_inner();
 
     let first = stream.next().await.expect("首帧").expect("首帧不应出错");
-    assert_eq!(first.current, 1);
+    let Some(generate_thumbnails_response::Payload::Progress(event)) = first.payload else {
+        panic!("首帧应当是进度事件：{first:?}");
+    };
+    assert_eq!(event.current, 1);
     drop(stream); // 客户端提前断开
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

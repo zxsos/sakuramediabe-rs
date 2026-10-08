@@ -19,10 +19,11 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_types::Struct;
 use sm_plugin_api::provider::StorageProviderExt;
 use sm_plugin_api::v1::{
-    playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType, GenerateThumbnailsRequest,
-    ImportFile, ImportFileEntry, LibraryHandle, MediaHandle, PlanPlaybackRequest,
-    PlanPlaybackResponse, PlaybackDelivery, PlaybackPlan, ProgressEvent, RedirectPlan,
-    ScanImportSourceRequest,
+    generate_thumbnails_response, playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType,
+    GenerateThumbnailsRequest, GenerateThumbnailsResponse, ImportFile, ImportFileEntry,
+    LibraryHandle, MediaHandle, PlanPlaybackRequest, PlanPlaybackResponse, PlaybackDelivery,
+    PlaybackPlan, ProgressEvent, RedirectPlan, ScanImportSourceRequest, ThumbnailArtifact,
+    ThumbnailGeneration,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -190,7 +191,25 @@ impl StorageProviderExt for LocalRefProvider {
         let start = self.confined_path(payload.source_ref.as_ref())?;
         match tokio::fs::metadata(&start).await {
             Ok(_) => {}
-            Err(source) => return Err(Status::not_found(format!("导入来源不存在：{source}"))),
+            // ★ **给插件作者看的示范**：失败要报**结构化**错误，而不是只给一个
+            // gRPC 码。只给 `Status::not_found` 的话，宿主只能按码猜
+            // `source_not_found`（而同一个 gRPC 码也被「媒体库不存在」用），
+            // 并且拿不到 `retryable`。
+            Err(_) => {
+                return Err(sm_plugin_api::error::to_status(
+                    &sm_plugin_api::v1::ProviderError {
+                        provider_key: self.provider_key.clone(),
+                        operation: "scan_import_source".to_owned(),
+                        code: sm_plugin_api::v1::ProviderErrorCode::SourceNotFound as i32,
+                        // 对外展示的文案：**不要**放内部路径、Cookie 或密码
+                        // （proto 注释的原话）。细节走 gRPC 的 message，宿主
+                        // 只把它写进日志。
+                        safe_message: "导入来源不存在".to_owned(),
+                        retryable: false,
+                    },
+                    Status::not_found("导入来源不存在").code(),
+                ));
+            }
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_BUFFER);
@@ -264,7 +283,8 @@ impl StorageProviderExt for LocalRefProvider {
     async fn generate_thumbnails(
         &self,
         request: Request<GenerateThumbnailsRequest>,
-    ) -> Result<Response<BoxStream<'static, Result<ProgressEvent, Status>>>, Status> {
+    ) -> Result<Response<BoxStream<'static, Result<GenerateThumbnailsResponse, Status>>>, Status>
+    {
         let payload = request.into_inner();
         let library = payload
             .library
@@ -291,6 +311,7 @@ impl StorageProviderExt for LocalRefProvider {
                 return;
             }
 
+            let mut artifacts: Vec<ThumbnailArtifact> = Vec::with_capacity(total as usize);
             for index in 1..=total {
                 // 本 crate 不解码视频，落一个占位文件代表「第 index 张真图」。
                 let artifact = format!("{stem}-{index:04}.jpg");
@@ -304,21 +325,44 @@ impl StorageProviderExt for LocalRefProvider {
                         .await;
                     return;
                 }
+                // 均分到整条时长上：第 i 张落在 i/(total+1) 处，不落在首尾帧
+                // （首帧常是黑场、末帧常是片尾）。
+                let divisor = i64::from(total) + 1;
+                let offset_seconds = (media.duration_seconds.max(0) * i64::from(index)) / divisor;
+                artifacts.push(ThumbnailArtifact {
+                    offset_seconds: offset_seconds as i32,
+                    relative_path: artifact.clone(),
+                });
 
-                let event = ProgressEvent {
+                let progress = ProgressEvent {
                     text: format!("已生成第 {index}/{total} 张：{artifact}"),
                     current: index,
                     total,
                 };
-                if sender.send(Ok(event)).await.is_err() {
+                if sender
+                    .send(Ok(GenerateThumbnailsResponse {
+                        payload: Some(generate_thumbnails_response::Payload::Progress(progress)),
+                    }))
+                    .await
+                    .is_err()
+                {
                     // 客户端断开：直接收尾，不要往已关闭的流里塞。
                     return;
                 }
             }
-            // GAP: 流就这样结束了。`ThumbnailGeneration`（含 expected_count 与
-            // 产物列表）没有任何返回通道 —— `GenerateThumbnailsResponse`
-            // 定义了却没被这个 rpc 用上，宿主拿不到产物文件名。
-            // 见报告 §4.3。
+
+            // ★ 以 `done` 收尾 —— 宿主**凭这一条**落库。
+            // （P1-1 修订前流就这样结束了，宿主拿不到产物清单。）
+            let _ = sender
+                .send(Ok(GenerateThumbnailsResponse {
+                    payload: Some(generate_thumbnails_response::Payload::Done(
+                        ThumbnailGeneration {
+                            expected_count: total,
+                            artifacts,
+                        },
+                    )),
+                }))
+                .await;
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
@@ -494,11 +538,20 @@ async fn walk_and_emit(
             let Ok(metadata) = tokio::fs::metadata(&path).await else {
                 continue;
             };
-            let relative = path
-                .strip_prefix(&base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            // `Path` 的 `Display` 用**平台分隔符** —— Windows 上会产出
+            // `b-movies\c-nested\deep-01.mov`。而 `source_ref` 与
+            // `relative_path` 是协议字段，契约是 POSIX 的 `/`（`fixture.rs`
+            // 取文件名也用 `rsplit('/')`）。所以不能直接 `to_string_lossy()`，
+            // 要按组件拼。
+            //
+            // 这不只是测试洁癖：宿主拿到的 ref 要当 storage key 用，
+            // Windows 上分隔符不一致会让同一文件在两个平台上产生两条记录。
+            let relative_path_ref = path.strip_prefix(&base).unwrap_or(&path);
+            let relative = relative_path_ref
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let entry = ImportFileEntry {
                 file: Some(ImportFile {
                     source_ref: Some(string_ref(&relative)),
@@ -530,9 +583,28 @@ fn thumbnail_count(duration_seconds: i64) -> i32 {
 }
 
 /// `file://` URL。路径里的空格等字符必须转义，否则宿主的 HTTP 客户端会解析出错。
+///
+/// # 分隔符必须转成 `/`
+///
+/// 和上面 `walk_and_emit` 里的 `relative_path` 是**同一个 bug 的第二处**：
+/// `Path` 的 `Display` 用平台分隔符，Windows 上是 `\`，而 URL 的路径部分是
+/// 由 `/` 分隔的。`file://C:\dir\a.mkv` 不是一个合法 URL —— 宿主拿去解析会
+/// 拿到错误的 host 或空的 path。
+///
+/// Windows 上还要多一个斜杠：`C:\dir\a.mkv` 的正确形态是
+/// `file:///C:/dir/a.mkv`（`file://` + 空 host + `/C:/...`）。直接用
+/// `path.to_string_lossy()` 得到的是 `C:\...`，拼出来是 `file://C:\...`
+/// —— 少一个斜杠，host 段会被解析成 `C:`。
 fn file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("file://{}", utf8_percent_encode(&raw, FILE_URL_ESCAPE))
+    let raw = path.to_string_lossy().replace('\\', "/");
+    // 盘符绝对路径（`C:/...`）前面要补 `/` 才是合法的 file URL。
+    let needs_leading_slash = !raw.starts_with('/');
+    let body = if needs_leading_slash {
+        format!("/{raw}")
+    } else {
+        raw
+    };
+    format!("file://{}", utf8_percent_encode(&body, FILE_URL_ESCAPE))
 }
 
 /// 按扩展名猜 Content-Type。

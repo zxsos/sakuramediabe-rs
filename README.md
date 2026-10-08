@@ -3,7 +3,7 @@
 SakuraMedia 的 **gRPC 参考插件**：把一个本地目录包装成 `StorageProvider`，用来
 打穿插件 ABI 的数据面、并量化「插件拆进程」的开销。
 
-归属仓库：[`sakuramediabe-rs`](https://cnb.cool/zxsos1/sakuramediabe-rs)。
+归属仓库：[`sakuramediabe-rs`](https://github.com/zxsos/sakuramediabe-rs)。
 
 ## 它回答的三个问题
 
