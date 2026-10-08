@@ -26,7 +26,7 @@ Rust 类型，外加一层给插件用的默认实现。
 ## 依赖方式
 
 ```toml
-sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.1" }
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.3" }
 ```
 
 **按 tag，不要按 branch**：用 branch 会让宿主与插件静默漂移到不同版本的契约，
