@@ -26,7 +26,7 @@ Rust 类型，外加一层给插件用的默认实现。
 ## 依赖方式
 
 ```toml
-sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.1" }
 ```
 
 **按 tag，不要按 branch**：用 branch 会让宿主与插件静默漂移到不同版本的契约，
@@ -36,6 +36,9 @@ sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", t
 ## 版本约定
 
 - 契约本身走 semver；不兼容变更递增版本并在 README 写明影响面。
+- tag 形如 `v0.<ABI_MAJOR>.<patch>`：**纯新增 rpc 只推 patch 位，`ABI_MAJOR` 不动**
+  —— 旧插件二进制照旧能加载，只有用到新 rpc 的插件才需要抬 tag。
+  已发的 tag 永不移动，改了契约就发新 tag。
 - `ABI_MAJOR`（契约里的常量）是宿主据以拒绝加载的编号，与 Cargo 版本相互独立。
 - 上游 Python 插件 `manifest.json` 里的 `host_api_version: 6` 是 **Python 侧
   编号**，与 `ABI_MAJOR` 不是同一套，不要拿来比。
