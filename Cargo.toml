@@ -14,9 +14,12 @@ unsafe_code = "forbid"
 [dependencies]
 # 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
 #
-# TODO(tag)：契约层发布 tag 后改成 `tag = "v0.1.0"`。按 branch 会让本插件与
-# 宿主静默漂移到不同版本的契约，症状是注册不上而不报错。
-sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖而不是
+# branch：按 branch 会让本插件与宿主静默漂移到不同版本的契约，症状是注册不上
+# 而不报错。两仓的逐字节同步由宿主仓的 `parity/check_contract_sync.py` 守。
+#
+# tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
 
 tonic = "0.14"
 # BoxStream：RunJob 的流式返回类型被生成代码固定成它。

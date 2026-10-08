@@ -5,7 +5,7 @@ JavBus 元数据插件，作为 `catalog.metadata_source` 扩展点给 SakuraMed
 [`sakuramedia_javbus_metadata`](https://github.com/tinypinglite/sakuramedia_javbus_metadata)
 的 Rust 移植。
 
-归属仓库：[`sakuramediabe-rs`](https://cnb.cool/zxsos1/sakuramediabe-rs)
+归属仓库：[`sakuramediabe-rs`](https://github.com/zxsos/sakuramediabe-rs)
 （宿主实现与任务书 `docs/tasks/javbus-metadata.md` 都在那里）。
 
 ## 宿主怎么用它
