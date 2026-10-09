@@ -392,6 +392,15 @@ impl DownloadTaskRepository {
     ///
     /// # 只碰 `import_status` 与 `import_task_run_id`
     ///
+    /// 删除下载任务。返回是否真的删了一行。
+    pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM download_task WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 与 [`Self::set_import_status`] 同一个理由：`state` 是 provider 的远端
     /// 状态，两个状态机不混。
     ///

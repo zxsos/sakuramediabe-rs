@@ -22,11 +22,7 @@
 
 > **推送已解决（2026-10-08）**：契约仓改放到 **GitHub** ——
 > [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)
-> （public；`main` + `v0.1.0` + `v0.2.0` 已推）。本机原来那个 `cnb.cool` 远端
 > **已从仓配置里删除**（对它提交也没有可用凭据：
-> `fatal: could not read Username for 'https://cnb.cool'`）；
-> cnb 的**服务端那份仍在**、且匿名可读（`git ls-remote` 不需要凭据），
-> 需要时 `git remote add cnb <url>` 即可加回来 —— **发布源已改为 GitHub**。
 >
 > 所以 §2.4 的第 4、5 步已做完，不再是「等推送」。
 
@@ -67,7 +63,6 @@
 
 ```toml
 # sakuramedia-plugin-ref-local/Cargo.toml / sakuramedia-javbus-metadata/Cargo.toml
-sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
 ```
 
 > 上面是**分叉当时**的地址与 tag。发布源现已改为 GitHub，插件已改指

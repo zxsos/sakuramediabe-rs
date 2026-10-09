@@ -64,6 +64,19 @@ pub struct AppState {
     /// `provider_not_installed`（`require_provider` 的文档）。缺省就是它 ——
     /// 单测里不注入也能构造 `AppState`。
     storage: Option<Arc<dyn StorageGateway>>,
+    /// provider 的**宿主侧工厂**（浏览 / 转存等走 `sm-plugin-api` 契约的操作）。
+    ///
+    /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 调用方报
+    /// 503 `provider_not_installed`。实现（`sm-plugins` 的
+    /// `RegistryProviderFactory`）由组合根注入 —— 只有它看得见注册表。
+    ///
+    /// # 与 `storage` 的分工
+    ///
+    /// `storage` 是**数据面**（删远端文件、缩略图，走 `sm-service` 自定的
+    /// `StorageGateway` trait）；这个是**控制面**（浏览、转存，走
+    /// `sm-plugin-api` 的 `HostProviderFactory` 契约）。两者都拿活的注册表，
+    /// 插件重启换端点时不受影响。
+    provider_factory: Option<Arc<dyn sm_plugin_api::host::HostProviderFactory>>,
     /// provider 的**播放投递能力**（`plan_playback` / `plan_merged_playback`）。
     ///
     /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 503
@@ -153,6 +166,7 @@ impl AppState {
             jobs: JobCatalog::default(),
             ranking: RankingSourceCatalog::default(),
             storage: None,
+            provider_factory: None,
             playback: None,
             downloads: None,
             media_libraries: None,
@@ -329,6 +343,24 @@ impl AppState {
     pub fn with_storage_gateway(mut self, storage: Arc<dyn StorageGateway>) -> Self {
         self.storage = Some(storage);
         self
+    }
+
+    /// 挂上 provider 宿主侧工厂。**只有组合根会调** —— 理由与
+    /// `with_storage_gateway` 一致。
+    pub fn with_provider_factory(
+        mut self,
+        factory: Arc<dyn sm_plugin_api::host::HostProviderFactory>,
+    ) -> Self {
+        self.provider_factory = Some(factory);
+        self
+    }
+
+    /// provider 宿主侧工厂。`None` = 没装插件 —— 调用方据此报 503
+    /// `provider_not_installed`（service 层各方法的既有语义）。
+    pub fn provider_factory(
+        &self,
+    ) -> Option<Arc<dyn sm_plugin_api::host::HostProviderFactory>> {
+        self.provider_factory.clone()
     }
 
     /// 挂上播放投递能力。**只有组合根会调** —— 理由与 `with_storage_gateway` 一致。

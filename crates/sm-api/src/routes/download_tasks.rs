@@ -72,6 +72,9 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use sm_core::pagination::Paginated;
+use sm_service::transfers::download_request::{
+    DownloadRequestCreateRequest, DownloadRequestCreateResponse, DownloadRequestService,
+};
 use sm_service::transfers::download_task::DownloadTaskService;
 
 use crate::auth::CurrentUser;
@@ -201,7 +204,7 @@ async fn list_download_tasks(
 /// 所以这里注册成 `delete(handler)` 而非 `delete(handler, body)`。
 async fn delete_download_task(
     _user: CurrentUser,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(task_id): Path<i32>,
     EnvelopeQuery(query): EnvelopeQuery<DeleteTaskQuery>,
 ) -> Result<StatusCode, ErrorResponse> {
@@ -212,7 +215,10 @@ async fn delete_download_task(
     // 因为错误码、状态码与 `details.task_id` 三者是一个整体，两处各写一份
     // 迟早会漂移。
     ensure_delete_confirmed(task_id, &query)?;
-    todo!("阶段二：接任务台账删除（要调下载器 provider 删远端任务；成功 204 不带 body）")
+    DownloadTaskService::new(state.db())
+        .delete_task(task_id, query.delete_files)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /download-requests` —— 创建下载请求。
@@ -222,9 +228,11 @@ async fn delete_download_task(
 async fn create_download_request(
     _user: CurrentUser,
     State(_state): State<AppState>,
-    axum::extract::Json(_payload): axum::extract::Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接下载请求创建（注意 200 而非 201/202）")
+    axum::extract::Json(payload): axum::extract::Json<DownloadRequestCreateRequest>,
+) -> Result<Json<DownloadRequestCreateResponse>, ErrorResponse> {
+    let service = DownloadRequestService::new();
+    let response = service.create_request(payload).await?;
+    Ok(Json(response))
 }
 
 /// `POST /download-tasks/{task_id}/import` —— **202 Accepted**。

@@ -934,6 +934,27 @@ impl BackgroundTaskRunRepository {
         Ok(true)
     }
 
+    /// 更新 `params` 列。worker 状态机用（转存的 `_current_item` / `_move_index`）。
+    ///
+    /// `params` 是 `TEXT` 列里的 JSON 文本（`JsonTextField`），这里整列覆盖 ——
+    /// 调用方先读出来、改完再写回（`_begin_item` / `_finish_item` / `_record_failure`
+    /// 都是这个模式）。返回是否更新了行。
+    pub async fn update_params(
+        &self,
+        id: i32,
+        params: &serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let updated = sqlx::query(
+            "UPDATE background_task_run SET params = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(params.to_string())
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
     /// 每个 `task_key` 各自**最新一条**运行记录，返回 `task_key -> 行`。
     ///
     /// 对应上游 `_latest_task_run_by_key`（`api/routers/system/jobs.py:21-32`）。

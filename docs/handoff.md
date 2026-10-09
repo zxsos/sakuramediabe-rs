@@ -5,20 +5,20 @@
 ## 一、当前状态
 
 > **数字以 `docs/progress-baseline.md` 为准** —— 跑 `pwsh -File scripts/progress.ps1 -Diff`
-> 核对，漂移即失败。下表同步到 **2026-10-08 晚**（HEAD `df0c39a`）。
+> 核对，漂移即失败。下表同步到 **2026-10-09**（HEAD `df466d9`）。
 
 | 项 | 值 |
 |---|---|
 | 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
 | 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
-| 端点方法体 | **实测 `todo!()` 共 47 个**：`sm-service` **27** + `sm-api` **20**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
-| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **20 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
+| 端点方法体 | **`todo!()` 共 22 个**（剥注释口径）：`sm-service` **17** + `sm-api` **5**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
+| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **5 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
 | 完成的域 | `collections`、`system`、**`playback`（`media_playback.rs` 3/3 ✅ 清零）**、**`videos`（3/7）** |
 | 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 6/21** |
 | 门禁 | `verify.ps1 -Tier full` **全绿**（fmt / doc / clippy / 单测 / 真库集成 / 对拍 / **契约两仓同步** / 进度基线，共 12 项） |
-| 提交 | 推送状态以 `git status -sb` 为准（`cnb` 从未推过） |
+| 提交 | 推送状态以 `git status -sb` 为准 |
 
-**下一步看 §七「交接快照」与 §八「接下来做什么」** —— 前者是剩余 47 条的
+**下一步看 §七「交接快照」与 §八「接下来做什么」** —— 前者是剩余待办（**数量以基线为准，当前 22**）的
 **卡点表**与待拍板项，后者是可立即开工的**执行清单**。§一之二以下的数字是**历史计划**，
 别照它开工。**部署形态与瘦身目标见 [`deployment.md`](deployment.md)。**
 
@@ -1511,7 +1511,6 @@ transfers 编排、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB �
 
 ## 四、纪律（踩过坑才定的）
 
-1. **直接推 `main`**。本地分支就是 `main`，提交后直接 `git push cnb main`，
    不开主题分支、不走 PR。
 
    > 这条**替换**掉了原先的「一个主题一条分支一个 PR」。原规则的理由是
@@ -1520,8 +1519,6 @@ transfers 编排、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB �
    > 动作由别人触发，你的提交会落在一个已经移动过的分支上。没有 PR 就没有
    > 「别人中途合并」这个环节，风险不存在。
    >
-   > 保留一句提醒：**推之前先 `git fetch` 看 `cnb/main` 有没有动过。** 多个
-   > 执行体（CNB 的 auto 分支 agent、你自己）可能同时在写主线。
 2. **先读跨文件依赖再开工**。三次半路撞墙（`subtitles`、`subscriptions`、proto 能力）都是因为只读了当前文件。尤其是 proto：`plugin.proto` **早就有 `enum Capability` 与 `PluginControl.Register`**，不要按「需要拆 service」的假定去改。
 3. **不要发明协议**。上游没实现的（数据面）、proto 没定义的，先查证再动手。
 4. **SQL 用 `QueryBuilder`**，不要拼字符串（占位符编号会静默错位）。
@@ -1684,7 +1681,6 @@ transfers 编排、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB �
 宁可只写签名 + `todo!()` 并注明「公式待照上游 `:行号` 核实」，也不要填一个
 看起来合理的值。
 
-
 ## 五、上游的两处「缺陷」，已刻意照抄
 
 - `/movies/latest` 的 `total` 不带黑名单过滤（与当页口径不一致）
@@ -1733,7 +1729,7 @@ transfers 编排、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB �
 | `6020a8e` | **feat(abi)：`ABI_MAJOR` → 2 + 契约两仓同步门禁**（`parity/check_contract_sync.py` 接进 verify） |
 | `a15a09b` | docs(tasks)：proto P1 缺口提案（纠正「三个待决策」的认知，指出契约分叉是 P0） |
 
-⚠️ 推送状态以 `git status -sb` 为准（`cnb` 从头到尾没推过；`origin` 推不推由你定）。
+⚠️ 推送状态以 `git status -sb` 为准（推送状态以 `git status -sb` 为准）。
 
 ### 7.2 `/media-libraries` 这批的两个决定（照做，别回退）
 
@@ -2263,17 +2259,19 @@ provider 插件上** —— 路由侧**没有一条不是**卡插件的。
 ⚠️ 而「21 条压在 provider 上」这句话**本身也太粗**：2026-10-09 逐条核过之后，
 它们缺的是**三样不同的东西**（别再一次当成「等 ABI」）：
 
-| 缺的东西 | 在哪 | 影响 |
-|---|---|---|
-| **storage provider**：宿主侧「provider_key → 端点 → 客户端」那一层缝 + 一条**能从测试里驱动**的参考实现 | `sm-service` 不依赖 `sm-plugins`（ADR），playback 有一份 `provider_helpers`，transfers 这边还是空壳（`download_common::library_provider` 就是它） | `provider_browse`、`import_task::execute`、`media_transfer_task`、`media_import` 剩的那条 |
-| **download provider 的调用面**：ABI（`DownloadProviderExt` + proto 全在）**有了**，但 `sm-plugins/src/provider_calls.rs` 里**一个 download 函数都没有**（模块文档却写着「storage / download 都发」），`plugin-ref-local` 也没实现它 | 只有 `sm-plugin-api` 内部的 `MinimalDownload` 测试替身 | `download_sync` 的 2 条、`download_task::delete`、`download_request::create`、`auto_download`、`download_tasks` 那 2 条路由 |
-| **image store**（与服务层解耦的读写图字节） | 尚无 | `catalog_import` 竖封面、`moment_recommendation` 生成侧 |
+**★ 2026-10-09 第三轮：上面这张表里有两行的描述都不准，下面是核实后的版本。**
 
-★ 最关键的一条：**`sm-plugins` 至今没有任何测试真的起过一个 provider**（
-`provider_calls` 只有 `connect_storage` 那一族，而 `plugin-ref-local` 的往返测试
-只在插件自己那个 crate 里跑）。所以 storage 那一路的**接入成本与可测性都还没被验证过** ——
-动 transfers 那批之前，先把这件事做出来（参考实现 + 一条真往返用例），否则每条都会
-各自发明一遍怎么连。
+| 缺的东西 | 现状（已核实） | 影响 |
+|---|---|---|
+| **storage 的宿主调用面** | ✅ **在，且已验**：`provider_calls.rs` 那 18 个函数由 `plugin-ref-local/tests/provider_calls_roundtrip.rs` 用真 provider 打通（结构化错误过线、不透明引用 `Struct`↔JSON、流收干、进度回调、未实现归类、连不上归类）。`Browse` 的包装已补（单页，2026-10-09）；不透明引用形状错当场拒 422，不再静默当库根。**服务层那一层还没接**：`ProviderBrowseService::browse` 仍是 `todo!()`（DTO 形状差三字段，已在该模块文档登记）| `provider_browse`、`media_transfer` 挑源 |
+| **transfers 侧拿句柄的那层缝** | ❌ `download_common::library_provider` 仍是 `todo!()`：缺的是「provider_key → 端点 → 客户端」那一层**服务层 trait**（`sm-service` 不依赖 `sm-plugins`，ADR）+ 组合根装配 —— 与 `PlaybackGateway` / `MediaLibraryRegistry` 同一个形状 | `import_task::execute`、`media_transfer_task`、`media_import` 剩的那条 |
+| **download 调用面** | ❌ 比上一版说的**更空**：proto 有 `service DownloadProvider`（`storage.proto:444`，5 个 rpc）、插件侧 `DownloadProviderExt` + 生成的 server + `MinimalDownload` 替身全在，但**全仓一行 `DownloadProviderClient` 都没有** —— 连「建个客户端」都没做过 | `download_sync` 2 条、`download_task::delete`、`download_request::create`、`auto_download`、`download_tasks` 2 条路由 |
+| **image store**（与服务层解耦的读写图字节） | ❌ 尚无 | `catalog_import` 竖封面、`moment_recommendation` 生成侧 |
+
+★ 上一版说「storage 那一路的接入成本还没被验证」—— **这条已经消掉了**（真往返用例
+已落地）。但**完整链条仍未验**：注册表 / supervisor 拉起插件 → 拿端点 → 经
+`provider_calls` 说话，这条端到端路径还没有用例（supervisor 拉进程有
+`plugin-ref-local/tests/lifecycle.rs`，`provider_calls` 有本轮这个文件，**中间那截没有**）。
 
 ⚠️ 但「压在 provider 上」**不等于**「等 ABI」—— §7.2k 就是一次反例：原来那 13 条里有 3 条
 （`media_playback.rs`）的卡点被写成「等 ABI」，实际 ABI 早就够用，真正的缺口是**宿主侧
@@ -2342,12 +2340,17 @@ provider 插件上** —— 路由侧**没有一条不是**卡插件的。
 「为什么」，这一节只讲**先做哪个、怎么算做完**。
 
 > ★ **2026-10-09 追加**：`media_import` 的失败项重试（`POST …/retry`）已落地，
-> 队列从 24 降到 23（§7.3 的表已更新）。**下一步不变**，仍是下面的 step 0
-> （storage seam）—— `transfers` 那 21 条各自缺什么，见 §7.4 末尾那三行表
-> （storage seam / download 调用面 / image store）。其中 **download 调用面**是
-> 本轮侦察的结论：ABI 有、宿主侧一个函数都没有、参考实现也没有。
+> 队列从 24 降到 23（§7.3 的表已更新）。
+>
+> 同日**又做了一轮核实**（结论写进 §7.4 的表），把 §8.0 原文里三句已经过期的话
+> 订正了：step 0（`ProviderRegistration` 四个字段 + `MediaLibraryRegistry` 装配 +
+> `media_libraries` 那 5 条）**早已落地**。storage 的宿主调用面也**补上了真往返
+> 用例**（`plugin-ref-local/tests/provider_calls_roundtrip.rs`）。
+>
+> **下一步照 §8.0 末尾那三条**走（`browse` 包装 → download 调用面 →
+> `library_provider` 那层服务层缝）—— 都不是「等 ABI」。
 
-### 8.0 ★ 正在做的一刀（2026-10-08，**代码未动，从这继续**）
+### 8.0 ★ 正在做的一刀（2026-10-08 立，**step 0 已完成**）
 
 一份已确认的计划（`provider-play-url`）走完第 1 步（核实），
 **但核实的结论在收尾时被自己推翻了一次**（见 §7.2k 的订正）：
@@ -2357,17 +2360,35 @@ provider 插件上** —— 路由侧**没有一条不是**卡插件的。
 按可验证粒度切成四条，**每条都控制在一个回合内能写完 + 编译 + 反向验证 + 提交**
 （合成一刀就会「开一半」）：
 
-**step 0 —— 把 seam 接上（新发现，原先没算到）**
+**step 0 —— 把 seam 接上 ✅ 已完成（2026-10-09 核实，本节的原文是错的）**
 
-- `sm-plugins/src/registry.rs` 的 `ProviderRegistration`（`:34-58`，字段止于
-  `plugin_endpoint`）补上 `MediaProviderBundle` 的四个字段：
-  `library_config_fields` / `playback_deliveries` / `merged_playback_format` /
-  `download_config_fields`。**不补就没有数据来源。**
-- 组合根实现 `MediaLibraryRegistry`（全仓目前只有测试替身 `FakeRegistry`），
-  并由 `AppState::with_media_library_registry`（`state.rs:278`）注入 —— 该 setter
-  **没有任何生产调用点**。不接的话 provider 目录是空表、写路径一律 503。
-- 顺带解掉 `media_libraries` 那 5 条（它们等的就是这个字段表，见 L1070-1083
-  那段「`config_fields` 没有来源」—— 那段**是对的**）。
+原文写着这三件事都**没做**，逐条核过之后三件**都已落地**：
+
+- ✅ `ProviderRegistration` 的四个字段在（`registry.rs:88-99`：`library_config_fields` /
+  `playback_deliveries` / `merged_playback_format` / `download_config_fields`）。
+- ✅ 组合根实现了 `MediaLibraryRegistry`：`sm-server/src/media_library_gateway.rs`，
+  并由 `sm-server/src/lib.rs:352` 的 `with_media_library_registry` 注入 ——
+  原文说「该 setter **没有任何生产调用点**」，那句在写下的当天就过期了。
+- ✅ `media_libraries` 那 5 条已清零（`routes/media_libraries.rs` 里没有 `todo!()`）。
+- ✅ 顺带：storage 的宿主调用面本轮补了真往返用例
+  （`plugin-ref-local/tests/provider_calls_roundtrip.rs`），见 §7.4 的表。
+
+**下一步（按依赖排，都不是「等 ABI」）**
+
+1. ✅ `provider_calls::browse` —— 已补（2026-10-09）。**单页**语义：`next_cursor`
+   透传给客户端，宿主**不**循环收干（收干会让「还有下一页」消失，且 `BrowsePage`
+   没有总数 —— proto 自己那条 GAP）。顺带补了 `require_opaque_object`：
+   不透明引用的根不是对象时，`browse` / `scan_import_source_all` 当场拒 422
+   `invalid_config`，不再静默降级成 `None`（= 库根 / 整库）。
+2. `ProviderBrowseService::browse` 接线（`provider_browse.rs` 仍是 `todo!()`）——
+   调用面已验，**这一步正好可以顺手改 DTO 形状**：该模块文档（:21-37）已登记
+   `BrowseEntry` 比上游少 `entry_type` / `modified_at` / `is_video`。现在
+   `provider_calls::browse` 返回的是 proto 的 `BrowsePage`（6 个字段都在，
+   逐个对齐 `common.proto:108-121`），不再有「形状改不动」的借口。
+3. download 调用面 —— `provider_calls` 里加那 5 个（`Submit` / `ListTasks` /
+   `DeleteTask` / `PrepareClient` / `TestClient`）+ 参考插件里补一个最小
+   `DownloadProviderExt` 实现，否则连测都没法测。
+4. `download_common::library_provider` 那层服务层 trait + 组合根装配。
 
 **2a —— 纯管道，可单测**
 
@@ -2449,7 +2470,6 @@ provider 插件上** —— 路由侧**没有一条不是**卡插件的。
 
 | # | 做什么 | 为什么先它 | 完成判据 |
 |---|---|---|---|
-| ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ✅ **已做完**（2026-10-08）。契约仓改放 GitHub [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)（public；`main` + `v0.1.0` + `v0.2.0`；本地 `cnb.cool` 远端**已删除**，发布源改指 GitHub）→ 两个插件改指 `v0.2.0` → `plugin-ref-local` 的 `done` 帧按**宿主内置副本**镜像过去（宿主侧早已实现，`GAP:` 注释删掉）。判据：两插件 `cargo test` 绿（`ref-local` 13 项 / `javbus` 33 项）、`parity/check_contract_sync.py` 报 9 个受管文件一致。详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md) §零 |
 | ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有三个 | ⚠️ **3/4 已完成**（2026-10-08）。`judge_collecttion_movie` → 新仓 `sakuramedia-judge-collecttion-movie`（`9726828`，46 项测试绿）；`subtitlecat` → `sakuramedia-subtitlecat`（`b7131db`，49 项测试绿）；`actor-metadata` → `sakuramedia-actor-metadata`（`17b0936`，69 项测试绿）。三个都是「只有后台任务、没有扩展点」，宿主侧缺的 rpc 也都补上了（`ListMovies`/`PatchMovie`/`ImportSubtitle`/`ListActors`/`PatchActor` + 影片快照的 `actors`）。**只剩 `javdb_ranking` 的 ABI 前提没齐** —— 见下表后的块 |
 | ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | ⚠️ **第一段已通**（`aeff054`）：`import_by_number` + 窄接口补 `find_movie_id` / `import_plugin_movie` + 4 单测 + 3 个真库测试。**剩 `impl MovieMetadataImporter`** —— 卡在接口冲突（那个 trait 的方法签名**没有 config**，而 `fetch` / `fetch_plugin` 要看 `plugins.enabled` 的顺序），两条走法待拍板 |
 | ④ | **P1-2 决策**：`PlaybackPlan` 加 `local_path` delivery | 同域反证：`OpenCoverSourceResponse` 早有 `oneof { local_path, url }`，唯独播放计划没有。**必须在阶段 ⑤ 之前定**，否则 `local_provider` 要先按 `file://` 写一遍再改 | `PlaybackPlan.oneof delivery` 有 `LocalPathPlan local_path = 3`；`docs/plugin-abi.md` 写明三种 delivery 的适用场景 |

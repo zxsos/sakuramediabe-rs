@@ -1677,6 +1677,26 @@ impl MovieRepository {
         Ok(result.rows_affected())
     }
 
+    /// 设置竖封面。`image_id = None` = 清除。
+    ///
+    /// 供 `CatalogImportService::backfill_movie_thin_cover`（竖封面回填）。
+    pub async fn set_thin_cover_image_id(
+        &self,
+        movie_id: i32,
+        image_id: Option<i32>,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE movie SET thin_cover_image_id = $2, updated_at = $3 \
+              WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(image_id)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 插入。
     ///
     /// `javdb_id` 的空串在此归一为 `None` —— 库里出现空串会让

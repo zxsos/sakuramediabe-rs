@@ -37,6 +37,11 @@ pub mod json_struct;
 /// 作者在插件自己的测试里就能验一遍交出去的文件。见模块文档。
 pub mod movie_delivery;
 
+/// 宿主侧的 provider 调用抽象（`sm-service` 调插件时用的 trait）。
+///
+/// 见模块文档：为什么 `sm-service` 不直接依赖 `sm-plugins`。
+pub mod host;
+
 pub use provider::{DownloadProviderExt, StorageProviderExt};
 
 /// 契约包名，供代码生成与文档引用。

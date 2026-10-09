@@ -120,7 +120,8 @@ pub struct ThinCoverResolution {
 
 /// 构造图片任务清单。供 [`super::catalog_import`] 依赖（那个 trait 名是
 /// `ImageTasksBuilder`）。
-pub trait ImageTasksBuilder {
+#[async_trait::async_trait]
+pub trait ImageTasksBuilder: Send + Sync {
     /// 为一次导入构造全部图片任务。
     ///
     /// 返回 `(封面任务, 剧情图任务列表, 演员头像任务按 JavDB id 分组)`。
@@ -131,6 +132,38 @@ pub trait ImageTasksBuilder {
         plot_urls: &[String],
         actors: &[serde_json::Value],
     ) -> Result<ImageTaskSet, ServiceError>;
+
+    /// 从**库里已有**的封面解析薄封面。**完全离线**。
+    ///
+    /// 供 [`super::catalog_import::CatalogImportService::backfill_movie_thin_cover`]
+    ///（竖封面回填）调用。`Err` = 算不出来（无封面/切不出），调用方降级为
+    /// `Ok(false)`，不抛错。
+    ///
+    /// 默认实现直接返回 `Err`（测试替身不需要这能力）。
+    async fn resolve_thin_cover_from_existing_movie(
+        &self,
+        movie_id: i32,
+    ) -> Result<ThinCoverResolution, ServiceError> {
+        Err(ServiceError::not_found(
+            "thin_cover_unavailable",
+            "未实现薄封面解析",
+            "movie_id",
+            movie_id,
+        ))
+    }
+
+    /// 把解析出的薄封面**落盘 + 登记**。返回新建的 `image` id。
+    ///
+    /// `None` = 没切出图（`resolution.thin_cover_path` 为空），调用方降级。
+    ///
+    /// 默认实现返回 `Ok(None)`（测试替身不需要这能力）。
+    async fn persist_thin_cover(
+        &self,
+        _movie_number: &str,
+        _resolution: ThinCoverResolution,
+    ) -> Result<Option<i32>, ServiceError> {
+        Ok(None)
+    }
 }
 
 /// 一次导入的全部图片任务。
@@ -178,6 +211,7 @@ pub struct MovieImageService {
     downloader: SharedDownloader,
 }
 
+#[async_trait::async_trait]
 impl ImageTasksBuilder for MovieImageService {
     /// 为一次导入构造全部图片任务。上游 `build_movie_import_image_tasks`：
     ///
@@ -259,6 +293,77 @@ impl ImageTasksBuilder for MovieImageService {
             plots,
             actor_avatars,
         })
+    }
+
+    /// 从**库里已有**的封面解析薄封面。**完全离线**。
+    ///
+    /// ⚠️ **剧情图回退分支尚未接线**：需要 `movie_plot_image` 的按影片查询
+    /// （仓储层还没有）。现在没有封面就返回 `Err`（可降级，调用方记
+    /// `skipped`）。
+    async fn resolve_thin_cover_from_existing_movie(
+        &self,
+        movie_id: i32,
+    ) -> Result<ThinCoverResolution, ServiceError> {
+        let movie = MovieRepository::new(self.db.clone())
+            .find_by_id(movie_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("movie_not_found", "影片不存在", "movie_id", movie_id)
+            })?;
+        let Some(cover_id) = movie.cover_image_id else {
+            return Err(ServiceError::not_found(
+                "cover_missing",
+                "这部影片没有封面，切不出薄封面",
+                "movie_id",
+                movie_id,
+            ));
+        };
+        let cover = ImageRepository::new(self.db.clone())
+            .find_by_id(cover_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("cover_missing", "封面记录不存在", "image_id", cover_id)
+            })?;
+        let absolute = svc_image::paths::absolute(&self.root, &cover.origin);
+        self.crop_to_temp(&movie.movie_number, &absolute)?
+            .ok_or_else(|| {
+                ServiceError::validation(
+                    "thin_cover_unavailable",
+                    "封面里找不到书脊，切不出薄封面（可降级）",
+                )
+            })
+    }
+
+    /// 把解析出的薄封面**落盘 + 登记**。返回新建的 `image` id。
+    ///
+    /// 复用 [`MovieImageService::finalize_prepared_image_files`]（原子落盘 +
+    /// `ImageRepository::upsert` 幂等登记），所以这里只做
+    /// `ThinCoverResolution` → `PreparedImageFile` 的适配。
+    async fn persist_thin_cover(
+        &self,
+        movie_number: &str,
+        resolution: ThinCoverResolution,
+    ) -> Result<Option<i32>, ServiceError> {
+        let (Some(temp_path), Some(relative_path)) = (
+            resolution.thin_cover_path,
+            resolution.relative_path,
+        ) else {
+            return Ok(None);
+        };
+        let size_bytes = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
+        let prepared = PreparedImageFile {
+            task: ImagePersistTask {
+                owner_type: "movie_thin_cover".to_owned(),
+                owner_key: movie_number.to_owned(),
+                image_url: String::new(),
+                relative_path,
+                plot_index: None,
+            },
+            temp_path,
+            size_bytes,
+        };
+        let ids = self.finalize_prepared_image_files(&[prepared]).await?;
+        Ok(ids.into_iter().next())
     }
 }
 
@@ -423,47 +528,6 @@ impl MovieImageService {
             "movie_number",
             0,
         ))
-    }
-
-    /// 从**库里已有**的封面解析薄封面。**完全离线**。
-    ///
-    /// 由 [`super::movie_thin_cover_backfill`] 调用 —— 那个任务不出网。
-    ///
-    /// ⚠️ **剧情图回退分支尚未接线**：需要 `movie_plot_image` 的按影片查询
-    /// （仓储层还没有）。现在没有封面就返回 `Err`（可降级，调用方记
-    /// `skipped`）。
-    pub async fn resolve_thin_cover_from_existing_movie(
-        &self,
-        movie_id: i32,
-    ) -> Result<ThinCoverResolution, ServiceError> {
-        let movie = MovieRepository::new(self.db.clone())
-            .find_by_id(movie_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::not_found("movie_not_found", "影片不存在", "movie_id", movie_id)
-            })?;
-        let Some(cover_id) = movie.cover_image_id else {
-            return Err(ServiceError::not_found(
-                "cover_missing",
-                "这部影片没有封面，切不出薄封面",
-                "movie_id",
-                movie_id,
-            ));
-        };
-        let cover = ImageRepository::new(self.db.clone())
-            .find_by_id(cover_id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::not_found("cover_missing", "封面记录不存在", "image_id", cover_id)
-            })?;
-        let absolute = svc_image::paths::absolute(&self.root, &cover.origin);
-        self.crop_to_temp(&movie.movie_number, &absolute)?
-            .ok_or_else(|| {
-                ServiceError::validation(
-                    "thin_cover_unavailable",
-                    "封面里找不到书脊，切不出薄封面（可降级）",
-                )
-            })
     }
 
     /// 登记一张图片。`plot_index = None` 表示不是剧情图。

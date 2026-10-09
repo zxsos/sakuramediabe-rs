@@ -190,7 +190,7 @@ pub struct MediaImportService {
 }
 
 /// 插件的存储能力。**形状待插件 ABI 定型**，这里只声明宿主用到的五个动作。
-pub trait StorageProvider {
+pub trait StorageProvider: Send + Sync {
     /// 扫描可导入的条目。
     fn scan_import_source(
         &self,
@@ -219,7 +219,7 @@ pub trait StorageProvider {
 }
 
 /// 目录写入（catalog 域）。**跨域调用**，接口刻意窄。
-pub trait CatalogImport {
+pub trait CatalogImport: Send + Sync {
     /// 写入一部影片。返回 `(movie_id, is_new)`。
     fn import_movie(
         &self,

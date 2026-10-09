@@ -191,6 +191,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let gateway = std::sync::Arc::new(provider_gateway::ProviderGateway::new(
         loaded_plugins.provider_registry(),
     ));
+    // provider 宿主侧工厂（浏览 / 转存等走 `sm-plugin-api` 契约的操作）。
+    // 与上面的 `ProviderGateway` 同一个「活的注册表」纪律：插件重启换端点时
+    // 不受影响。`sm-service` 只认 trait（`HostProviderFactory`），实现由这里给。
+    let provider_factory_source =
+        std::sync::Arc::new(sm_plugins::host_impl::RegistryProviderFactory::new(
+            loaded_plugins.provider_registry(),
+        ));
+    let provider_factory: std::sync::Arc<dyn sm_plugin_api::host::HostProviderFactory> =
+        provider_factory_source;
     // 排行同步（写侧）：目录（4b 才有的快照）+ 取数网关（每次现取插件的控制面
     // 端点，所以给的是**活的注册表句柄**）。填进 4a 建的那个槽。
     ranking_slot.fill(std::sync::Arc::new(
@@ -348,6 +357,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .with_ranking_sources(ranking_sources)
         // 克隆给 worker（下面 6b 步三个 playback 任务用），本体进 AppState。
         .with_storage_gateway(std::sync::Arc::clone(&storage_gateway))
+        .with_provider_factory(std::sync::Arc::clone(&provider_factory))
         .with_playback_gateway(playback_gateway)
         .with_media_library_registry(media_library_gateway)
         .with_metadata_search(Arc::new(metadata_search))

@@ -101,7 +101,7 @@ impl Default for DownloadRequestService {
 }
 
 /// 可注入依赖面。**存在是为了测试**，生产路径用 `None` 走真实实现。
-pub trait RequestDeps {
+pub trait RequestDeps: Send + Sync {
     /// 取索引器。
     fn indexer(&self, name: &str) -> Result<IndexerRow, ServiceError>;
     /// 取与索引器绑定的客户端（空列表 → 422）。
@@ -144,8 +144,53 @@ impl DownloadRequestService {
         &self,
         payload: DownloadRequestCreateRequest,
     ) -> Result<DownloadRequestCreateResponse, ServiceError> {
-        let _ = payload;
-        todo!("骨架：番号/候选校验 -> 解析唯一客户端 -> 算 hash -> 比黑名单 -> 提交 -> 落台账")
+        // 1. 校验：番号 -> 候选字段（纯函数，不碰 IO）
+        validate_request(&payload)?;
+
+        // 2. 取依赖（测试注入或真实实现）
+        let deps = self.inner.as_ref().ok_or_else(|| {
+            ServiceError::unavailable(
+                "download_request_no_deps",
+                "真实依赖尚未实现（需要 provider seam）",
+            )
+        })?;
+
+        // 3. 解析索引器
+        let indexer = deps.indexer(&payload.indexer_name)?;
+
+        // 4. 解析绑定的客户端（空列表 -> 422，由 deps 实现负责）
+        let clients = deps.bound_clients(&indexer)?;
+        let client = clients.into_iter().next().ok_or_else(|| {
+            ServiceError::validation(
+                "download_request_client_not_bound_to_indexer",
+                "没有可用的下载客户端",
+            )
+        })?;
+
+        // 5. 算资源哈希
+        let info_hash = super::download_resource_hash::resolve_resource_hash(
+            &payload.candidate.source_uri,
+        )
+        .await?;
+
+        // 6. 查黑名单（提交之前是硬要求）
+        if deps.is_blacklisted(&info_hash)? {
+            return Err(ServiceError::validation(
+                "download_source_blacklisted",
+                "该资源已被拉黑",
+            ));
+        }
+
+        // 7. 提交到下载器（provider 调用走 trait）
+        let remote_task_id = deps.submit(&client, &payload.candidate)?;
+
+        // 8. 返回响应
+        Ok(DownloadRequestCreateResponse {
+            movie_number: payload.movie_number,
+            client_name: client.name.clone(),
+            remote_task_id,
+            task_id: None, // 台账落库待 provider seam 就绪后补
+        })
     }
 }
 

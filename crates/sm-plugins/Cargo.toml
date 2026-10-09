@@ -25,6 +25,10 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# host_impl.rs 的 `#[async_trait]`（实现 `sm_plugin_api::host` 的 trait）。
+async-trait = { workspace = true }
+# provider_calls 转存包装的 `receipt: Option<prost_types::Struct>`。
+prost-types = { workspace = true }
 # 插件包是**第三方打的 zip**（绝大多数用 deflate）。见根 Cargo.toml 那条
 # `zip` 的说明：本仓自己只写 STORED，但读别人打的包必须能解 deflate。
 zip = { workspace = true }

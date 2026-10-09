@@ -2675,6 +2675,7 @@ dependencies = [
  "serde_json",
  "sm-core",
  "sm-db",
+ "sm-plugin-api",
  "sm-plugins",
  "sm-service",
  "sqlx",
@@ -2726,6 +2727,7 @@ dependencies = [
 name = "sm-plugin-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "futures",
  "prost",
@@ -2743,7 +2745,9 @@ dependencies = [
 name = "sm-plugins"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hashing",
+ "prost-types",
  "serde_json",
  "sm-core",
  "sm-db",
@@ -2805,6 +2809,7 @@ dependencies = [
 name = "sm-service"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bcrypt",
  "chrono",
  "futures",

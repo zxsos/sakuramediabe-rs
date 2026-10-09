@@ -476,13 +476,42 @@ impl CatalogImportService {
 
     /// 为已有影片补算竖封面。上游 `backfill_movie_thin_cover(movie) -> bool`。
     ///
-    /// `cv2` 缺失时**降级返回 `false`**，不报错。
+    /// 流程：查影片（不存在 → 404）→ 已有竖封面直接返回 `false`（**不覆盖**，
+    /// 上游 `backfill_missing_thin_cover_images` 语义）→ 解析薄封面 →
+    /// 落盘登记 → 更新 `movie.thin_cover_image_id`。
     ///
-    /// ❌ **仍未实现**：依赖 [`super::movie_image`]（5 处 `todo!()`）与
-    /// **image store**（读已落盘的剧情图做切割）—— 本仓还没有那一层。
+    /// 解析失败（无封面/切不出书脊）→ `Ok(false)` **降级**，不抛错 —— 上游
+    /// `cv2` 缺失时也是降级返回 `false`。
     pub async fn backfill_movie_thin_cover(&self, movie_id: i32) -> Result<bool, ServiceError> {
-        let _ = movie_id;
-        todo!("被 image store / cv2 挡住：见方法文档与 docs/handoff.md 的登记")
+        let movie = MovieRepository::new(self.db.clone())
+            .find_by_id(movie_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("movie_not_found", "影片不存在", "movie_id", movie_id)
+            })?;
+        // 已有竖封面的不覆盖（回填语义：只补没有的）。
+        if movie.thin_cover_image_id.is_some() {
+            return Ok(false);
+        }
+        let resolution = match self
+            .image_service
+            .resolve_thin_cover_from_existing_movie(movie_id)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(_) => return Ok(false),
+        };
+        let Some(image_id) = self
+            .image_service
+            .persist_thin_cover(&movie.movie_number, resolution)
+            .await?
+        else {
+            return Ok(false);
+        };
+        MovieRepository::new(self.db.clone())
+            .set_thin_cover_image_id(movie_id, Some(image_id))
+            .await?;
+        Ok(true)
     }
 
     /// 从 JavDB 资源 upsert 一位演员。

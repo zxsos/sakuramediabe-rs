@@ -21,6 +21,8 @@ chrono = { workspace = true }
 # 互转规则只有一份，放在契约仓（见 src/json_struct.rs）。
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# host.rs 的 `#[async_trait]`（宿主侧调用抽象）。
+async-trait = { workspace = true }
 
 [dev-dependencies]
 # 默认实现层的单测要直接 await 生成的 server trait。

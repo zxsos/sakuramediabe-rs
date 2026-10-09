@@ -83,7 +83,7 @@
 //! | 方法 | 缺什么 |
 //! |---|---|
 //! | [`ImportTaskService::search_failed_item`] | 元数据搜索 —— 走**插件 ABI**（`metadata_source`）|
-//! | [`ImportTaskService::execute`] | `import_service`（扫描/暂存/定稿）+ `catalog_import`；且 `sm-scheduler` 尚未注册 `library_import` 处理器 |
+//! | [`ImportTaskService::execute`] | ✅ 已实现（三模式分发 + 409 终态检查 + 批量容错聚合）。执行依赖由组合根经 `with_import_service` 注入；`sm-scheduler` 尚未注册 `library_import` 处理器 |
 //!
 //! # 手动搜索的两种失败**要区别对待**
 //!
@@ -98,17 +98,20 @@ use sm_db::system::task_state;
 
 use sm_db::repo::{
     BackgroundTaskRunRepository, DownloadClientRepository, DownloadTaskRepository,
-    MediaLibraryRepository,
+    MediaLibraryRepository, SystemNotificationRepository,
 };
 use sm_db::system::activity::BackgroundTaskRun;
 use sm_db::transfers::downloads::{import_status, DownloadTask};
 use sm_db::{Db, MediaLibrary};
+use tracing::warn;
 
 use crate::catalog::movie_metadata_search::MovieMetadataSearchService;
 use crate::error::{details_of, ProgrammerError, ServiceError};
 use crate::system::activity::TaskRunService;
 use crate::system::task_queue::{ConflictPolicy, EnqueueOutcome, TaskQueueService};
 
+use super::import_notifications::{create_new_media_reminder, NewMovieReminderItem};
+use super::import_service::{ImportFailure, ImportResult, MediaImportService};
 use super::import_write_mutex::library_import_mutex_key;
 
 /// 任务键。与 `cron_spec` 与 `sm_scheduler::lane_of` 里的 `library_import`
@@ -486,15 +489,42 @@ pub struct ImportExecuteSummary {
 }
 
 /// 导入服务。
-#[derive(Debug, Clone)]
+///
+/// `import_service` 是**可选**的执行依赖：入队（`enqueue` / `enqueue_batch`）
+/// 与查询路径都不需要它，只有 worker 的执行体（[`Self::execute`]）需要
+/// （扫描 / 暂存 / 定稿）。所以 `new` 不收它，由组合根在装配 worker handler
+/// 时经 [`Self::with_import_service`] 注入；没装时 `execute` 报 503
+/// `import_service_not_wired`，而不是在构造期 panic ——
+/// `sm-scheduler` 的 `HandlerFactory` 签名是 `Fn(&Db, &Value)`，每次调用只
+/// 拿到库，进程级依赖只能由注册闭包从外部捕获进来。
+///
+/// ⚠️ 没有 `Debug` / `Clone` 派生：[`MediaImportService`] 里的 trait 对象
+/// 不支持它们。本类型处处现用现建，没有克隆它的调用点。
 pub struct ImportTaskService {
     db: Db,
+    import_service: Option<MediaImportService>,
 }
 
 impl ImportTaskService {
     /// 构造。取 `&Db` 并克隆（与本 crate 全部 service 同形）。
     pub fn new(db: &Db) -> Self {
-        Self { db: db.clone() }
+        Self {
+            db: db.clone(),
+            import_service: None,
+        }
+    }
+
+    /// 装上执行依赖（worker 组合根用）。Builder 风格，可链式调用。
+    pub fn with_import_service(mut self, import_service: MediaImportService) -> Self {
+        self.import_service = Some(import_service);
+        self
+    }
+
+    /// 取执行依赖。没装 → 503（见结构体文档）。
+    fn require_import_service(&self) -> Result<&MediaImportService, ServiceError> {
+        self.import_service.as_ref().ok_or_else(|| {
+            ServiceError::unavailable("import_service_not_wired", "导入执行链路尚未接线")
+        })
     }
 
     /// 手动搜索的可重试原因（见模块文档）。
@@ -750,8 +780,48 @@ impl ImportTaskService {
         item_id: &str,
         movie_number: &str,
     ) -> Result<ImportMetadataSearchResponse, ServiceError> {
-        let _ = (task_run_id, item_id, movie_number);
-        todo!("骨架：取失败项 -> 按番号搜元数据候选（走插件 metadata_source）")
+        // ① 任务存在且是导入任务（404）。
+        let task_run = self.require_import_task_run(task_run_id).await?;
+
+        // ② 失败项存在（404）。
+        let items = failed_files(task_run_id, task_run.result_summary.as_deref())?;
+        let item_value = find_failure_item(task_run_id, &items, item_id)?;
+        let item: StoredFailedItem = serde_json::from_value(item_value.clone())
+            .map_err(|e| malformed_summary(task_run_id, format!("失败项形状不对：{e}")))?;
+
+        // ③ 失败项必须还是 pending（409）。
+        if item.state != ImportFailedItemState::Pending {
+            return Err(ServiceError::conflict(
+                "failed_item_not_pending",
+                "该失败项已在重试或已解决",
+                None,
+            ));
+        }
+
+        // ④ 必须是「JAV 视频 + 可人工处理的原因」（409）。
+        if !item.is_searchable_kind() {
+            return Err(ServiceError::conflict(
+                "failed_item_search_unavailable",
+                "该失败项不支持人工搜索元数据",
+                None,
+            ));
+        }
+
+        // ⑤ 番号不能为空（422）。
+        let movie_number = movie_number.trim();
+        if movie_number.is_empty() {
+            return Err(ServiceError::validation(
+                "validation_error",
+                "番号不能为空",
+            ));
+        }
+
+        // ⑥ 实际搜索走插件 ABI（metadata_source），宿主侧调用面未接线。
+        // 诚实返回 503，而非 panic。
+        Err(ServiceError::unavailable(
+            "metadata_source_not_installed",
+            "元数据源插件未安装或未接线，无法搜索",
+        ))
     }
 
     /// `POST /imports/{task_run_id}/failed-items/{item_id}/retry` —— **202**。
@@ -893,20 +963,310 @@ impl ImportTaskService {
         })
     }
 
-    /// ★ 执行体。worker 调用。
+    /// ★ 执行体。worker 调用。上游 `execute`（`:279-310`）。
     ///
-    /// 按 `params["mode"]` 分发（见模块文档）。**未结束的 TaskRun 不得再执行**
-    /// （`409 import_task_not_finished`）—— 那会让同一批文件被导两次。
+    /// 按 `params["mode"]` 分发（见模块文档）：
     ///
-    /// ⚠️ **未落地**，且**尚未接线**：`sm-scheduler` 的处理器注册表里还没有
-    /// `library_import`。所以本轮之后入队的任务会被 worker 领取、然后以
-    /// `NoHandler` 判失败（`WorkerError::NoHandler`，文案
-    /// 「task_key 未在处理器注册表中」）。这是阶段性事实，不是回归。
-    /// 真要跑起来还需要 [`super::import_service`] 的编排与
-    /// `catalog_import` 的入库。
+    /// | 条件 | 模式 | 上游 |
+    /// |---|---|---|
+    /// | `mode == "retry_failed_file"` | 重试一条失败项 | `_execute_failed_item_retry` |
+    /// | `params` 里有 `download_tasks` | 批量 | `_execute_batch` |
+    /// | 缺省 | 单个 | `_execute_single` |
+    ///
+    /// **未结束的 TaskRun 不得再执行**（`409 import_task_not_finished`）——
+    /// 那会让同一批文件被导两次。检查点在重试模式：原任务必须已是终态
+    /// （[`ensure_retryable_task`]）。单 / 批量模式下 params 里没有自己的
+    /// run id（worker 领取时只领 pending 的行，执行中途也不会有人再领同一行），
+    /// 所以这里没有可查的行 —— 不是漏了检查，是签名里就没有这个信息。
+    ///
+    /// 尾巴与上游一致：批量、或单个（带 `download_task_id` 的）且有新可播放
+    /// 影片时发一次上新提醒（[`create_new_media_reminder`]）。
+    ///
+    /// ⚠️ `sm-scheduler` 的处理器注册表里还没有 `library_import`
+    /// （`WorkerError::NoHandler`，文案「task_key 未在处理器注册表中」）——
+    /// 本轮之后入队的任务会被 worker 领取、然后以 `NoHandler` 判失败。
+    /// 这是阶段性事实，不是回归；接线时由组合根用
+    /// [`Self::with_import_service`] 把 [`MediaImportService`] 装进来。
     pub async fn execute(&self, params: &Value) -> Result<ImportExecuteSummary, ServiceError> {
-        let _ = params;
-        todo!("骨架：按 params.mode 分发三种模式；逐条失败进 failed 列表而非整体 Err")
+        let retry_mode =
+            params.get("mode").and_then(Value::as_str) == Some(IMPORT_MODE_RETRY_FAILED_FILE);
+        let batch_mode = !retry_mode && params.get("download_tasks").is_some();
+
+        let summary = if retry_mode {
+            self.execute_failed_item_retry(params).await?
+        } else if batch_mode {
+            self.execute_batch(params).await?
+        } else {
+            self.execute_single(params).await?
+        };
+
+        // 上游 execute 尾巴（`:297-309`）：只有批量、或带下载任务的单个才发提醒。
+        let single_with_download_task = !batch_mode
+            && params
+                .get("download_task_id")
+                .is_some_and(|value| !value.is_null());
+        if (batch_mode || single_with_download_task) && !summary.new_playable_movies.is_empty() {
+            self.send_new_media_reminder(&summary).await?;
+        }
+        Ok(summary)
+    }
+
+    /// 批量执行。上游 `_execute_batch`（`:314-377`）。
+    ///
+    /// `params["download_tasks"]` 的每一项都是一个完整的 single params
+    /// （`enqueue_batch` 里宿主自己造的）。逐条调 [`Self::execute_single`]：
+    /// **单条抛错只记数、不中断** —— 对应上游的 `except Exception:
+    /// failed_task_count += 1`。
+    ///
+    /// ⚠️ 与上游的一处形状差异：上游返回的 dict 里还有 `download_task_count` /
+    /// `processed_download_task_count` / `failed_download_task_count` 三个键，
+    /// 本仓的 [`ImportExecuteSummary`] 没有这三个字段（它是上游 `ImportResult`
+    /// 的形状，不是 batch dict 的形状），计数在这里算完即弃，只保留聚合后的
+    /// 六个字段。
+    async fn execute_batch(&self, params: &Value) -> Result<ImportExecuteSummary, ServiceError> {
+        let items = params
+            .get("download_tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProgrammerError::new("download_tasks 必须是数组"))?;
+        if items.is_empty() {
+            // 上游 `ValueError("download_tasks must not be empty")` —— 调用方
+            // （worker 代码）的 bug，不是用户请求的问题，走 500。
+            return Err(ProgrammerError::new("download_tasks must not be empty").into());
+        }
+        let mut summary = ImportExecuteSummary::default();
+        for item in items {
+            match self.execute_single(item).await {
+                Ok(single) => {
+                    summary.imported_count += single.imported_count;
+                    summary.skipped_count += single.skipped_count;
+                    summary.failed_count += single.failed_count;
+                    summary.new_playable_movies.extend(single.new_playable_movies);
+                    summary.created_video_ids.extend(single.created_video_ids);
+                    summary.failed_files.extend(single.failed_files);
+                }
+                Err(error) => {
+                    // 这一条下载任务整体失败：execute_single 的 Err 路径里已经
+                    // 把它的下载任务标了 failed，这里只记数、继续下一条。
+                    warn!(
+                        code = error.code(),
+                        message = %error.api.message,
+                        "批量导入中单条下载任务失败，已跳过继续下一条"
+                    );
+                }
+            }
+        }
+        Ok(summary)
+    }
+
+    /// 单个执行。上游 `_execute_single`（`:433-479`）。
+    ///
+    /// 流程：`params` → [`ImportRequest`]（非法 → 422 `validation_error`）→
+    /// [`MediaImportService::import_from_source`] → 按结果回写下载任务状态 →
+    /// 转成 [`ImportExecuteSummary`]。
+    ///
+    /// 下载任务状态映射（上游 `:469-475`）：`failed_count > 0` → `failed`；
+    /// 否则 `imported > 0` → `completed`；否则 `skipped`。
+    /// 导入本身抛错时先把下载任务标 `failed` 再把错抛出去（上游 `:466-468`）。
+    ///
+    /// ⚠️ `params["target_movie_number"]` 在这里**读不到下游**：上游把它传给
+    /// `import_from_source` 做「只导这个番号」的过滤，本仓
+    /// [`MediaImportService::import_from_source`] 的签名里没有这一项。键照常
+    /// 留在 params 里，不拒；等执行层补上参数再透传。
+    async fn execute_single(&self, item: &Value) -> Result<ImportExecuteSummary, ServiceError> {
+        let request: ImportRequest = serde_json::from_value(item.clone())
+            .map_err(|error| request_validation_error(&format!("导入请求参数非法：{error}")))?;
+        request.validate()?;
+        let download_task_id = item
+            .get("download_task_id")
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok());
+
+        let source_ref = Value::Object(request.source_ref.clone());
+        let result = match self
+            .require_import_service()?
+            .import_from_source(
+                &source_ref,
+                i64::from(request.library_id),
+                media_kind_value(request.media_kind),
+                source_disposition_value(request.source_disposition),
+                request.collection_id.map(i64::from),
+                None,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(task_id) = download_task_id {
+                    DownloadTaskRepository::new(self.db.clone())
+                        .set_import_status(task_id, import_status::FAILED, None)
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+        let failed_count = i64::try_from(result.failed.len()).unwrap_or(i64::MAX);
+        let status = if failed_count > 0 {
+            import_status::FAILED
+        } else if result.imported > 0 {
+            import_status::COMPLETED
+        } else {
+            import_status::SKIPPED
+        };
+        if let Some(task_id) = download_task_id {
+            DownloadTaskRepository::new(self.db.clone())
+                .set_import_status(task_id, status, None)
+                .await?;
+        }
+        Ok(import_result_to_summary(result))
+    }
+
+    /// 重试一条失败项。上游 `_execute_failed_item_retry`（`:380-430`）。
+    ///
+    /// `params` 由 [`Self::enqueue_failed_item_retry`] 组装，是**自足**的：
+    /// `original_task_run_id` / `failure_item_id` / `candidate_id` /
+    /// `failure_item`（整条存储项，含 `source_ref` / `library_id`），worker
+    /// 不回头读原任务的其它东西。
+    ///
+    /// 顺序照上游：先判原任务终态（[`ensure_retryable_task`]，未终态 →
+    /// 409 `import_task_not_finished`，否则同一批文件会被导两次）→ 调
+    /// [`MediaImportService::retry_failed_file`] → 回写原任务的失败项。
+    ///
+    /// 回写语义（上游 `_update_failure_item`，`:571-…`）：
+    /// - 成功：`state=resolved`、`last_retry_error` 清掉；`retry_task_run_id`
+    ///   **不覆写** —— 入队时已写成这次重试的 run id，这里写 null 反而丢信息。
+    /// - 失败：`state` 打回 `pending`（可再重试）、`last_retry_error` 记错；
+    ///   回写本身失败只记日志，**不吞掉原始错误**（上游 `:402-408` 的取向）。
+    ///
+    /// ⚠️ 两处与上游的形状差异（本仓 `retry_failed_file` 的返回缺口）：
+    /// 上游返回 `{**result, "original_task_run_id", "failure_item_id",
+    /// "candidate_id"}` 且 `result` 里有 `movie_id` / `media_id`（回写
+    /// `resolved_movie_id` / `resolved_media_id` 用）；本仓只回
+    /// `{"movie_number", "operation_key"}`，所以 `resolved_*` 写不进去，
+    /// 返回的 [`ImportExecuteSummary`] 也只能按上游的 `summary_patch`
+    /// （`{"imported_count": 1, "failed_count": 0}`）填。
+    ///
+    /// ⚠️ `operation_key`：上游是 `f"task:{task_run_id}:retry"`，用的是**这次
+    /// 重试任务**的 run id；本执行体签名里拿不到它，退用
+    /// `import-retry:{original_task_run_id}:{failure_item_id}` 拼一个稳定的键。
+    async fn execute_failed_item_retry(
+        &self,
+        params: &Value,
+    ) -> Result<ImportExecuteSummary, ServiceError> {
+        let original_task_run_id = params
+            .get("original_task_run_id")
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .ok_or_else(|| request_validation_error("original_task_run_id 缺失或非法"))?;
+        let failure_item_id = params
+            .get("failure_item_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| request_validation_error("failure_item_id 缺失或非法"))?;
+        let candidate_id = params
+            .get("candidate_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| request_validation_error("candidate_id 缺失或非法"))?;
+        let failure_item = params.get("failure_item").cloned().unwrap_or(Value::Null);
+
+        let task_run = self.require_import_task_run(original_task_run_id).await?;
+        ensure_retryable_task(&task_run)?;
+
+        let failure: ImportFailure = serde_json::from_value(failure_item)
+            .map_err(|error| request_validation_error(&format!("failure_item 形状非法：{error}")))?;
+        let operation_key =
+            format!("import-retry:{original_task_run_id}:{failure_item_id}");
+        let outcome = self
+            .require_import_service()?
+            .retry_failed_file(&failure, candidate_id, &operation_key)
+            .await;
+
+        // 原任务 `result_summary.failed_files` 整段替换（数组是顶层键覆盖，
+        // 不能只改一个元素的字段 —— 见 `enqueue_failed_item_retry` 的注释）。
+        let items = failed_files(original_task_run_id, task_run.result_summary.as_deref())?;
+        match outcome {
+            Ok(_) => {
+                self.write_back_failure_item(
+                    original_task_run_id,
+                    &items,
+                    failure_item_id,
+                    json!({
+                        "state": ImportFailedItemState::Resolved,
+                        "last_retry_error": Value::Null,
+                    }),
+                )
+                .await?;
+                Ok(ImportExecuteSummary {
+                    imported_count: 1,
+                    ..Default::default()
+                })
+            }
+            Err(error) => {
+                let message = error.api.message.clone();
+                if let Err(write_error) = self
+                    .write_back_failure_item(
+                        original_task_run_id,
+                        &items,
+                        failure_item_id,
+                        json!({
+                            "state": ImportFailedItemState::Pending,
+                            "last_retry_error": message,
+                        }),
+                    )
+                    .await
+                {
+                    warn!(
+                        original_task_run_id,
+                        failure_item_id,
+                        write_error = ?write_error,
+                        "失败项重试的错误回写失败，原始错误继续上抛"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// 回写原任务 `result_summary.failed_files` 里的一条（整段替换）。
+    ///
+    /// 上游 `_update_failure_item`（`:571-…`）的本仓形状。
+    async fn write_back_failure_item(
+        &self,
+        original_task_run_id: i32,
+        items: &[Value],
+        failure_item_id: &str,
+        changes: Value,
+    ) -> Result<(), ServiceError> {
+        let patch = replace_failure_item(items, failure_item_id, changes)?;
+        BackgroundTaskRunRepository::new(self.db.clone())
+            .merge_result_summary(original_task_run_id, Some(&json!({ "failed_files": patch })))
+            .await?;
+        Ok(())
+    }
+
+    /// 发「本次导入新增影片」提醒。上游 `execute` 尾巴的
+    /// `create_new_media_reminder`（`:297-309`）。
+    ///
+    /// ⚠️ `related_task_run_id` 传 `None`：本执行体签名里拿不到自己的 run id，
+    /// 按 [`create_new_media_reminder`] 的文档这会走「无幂等键」那条 ——
+    /// 同一任务重放会多发一条提醒。等 `sm-scheduler` 接线 `library_import`
+    /// 时把 run id 传进来再收掉这个缺口。
+    ///
+    /// ⚠️ 目前这条是**死代码**：本仓 [`MediaImportService::import_from_source`]
+    /// 的返回里没有 `new_playable_movies`（见 [`import_result_to_summary`]），
+    /// 条件恒为假。先按上游形状留着，等执行层补上字段自动生效。
+    async fn send_new_media_reminder(
+        &self,
+        summary: &ImportExecuteSummary,
+    ) -> Result<(), ServiceError> {
+        let items: Vec<NewMovieReminderItem> = summary
+            .new_playable_movies
+            .iter()
+            .filter_map(|value| serde_json::from_value(value.clone()).ok())
+            .collect();
+        let repo = SystemNotificationRepository::new(self.db.clone());
+        create_new_media_reminder(&repo, &items, None).await?;
+        Ok(())
     }
 
     /// 这个失败原因是否**不该**让用户自己背锅。
@@ -1228,6 +1588,48 @@ fn ensure_retryable_task(task_run: &BackgroundTaskRun) -> Result<(), ServiceErro
         "导入任务尚未完成",
         None,
     ))
+}
+
+/// [`MediaKind`] → [`MediaImportService::import_from_source`] 要的 `&str`
+///（`"jav"` / `"video"`）。
+fn media_kind_value(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Jav => "jav",
+        MediaKind::Video => "video",
+    }
+}
+
+/// [`SourceDisposition`] → [`MediaImportService::import_from_source`] 要的
+/// `&str`（`"keep"` / `"delete_after_commit"` / `"in_place"`）。
+fn source_disposition_value(disposition: SourceDisposition) -> &'static str {
+    match disposition {
+        SourceDisposition::Keep => "keep",
+        SourceDisposition::DeleteAfterCommit => "delete_after_commit",
+        SourceDisposition::InPlace => "in_place",
+    }
+}
+
+/// [`super::import_service::ImportResult`] → [`ImportExecuteSummary`]。
+///
+/// ⚠️ 上游 `import_from_source` 返回的 `ImportResult` 有六个字段；本仓执行层
+/// 的 `ImportResult` 只有 `{imported, skipped, failed: Vec<ImportFailure>}`：
+/// `new_playable_movies` / `created_video_ids` 在这里**没有来源**，置空 ——
+/// 等执行层补上字段再填（[`ImportTaskService::send_new_media_reminder`] 的
+/// 条件届时自动生效）。`failed_files` 取逐条失败的序列化（键名与上游逐字一致，
+/// 见 [`ImportFailure`] 的文档）。
+fn import_result_to_summary(result: ImportResult) -> ImportExecuteSummary {
+    ImportExecuteSummary {
+        imported_count: i64::from(result.imported),
+        skipped_count: i64::from(result.skipped),
+        failed_count: i64::try_from(result.failed.len()).unwrap_or(i64::MAX),
+        new_playable_movies: Vec::new(),
+        created_video_ids: Vec::new(),
+        failed_files: result
+            .failed
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
+            .collect(),
+    }
 }
 
 /// 404 `failed_item_not_found`。

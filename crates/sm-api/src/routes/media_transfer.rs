@@ -30,7 +30,11 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+
+use sm_service::transfers::media_transfer_task::{
+    MediaStorageTransferAcceptedResponse, MediaStorageTransferCandidatesRequest,
+    MediaStorageTransferCandidatesResponse, MediaStorageTransferRequest, MediaTransferTaskService,
+};
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -49,59 +53,27 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// 可转存目标。
-#[derive(Debug, Clone, Serialize)]
-pub struct MediaStorageTransferTarget {
-    pub library_id: i64,
-    pub library_name: String,
-    /// 目标路径（库内相对路径）。
-    pub path: String,
-    /// 该目标是否可写。**不可写的也要列出来** —— 客户端要显示「为什么不行」。
-    pub writable: bool,
-    /// 不可写的原因。
-    pub blocked_reason: Option<String>,
-}
-
-/// 候选查询响应。
-#[derive(Debug, Clone, Serialize)]
-pub struct MediaStorageTransferCandidatesResponse {
-    pub media_id: i64,
-    pub targets: Vec<MediaStorageTransferTarget>,
-}
-
-/// 候选查询请求。
-#[derive(Debug, Clone, Deserialize)]
-pub struct MediaStorageTransferCandidatesRequest {
-    pub media_id: i64,
-    /// 限定只返回这些库；`None` = 全部库。
-    pub library_ids: Option<Vec<i64>>,
-}
-
-/// 已受理的转存。
-#[derive(Debug, Clone, Serialize)]
-pub struct MediaStorageTransferAcceptedResponse {
-    pub task_run_id: i64,
-    pub accepted: i32,
-}
-
 /// `POST /media-transfers/candidates` —— **200**（查询）。
 ///
 /// 媒体不存在 → **404**。目标库不存在 → 同样 404（不是空列表）——
 /// 传了 `library_ids` 却有一个不存在，说明客户端状态与服务端不一致。
 async fn list_media_transfer_candidates(
     _user: CurrentUser,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Json(payload): axum::extract::Json<MediaStorageTransferCandidatesRequest>,
 ) -> Result<Json<MediaStorageTransferCandidatesResponse>, ErrorResponse> {
-    let _ = payload.media_id;
-    todo!("骨架：接媒体库句柄（插件）；不可写目标也要列出并带原因")
+    let service = MediaTransferTaskService::new(state.db().clone(), state.provider_factory());
+    let response = service.list_candidates(payload).await?;
+    Ok(Json(response))
 }
 
 /// `POST /media-transfers` —— **202 Accepted**（长任务）。
 async fn create_media_transfer(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    axum::extract::Json(_payload): axum::extract::Json<serde_json::Value>,
+    State(state): State<AppState>,
+    axum::extract::Json(payload): axum::extract::Json<MediaStorageTransferRequest>,
 ) -> Result<(StatusCode, Json<MediaStorageTransferAcceptedResponse>), ErrorResponse> {
-    todo!("骨架：接转存流水线；成功返回 202 + task_run_id")
+    let service = MediaTransferTaskService::new(state.db().clone(), state.provider_factory());
+    let accepted = service.enqueue(payload).await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }

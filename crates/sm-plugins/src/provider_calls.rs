@@ -1,14 +1,36 @@
-//! provider 数据面的**调用面**：真的把 storage / download rpc 发出去。
+//! provider 数据面的**调用面**：真的把 storage rpc 发出去。
 //!
 //! # 上游对应 / 与 [`crate::extension_calls`] 的分工
 //!
 //! | 模块 | 上游 | 服务 |
 //! |---|---|---|
 //! | [`crate::extension_calls`] | `MetadataSourceExtensionService` / `RankingSourceExtensionService` | 两个扩展点 |
-//! | 本模块 | `StorageProvider` / `DownloadProvider`（`proto/storage.proto`） | **provider 数据面** |
+//! | 本模块 | `StorageProvider`（`proto/storage.proto`） | **provider 数据面**（storage 这半边）|
 //!
-//! 两者发的是**同一个插件进程**上的不同 service（proto 里各是一个 service，
-//! 但没有任何字段声明另一个端口 —— 只有数据面才有 `data_plane_endpoint`）。
+//! ⚠️ **download 那半边不在这里**（2026-10-09 核实）。`proto/storage.proto:444` 的
+//! `service DownloadProvider`（`Submit` / `ListTasks` / `DeleteTask` /
+//! `PrepareClient` / `TestClient`）在**插件侧**已经齐了（[`sm_plugin_api::DownloadProviderExt`]
+//! + 生成的 server + `MinimalDownload` 测试替身），但**宿主侧一行调用都没有** ——
+//! 全仓搜不到任何 `DownloadProviderClient`。本模块的文档曾经写成
+//! 「`StorageProvider` / `DownloadProvider` 都在这里」，那是不对的：download
+//! 现在连「建客户端」这一步都没有。依赖它的是 `transfers` 的下载那几条
+//! （`download_sync` / `download_task::delete` / `download_request::create` /
+//! `auto_download`），见 `docs/handoff.md` §7.4。
+//!
+//! ✅ `Browse` 的包装已补上（[`browse`]，单页语义）。它此前是「参考插件实现了、
+//! 宿主一处都调不到」——`provider_browse`（浏览导入来源）与 `media_transfer`
+//! （转存挑源）都要它。注意它是**单页**的：`next_cursor` 透传给客户端，
+//! 宿主**不**循环收干（理由写在函数文档里）。
+//!
+//! # 这一层是被**验证过**的
+//!
+//! `crates/plugin-ref-local/tests/provider_calls_roundtrip.rs` 用真实的参考 provider
+//! 把本模块打了一遍：不透明引用的 `Struct` ↔ JSON 转换、结构化错误过线后
+//! `code` / `safe_message` / `retryable` 是否完好、流收干成 `Vec`、
+//! 进度回调、未实现 rpc 的归类、连不上端点的归类。改字段映射或流处理时先跑它。
+//!
+//! 两个 service 发的是**同一个插件进程**上的不同 service（proto 里各是一个
+//! service，但没有任何字段声明另一个端口 —— 只有数据面才有 `data_plane_endpoint`）。
 //! 所以客户端都用控制面那条 `Channel` 建：`Client::new(channel)`。
 //!
 //! # ✅ 已闭合的 ABI 缺口：**错误码过线了**
@@ -56,7 +78,7 @@
 
 use sm_plugin_api::v1::storage_provider_client::StorageProviderClient;
 use sm_plugin_api::v1::{
-    generate_thumbnails_response, AbortImportRequest, ComputeFileHashRequest,
+    generate_thumbnails_response, AbortImportRequest, BrowseRequest, ComputeFileHashRequest,
     DeleteImportFileRequest, DeleteMediaRequest, FinalizeImportRequest, GenerateThumbnailsRequest,
     LibraryHandle, ManagedMediaRefKeyRequest, MediaHandle, ProbeVideoInfoRequest,
     ProviderErrorCode, ScanImportSourceRequest, ScanManagedMediaRefKeysRequest, SourceDisposition,
@@ -207,6 +229,39 @@ pub fn classify_status(
         // 没带结构 → provider 什么都没说，只能按码猜。
         provider_retryable: None,
     }
+}
+
+/// 不透明引用的根**必须**是 object，不是就当场拒（422 `invalid_config`）。
+///
+/// # 为什么不能「转不出来就当没给」
+///
+/// [`sm_plugin_api::json_struct::json_to_struct`] 只接受 object 作根，其它形状
+/// 返回 `None`。而对 provider 来说 `None` 是**有意义的**：浏览 = 库根、扫描 = 整个
+/// 库。把「客户端传了个字符串」静默降级成「那给你列根目录吧」，用户会看到一份
+/// 看起来正常的结果 —— 这正是本仓一直在避免的那种「糊过去」。
+///
+/// 上游在同一条线上是 **422**：`ImportBrowseRequest.parent_ref` /
+/// `ImportRequest.source_ref` 都是 pydantic 的 `dict[str, Any]`，形状不对进不了
+/// 服务层。这里把同一道闸放在调用面上。
+fn require_opaque_object(
+    provider_key: &str,
+    operation: &'static str,
+    what: &'static str,
+    value: &serde_json::Value,
+) -> Result<(), ProviderOperationError> {
+    if value.is_object() {
+        return Ok(());
+    }
+    Err(ProviderOperationError {
+        provider_key: provider_key.to_owned(),
+        operation: operation.to_owned(),
+        code: ProviderErrorCode::InvalidConfig,
+        safe_message: safe_message_for(ProviderErrorCode::InvalidConfig).to_owned(),
+        plugin_detail: format!("{what} 必须是对象（不透明引用的根是 object），实际是 {value}"),
+        // 形状错的是**调用方**，不是 provider 在说话 —— 它没给 retryable，
+        // 按码猜（`invalid_config` → 不值得重试）。
+        provider_retryable: None,
+    })
 }
 
 /// 宿主生成的对外文案。
@@ -360,6 +415,67 @@ pub async fn preflight_merged_playback(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 浏览组
+//
+// 上游 `StorageProvider.browse` —— 列媒体库的一层目录（导入时挑来源）。
+// 服务层对应 `sm_service::transfers::provider_browse::ProviderBrowseService`。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 让 provider 列出一层目录。上游 `StorageProvider.browse`，调用点
+/// `ProviderBrowseService.browse`（`imports/provider_browse_service.py:21-29`）。
+///
+/// # ★ 取**一页**，不做宿主侧循环
+///
+/// 分页是**客户端**的事：`next_cursor` 原样透传，由前端带着它再调一次
+/// （上游同一个形状 —— `ImportBrowseResponse.next_cursor` 就是 `BrowsePage` 里那个）。
+/// 在这里收干成整个目录有两个后果：用户再也说不出「还有下一页」（`BrowsePage`
+/// **没有总数**，proto 里那条 GAP 注释也认了），以及「点一次算一次」的 provider
+/// 会被宿主一口气打满。所以这个函数**没有** `_all` 后缀 —— 那是对应
+/// [`scan_import_source_all`]（流式，必须收干）的命名，别串。
+///
+/// # ★ `entries` 有序，且目录与文件**混在一起**
+///
+/// 顺序是 provider 建议的浏览顺序（`plugin-ref-local` 按字典序，别的按「先看什么」）。
+/// 别排序、别拆成 `dirs` + `files` —— 那是服务层 `ImportBrowseResponse` 的红线。
+///
+/// # `limit <= 0`
+///
+/// 用 provider 自己的兜底页大小（proto 没规定默认值；`plugin-ref-local` 落
+/// `DEFAULT_PAGE_SIZE`）。宿主侧 1..=200 那个上限属于**路由层**的校验
+/// （上游 `ImportBrowseRequest.limit`），不在这里夹。
+///
+/// # `parent_ref`
+///
+/// `None` = 从库根开始。它是 provider 私有的不透明引用（`Struct`），宿主不解释、
+/// 只把上一条的 `source_ref` 传回来。
+///
+/// ⚠️ 给了但**根不是对象**（比如客户端把字符串当引用传上来）→ 422
+/// `invalid_config`，**不会**被当成「没给」而列根目录
+/// （理由见 [`require_opaque_object`]）。
+pub async fn browse(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    parent_ref: Option<&serde_json::Value>,
+    cursor: Option<&str>,
+    limit: i32,
+) -> Result<sm_plugin_api::v1::BrowsePage, ProviderOperationError> {
+    if let Some(value) = parent_ref {
+        require_opaque_object(provider_key, "browse", "parent_ref", value)?;
+    }
+    client
+        .browse(BrowseRequest {
+            library: Some(library),
+            parent_ref: parent_ref.and_then(sm_plugin_api::json_struct::json_to_struct),
+            cursor: cursor.map(str::to_owned),
+            limit,
+        })
+        .await
+        .map(|response| response.into_inner())
+        .map_err(|status| classify_status(provider_key, "browse", status))
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 导入组（`import_service` 用的那四个 + 指纹）
 //
 // 上游 `StorageProvider.scan_import_source` / `stage_import_file` /
@@ -412,6 +528,9 @@ pub async fn scan_import_source_all(
     library: LibraryHandle,
     source_ref: &serde_json::Value,
 ) -> Result<Vec<ImportFileEntry>, ProviderOperationError> {
+    // ⚠️ 与 [`browse`] 同一道闸：根不是对象就当场拒，**不**降级成「没给」
+    // （对 provider 来说 `None` 是「扫整个库」，那是个看起来正常的结果）。
+    require_opaque_object(provider_key, "scan_import_source", "source_ref", source_ref)?;
     let mut stream = client
         .scan_import_source(ScanImportSourceRequest {
             library: Some(library),
@@ -819,6 +938,160 @@ pub async fn get_space_usage(
         .await
         .map(|response| response.into_inner().usage.unwrap_or_default())
         .map_err(|status| classify_status(provider_key, "get_space_usage", status))
+}
+
+// ══════════════════════════════════════════════════════════════
+// 转存组（`media_transfer_task` 用的七个）。
+//
+// 上游 `MediaTransferTaskService.execute` 的调用序列：
+// `open_transfer_source` → `stage_transfer` → `assert_unchanged` →
+// `finalize_transfer` →（可选）`cleanup_transfer_source`；
+// 失败时 `abort_transfer`；`close_transfer_source` 保证调用。
+//
+// 注意这是**控制面编排**：字节不经过宿主（`StageTransfer` 收的是
+// `TransferSourceSession`，不是字节流）。`ReadTransferSource` 那条
+// 双向流是直读场景用的，转存不需要。
+// ══════════════════════════════════════════════════════════════
+
+/// 打开转存源会话。上游 `source_storage.open_transfer_source(media=...)`。
+///
+/// 返回的 session 不透明 —— 宿主只保存与回传，不解释 `info`。
+pub async fn open_transfer_source(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    media: MediaHandle,
+) -> Result<sm_plugin_api::v1::TransferSourceSession, ProviderOperationError> {
+    client
+        .open_transfer_source(sm_plugin_api::v1::OpenTransferSourceRequest {
+            library: Some(library),
+            media: Some(media),
+        })
+        .await
+        .map(|response| response.into_inner().session.unwrap_or_default())
+        .map_err(|status| classify_status(provider_key, "open_transfer_source", status))
+}
+
+/// 断言源在会话期间未变化。上游 `source.assert_unchanged()`。
+///
+/// 返回 `false` = 源已变化，宿主必须中止转存（不是 provider 出错）。
+pub async fn assert_transfer_source_unchanged(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    session_id: &str,
+) -> Result<bool, ProviderOperationError> {
+    client
+        .assert_transfer_source_unchanged(sm_plugin_api::v1::TransferAssertRequest {
+            session_id: session_id.to_owned(),
+        })
+        .await
+        .map(|response| response.into_inner().unchanged)
+        .map_err(|status| {
+            classify_status(provider_key, "assert_transfer_source_unchanged", status)
+        })
+}
+
+/// 关闭源会话。上游 `open_transfer_source` 上下文管理器的退出。
+///
+/// 宿主保证**一定调用**（正常走完与出错都要）。
+pub async fn close_transfer_source(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    session_id: &str,
+) -> Result<(), ProviderOperationError> {
+    client
+        .close_transfer_source(sm_plugin_api::v1::CloseTransferSourceRequest {
+            session_id: session_id.to_owned(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "close_transfer_source", status))
+}
+
+/// 清理源（只删当前会话对应且未变化的源文件）。上游
+/// `source_storage.cleanup_transfer_source(media=..., source=...)`。
+///
+/// 能力可选：插件没声明 `CAPABILITY_TRANSFER_SOURCE_CLEANUP` 时宿主
+/// 不调它（转存后保留源），而不是调了再按 `unsupported` 处理。
+pub async fn cleanup_transfer_source(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    media: MediaHandle,
+    session_id: &str,
+) -> Result<(), ProviderOperationError> {
+    client
+        .cleanup_transfer_source(sm_plugin_api::v1::CleanupTransferSourceRequest {
+            library: Some(library),
+            media: Some(media),
+            session_id: session_id.to_owned(),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "cleanup_transfer_source", status))
+}
+
+/// 暂存转存。上游 `target_storage.stage_transfer(source=..., placement=...,
+/// operation_key=...)`。
+///
+/// `operation_key` 按操作键幂等（上游 `f"task:{task_id}:{index + 1}"`）。
+pub async fn stage_transfer(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    source: sm_plugin_api::v1::TransferSourceSession,
+    placement: sm_plugin_api::v1::ImportPlacement,
+    operation_key: &str,
+) -> Result<sm_plugin_api::v1::StagedMediaTransfer, ProviderOperationError> {
+    client
+        .stage_transfer(sm_plugin_api::v1::StageTransferRequest {
+            library: Some(library),
+            source: Some(source),
+            placement: Some(placement),
+            operation_key: operation_key.to_owned(),
+        })
+        .await
+        .map(|response| response.into_inner().transfer.unwrap_or_default())
+        .map_err(|status| classify_status(provider_key, "stage_transfer", status))
+}
+
+/// 提交转存。上游 `target_storage.finalize_transfer(receipt=...)`。
+///
+/// `receipt` 是 `stage_transfer` 给的凭据（不透明 `Struct`），只回传。
+pub async fn finalize_transfer(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    receipt: Option<prost_types::Struct>,
+) -> Result<(), ProviderOperationError> {
+    client
+        .finalize_transfer(sm_plugin_api::v1::FinalizeTransferRequest {
+            library: Some(library),
+            receipt,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "finalize_transfer", status))
+}
+
+/// 回滚转存。上游 `target_storage.abort_transfer(receipt=...)`。
+///
+/// 只在「已暂存但未切换」时调用 —— 切换已提交后**绝不**调用
+/// （上游：`switch_attempted` 为假且 `staged.status == "staged"` 才进补偿）。
+pub async fn abort_transfer(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    receipt: Option<prost_types::Struct>,
+) -> Result<(), ProviderOperationError> {
+    client
+        .abort_transfer(sm_plugin_api::v1::AbortTransferRequest {
+            library: Some(library),
+            receipt,
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "abort_transfer", status))
 }
 
 #[cfg(test)]

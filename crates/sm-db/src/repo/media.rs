@@ -946,6 +946,47 @@ impl MediaRepository {
         self.require_by_id(id).await
     }
 
+    /// 转存切换：把媒体搬到目标库（乐观并发）。
+    ///
+    /// `WHERE` 带上期望的旧值（`library_id` / `file_name` / `file_size_bytes`）——
+    /// 有人动过源就更新 0 行，调用方按「源已变化」处理。对应上游
+    /// `_switch_media` 的 `for_update` + 字段比对（那里是行锁，这里是
+    /// 单条语句的原子比较，效果等价且不需要事务）。
+    ///
+    /// `import_source_identity` 置空：新位置的身份与旧的不同。
+    /// 返回是否更新了行。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn switch_library(
+        &self,
+        id: i32,
+        expected_library_id: i32,
+        expected_file_name: &str,
+        expected_size_bytes: i64,
+        new_library_id: i32,
+        storage_ref: &str,
+        file_name: &str,
+        size_bytes: i64,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE media SET library_id = $1, storage_ref = $2, file_name = $3, \
+             file_size_bytes = $4, import_source_identity = NULL, updated_at = $5 \
+             WHERE id = $6 AND library_id = $7 AND file_name = $8 AND file_size_bytes = $9",
+        )
+        .bind(new_library_id)
+        .bind(storage_ref)
+        .bind(file_name)
+        .bind(size_bytes)
+        .bind(crate::common::time::now_utc())
+        .bind(id)
+        .bind(expected_library_id)
+        .bind(expected_file_name)
+        .bind(expected_size_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 列出待生成缩略图的媒体。
     ///
     /// 索引是 `(thumbnail_generation_state, thumbnail_next_retry_at)`，

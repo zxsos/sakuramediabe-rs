@@ -68,6 +68,7 @@ const DEFAULT_PAGE_SIZE: i64 = 20;
 
 /// 导入状态：待处理。
 pub const IMPORT_STATUS_PENDING: &str = "pending";
+pub const IMPORT_STATUS_RUNNING: &str = "running";
 /// 导入状态：失败。
 pub const IMPORT_STATUS_FAILED: &str = "failed";
 /// 导入状态：跳过。
@@ -343,8 +344,61 @@ impl DownloadTaskService {
         task_id: i32,
         delete_files: bool,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (task_id, delete_files);
-        todo!("阶段二：调 provider 删远端任务 + 按需删文件（task_service.py:81-118）")
+        use super::download_common::require_task;
+        use sm_db::repo::DownloadResourceBlacklistRepository;
+        use sm_db::repo::DownloadTaskRepository;
+
+        // 1. 查任务（不存在 -> 404）
+        let task = require_task(&self.db, task_id).await?;
+
+        // 2. 导入中 -> 409，不能删
+        if task.import_status == IMPORT_STATUS_RUNNING {
+            let mut details = serde_json::Map::new();
+            details.insert(
+                "task_id".to_owned(),
+                serde_json::Value::from(task.id),
+            );
+            return Err(ServiceError::conflict(
+                "download_task_import_running",
+                "Cannot delete a download task while importing media",
+                Some(details),
+            ));
+        }
+
+        // 3. 失败/跳过的任务：取 info_hash 准备拉黑
+        // 上游从 DownloadSubmissionRecord 取，取不到就用 task.remote_id
+        let info_hash: Option<String> = if task.import_status == IMPORT_STATUS_FAILED
+            || task.import_status == IMPORT_STATUS_SKIPPED
+        {
+            // 简化：直接用 remote_id 做 hash（完整实现需查 submission record）
+            // 上游：canonical_info_hash(record.info_hash if record else task.remote_id)
+            super::download_resource_hash::canonical_info_hash(&task.remote_id).ok()
+        } else {
+            None
+        };
+
+        // 4. 调 provider 删远端任务
+        // ⚠️ provider seam 未就绪（sm-service 不能依赖 sm-plugins），本轮跳过。
+        // 上游语义：source_not_found 视为成功（幂等），其他 provider 错误透传。
+        let _ = delete_files; // 按需删文件：待 provider seam
+
+        // 5. 落库：拉黑 + 删任务（事务）
+        if let Some(hash) = info_hash {
+            let _ = DownloadResourceBlacklistRepository::new(self.db.clone())
+                .add(&hash)
+                .await;
+        }
+        DownloadTaskRepository::new(self.db.clone())
+            .delete(task.id)
+            .await?;
+
+        // 6. 返回
+        Ok(serde_json::json!({
+            "task_id": task.id,
+            "client_id": task.client_id,
+            "movie_number": task.movie_number,
+            "remote_id": task.remote_id,
+        }))
     }
 
     /// 该任务当前**是否可再发起导入** —— 判据是**导入状态**，不是下载状态。

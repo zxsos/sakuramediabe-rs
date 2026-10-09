@@ -55,16 +55,22 @@
 //! `reason_codes`」—— 那是**另一套语义**，且本仓库根本没有 `reason_codes`
 //! 这个字段（上游只有单个 `reason` 字符串）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use sm_db::repo::moment::{MediaThumbnailRepository, MomentRecommendationRepository};
+use sm_db::repo::moment::{
+    MediaThumbnailRepository, MediaThumbnailRow, MomentRecommendationRepository,
+    MomentSeedRepository, NewMomentRecommendation,
+};
 use sm_db::Db;
 
 use super::embedding::EmbeddingClient;
 use super::qdrant::dense::DenseStore;
+use super::qdrant::plot_image::payload_i64;
+use super::recommendation::MovieRecommendationService;
 use crate::catalog::movie::{MovieCard, MovieService};
 use crate::error::ServiceError;
 
@@ -131,6 +137,14 @@ pub struct MomentSeed {
     pub duration_seconds: Option<i64>,
     /// 新鲜度权重 `1 - index / total`（上游 `:153`）。
     pub recency_score: f64,
+    /// 种子缩略图的图片相对路径（未签名），`_read_seed_image_bytes` 用。
+    ///
+    /// 上游 `_MomentSeed.thumbnail.image.origin` —— 一条 JOIN 当时就带出来了。
+    /// Rust 侧种子投影里没有这一列，[`MomentRecommendationService::load_seeds`]
+    /// 用一次 `by_ids` 批量补上。`None` = 补查时缩略图已不在库里（并发删除
+    /// 窗口），这种种子在 [`MomentRecommendationService::infer_seed_vector`]
+    /// 里直接跳过。
+    pub image_origin: Option<String>,
 }
 
 /// 候选：三个源合并后的统一形状（上游 `_MomentCandidate`，`:75-87`）。
@@ -142,6 +156,9 @@ pub struct MomentCandidate {
     pub thumbnail_id: i64,
     pub media_id: i64,
     pub movie_id: i64,
+    /// 该缩略图在影片里的偏移（秒）。上游 `candidate.thumbnail.offset`
+    ///（落库 `:487` 用）。纯标量，不算「完整模型」。
+    pub offset_seconds: i64,
     /// 影片热度，**只用于同分 tie-break**（`:399`），不参与打分。
     pub movie_heat: Option<i64>,
     pub score: f64,
@@ -407,17 +424,36 @@ impl MomentRecommendationQuery {
 }
 
 /// 瞬时推荐服务。
-// 两个依赖尚未被方法体引用（`generate_recommendations` 还是 `todo!()`）。
-#[allow(dead_code)]
 pub struct MomentRecommendationService {
     store: Arc<DenseStore>,
     embedding: Arc<EmbeddingClient>,
+    movie_recommendation: Arc<MovieRecommendationService>,
+    db: Db,
+    image_root: PathBuf,
+    /// 图搜能力开关。上游 `_collect_visual_candidates` 开头的
+    /// `image_search_enabled()`（`:204`）—— 关着时**连推理都不调**，
+    /// 直接返回 0。服务内部不读配置文件，由组合根构造时按配置算好传进来。
+    image_search_enabled: bool,
 }
 
 impl MomentRecommendationService {
-    /// 构造。
-    pub fn new(store: Arc<DenseStore>, embedding: Arc<EmbeddingClient>) -> Self {
-        Self { store, embedding }
+    /// 构造。`db` 取 `&Db` 并克隆（与 [`MomentRecommendationQuery::new`] 同形）。
+    pub fn new(
+        store: Arc<DenseStore>,
+        embedding: Arc<EmbeddingClient>,
+        movie_recommendation: Arc<MovieRecommendationService>,
+        db: &Db,
+        image_root: PathBuf,
+        image_search_enabled: bool,
+    ) -> Self {
+        Self {
+            store,
+            embedding,
+            movie_recommendation,
+            db: db.clone(),
+            image_root,
+            image_search_enabled,
+        }
     }
 
     /// 种子新鲜度权重。上游 `:153`。
@@ -563,19 +599,466 @@ impl MomentRecommendationService {
         ranked
     }
 
-    /// 生成瞬时推荐并落快照。上游 `generate_recommendations`（`:415-508`，95 行）。
+    /// 取种子（上游 `_load_seeds`，`:137-163`）。
     ///
-    /// **仍是 `todo!()`，但只剩一块前置**：`sm_db::repo::moment`（本轮新增）
-    /// 已覆盖取种子、按 id / 按影片取缩略图、热门候选、整表替换、分页读、
-    /// 计数与最近生成时间；打分与排名是本文件的纯函数。唯一还缺的是
-    /// **读种子图字节** —— 上游 `_read_seed_image_bytes`（`:165-173`）读
-    /// `image.origin` 指向的磁盘文件，而 `image` 表只有路径列
-    /// （`schema.sql:144-149`），本仓库还没有 image store 模块。
+    /// 种子投影里没有图片路径 —— 用一次 `by_ids` 把全部种子缩略图的
+    /// `image_origin` 批量补上（上游是一条 JOIN 当时带出）。
+    async fn load_seeds(&self) -> Result<Vec<MomentSeed>, ServiceError> {
+        let rows = MomentSeedRepository::new(self.db.clone())
+            .load_seeds(SEED_LIMIT as i64)
+            .await?;
+        // 去重保序（上游 `dict.fromkeys` 的写法）。
+        let mut seen = HashSet::new();
+        let thumbnail_ids: Vec<i32> = rows
+            .iter()
+            .map(|row| row.2)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let origins: HashMap<i32, String> = MediaThumbnailRepository::new(self.db.clone())
+            .by_ids(&thumbnail_ids)
+            .await?
+            .into_iter()
+            .map(|row| (row.0, row.4))
+            .collect();
+        let total = rows.len();
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, row)| MomentSeed {
+                point_id: i64::from(row.0),
+                media_id: i64::from(row.1),
+                thumbnail_id: i64::from(row.2),
+                movie_id: i64::from(row.3),
+                offset_seconds: i64::from(row.4),
+                // 库里 `0` 即「时长未知」（见 `MomentSeedRow` 的位置说明），
+                // 与上游 `media.duration_seconds or 0` 兜的是同一件事。
+                duration_seconds: if row.5 > 0 {
+                    Some(i64::from(row.5))
+                } else {
+                    None
+                },
+                recency_score: Self::recency_score(index, total),
+                image_origin: origins.get(&row.2).cloned(),
+            })
+            .collect())
+    }
+
+    /// 读种子图字节（上游 `_read_seed_image_bytes`，`:165-173`）。
+    ///
+    /// **读不到 → `None`，跳过该种子，不抛错**。`NotFound` 静默（上游
+    /// `except FileNotFoundError: return None`），其它 IO 错误记 warn
+    ///（上游 `except Exception` 那支）。
+    fn read_seed_image_bytes(&self, seed: &MomentSeed) -> Option<Vec<u8>> {
+        let origin = seed.image_origin.as_deref()?;
+        match svc_image::store::read_image_bytes(&self.image_root, origin) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(
+                    point_id = seed.point_id,
+                    error = %error,
+                    "时刻推荐种子图跳过：读图失败"
+                );
+                None
+            }
+        }
+    }
+
+    /// 种子图 → 向量（上游 `_infer_seed_vector`，`:175-187`）。
+    ///
+    /// 读不到图或推理失败 → `None`（跳过该种子）。上游只接
+    /// `(EmbeddingClientError, ValueError)`；Rust 侧 `embed_images` 的错误
+    /// 统一是 [`ServiceError`]，语义同为「该种子作废」，不中断整次生成。
+    async fn infer_seed_vector(&self, seed: &MomentSeed) -> Option<Vec<f32>> {
+        let bytes = self.read_seed_image_bytes(seed)?;
+        // 上游 `if not image_bytes: return None`。
+        if bytes.is_empty() {
+            return None;
+        }
+        match self.embedding.embed_images(&[bytes]).await {
+            Ok(mut vectors) => vectors.pop(),
+            Err(error) => {
+                // `ServiceError` 没有 `Display`，用 `Debug`（`?`）记日志。
+                tracing::warn!(
+                    point_id = seed.point_id,
+                    error = ?error,
+                    "时刻推荐种子向量跳过：推理失败"
+                );
+                None
+            }
+        }
+    }
+
+    /// 源 A：视觉相似候选（上游 `_collect_visual_candidates`，`:201-255`）。
+    ///
+    /// 返回**新增**条数（上游 `added_count`）。
+    ///
+    /// # 错误处理
+    ///
+    /// - 图搜开关没开 → 直接返回 0，**连推理都不调**（`:204-205`）；
+    /// - 单个种子的向量推理失败 → 跳过该种子；
+    /// - `store.search` 失败 → warn 后跳过该种子（上游 `:217-220`）。
+    ///   [`DenseStore::search`] 本身已把 Qdrant 异常吞成空结果，这里接的是
+    ///   参数校验那类不该发生的错；
+    /// - `by_ids` 的库错误 → **向上传**（上游也不接，整次生成失败）。
+    async fn collect_visual_candidates(
+        &self,
+        seeds: &[MomentSeed],
+        pool: &mut HashMap<i64, MomentCandidate>,
+    ) -> Result<usize, ServiceError> {
+        if !self.image_search_enabled {
+            return Ok(0);
+        }
+        let thumbnails = MediaThumbnailRepository::new(self.db.clone());
+        let mut added_count = 0usize;
+        for seed in seeds {
+            let Some(query_vector) = self.infer_seed_vector(seed).await else {
+                continue;
+            };
+            let hits = match self
+                .store
+                .search(
+                    query_vector,
+                    VISUAL_SEARCH_PER_SEED_LIMIT,
+                    0,
+                    None,
+                    Some(&[seed.movie_id]),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(
+                        point_id = seed.point_id,
+                        error = ?error,
+                        "时刻推荐向量检索跳过"
+                    );
+                    continue;
+                }
+            };
+            // 先把命中的缩略图批量取回（上游 `_get_thumbnails_by_ids`）。
+            let mut seen_ids = HashSet::new();
+            let hit_ids: Vec<i32> = hits
+                .iter()
+                .filter_map(|hit| payload_i64(&hit.payload, "thumbnail_id"))
+                .filter_map(|id| i32::try_from(id).ok())
+                .filter(|id| seen_ids.insert(*id))
+                .collect();
+            let thumbnails_by_id: HashMap<i32, MediaThumbnailRow> = thumbnails
+                .by_ids(&hit_ids)
+                .await?
+                .into_iter()
+                .map(|row| (row.0, row))
+                .collect();
+            for hit in &hits {
+                let Some(thumbnail_id) = payload_i64(&hit.payload, "thumbnail_id")
+                    .and_then(|id| i32::try_from(id).ok())
+                else {
+                    continue;
+                };
+                // 种子自己不算（`:224-225`）。
+                if i64::from(thumbnail_id) == seed.thumbnail_id {
+                    continue;
+                }
+                let Some(row) = thumbnails_by_id.get(&thumbnail_id) else {
+                    continue;
+                };
+                // `by_ids` 已滤掉失效媒体（`med.valid`）；剩下两层：
+                // 合集条目跳过（`:232`），种子所属影片双层排除（`:234-235`，
+                // 防旧索引或替身漏传过滤条件）。
+                if row.7 {
+                    continue;
+                }
+                if i64::from(row.2) == seed.movie_id {
+                    continue;
+                }
+                let score = Self::score_visual(
+                    f64::from(hit.score),
+                    Self::heat_score(Some(i64::from(row.6))),
+                    seed.recency_score,
+                );
+                let before = pool.len();
+                Self::add_candidate(
+                    pool,
+                    MomentCandidate {
+                        thumbnail_id: i64::from(row.0),
+                        media_id: i64::from(row.1),
+                        movie_id: i64::from(row.2),
+                        offset_seconds: i64::from(row.3),
+                        movie_heat: Some(i64::from(row.6)),
+                        score,
+                        strategy: strategy::VISUAL,
+                        reason: reason_text(strategy::VISUAL).unwrap_or(""),
+                        seed_point_id: Some(seed.point_id),
+                        seed_thumbnail_id: Some(seed.thumbnail_id),
+                        source_movie_id: Some(seed.movie_id),
+                        visual_score: Some(f64::from(hit.score)),
+                        movie_similarity_score: None,
+                    },
+                );
+                if pool.len() > before {
+                    added_count += 1;
+                }
+            }
+        }
+        Ok(added_count)
+    }
+
+    /// 某部影片选一张最接近目标时刻的缩略图（上游 `_choose_thumbnail_for_movie`，
+    /// `:281-307`）。
+    ///
+    /// `by_movie` 已按 `(media_id, offset, thumbnail_id)` 排好 —— 按
+    /// `media_id` 切组，每组用 [`MediaThumbnailRepository::pick_closest`] 选一张，
+    /// 再按 `(与目标时刻的距离, media_id, thumbnail_id)` 取最小（`:306`）。
+    /// `None` = 该影片没有可选缩略图。
+    async fn choose_thumbnail_for_movie(
+        &self,
+        movie_id: i64,
+        target_ratio: Option<f64>,
+    ) -> Result<Option<MediaThumbnailRow>, ServiceError> {
+        let Ok(movie_id) = i32::try_from(movie_id) else {
+            return Ok(None);
+        };
+        let rows = MediaThumbnailRepository::new(self.db.clone())
+            .by_movie(movie_id)
+            .await?;
+        let ratio = target_ratio.unwrap_or(POPULAR_TARGET_RATIO);
+        // (距离, media_id, thumbnail_id, 行) —— 按三元组取最小。
+        let mut best: Option<(i64, i32, i32, MediaThumbnailRow)> = None;
+        let mut start = 0usize;
+        while start < rows.len() {
+            let media_id = rows[start].1;
+            let mut end = start + 1;
+            while end < rows.len() && rows[end].1 == media_id {
+                end += 1;
+            }
+            let group = &rows[start..end];
+            start = end;
+            // 上游注释（`:301`）：按**每条媒体自身时长**算目标时间点。
+            let duration = i64::from(group[0].5);
+            let mut desired = (duration as f64 * ratio) as i64;
+            if desired <= 0 {
+                // 上游 `:268-269`：退到中点那张的偏移。
+                desired = i64::from(group[group.len() / 2].3);
+            }
+            let Some(picked) = MediaThumbnailRepository::pick_closest(group, desired) else {
+                continue;
+            };
+            // 最终比较用的目标点与选图是同一份算法；`<= 0` 时退到**选中**
+            // 那张的偏移（上游 `:303-304`），此时距离恒为 0。
+            let mut final_desired = (duration as f64 * ratio) as i64;
+            if final_desired <= 0 {
+                final_desired = i64::from(picked.3);
+            }
+            let distance = (i64::from(picked.3) - final_desired).abs();
+            let key = (distance, media_id, picked.0);
+            let replace = match &best {
+                None => true,
+                Some((best_distance, best_media, best_thumbnail, _)) => {
+                    key < (*best_distance, *best_media, *best_thumbnail)
+                }
+            };
+            if replace {
+                best = Some((distance, media_id, picked.0, picked.clone()));
+            }
+        }
+        Ok(best.map(|(_, _, _, row)| row))
+    }
+
+    /// 源 B：相似影片候选（上游 `_collect_similar_movie_candidates`，`:309-355`）。
+    ///
+    /// 稀疏索引查失败（`NotReady`）→ warn 后**整个源返回 0**（上游
+    /// `:316-319`：「Qdrant 故障不阻塞整池生成」）。`Unavailable`
+    /// 已在 [`MovieRecommendationService::search_similar_movies`] 内部降级成
+    /// 空列表。注意 Rust 侧是**逐种子**调（上游一次批量查全部种子）。
+    async fn collect_similar_movie_candidates(
+        &self,
+        seeds: &[MomentSeed],
+        pool: &mut HashMap<i64, MomentCandidate>,
+    ) -> Result<usize, ServiceError> {
+        let mut added_count = 0usize;
+        for seed in seeds {
+            let hits = match self
+                .movie_recommendation
+                .search_similar_movies(seed.movie_id, SIMILAR_MOVIE_PER_SEED_LIMIT as i64)
+                .await
+            {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(error = %error, "时刻推荐跳过影片相似度信号");
+                    return Ok(0);
+                }
+            };
+            let target_ratio = Self::safe_ratio(seed.offset_seconds, seed.duration_seconds);
+            for hit in hits {
+                let selected = self
+                    .choose_thumbnail_for_movie(hit.movie_id, target_ratio)
+                    .await?;
+                let Some(row) = selected else { continue };
+                // 推荐时刻只面向单部影片（`:333`）。
+                if row.7 {
+                    continue;
+                }
+                let score = Self::score_similar_movie(
+                    f64::from(hit.score),
+                    Self::heat_score(Some(i64::from(row.6))),
+                    seed.recency_score,
+                );
+                let before = pool.len();
+                Self::add_candidate(
+                    pool,
+                    MomentCandidate {
+                        thumbnail_id: i64::from(row.0),
+                        media_id: i64::from(row.1),
+                        movie_id: i64::from(row.2),
+                        offset_seconds: i64::from(row.3),
+                        movie_heat: Some(i64::from(row.6)),
+                        score,
+                        strategy: strategy::SIMILAR_MOVIE,
+                        reason: reason_text(strategy::SIMILAR_MOVIE).unwrap_or(""),
+                        seed_point_id: Some(seed.point_id),
+                        seed_thumbnail_id: Some(seed.thumbnail_id),
+                        source_movie_id: Some(seed.movie_id),
+                        visual_score: None,
+                        movie_similarity_score: Some(f64::from(hit.score)),
+                    },
+                );
+                if pool.len() > before {
+                    added_count += 1;
+                }
+            }
+        }
+        Ok(added_count)
+    }
+
+    /// 源 C：热门候选（上游 `_collect_popular_candidates`，`:356-390`）。
+    ///
+    /// 目标比例固定 [`POPULAR_TARGET_RATIO`]；收集够 `limit` 个就停
+    ///（`:388-389`，不补位）。
+    async fn collect_popular_candidates(
+        &self,
+        pool: &mut HashMap<i64, MomentCandidate>,
+        limit: usize,
+    ) -> Result<usize, ServiceError> {
+        let mut added_count = 0usize;
+        // `popular_movies` 内部已按 `limit * 5` 多取（上游 `:367`）。
+        let movies = MomentRecommendationRepository::new(self.db.clone())
+            .popular_movies(limit as i64)
+            .await?;
+        for (movie_id, heat) in movies {
+            let selected = self
+                .choose_thumbnail_for_movie(i64::from(movie_id), Some(POPULAR_TARGET_RATIO))
+                .await?;
+            let Some(row) = selected else { continue };
+            // 合集已在 SQL 里排除（`is_collection = false`），这里不再判。
+            let score = Self::score_popular(Self::heat_score(Some(i64::from(heat))));
+            let before = pool.len();
+            Self::add_candidate(
+                pool,
+                MomentCandidate {
+                    thumbnail_id: i64::from(row.0),
+                    media_id: i64::from(row.1),
+                    movie_id: i64::from(row.2),
+                    offset_seconds: i64::from(row.3),
+                    movie_heat: Some(i64::from(row.6)),
+                    score,
+                    strategy: strategy::POPULAR,
+                    reason: reason_text(strategy::POPULAR).unwrap_or(""),
+                    seed_point_id: None,
+                    seed_thumbnail_id: None,
+                    source_movie_id: None,
+                    visual_score: None,
+                    movie_similarity_score: None,
+                },
+            );
+            if pool.len() > before {
+                added_count += 1;
+            }
+            if pool.len() >= limit {
+                break;
+            }
+        }
+        Ok(added_count)
+    }
+
+    /// 生成瞬时推荐并落快照。上游 `generate_recommendations`（`:415-508`）。
+    ///
+    /// # 编排（与上游逐段对齐）
+    ///
+    /// 1. 取种子（`load_seeds`）；
+    /// 2. 有种子 → 源 A（视觉）；候选 **< limit** 且有种子 → 源 B（相似影片，
+    ///    兜底）；候选 **< limit** → 源 C（热门，兜底）—— B / C 是**按需降级**
+    ///    不是并行（见模块文档）；
+    /// 3. [`Self::rank_candidates`] 排名（含每片 [`MAX_RECOMMENDATIONS_PER_MOVIE`]
+    ///    条截流）；
+    /// 4. [`MomentRecommendationRepository::replace_all`] **整表替换**
+    ///    （空候选也删 —— 「清空旧池，而不是继续展示过期数据」，`:495`）。
+    ///
+    /// 上游的 `progress_callback` / `emit_progress` 在 Rust 侧没有对应物：
+    /// 进度由调度器（`sm-scheduler` 的任务运行记录）负责，这里只返回
+    /// [`GenerateStats`]（键名与上游 `summary` 逐字一致）。
     pub async fn generate_recommendations(
         &self,
         limit: usize,
     ) -> Result<GenerateStats, ServiceError> {
-        let _ = limit;
-        todo!("骨架：编排已就位，只差 image store 的读图字节（种子/选图/热门/落库/打分的仓储都已在 sm_db::repo::moment）")
+        let seeds = self.load_seeds().await?;
+        tracing::info!(seed_points = seeds.len(), "时刻推荐生成开始");
+        let mut pool: HashMap<i64, MomentCandidate> = HashMap::new();
+        let visual_candidates = if seeds.is_empty() {
+            0
+        } else {
+            self.collect_visual_candidates(&seeds, &mut pool).await?
+        };
+        let mut similar_candidates = 0;
+        if pool.len() < limit && !seeds.is_empty() {
+            similar_candidates = self
+                .collect_similar_movie_candidates(&seeds, &mut pool)
+                .await?;
+        }
+        let mut popular_candidates = 0;
+        if pool.len() < limit {
+            popular_candidates = self.collect_popular_candidates(&mut pool, limit).await?;
+        }
+        tracing::info!(
+            visual = visual_candidates,
+            similar = similar_candidates,
+            popular = popular_candidates,
+            total = pool.len(),
+            "时刻推荐候选收集完成"
+        );
+        let mut candidates: Vec<MomentCandidate> = pool.into_values().collect();
+        let ranked = Self::rank_candidates(&mut candidates, limit);
+        let generated_at = sm_db::common::now_utc();
+        // 候选 id 全部来自库里的 `i32` 列（种子投影 / `by_ids` / `by_movie`；
+        // 相似索引回填的也是库 id），`as i32` 是精确回转。
+        let rows: Vec<NewMomentRecommendation> = ranked
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| NewMomentRecommendation {
+                rank: (index + 1) as i32,
+                score: candidate.score,
+                strategy: candidate.strategy.to_owned(),
+                reason: candidate.reason.to_owned(),
+                movie_id: candidate.movie_id as i32,
+                media_id: candidate.media_id as i32,
+                thumbnail_id: candidate.thumbnail_id as i32,
+                offset_seconds: candidate.offset_seconds as i32,
+                seed_point_id: candidate.seed_point_id.map(|id| id as i32),
+                seed_thumbnail_id: candidate.seed_thumbnail_id.map(|id| id as i32),
+                source_movie_id: candidate.source_movie_id.map(|id| id as i32),
+                visual_score: candidate.visual_score,
+                movie_similarity_score: candidate.movie_similarity_score,
+            })
+            .collect();
+        MomentRecommendationRepository::new(self.db.clone())
+            .replace_all(&rows, generated_at)
+            .await?;
+        Ok(GenerateStats {
+            seed_points: seeds.len(),
+            visual_candidates,
+            similar_candidates,
+            popular_candidates,
+            stored_items: ranked.len(),
+        })
     }
 }

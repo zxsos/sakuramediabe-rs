@@ -58,7 +58,9 @@ use sm_service::transfers::import_task::{
     ImportAcceptedResponse, ImportFailedItemResource, ImportFailedItemRetryRequest,
     ImportMetadataSearchRequest, ImportMetadataSearchResponse, ImportRequest, ImportTaskService,
 };
-use sm_service::transfers::provider_browse::{ImportBrowseRequest, ImportBrowseResponse};
+use sm_service::transfers::provider_browse::{
+    ImportBrowseRequest, ImportBrowseResponse, ProviderBrowseService,
+};
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -89,16 +91,17 @@ pub fn routes() -> Router<AppState> {
 
 /// `POST /import-sources/browse` —— **200**（查询，不是任务）。
 ///
-/// ⚠️ **未接线**：浏览要调 storage provider（插件 ABI），属
-/// `provider_browse` 那一轮。请求/响应形状已在
-/// [`sm_service::transfers::provider_browse`] 定义（那里也还带着几处与上游的
-/// 偏差，一并留到那一轮）。
+/// 直接委托给 [`ProviderBrowseService::browse`]：媒体库 404、插件未装 503、
+/// provider 错误透传，全在 service 层。
 async fn browse_import_sources(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    EnvelopeJson(_payload): EnvelopeJson<ImportBrowseRequest>,
+    State(state): State<AppState>,
+    EnvelopeJson(payload): EnvelopeJson<ImportBrowseRequest>,
 ) -> Result<Json<ImportBrowseResponse>, ErrorResponse> {
-    todo!("骨架：接导入器（依赖 provider 插件）")
+    let response = ProviderBrowseService::new(state.db().clone(), state.provider_factory())
+        .browse(payload)
+        .await?;
+    Ok(Json(response))
 }
 
 /// `POST /imports` —— **202 Accepted**（长任务）。

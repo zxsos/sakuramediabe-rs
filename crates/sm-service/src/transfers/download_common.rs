@@ -25,6 +25,8 @@
 //! 别把它们写成「查不到就返回 `Option` 让调用方自己判」—— 那样每个调用点
 //! 都要重复一遍同样的判空，而漏一个就变成 panic。
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use sm_db::repo::{
@@ -32,6 +34,7 @@ use sm_db::repo::{
     IndexerRepository, MediaLibraryRepository,
 };
 use sm_db::Db;
+use sm_plugin_api::host::{HostProviderFactory, HostStorageProvider};
 
 use crate::error::{details_of, ServiceError};
 
@@ -218,9 +221,38 @@ pub fn download_provider(
 }
 
 /// 取媒体库的存储 provider 句柄。
-pub fn library_provider(library: &MediaLibraryRow) -> Result<PluginStorageProvider, ServiceError> {
-    let _ = library;
-    todo!("骨架：经 sm-plugins 的 media.provider 能力取句柄；未装 -> 503 provider_not_installed")
+///
+/// 经 [`HostProviderFactory`] 按 `library.provider_key` 取 ——
+//  与 `ProviderBrowseService::browse` 同一条链路（查注册表 → 建 gRPC client）。
+///
+/// | 情况 | 结果 |
+/// |---|---|
+/// | `factory` 为 `None`（组合根没注入） | 503 `provider_not_installed` |
+/// | 注册表里没有这个 provider / 连不上 | 503 `provider_not_installed` |
+/// | provider 操作失败 | `provider_{code}`（按码分状态，见 [`provider_error`]） |
+pub async fn library_provider(
+    library: &MediaLibraryRow,
+    factory: Option<&dyn HostProviderFactory>,
+) -> Result<Arc<dyn HostStorageProvider>, ServiceError> {
+    let factory = factory.ok_or_else(|| {
+        ServiceError::unavailable("provider_not_installed", "媒体提供方未安装")
+    })?;
+    factory
+        .for_provider_key(&library.provider_key)
+        .await
+        .map_err(|err| {
+            if err.is_not_installed() {
+                ServiceError::unavailable("provider_not_installed", "媒体提供方未安装")
+            } else {
+                // `HostProviderError` → 本域的 `ProviderOperationError` 镜像，
+                // 复用 `provider_error` 的码表（`provider_{code}`）。
+                provider_error(&ProviderOperationError {
+                    code: err.code,
+                    message: err.safe_message,
+                    operation: Some(err.operation),
+                })
+            }
+        })
 }
 
 /// **provider 错误码 → HTTP 状态码**。见模块文档的映射表。
@@ -502,7 +534,10 @@ pub struct MediaLibraryRow {
 
 impl MediaLibraryRow {
     /// 从库里的行投影。
-    fn from_entity(row: &sm_db::MediaLibrary) -> Self {
+    ///
+    /// `pub(crate)`：`media_transfer_task` 的候选列表也要把 `MediaLibrary`
+    /// 转成行投影（`provider_config` 的归一化逻辑只应有一处）。
+    pub(crate) fn from_entity(row: &sm_db::MediaLibrary) -> Self {
         Self {
             id: row.id,
             name: row.name.clone(),
@@ -593,8 +628,10 @@ pub(crate) fn provider_config_object(raw: Option<&str>) -> serde_json::Value {
 /// 下载能力的真实形状是 [`super::download_client::DownloadClientCapability`]
 /// 那个 trait（有 `config_fields` / `prepare_client` / `test_client` 三个动作），
 /// 空壳留着只会让人以为「句柄已经存在」。
-/// 插件的存储句柄。**形状待插件 ABI 定型**，这里只占位。
-pub struct PluginStorageProvider;
+///
+/// 同理，占位的 `PluginStorageProvider`（unit struct）也已删除：
+/// 存储 provider 的真实形状是 `sm_plugin_api::host::HostStorageProvider`
+/// 那个 trait（宿主侧调用抽象），取句柄走 [`library_provider`]。
 
 #[cfg(test)]
 mod tests {

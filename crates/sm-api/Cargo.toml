@@ -14,6 +14,7 @@ workspace = true
 sm-core = { workspace = true }
 sm-service = { workspace = true }
 sm-db = { workspace = true }
+sm-plugin-api = { workspace = true }
 axum = { workspace = true }
 # 只为 `HtmlFormQuery`（重复 query 参数）—— 见 `crates/sm-api/src/extract.rs`。
 # `query` 特性在这里是**必需**的（默认不带）。

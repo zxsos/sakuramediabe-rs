@@ -27,6 +27,8 @@ pub mod manifest;
 pub use sm_plugin_api::movie_delivery;
 /// provider 数据面（`StorageProvider` / `DownloadProvider`）的调用面。
 pub mod provider_calls;
+/// `sm_plugin_api::host` trait 的 gRPC 实现（给 `sm-server` 注入用）。
+pub mod host_impl;
 pub mod registration;
 pub mod registry;
 pub mod runner;

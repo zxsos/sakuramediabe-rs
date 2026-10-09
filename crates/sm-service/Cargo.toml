@@ -50,6 +50,8 @@ sha1 = { workspace = true }
 hashing = { workspace = true }
 # 宿主侧图像原语：缩略图校验要 `is_webp`，读尺寸要 `decode`。
 svc-image = { workspace = true }
+# `ImageTasksBuilder` trait 需要 async 方法（`Box<dyn>` 对象安全）。
+async-trait = { workspace = true }
 svc-probe = { workspace = true }
 # 图片包（`assets.zip` / `thumbnails.zip`）：只写/读 STORED 条目，见根 Cargo.toml。
 zip = { workspace = true }

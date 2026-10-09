@@ -131,7 +131,9 @@ impl Default for SubscribedMovieAutoDownloadService {
 }
 
 /// 可注入依赖面。
-pub trait AutoDownloadDeps {
+pub trait AutoDownloadDeps: Send + Sync {
+    /// 待处理的已订阅番号列表。实现方从订阅状态表查「待搜索」的影片。
+    fn subscribed_movie_numbers(&self) -> Result<Vec<String>, ServiceError>;
     /// 搜候选。**已按体积窗口过滤**（实现方负责，过滤规则见
     /// [`size_in_window`]）。
     fn search(
@@ -169,7 +171,112 @@ impl SubscribedMovieAutoDownloadService {
     /// **单部影片失败不中断整轮** —— 一部影片的索引器故障不该让其它影片
     /// 今晚都不下载。
     pub async fn run(&self) -> Result<AutoDownloadStats, ServiceError> {
-        todo!("骨架：逐部订阅影片 -> 查重 -> 搜 -> 过滤(体积/黑名单) -> 提交；连续拒 5 个放弃该片")
+        let deps = self.inner.as_deref().ok_or_else(|| {
+            ServiceError::unavailable(
+                "auto_download_deps_not_wired",
+                "自动下载依赖未接线（需要 DB 与索引器）",
+            )
+        })?;
+
+        let mut stats = AutoDownloadStats::default();
+        let movie_numbers = deps.subscribed_movie_numbers()?;
+
+        for movie_number in &movie_numbers {
+            stats.examined_movies += 1;
+
+            // 查重：已有进行中的任务就跳过。
+            match deps.has_active_task(movie_number) {
+                Ok(true) => {
+                    stats.skipped_existing_task += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    // 查重失败按「无任务」处理，继续走搜索；提交时的幂等由
+                    // download_request 层保证。
+                }
+            }
+
+            // 搜候选。
+            let candidates = match deps.search(movie_number) {
+                Ok(c) => c,
+                Err(_) => {
+                    stats.failed += 1;
+                    continue;
+                }
+            };
+            if candidates.is_empty() {
+                stats.skipped_no_candidate += 1;
+                continue;
+            }
+
+            // 逐个过滤，提交第一个合格的；连续拒满 5 个就放弃这部影片。
+            let mut rejected = 0usize;
+            let mut submitted = false;
+            for candidate in &candidates {
+                // 体积过滤（未知体积也拒）。
+                let reason = match candidate.size_bytes {
+                    None => Some(RejectReason::TooSmall),
+                    Some(size) => {
+                        if size < MIN_SIZE_BYTES {
+                            Some(RejectReason::TooSmall)
+                        } else if size > MAX_SIZE_BYTES {
+                            Some(RejectReason::TooLarge)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(_reason) = reason {
+                    rejected += 1;
+                    if rejected >= MAX_REJECTED_CANDIDATES {
+                        break;
+                    }
+                    continue;
+                }
+
+                // 黑名单过滤。
+                match deps.is_blacklisted(&candidate.source_uri) {
+                    Ok(true) => {
+                        rejected += 1;
+                        if rejected >= MAX_REJECTED_CANDIDATES {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        // 黑名单查失败按「未拉黑」处理，避免误杀。
+                    }
+                }
+
+                // 提交。
+                match deps.submit(movie_number, candidate) {
+                    Ok(_) => {
+                        stats.submitted += 1;
+                        submitted = true;
+                        break;
+                    }
+                    Err(_) => {
+                        rejected += 1;
+                        if rejected >= MAX_REJECTED_CANDIDATES {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if !submitted {
+                // 全部候选都被拒（或提交失败），记为失败。
+                // 注意：无候选的情况上面已单独计数，这里只记「有候选但全拒」。
+                if !candidates.is_empty() {
+                    stats.failed += 1;
+                }
+            }
+        }
+
+        Ok(stats)
     }
 }
 

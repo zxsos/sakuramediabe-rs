@@ -9,7 +9,6 @@
 > | B 纯 Rust 媒体探测 | `feat/svc-probe` | 未开工。ADR §3.3 已定「默认 `ffprobe` CLI，缺失时切 `symphonia`」 |
 >
 > 三条分支都**不在本地**（`git worktree list` 只有仓库本身）——本轮走的是单线
-> 推进，`feat/grpc-ref-plugin` 也已用 `cherry-pick` 重放进 main，因此 CNB 上
 > 那条 MR 的 head SHA 不再是 main 的祖先，**需要手动关闭**。
 >
 > 方案本身仍然成立：线 C 的实测结论（控制面 0.4ms 可接受、字节搬运必须走

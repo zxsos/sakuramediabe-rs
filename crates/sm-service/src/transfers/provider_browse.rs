@@ -30,15 +30,28 @@
 //! 差别在**条目**上：上游用 `entry_type` 而不是布尔，且多两个字段 ——
 //! 客户端要靠 `is_video` 决定「这一项能不能导」、靠 `entry_type` 渲染图标。
 //! 这里只登记不改：浏览端点还没接线（[`ProviderBrowseService::browse`] 仍是
-//! `todo!()`），改形状得连着 provider 调用面一起验。
+//! `todo!()`）。
+//!
+//! ✅ **2026-10-09：改形状的前置条件已满足。** `sm_plugins::provider_calls::browse`
+//! 已补上（单页，`next_cursor` 透传），它返回的是 proto 的 `BrowsePage` ——
+//! 上游那 6 个字段（`source_ref` / `name` / `entry_type` / `size_bytes` /
+//! `modified_at` / `is_video`）逐个都在（`common.proto:108-121`），并且由
+//! `plugin-ref-local/tests/provider_calls_roundtrip.rs` 用真 provider 验过。
+//! 所以接线这一轮**应当**把 [`BrowseEntry`] 改成上游的形状，而不是拖到以后。
 //!
 //! **没有**第二份定义：`sm-api` 的 `/import-sources/browse` 已经 `use` 本模块
 //! 的类型（骨架期那里另有一套 `{source, depth}` / `{items, ...}` 的内联
 //! DTO，已删）。
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
+use sm_db::Db;
+use sm_plugin_api::host::{HostProviderError, HostProviderFactory};
+use sm_plugin_api::v1::{EntryType, LibraryHandle};
 
 use crate::error::ServiceError;
+use crate::transfers::download_common::require_library;
 
 /// 浏览请求。
 #[derive(Debug, Clone, Deserialize)]
@@ -64,23 +77,43 @@ pub struct ImportBrowseResponse {
     pub next_cursor: Option<String>,
 }
 
-/// 一条浏览结果。
+/// 一条浏览结果。对齐上游 `ImportBrowseEntryResource` / proto `BrowseEntry` 形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowseEntry {
     /// **不透明**引用。回传给 `import_from_source` 与下一页的 `parent_ref`。
     pub source_ref: serde_json::Value,
     /// 显示名。
     pub name: String,
-    /// 是不是目录。`true` 时前端渲染成可点开的层级。
-    pub is_directory: bool,
+    /// 条目类型：`"file"` 或 `"directory"`。前端靠它决定渲染成文件还是可点开的层级。
+    pub entry_type: String,
     /// 文件大小。目录时为 `None`。
     pub size_bytes: Option<i64>,
+    /// 修改时间（RFC 3339）。目录时为 `None`。
+    pub modified_at: Option<String>,
+    /// 是否视频文件。客户端靠它决定「能不能导」。
+    pub is_video: bool,
 }
 
 /// 浏览服务。
-pub struct ProviderBrowseService;
+///
+/// # 插件注入
+///
+/// `provider_factory` 是 `Option`：`None` = 组合根没注入（没装插件），
+/// `browse` 直接报 503 `provider_not_installed`。与 `AppState` 里那几个
+/// `Option<Arc<dyn ...>>` 同一个理由 —— 缺省也能构造，单测不依赖插件。
+pub struct ProviderBrowseService {
+    db: Db,
+    provider_factory: Option<Arc<dyn HostProviderFactory>>,
+}
 
 impl ProviderBrowseService {
+    /// 构造。
+    pub fn new(db: Db, provider_factory: Option<Arc<dyn HostProviderFactory>>) -> Self {
+        Self {
+            db,
+            provider_factory,
+        }
+    }
     /// ★ 浏览。上游 `browse(cls, payload)`。
     ///
     /// 错误码：
@@ -98,10 +131,123 @@ impl ProviderBrowseService {
     /// 前者更笼统，后者说明是契约被破坏 —— 客户端要靠它们区分「重试」与
     /// 「上报插件 bug」。
     pub async fn browse(
+        &self,
         payload: ImportBrowseRequest,
     ) -> Result<ImportBrowseResponse, ServiceError> {
-        let _ = payload;
-        todo!("骨架：解析媒体库的 provider -> browse(parent_ref, cursor, limit) -> 原样透传 next_cursor")
+        // 1. 查媒体库（404）。
+        let library = require_library(&self.db, payload.library_id as i32).await?;
+
+        // 2. 取 provider（没注入 factory = 没装插件 → 503）。
+        let factory = self.provider_factory.as_ref().ok_or_else(|| {
+            ServiceError::unavailable("provider_not_installed", "媒体提供方未安装")
+        })?;
+        let provider = factory
+            .for_provider_key(&library.provider_key)
+            .await
+            .map_err(|err| map_host_error(&err))?;
+
+        // 3. 调插件。
+        let handle = LibraryHandle {
+            library_id: library.id as i64,
+            provider_key: library.provider_key.clone(),
+            provider_config: sm_plugin_api::json_struct::json_to_struct(
+                &library.provider_config,
+            ),
+            account_key: None,
+        };
+        let page = provider
+            .browse(
+                handle,
+                payload.parent_ref,
+                payload.cursor,
+                payload.limit.unwrap_or(100) as i32,
+            )
+            .await
+            .map_err(|err| map_host_error(&err))?;
+
+        // 4. 转条目（`entry_type` / `modified_at` / `is_video` 已对齐上游）。
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let entry_type = match entry.entry_type() {
+                    EntryType::File => "file",
+                    EntryType::Directory => "directory",
+                    EntryType::Unspecified => "file",
+                }
+                .to_owned();
+                BrowseEntry {
+                    source_ref: sm_plugin_api::json_struct::struct_to_json(
+                        entry.source_ref.as_ref(),
+                    ),
+                    name: entry.name,
+                    entry_type,
+                    size_bytes: entry.size_bytes,
+                    modified_at: entry.modified_at,
+                    is_video: entry.is_video,
+                }
+            })
+            .collect();
+
+        // 5. `next_cursor` 原样透传。
+        Ok(ImportBrowseResponse {
+            library_id: payload.library_id,
+            entries,
+            next_cursor: page.next_cursor,
+        })
+    }
+}
+
+/// 把 [`HostProviderError`] 映射成 [`ServiceError`]。
+///
+/// 映射表（按上游 `ProviderOperationError.code` 的语义）：
+///
+/// | code | 状态码 | 说明 |
+/// |---|---|---|
+/// | `unavailable` | 503 `provider_not_installed` | 插件没装 / 连不上 |
+/// | `invalid_config` | 422 | 配置问题 |
+/// | `authentication_failed` | 401 | 认证失败 |
+/// | `source_not_found` | 404 | 远端对象不在（浏览里一般不会出现） |
+/// | `unsupported` | 502 `provider_invalid_response` | 插件不支持（契约被破坏） |
+/// | 其余 | 502 `provider_browse_failed` | 浏览本身失败 |
+fn map_host_error(err: &HostProviderError) -> ServiceError {
+    // 插件没装 / 连不上 → 503。
+    if err.is_not_installed() {
+        return ServiceError::unavailable("provider_not_installed", "媒体提供方未安装");
+    }
+    // provider_{code}：按码分状态。
+    let code = format!("provider_{}", err.code);
+    match err.code.as_str() {
+        "invalid_config" => ServiceError::from_status(422, code, err.safe_message.clone()),
+        "authentication_failed" => ServiceError::from_status(401, code, err.safe_message.clone()),
+        "source_not_found" => ServiceError::from_status(404, code, err.safe_message.clone()),
+        "unsupported" => {
+            // 插件说不支持 —— 这是契约被破坏（它声明了能力却调不动）。
+            ServiceError::bad_gateway(
+                "provider_invalid_response",
+                "媒体提供方返回了非法结构",
+                {
+                    let mut details = serde_json::Map::new();
+                    details.insert(
+                        "provider_code".to_owned(),
+                        serde_json::Value::from(err.code.clone()),
+                    );
+                    details
+                },
+            )
+        }
+        _ => ServiceError::bad_gateway(
+            "provider_browse_failed",
+            err.safe_message.clone(),
+            {
+                let mut details = serde_json::Map::new();
+                details.insert(
+                    "provider_code".to_owned(),
+                    serde_json::Value::from(err.code.clone()),
+                );
+                details
+            },
+        ),
     }
 }
 
@@ -121,21 +267,27 @@ mod tests {
                 BrowseEntry {
                     source_ref: serde_json::json!({"p": "a"}),
                     name: "演员合集".to_owned(),
-                    is_directory: true,
+                    entry_type: "directory".to_owned(),
                     size_bytes: None,
+                    modified_at: None,
+                    is_video: false,
                 },
                 BrowseEntry {
                     source_ref: serde_json::json!({"p": "b.mkv"}),
                     name: "b.mkv".to_owned(),
-                    is_directory: false,
+                    entry_type: "file".to_owned(),
                     size_bytes: Some(1024),
+                    modified_at: Some("2026-10-09T00:00:00Z".to_owned()),
+                    is_video: true,
                 },
             ],
             next_cursor: None,
         };
         assert_eq!(response.entries.len(), 2);
-        assert!(response.entries[0].is_directory);
-        assert!(!response.entries[1].is_directory);
+        assert_eq!(response.entries[0].entry_type, "directory");
+        assert_eq!(response.entries[1].entry_type, "file");
+        assert!(response.entries[1].is_video);
+        assert!(!response.entries[0].is_video);
         assert!(response.entries[1].size_bytes.is_some());
         assert!(response.entries[0].size_bytes.is_none(), "目录没有大小");
     }
