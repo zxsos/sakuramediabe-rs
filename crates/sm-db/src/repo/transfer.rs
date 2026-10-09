@@ -166,6 +166,20 @@ impl DownloadClientRepository {
     ///
     /// 单独成方法而不是通用 `update`：该列是 `NOT NULL`，通用路径能绑
     /// `None` 进去。空白串按「没有配置」处理，落 `'{}'`。
+    /// 改名。`name` 在此 归一（trim），全空白按仓储惯例由调用方挡掉。
+    pub async fn rename(&self, id: i32, name: &str) -> Result<DownloadClient, DbError> {
+        let trimmed = name.trim();
+        let row = sqlx::query_as::<_, DownloadClient>(
+            "UPDATE download_client SET name = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(trimmed)
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found("download_client", id))?;
+        Ok(row)
+    }
     pub async fn set_provider_config(
         &self,
         id: i32,

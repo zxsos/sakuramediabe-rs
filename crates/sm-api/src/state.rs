@@ -8,6 +8,7 @@ use sm_service::playback::provider_helpers::StorageGateway;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
 use sm_service::system::JobCatalog;
+use sm_service::transfers::download_client::DownloadClientService;
 
 /// 所有路由共享的运行时状态。
 ///
@@ -60,6 +61,11 @@ pub struct AppState {
     /// `provider_not_installed`（`require_provider` 的文档）。缺省就是它 ——
     /// 单测里不注入也能构造 `AppState`。
     storage: Option<Arc<dyn StorageGateway>>,
+    /// provider 的**下载能力**（`config_fields` / `prepare_client` / `test_client`）。
+    ///
+    /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 写方法报
+    /// 503 `provider_not_installed`（不是「假装配置合法」）。
+    downloads: Option<Arc<dyn sm_service::transfers::download_client::DownloadCapabilityRegistry>>,
 }
 
 impl AppState {
@@ -73,6 +79,7 @@ impl AppState {
             jobs: JobCatalog::default(),
             ranking: RankingSourceCatalog::default(),
             storage: None,
+            downloads: None,
         }
     }
 
@@ -98,6 +105,29 @@ impl AppState {
     pub fn with_storage_gateway(mut self, storage: Arc<dyn StorageGateway>) -> Self {
         self.storage = Some(storage);
         self
+    }
+
+    /// 挂上下载能力。**只有组合根会调** —— 理由与上面那条完全一致。
+    pub fn with_download_capabilities(
+        mut self,
+        downloads: Arc<dyn sm_service::transfers::download_client::DownloadCapabilityRegistry>,
+    ) -> Self {
+        self.downloads = Some(downloads);
+        self
+    }
+
+    /// ★ 下载器客户端服务。**路由不要自己拼** —— 拼漏了 `with_downloads` 的表现是
+    /// 三个写方法**一律 503**，而不是「缺哪个插件就哪个报错」，排查时极难分清。
+    pub fn download_client_service(
+        &self,
+    ) -> sm_service::transfers::download_client::DownloadClientService {
+        match self.downloads.as_ref() {
+            Some(_) => {
+                let registry = Arc::clone(self.downloads.as_ref().expect("刚匹配到 Some"));
+                DownloadClientService::new_with_downloads(self.db(), registry)
+            }
+            None => DownloadClientService::new(self.db()),
+        }
     }
 
     /// provider 数据面。`None` 表示组合根没注入（等价于「没装任何插件」）。

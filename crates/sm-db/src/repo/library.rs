@@ -243,6 +243,30 @@ impl MediaLibraryRepository {
     /// 已被 `media` 引用的库会怎样由 schema 的 `on_delete` 决定；这里
     /// 不做静默跳过 —— 「这个库还有 N 条媒体」是调用方删之前该知道的，
     /// 库的删除本身是低频操作。
+    /// 全量列表。上游 `list_libraries`（`media_library_service.py:182-186`）
+    /// 要 `created_at DESC, id DESC`（最新在前），而 `list` 是按 `name` 排的。
+    pub async fn list_ordered(&self) -> Result<Vec<MediaLibrary>, DbError> {
+        Ok(sqlx::query_as::<_, MediaLibrary>(
+            "SELECT * FROM media_library ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 改名。`name` 在此归一（trim）。名字唯一的约束在**表里**，所以并发抢同一个
+    /// 名字会在这一步炸 —— 调用方先查重只是为了给一个可读的 409。
+    pub async fn rename(&self, id: i32, name: &str) -> Result<MediaLibrary, DbError> {
+        sqlx::query_as::<_, MediaLibrary>(
+            "UPDATE media_library SET name = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(name.trim())
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
     pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM media_library WHERE id = $1")
             .bind(id)

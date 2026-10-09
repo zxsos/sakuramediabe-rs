@@ -96,6 +96,60 @@ impl NewMedia {
     }
 }
 
+/// 媒体列表的筛选条件。上游 `list_media`（`media_service.py:254-309`）的参数。
+///
+/// # ★ `kind` 的判据是「归属列是否为空」，不是某个枚举列
+///
+/// `jav` = `movie_number IS NOT NULL`；`video` = `video_item_id IS NOT NULL`；
+/// `all` = 不过滤。`media` 表同时装两类，靠哪个外键非空区分。
+#[derive(Debug, Clone, Default)]
+pub struct MediaListFilter<'a> {
+    /// `"jav"` / `"video"` / `"all"` / `None`。
+    pub kind: Option<&'a str>,
+    pub library_id: Option<i32>,
+    /// 演员筛选的**中间产物**：调用方先把 `actor_ids` 解析成番号列表。
+    ///
+    /// 上游把它做成 `IN` 子查询而不是 JOIN（`media_service.py:275-290`）：
+    /// JOIN 会让「多个演员都演这部片」时主查询出现**重复行**。
+    pub movie_numbers: Option<&'a [String]>,
+    pub thumbnail_generation_state: Option<&'a str>,
+}
+
+impl MediaListFilter<'_> {
+    /// 把 WHERE 子句推给 `QueryBuilder`。**唯一**的条件拼接处。
+    fn push_where(&self, builder: &mut sqlx::QueryBuilder<sqlx::Postgres>) {
+        // ★ 所有值都走 `push_bind`，**没有一处**把外部数据拼进 SQL 字符串。
+        builder.push(" WHERE 1 = 1");
+        let kind_fragment = match self.kind {
+            Some("jav") => Some(" AND movie_number IS NOT NULL"),
+            Some("video") => Some(" AND video_item_id IS NOT NULL"),
+            _ => None,
+        };
+        if let Some(fragment) = kind_fragment {
+            builder.push(fragment);
+        }
+        if let Some(library_id) = self.library_id {
+            builder.push(" AND library_id = ");
+            builder.push_bind(library_id);
+        }
+        if let Some(numbers) = self.movie_numbers {
+            // 空名单 = 命中不了任何媒体。**不能**退化成「不过滤」—— 那会把
+            // 「筛选了但没有作品的演员」显示成「全部媒体」。
+            if numbers.is_empty() {
+                builder.push(" AND FALSE");
+            } else {
+                builder.push(" AND movie_number = ANY(");
+                builder.push_bind(numbers.to_vec());
+                builder.push(")");
+            }
+        }
+        if let Some(state) = self.thumbnail_generation_state {
+            builder.push(" AND thumbnail_generation_state = ");
+            builder.push_bind(state);
+        }
+    }
+}
+
 /// `media` 表仓储。
 #[derive(Debug, Clone)]
 pub struct MediaRepository {
@@ -154,6 +208,119 @@ impl MediaRepository {
                 .fetch_all(&self.pool)
                 .await?,
         )
+    }
+
+    /// 列出符合筛选条件的媒体。**排序由调用方给的 SQL 片段决定。**
+    ///
+    /// # 为什么用 `QueryBuilder` 而不是拼占位符
+    ///
+    /// 四个筛选条件都是可选的（`kind` / `library_id` / `movie_numbers` /
+    /// `thumbnail_generation_state`），占位符序号会随组合变化。手数 `$1..$n`
+    /// 迟早错位，而错位在编译期看不出来。
+    ///
+    /// # `order_sql` 必须是**白名单产出**
+    ///
+    /// 拼接进 SQL 的字符串不能来自请求参数 —— 调用方（服务层）先经白名单映射
+    /// 表解析，这里只负责拼。
+    pub async fn list_filtered(
+        &self,
+        filter: &MediaListFilter<'_>,
+        order_sql: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Media>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT * FROM media");
+        filter.push_where(&mut builder);
+        builder.push(" ORDER BY ");
+        builder.push(order_sql);
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_as::<Media>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 与 [`Self::list_filtered`] **同一份** WHERE 的计数。
+    ///
+    /// ★ 两份 WHERE 必须来自同一个 [`MediaListFilter`] —— 计数与分页各写一遍
+    /// 条件，改一处漏一处时会得到「总数 200、翻到第 3 页没东西」。
+    pub async fn count_filtered(&self, filter: &MediaListFilter<'_>) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT COUNT(*) FROM media");
+        filter.push_where(&mut builder);
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    /// ★ 同番号多文件：按番号分组，**只要 `count > 1` 的组**。
+    ///
+    /// `include_vr = false` 时上游排除**两类**（`media_service.py:323-332`）：
+    ///
+    /// 1. 番号本身含 `VR`；
+    /// 2. 影片打了名为 `vr` 的**标签**。
+    ///
+    /// 只做其中一条会漏 —— 打了 vr 标签但番号里没有 VR 的影片照样会被列出来。
+    pub async fn multi_version_movie_numbers(
+        &self,
+        include_vr: bool,
+        include_fc2: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT media.movie_number FROM media WHERE media.movie_number IS NOT NULL",
+        );
+        if !include_vr {
+            builder.push(
+                " AND media.movie_number NOT ILIKE '%vr%' AND media.movie_number NOT IN (\
+                   SELECT m.movie_number FROM movie m \
+                     JOIN movie_tag mt ON mt.movie_id = m.id \
+                     JOIN tag t ON t.id = mt.tag_id \
+                    WHERE LOWER(t.name) = 'vr')",
+            );
+        }
+        if !include_fc2 {
+            builder.push(" AND media.movie_number NOT ILIKE 'FC2%'");
+        }
+        builder.push(" GROUP BY media.movie_number HAVING COUNT(media.id) > 1");
+        builder.push(" ORDER BY MAX(media.updated_at) DESC, media.movie_number ASC");
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 同上分组的**总数**。
+    pub async fn count_multi_version_movies(
+        &self,
+        include_vr: bool,
+        include_fc2: bool,
+    ) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM (\
+               SELECT media.movie_number FROM media WHERE media.movie_number IS NOT NULL",
+        );
+        if !include_vr {
+            builder.push(
+                " AND media.movie_number NOT ILIKE '%vr%' AND media.movie_number NOT IN (\
+                   SELECT m.movie_number FROM movie m \
+                     JOIN movie_tag mt ON mt.movie_id = m.id \
+                     JOIN tag t ON t.id = mt.tag_id \
+                    WHERE LOWER(t.name) = 'vr')",
+            );
+        }
+        if !include_fc2 {
+            builder.push(" AND media.movie_number NOT ILIKE 'FC2%'");
+        }
+        builder.push(" GROUP BY media.movie_number HAVING COUNT(media.id) > 1) AS groups");
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
     }
 
     paged_list! {

@@ -189,12 +189,32 @@ fn indexer_not_found(shown: &str) -> ServiceError {
     )
 }
 
-/// 取某个下载器客户端的 provider 句柄。
+/// 取某个下载器客户端的 provider 能力。
+///
+/// # 为什么按 `provider_key` 而不是「下载器种类」
+///
+/// ⚠️ 骨架期这个函数收的是 **`&DownloadClientRow` 而直接 `todo!()`** —— 但真正
+/// 的决定因素是客户端**所属媒体库的 `provider_key`**（上游
+/// `_bundle(library)`，`client_config_service.py:52-70`）。把 row 传进来就
+/// 还要再查一次库，而这个帮助函数放在这里本来就是为了让**调用方不必关心查库**。
+///
+/// 两处 `None` / `Err` 的区别照上游：
+///
+/// | 返回 | 含义 | HTTP |
+/// |---|---|---|
+/// | `Err` | provider **没安装** | 503 `provider_not_installed` |
+/// | `Ok(None)` | 装了但该库**没有下载能力** | 422 `provider_download_unsupported` |
 pub fn download_provider(
-    client: &DownloadClientRow,
-) -> Result<PluginDownloadProvider, ServiceError> {
-    let _ = client;
-    todo!("骨架：经 sm-plugins 的 download_client 能力取句柄；未装 -> 503 provider_not_installed")
+    registry: &dyn super::download_client::DownloadCapabilityRegistry,
+    provider_key: &str,
+) -> Result<Option<Box<dyn super::download_client::DownloadClientCapability>>, ServiceError> {
+    match registry.download_client_for(provider_key) {
+        Ok(capability) => Ok(capability),
+        Err(failure) => Err(ServiceError::unavailable(
+            format!("provider_{}", failure.code),
+            failure.message,
+        )),
+    }
 }
 
 /// 取媒体库的存储 provider 句柄。
@@ -569,9 +589,10 @@ pub(crate) fn provider_config_object(raw: Option<&str>) -> serde_json::Value {
     }
 }
 
-/// 插件的下载器句柄。**形状待插件 ABI 定型**，这里只占位。
-pub struct PluginDownloadProvider;
-
+/// ⚠️ 这里**曾经**有一个占位的 `PluginDownloadProvider`（unit struct）。它已删除：
+/// 下载能力的真实形状是 [`super::download_client::DownloadClientCapability`]
+/// 那个 trait（有 `config_fields` / `prepare_client` / `test_client` 三个动作），
+/// 空壳留着只会让人以为「句柄已经存在」。
 /// 插件的存储句柄。**形状待插件 ABI 定型**，这里只占位。
 pub struct PluginStorageProvider;
 

@@ -6,9 +6,15 @@
 //! |---|---|---|
 //! | [`DownloadClientService::list_clients`] | `:257-265` | ✅ 已落地（纯库）|
 //! | [`DownloadClientService::delete_client`] | `:333-351` | ✅ 已落地（纯库）|
-//! | `create_client` | `:266-278` | ⏳ 阶段二：要 `_prepare`（`:144-172`）|
-//! | `update_client` | `:279-331` | ⏳ 阶段二：同上 |
-//! | `test_client` | `:199-256` | ⏳ 阶段二：要插件探测 |
+//! | [`DownloadClientService::create_client`] | `:266-278` | ✅ 已落地（经注入的 [`DownloadCapabilityRegistry`]）|
+//! | [`DownloadClientService::update_client`] | `:279-331` | ✅ 已落地 |
+//! | [`DownloadClientService::test_client`] | `:199-256` | ✅ 已落地（连不上也是 200，`status="failed"`）|
+//!
+//! # ★ 响应体要剥掉 secret 字段（上游 `_resource`，`:72-91`）
+//!
+//! `provider_config` 里可能有密码 / 令牌。判据是**插件声明**的
+//! `input == "secret"`：拿得到字段表才判得了，拿不到（插件没装 / 没有下载
+//! 能力）时上游直接发 `{}` —— 不知道哪些是 secret 的时候，原样发出去就等于泄漏。
 //!
 //! # 为什么 `create` / `update` 不能「先落库、以后补校验」
 //!
@@ -55,11 +61,12 @@ use serde::{Deserialize, Serialize};
 
 use sm_db::repo::{
     DownloadClientRepository, DownloadTaskRepository, IndexerDownloadClientRepository,
+    MediaLibraryRepository,
 };
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
-use crate::transfers::download_common::require_client;
+use crate::transfers::download_common::{require_client, require_library};
 
 /// 客户端配置（响应体）。上游 `DownloadClientResource`
 /// （`schema/transfers/downloads.py:14-33`）。
@@ -76,28 +83,6 @@ pub struct DownloadClientResource {
     pub provider_config: serde_json::Value,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
-}
-
-impl DownloadClientResource {
-    /// 从库里的行投影。`provider_config` 是不透明 JSON 文本 → 用
-    /// [`provider_config_object`](crate::transfers::download_common) 同款规则
-    /// （NULL / 脏数据当空对象，上游 `client.provider_config or {}`）。
-    fn from_entity(row: &sm_db::DownloadClient) -> Self {
-        Self {
-            id: row.id,
-            name: row.name.clone(),
-            library_id: row.library_id,
-            provider_config: sm_db_provider_config(row.provider_config.as_deref()),
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
-
-/// 库里的 `provider_config` 文本 → 对象。规则与 `download_common` 那份一致
-/// （上游 `downloads/common.py:93` 的 `or {}`），所以复用它。
-fn sm_db_provider_config(raw: Option<&str>) -> serde_json::Value {
-    crate::transfers::download_common::provider_config_object(raw)
 }
 
 /// 创建请求。上游 `DownloadClientCreateRequest`（`:35-38`）。
@@ -164,33 +149,67 @@ pub struct DownloadClientDiagnostic {
     pub elapsed_ms: i64,
 }
 
-/// 插件能力：下载器配置与探测。**形状待 provider seam 定型**（阶段二）。
-pub struct DownloadClientProvider {
-    _private: (),
+/// 插件声明的一个配置项。宿主用它做白名单，**自己不维护这份表**。
+///
+/// 上游 `bundle.downloads.config_fields` 的元素（`client_config_service.py:107`）。
+/// ⚠️ 别在宿主里抄一份字段表：插件升版新增配置项时，老宿主会把新字段判成
+/// 「未知字段」而拒掉整个请求 —— 那个插件就完全不能用了。
+#[derive(Debug, Clone)]
+pub struct DownloadClientConfigField {
+    pub key: String,
+    /// 输入种类。`"secret"` 有两个后果：不出现在响应里（`_resource`），
+    /// 更新时**从旧值回填**（`_prepare`）。
+    pub input: String,
+    /// 只读字段：只能由 provider 派生，**用户提交不得包含**（除非允许）。
+    pub read_only: bool,
 }
 
-impl DownloadClientProvider {
-    /// 取某个库的下载器 provider 句柄。**未装插件 → 503**。
-    ///
-    /// ⚠️ 骨架期这个函数收的是 `kind`（「下载器种类」）—— 而**没有 `kind` 这个东西**：
-    /// provider 由**媒体库的 `provider_key`** 决定（上游 `_bundle(library)`，`:53-72`）。
-    pub fn require(library_provider_key: &str) -> Result<Self, ServiceError> {
-        let _ = library_provider_key;
-        todo!("骨架：经 provider seam 取 download_client 能力；未装 -> 503 provider_not_installed")
-    }
+/// 已有的那个客户端 —— `prepare_client` 要它来合并 secret / 只读字段。
+///
+/// 上游 `DownloadClientHandle`（`:157-161`）。
+#[derive(Debug, Clone)]
+pub struct PreviousClientHandle {
+    pub client_id: i32,
+    pub library_id: i32,
+    pub provider_config: serde_json::Value,
+}
 
-    /// 探测。**失败不返回 `Err`** —— 上游把失败也包成诊断结果（200）。
-    pub async fn test(&self, config: &serde_json::Value) -> DownloadClientDiagnostic {
-        let _ = config;
-        todo!(
-            "骨架：调插件的 downloads.test_client；连不上也要 200（见上游 `_diagnostic_resource`）"
-        )
-    }
+/// provider 侧的失败。**宿主据此构造失败项，不是把它吞掉。**
+#[derive(Debug, Clone)]
+pub struct ProviderFailureInfo {
+    /// `invalid_config` / `authentication_failed` … 与 `ProviderOperationError.code` 同源。
+    pub code: String,
+    pub message: String,
+}
 
-    /// 插件声明的 `provider_config` schema。**用它**做字段白名单。
-    pub fn config_schema(&self) -> serde_json::Value {
-        todo!("骨架：取插件声明的配置 schema（字段白名单的依据，上游 `_validate_config`）")
-    }
+/// 插件的下载器能力。**注入 seam** —— 组合根（sm-server）实现它，
+/// 本模块不认识 gRPC。
+pub trait DownloadClientCapability: Send + Sync {
+    /// 插件声明的配置字段表。白名单 / secret / 只读的**唯一**判据来源。
+    fn config_fields(&self) -> Vec<DownloadClientConfigField>;
+    /// 合并 secret、派生并归一化配置。**返回必须能当配置对象用的东西。**
+    fn prepare_client(
+        &self,
+        submitted: &serde_json::Value,
+        library_id: i32,
+        previous: Option<&PreviousClientHandle>,
+    ) -> Result<serde_json::Value, ProviderFailureInfo>;
+    /// 探测。**失败由宿主转成失败诊断**（HTTP 仍是 200）。
+    fn test_client(
+        &self,
+        submitted: &serde_json::Value,
+        library_id: i32,
+    ) -> Result<DownloadClientDiagnostic, ProviderFailureInfo>;
+}
+
+/// 按 `provider_key` 取下载能力。**未注入 → 无能力**（`Ok(None)`）。
+pub trait DownloadCapabilityRegistry: Send + Sync {
+    /// `Err` = provider **没安装** → 503 `provider_not_installed`；
+    /// `Ok(None)` = 装了但没下载能力 → 422 `provider_download_unsupported`。
+    fn download_client_for(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<Box<dyn DownloadClientCapability>>, ProviderFailureInfo>;
 }
 
 /// 下载器客户端服务（**库侧**）。
@@ -202,24 +221,205 @@ impl DownloadClientProvider {
 /// provider seam 时再加一个网关字段（与 `playback::media::MediaService` 同款）。
 pub struct DownloadClientService {
     db: Db,
+    /// 插件能力注册表。`None` = 未注入 —— 那时三个写方法 RETURN **503**，
+    /// 而不是假装配置合法。
+    downloads: Option<std::sync::Arc<dyn DownloadCapabilityRegistry>>,
 }
 
 impl DownloadClientService {
-    /// 构造。
+    /// 构造（库侧能力）。`list_clients` / `delete_client` 只查库，这样就够。
     pub fn new(db: &Db) -> Self {
-        Self { db: db.clone() }
+        Self {
+            db: db.clone(),
+            downloads: None,
+        }
+    }
+
+    /// 构造（带上插件能力）。**写方法必须由组合根用这个构造**，
+    /// 否则三个写方法会一律返回 503（刻意如此：宁可报错，也不放行未校验的配置）。
+    pub fn new_with_downloads(
+        db: &Db,
+        downloads: std::sync::Arc<dyn DownloadCapabilityRegistry>,
+    ) -> Self {
+        Self {
+            db: db.clone(),
+            downloads: Some(downloads),
+        }
+    }
+
+    /// 取某个库的下载能力。上游 `_bundle(library)`（`:52-70`）。
+    fn bundle_for(
+        &self,
+        provider_key: &str,
+    ) -> Result<Box<dyn DownloadClientCapability>, ServiceError> {
+        let Some(registry) = self.downloads.as_deref() else {
+            return Err(ServiceError::unavailable(
+                "provider_not_installed",
+                "媒体提供方未安装",
+            ));
+        };
+        let capability =
+            crate::transfers::download_common::download_provider(registry, provider_key)?;
+        capability.ok_or_else(|| {
+            ServiceError::validation_with(
+                "provider_download_unsupported",
+                "该媒体库未提供下载能力",
+                details_of("provider_key", serde_json::Value::from(provider_key)),
+            )
+        })
+    }
+
+    /// 投影成响应体 —— **剥掉 `input == "secret"` 的字段**。
+    ///
+    /// 上游 `_resource`（`:72-91`）：provider 不可用或没有下载能力时把
+    /// `provider_config` 整个换成 `{}`。这是**数据最小化**，不是「省略卫语句」——
+    /// 不知道哪些字段是 secret 时，把原始配置原样发出去等于泄漏凭据。
+    async fn resource_of(
+        &self,
+        client: &sm_db::DownloadClient,
+    ) -> Result<DownloadClientResource, ServiceError> {
+        let raw = crate::transfers::download_common::provider_config_object(
+            client.provider_config.as_deref(),
+        );
+        let Ok(library) = MediaLibraryRepository::new(self.db.clone())
+            .find_by_id(client.library_id)
+            .await
+        else {
+            return Ok(Self::masked(
+                client,
+                serde_json::Value::Object(Default::default()),
+            ));
+        };
+        let Some(library) = library else {
+            return Ok(Self::masked(
+                client,
+                serde_json::Value::Object(Default::default()),
+            ));
+        };
+        let Ok(capability) = self.bundle_for(&library.provider_key) else {
+            return Ok(Self::masked(
+                client,
+                serde_json::Value::Object(Default::default()),
+            ));
+        };
+        let secret_keys: std::collections::BTreeSet<String> = capability
+            .config_fields()
+            .into_iter()
+            .filter(|field| field.input == "secret")
+            .map(|field| field.key)
+            .collect();
+        let visible: serde_json::Map<String, serde_json::Value> = raw
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, _)| !secret_keys.contains(*key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self::masked(client, serde_json::Value::Object(visible)))
+    }
+
+    fn masked(
+        client: &sm_db::DownloadClient,
+        provider_config: serde_json::Value,
+    ) -> DownloadClientResource {
+        DownloadClientResource {
+            id: client.id,
+            name: client.name.clone(),
+            library_id: client.library_id,
+            provider_config,
+            created_at: client.created_at,
+            updated_at: client.updated_at,
+        }
+    }
+
+    /// `# ★ 白名单校验：判据来自插件，不是宿主`
+    ///
+    /// 上游 `_validate_config`（`:93-128`）：不是对象 → 422；未知字段 → 422
+    /// （`details.fields`）；只读字段 → 422。
+    /// `allow_read_only` 只在「用户**没有**提交 `provider_config`、只是改了别的
+    /// 字段而需要把旧配置带上去略一遍」时才放行（`:324`）。
+    fn validate_config(
+        capability: &dyn DownloadClientCapability,
+        submitted: &serde_json::Value,
+        allow_read_only: bool,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let Some(map) = submitted.as_object() else {
+            return Err(ServiceError::validation(
+                "invalid_download_client_provider_config",
+                "provider_config must be an object",
+            ));
+        };
+        let fields = capability.config_fields();
+        let known: std::collections::BTreeSet<String> =
+            fields.iter().map(|field| field.key.clone()).collect();
+        let unknown: Vec<String> = map
+            .keys()
+            .filter(|key| !known.contains(*key))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ServiceError::validation_with(
+                "invalid_download_client_provider_config",
+                "provider_config contains unknown fields",
+                details_of("fields", serde_json::Value::from(unknown)),
+            ));
+        }
+        if !allow_read_only {
+            let read_only: Vec<String> = fields
+                .iter()
+                .filter(|field| field.read_only && map.contains_key(&field.key))
+                .map(|field| field.key.clone())
+                .collect();
+            if !read_only.is_empty() {
+                return Err(ServiceError::validation_with(
+                    "invalid_download_client_provider_config",
+                    "provider_config contains read-only fields",
+                    details_of("fields", serde_json::Value::from(read_only)),
+                ));
+            }
+        }
+        Ok(submitted.clone())
+    }
+
+    /// 名字可用性。上游 `_ensure_name_available`（`:130-141`）→ **409**，
+    /// `details.name`。排除自己（`exclude_client_id`）用于更新。
+    async fn ensure_name_available(
+        &self,
+        name: &str,
+        exclude_client_id: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        let hit = DownloadClientRepository::new(self.db.clone())
+            .find_by_name(name)
+            .await?;
+        let conflict = match (hit, exclude_client_id) {
+            (Some(client), Some(exclude)) => client.id != exclude,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if conflict {
+            return Err(ServiceError::conflict(
+                "download_client_name_conflict",
+                "Download client name already exists",
+                Some(details_of("name", serde_json::Value::from(name))),
+            ));
+        }
+        Ok(())
     }
 
     /// `GET /download-clients` —— **裸数组**（上游没有分页信封）。
     ///
     /// 上游 `list_clients`（`:257-265`）：`created_at DESC, id DESC`，最新在前。
     pub async fn list_clients(&self) -> Result<Vec<DownloadClientResource>, ServiceError> {
-        Ok(DownloadClientRepository::new(self.db.clone())
+        let rows = DownloadClientRepository::new(self.db.clone())
             .list_ordered()
-            .await?
-            .iter()
-            .map(DownloadClientResource::from_entity)
-            .collect())
+            .await?;
+        let mut resources = Vec::with_capacity(rows.len());
+        for row in rows {
+            resources.push(self.resource_of(&row).await?);
+        }
+        Ok(resources)
     }
 
     /// `DELETE /download-clients/{client_id}` —— **204**，无 body。
@@ -270,28 +470,228 @@ impl DownloadClientService {
         &self,
         payload: DownloadClientCreateRequest,
     ) -> Result<DownloadClientResource, ServiceError> {
-        let _ = payload;
-        todo!("骨架：等 provider seam —— `_bundle` + `_validate_config`(`:94-128`) + `_prepare`(`:144-172`)")
+        let name = crate::transfers::download_common::validate_non_empty(
+            &payload.name,
+            "invalid_download_client_name",
+            "Download client name cannot be empty",
+        )?;
+        let library = require_library(&self.db, payload.library_id).await?;
+        let capability = self.bundle_for(&library.provider_key)?;
+        // 顺序照上游：先 `_bundle` → `_validate_config` → `_prepare` →
+        // **名字查重** → 落库。名字冲突放在最后是为了让「插件没装 /
+        // 配置不合法」先报错（那些用户改不了请求体也解决不了）。
+        let prepared = Self::validate_config(capability.as_ref(), &payload.provider_config, false)
+            .and_then(|submitted| {
+                capability
+                    .prepare_client(&submitted, library.id, None)
+                    .map_err(provider_config_failed)
+            })?;
+        self.ensure_name_available(&name, None).await?;
+        let row = DownloadClientRepository::new(self.db.clone())
+            .insert(&sm_db::repo::NewDownloadClient {
+                name,
+                library_id: library.id,
+                provider_config: Some(prepared.to_string()),
+            })
+            .await?;
+        self.resource_of(&row).await
     }
 
     /// `PATCH /download-clients/{client_id}` —— 不存在 → **404**。**阶段二**。
+    ///
+    /// 顺序照上游 `:279-331`：改名查重 → **改库要先判有没有任务** → 再动配置。
+    ///
+    /// ⚠️ 骨架期那条「`kind` 不可改」的规则上游并**不存在**（上游没有 `kind`）；
+    /// 真正被禁的是「**有任务时不能换库**」，码是
+    /// `409 download_client_library_change_forbidden`（`:297-302`）。
     pub async fn update_client(
         &self,
         client_id: i32,
         payload: DownloadClientUpdateRequest,
     ) -> Result<DownloadClientResource, ServiceError> {
-        let _ = (client_id, payload);
-        todo!("骨架：等 provider seam —— 上游 `:279-331`（`_ensure_name_available` 之后走 `_prepare`）")
+        let client = require_client(&self.db, client_id).await?;
+        if payload.name.is_none()
+            && payload.library_id.is_none()
+            && payload.provider_config.is_none()
+        {
+            return Err(ServiceError::validation(
+                "empty_download_client_update",
+                "At least one field must be provided",
+            ));
+        }
+        if let Some(requested) = payload.name.as_deref() {
+            let name = crate::transfers::download_common::validate_non_empty(
+                requested,
+                "invalid_download_client_name",
+                "Download client name cannot be empty",
+            )?;
+            if name != client.name {
+                self.ensure_name_available(&name, Some(client.id)).await?;
+                DownloadClientRepository::new(self.db.clone())
+                    .rename(client.id, &name)
+                    .await?;
+            }
+        }
+        let mut target_library_id = client.library_id;
+        if let Some(requested_library_id) = payload.library_id {
+            if requested_library_id != client.library_id {
+                if DownloadTaskRepository::new(self.db.clone())
+                    .exists_for_client(client.id)
+                    .await?
+                {
+                    return Err(ServiceError::conflict(
+                        "download_client_library_change_forbidden",
+                        "Download client library cannot change while tasks exist",
+                        Some(details_of("client_id", serde_json::Value::from(client.id))),
+                    ));
+                }
+                let _ = require_library(&self.db, requested_library_id).await?;
+                target_library_id = requested_library_id;
+            }
+        }
+        // ★ 只有动了 `library_id` 或 `provider_config` 才重跑 `_prepare`
+        // —— 改个名字不该触发一次 provider 往返。
+        if payload.library_id.is_some() || payload.provider_config.is_some() {
+            let Some(submitted) = payload.provider_config.as_ref() else {
+                return Err(ServiceError::validation(
+                    "invalid_download_client_provider_config",
+                    "provider_config must be an object",
+                ));
+            };
+            if !submitted.is_object() {
+                return Err(ServiceError::validation(
+                    "invalid_download_client_provider_config",
+                    "provider_config must be an object",
+                ));
+            }
+            let library = require_library(&self.db, target_library_id).await?;
+            let capability = self.bundle_for(&library.provider_key)?;
+            // 没传 `provider_config` 只是改别的字段 → 用旧配置过一遍，
+            // 此时**允许**只读字段（它们本来就躺在库里）。
+            let config_submitted = payload.provider_config.is_some();
+            let submitted_value = payload.provider_config.clone().unwrap_or_else(|| {
+                crate::transfers::download_common::provider_config_object(
+                    client.provider_config.as_str(),
+                )
+            });
+            // 用户提交了配置 → 只读字段不许出现；只是改别的字段 → 放行
+            // （库里本来就有那些派生值）。
+            let submitted =
+                Self::validate_config(capability.as_ref(), &submitted_value, !config_submitted)?;
+            let previous = PreviousClientHandle {
+                client_id: client.id,
+                library_id: client.library_id,
+                provider_config: submitted.clone(),
+            };
+            let prepared = capability
+                .prepare_client(&submitted, library.id, Some(&previous))
+                .map_err(provider_config_failed)?;
+            let repo = DownloadClientRepository::new(self.db.clone());
+            repo.set_provider_config(client.id, &prepared.to_string())
+                .await?;
+            if target_library_id != client.library_id {
+                repo.move_to_library(client.id, target_library_id).await?;
+            }
+        }
+        let row = DownloadClientRepository::new(self.db.clone())
+            .find_by_id(client_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(
+                    "download_client_not_found",
+                    "Download client not found",
+                    "client_id",
+                    client_id,
+                )
+            })?;
+        self.resource_of(&row).await
     }
 
     /// `POST /download-clients/test` —— **无副作用**，成功与失败都 200。**阶段二**。
+    ///
+    /// ★ 失败**不返回 `Err`**：连不上也要 200，只不过 `status = "failed"`
+    /// 且 `checks[]` 里带着原因 —— 这本来就是「诊断」接口。
     pub async fn test_client(
         &self,
         payload: DownloadClientTestRequest,
     ) -> Result<DownloadClientDiagnostic, ServiceError> {
-        let _ = payload;
-        todo!("骨架：等 provider seam —— 上游 `:199-256` + `_diagnostic_resource`(`:175-198`)")
+        let started = std::time::Instant::now();
+        let existing = match payload.client_id {
+            Some(client_id) => Some(require_client(&self.db, client_id).await?),
+            None => None,
+        };
+        let library = require_library(&self.db, payload.library_id).await?;
+        // ⚠️ 已存在的客户端只能用它**自己所属**的库来测 —— 否则插件会拿着
+        // A 库的凭据去连 B 库的下载器。
+        if let Some(client) = existing.as_ref() {
+            if client.library_id != library.id {
+                return Err(ServiceError::validation_with(
+                    "download_client_test_library_mismatch",
+                    "下载器测试必须使用当前下载器绑定的媒体库",
+                    details_of("client_id", serde_json::Value::from(client.id)),
+                ));
+            }
+        }
+        let capability = self.bundle_for(&library.provider_key)?;
+        // 没给配置就用库里存的那份（上游 `:214-215`）。
+        let submitted_value = if payload.provider_config.is_object()
+            && payload
+                .provider_config
+                .as_object()
+                .is_some_and(|map| !map.is_empty())
+        {
+            payload.provider_config.clone()
+        } else {
+            crate::transfers::download_common::provider_config_object(
+                existing
+                    .as_ref()
+                    .and_then(|client| client.provider_config.as_str()),
+            )
+        };
+        let submitted = Self::validate_config(capability.as_ref(), &submitted_value, false)?;
+        let previous = existing.as_ref().map(|client| PreviousClientHandle {
+            client_id: client.id,
+            library_id: client.library_id,
+            provider_config: submitted.clone(),
+        });
+        let prepared = match capability.prepare_client(&submitted, library.id, previous.as_ref()) {
+            Ok(prepared) => prepared,
+            Err(failure) => return Ok(failed_diagnostic(&failure.code, &failure.message, started)),
+        };
+        // ★ provider 的失败（含连接不上）在**这里**转成失败诊断。
+        let diagnostic = match capability.test_client(&prepared, library.id) {
+            Ok(diagnostic) => diagnostic,
+            Err(failure) => failed_diagnostic(&failure.code, &failure.message, started),
+        };
+        let _ = started;
+        Ok(diagnostic)
     }
+}
+
+/// provider 失败 → 失败诊断。**HTTP 仍是 200**。
+fn failed_diagnostic(
+    code: &str,
+    message: &str,
+    started: std::time::Instant,
+) -> DownloadClientDiagnostic {
+    DownloadClientDiagnostic {
+        status: "failed".to_owned(),
+        checks: vec![DownloadClientDiagnosticCheck {
+            key: "provider".to_owned(),
+            status: "failed".to_owned(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            details: None,
+        }],
+        checked_at: chrono::Utc::now().naive_utc(),
+        elapsed_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+    }
+}
+
+/// provider 的 `prepare_client` 失败 → 服务错误。**配置不合法不能放行**：
+/// 落到这里说明插件拒绝了这份配置（错误码跟着 provider 走）。
+fn provider_config_failed(failure: ProviderFailureInfo) -> ServiceError {
+    ServiceError::unavailable(format!("provider_{}", failure.code), failure.message)
 }
 
 #[cfg(test)]

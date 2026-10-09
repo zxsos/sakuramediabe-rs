@@ -932,6 +932,120 @@ Finalize/Abort/GetIdentity/DeleteImportFile）、指纹组（ComputeFileHash）�
 媒体记录与 provider 定稿那两步要等失败项携带暂存句柄（`ImportFailure` 还没有
 那一列）。另外 `in_place` 因 proto 缺口只能按「能力不支持」处理。
 
+#### `download_client` 三处落地（117 → 111）
+
+**读上游原文**（`../sakuramediabe/src/service/transfers/downloads/client_config_service.py`）
+而不是照骨架注释写 —— 因此又订正了三处骨架期的错误：
+
+1. ★ **响应体必须剥掉 secret 字段**（上游 `_resource` `:72-91`）。原 `list_clients`
+   把 `provider_config` **原样**发出去 = 泄漏凭据。判据来自插件声明的
+   `input == "secret"`；拿不到字段表（插件没装 / 无下载能力）时上游发 `{}`。
+2. 骨架期那条「`kind` 不可改」的规则上游**不存在**（上游没有 `kind`）；真正被禁
+   的是「**有任务时不能换库**」，码 `409 download_client_library_change_forbidden`。
+3. 更新只在动了 `library_id` / `provider_config` 时才重跑 `_prepare` —— 改个名字
+   不该触发一次 provider 往返。
+
+没有新增依赖：`sm-service` 本来就能看到 `ProviderOperationError`；但真正需要的是
+「**谁**提供 `config_fields` / `prepare_client` / `test_client`」，所以拆两个_trait
+作注入缝（`DownloadClientCapability` + `DownloadCapabilityRegistry`），由组合根实现。
+保留 `new(db)` 不动（纯库两个方法够用），新增 `new_with_downloads` —— **未注入时三个
+写方法返回 503**，而不是假装配置合法。
+
+顺带：`test_client` 的失败（含 `prepare_client` 失败）都转成失败诊断、**HTTP 200**；
+已有客户端只能用**它自己所属**的库测试（`download_client_test_library_mismatch`）。
+
+⚠️ **未接线**：`routes/download_clients.rs` 那 3 个 handler 还是 `todo!()` ——
+它们要 app state 里的插件注册表，下一步和 `download_common::download_provider` 一起做。
+
+#### 下载组闭环：`download_clients` 三路由 + `download_provider`（111 → 107）
+
+接上服务端三处与路由三处，**顺手删掉了路由层四份自造类型**：
+
+- `download_common::download_provider` 落地：★ 参数改成 **`provider_key`**（上游
+  `_bundle(library)`），而不是骨架期的 `&DownloadClientRow` —— 真正决定能力的是
+  客户端**所属媒体库的 `provider_key`**，传 row 就得再查一次库，而这个助手存在
+  的意义正是「调用方不必关心查库」。顺带删掉占位的 `PluginDownloadProvider`
+  （unit struct 留着只会让人以为句柄已经有了）。
+- `AppState` 加 `downloads: Option<Arc<dyn DownloadCapabilityRegistry>>` +
+  `with_download_capabilities`，**照 `storage` 既有的那套写法**（活的 `Option`、
+  缺省 = 没装插件）。★ 并加了 `download_client_service()` 便捷构造器 —— 路由
+  **不要**自己 `new`：漏了 `with_downloads` 的表现是三个写方法**一律 503**，
+  而不是「缺哪个插件报哪个错」，最难分清。
+- 路由三个 handler 接上。★ 顺带删掉四类**本地副本**：自造的诊断结果
+  （`reachable`/`latency_ms`/`version`/`error`）与两份请求体（`{name, kind,
+  config}`），改用服务层那一份 —— wire 形状留两份定义，改一处漏一处时前端发出
+  去的键后端不认。
+
+⚠️ 组合根（sm-server）**还没注入**注册表，所以现在三条写路径仍是 503 —— 下一段
+就是把 sm-plugins 的能力接进 `with_download_capabilities`。
+
+#### `media_library` 六处落地（107 → 101）+ 又一次「按上游原文纠错」
+
+这轮又是**读上游原文**（`media_library_service.py:182-328` +
+`schema/playback/media_libraries.py`）而不是照骨架注释写。骨架期错四处：
+
+1. ★ **`provider_config` 是可改的**，而且是 `update_library` 的**主干分支**
+   （带 `previous` 重跑 `prepare_library`）。骨架文档写的「`provider_config`
+   不可改」是反的 —— 真正不可改的只有 **`provider_key`**（更新请求里根本没有它）。
+2. `enabled` **库里没有这一列**（响应体与创建请求都多写了它）；`space_usage`
+   也不在响应体里 —— 容量走独立端点。
+3. 更新请求的字段是 `{name?, provider_config?}`，不是 `{name?, enabled?}`。
+4. 空间缓存**按 `{provider_key}:{account_key or library:{id}}`**，不是按
+   `library_id` —— 同一 115 账号可以挂多个库，按账号去重才少一次远程查询。
+
+实现层面与下载客户端同构（`provider_config` 同样要剥 secret、`prepare_*` 同样在
+落库之前），但**刻意没有**把两个 seam 合成一个类型：它们分属「下载能力」与
+「库能力」，合并会让边界变模糊。新增 trait `MediaLibraryCapability` /
+`MediaLibraryRegistry`（后者还带 `supports_in_place_import` 与容量的**可选**
+读取 —— 不支持 / 失败的库不出现在结果里，不让状态页整体失败）。
+`account_key` 由 `prepare_library` 派生并落库（`set_account_key`）。
+
+⚠️ 未接线：`routes/media_libraries.rs` 那 5 个 handler 仍是 `todo!()`，且
+AppState 还没塞 `MediaLibraryRegistry` —— 下一步接组合根。
+
+#### ⛔ 查证：组合根注入被插件**字段表**卡住（不是「顺手接一下」）
+
+上一段写的「下一步接组合根」**不成立**，原因是查出来的一个真实缺口：
+
+- `prepare_library` / `prepare_client` / `test_client` / `get_space_usage` 这**四个
+  rpc 动词在 proto 里全都有**（`sm-plugin-api/src/provider.rs:339/377/387/242`），
+  照 `provider_gateway.rs` 的样子包一层就能调。
+- 但白名单校验要的 **`config_fields` 没有来源**：全仓
+  `sm-plugin-api/**/*.rs` 搜 `ConfigField` / `config_field` / `read_only`
+  **零命中**；`ProviderRegistration`（`sm-plugins/src/registry.rs:34`）只带
+  `provider_key` / `display_name` / `plugin_id` / `capabilities` /
+  `data_plane_endpoint` / `plugin_endpoint`。
+- 上游这些字段来自**进程内加载的 Python bundle**（bundle 是对象、自带
+  `library_config_fields`），我们的插件是**独立进程** —— 宿主不去问，就永远没有
+  那份表。同一族的既有缺口：`playback_deliveries`
+  / `merged_playback_format` 也未存（见本文早前的 `videos` 一节）。
+
+**后果不是「功能少一点」，而是会把功能做坏**：字段表为空时 `_validate_config`
+把用户提交的每个字段都判成「未知字段」，结果是**建库/建下载器一律 422**；
+`_resource` 又会因为拿不到 secret 名单而把 `provider_config` 全部返 `{}`。
+所以这里**不做半截实现**，宁可保持三条写路径返回 503。
+
+要往下走，得先在 proto 的注册/描述里补一份 bundle 描述符（config 字段 + 交付方式
++ `supports_in_place_import`），那是插件契约的改动，不属于「顺手接线」。
+
+#### ⚠️ `media.rs` 列表五处：**先纠排序白名单**，别照骨架写
+
+上游 `MediaService.MEDIA_LIST_SORT_FIELD_MAP`（`media_service.py:94-97`）只有
+**两个**字段：
+
+```python
+MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": Movie.heat}
+```
+
+而骨架的 `MEDIA_LIST_SORT_FIELD_MAP`（`playback/media.rs`）是 **4 个**
+（`created_at` / `updated_at` / `file_name` / `heat`）—— 多出来的三个是**自造**的。
+★ `heat` 在上游是 **`Movie.heat`**，不是 media 的列 → 排序必须 **LEFT JOIN movie**，
+且 `NULLS LAST`（非 JAV 视频没有 movie，heat 恒空；不受排序方向影响都要垫底）。
+
+已落地的一半：仓储层 `MediaRepository::list_filtered` / `count_filtered` /
+`multi_version_movie_numbers` / `count_multi_version_movies` + `MediaListFilter`
+（WHERE 唯一拼接处，全部走 `push_bind`，无字符串插值）。服务层两个方法**还没接**。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |

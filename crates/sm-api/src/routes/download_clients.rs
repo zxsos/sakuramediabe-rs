@@ -37,13 +37,12 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
-use sm_service::transfers::download_client::DownloadClientService;
+use sm_service::transfers::download_client::{DownloadClientDiagnostic, DownloadClientTestRequest};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -77,40 +76,17 @@ pub fn routes() -> Router<AppState> {
 /// `provider_config`。
 pub use sm_service::transfers::download_client::DownloadClientResource;
 
-/// 创建请求。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DownloadClientCreateRequest {
-    pub name: String,
-    pub kind: String,
-    pub config: serde_json::Value,
-}
-
-/// 更新请求 —— **部分更新**，字段全 `Option`。
+/// 创建 / 更新请求也**直接复用服务层那一份**。
 ///
-/// 与 `media_libraries` 的 `PATCH` 同一个 serde 局限：`None` 不区分
-/// 「没传」与「显式 null」。见那个文件模块文档的说明。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct DownloadClientUpdateRequest {
-    pub name: Option<String>,
-    pub enabled: Option<bool>,
-    pub config: Option<serde_json::Value>,
-}
+/// ⚠️ 骨架期这里是两份**本地副本**（`{name, kind, config}` / `{name, enabled,
+/// config}`），而上游 `schema/transfers/downloads.py:35-44` 根本没有
+/// `kind` / `enabled`，真名是 `provider_config`。留着它们等于让 wire 形状有
+/// 两份定义 —— 改一处漏一处时，前端发出去的键后端不认。
+pub use sm_service::transfers::download_client::{
+    DownloadClientCreateRequest, DownloadClientUpdateRequest,
+};
 
 /// 诊断结果。
-///
-/// **失败也返回 200** —— 见模块文档「诊断端点的失败不是 HTTP 失败」。
-#[derive(Debug, Clone, Serialize)]
-pub struct DownloadClientDiagnostic {
-    /// 能否连上。
-    pub reachable: bool,
-    /// 延迟（毫秒）；不可达时为 `None`。
-    pub latency_ms: Option<i64>,
-    /// 下载器版本字符串。
-    pub version: Option<String>,
-    /// 失败原因。`reachable = true` 时为 `None`。
-    pub error: Option<String>,
-}
-
 /// `GET /download-clients`
 async fn list_download_clients(
     _user: CurrentUser,
@@ -119,38 +95,49 @@ async fn list_download_clients(
     // ⚠️ 骨架期这条写的是「接下载器 provider 插件（未移植）」—— **过度保守**：
     // 上游 `DownloadClientService.list_clients`（`client_config_service.py:257-265`）
     // 只查库并投影，与插件无关。排序是 `created_at DESC, id DESC`（最新在前）。
-    let clients = DownloadClientService::new(state.db())
-        .list_clients()
-        .await?;
+    let clients = state.download_client_service().list_clients().await?;
     Ok(Json(clients))
 }
 
 /// `POST /download-clients` —— **201 Created**。
 async fn create_download_client(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    axum::extract::Json(_payload): axum::extract::Json<DownloadClientCreateRequest>,
+    State(state): State<AppState>,
+    axum::extract::Json(payload): axum::extract::Json<DownloadClientCreateRequest>,
 ) -> Result<(StatusCode, Json<DownloadClientResource>), ErrorResponse> {
-    todo!("骨架：接插件；成功返回 201 + body")
+    // 服务由 `AppState` 统一拼（含「插件能力有没有注入」），别在这里 `new`：
+    // 漏了注入的表现是三个写方法一律 503，而不是「缺哪个插件报哪个错」。
+    let created = state
+        .download_client_service()
+        .create_client(payload)
+        .await?;
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 /// `POST /download-clients/test` —— **无副作用探测，成功与失败都 200**。
 async fn test_download_client(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    axum::extract::Json(_payload): axum::extract::Json<serde_json::Value>,
+    State(state): State<AppState>,
+    axum::extract::Json(payload): axum::extract::Json<DownloadClientTestRequest>,
 ) -> Result<Json<DownloadClientDiagnostic>, ErrorResponse> {
-    todo!("骨架：接插件探测；连不上也要 200 + reachable=false，不要 502")
+    // ★ 连不上也是 200：服务层把它包成 `status = "failed"` 的诊断结果。
+    let diagnostic = state.download_client_service().test_client(payload).await?;
+    Ok(Json(diagnostic))
 }
 
 /// `PATCH /download-clients/{client_id}` —— 不存在 → **404**。
 async fn update_download_client(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_client_id): Path<i32>,
-    axum::extract::Json(_payload): axum::extract::Json<DownloadClientUpdateRequest>,
+    State(state): State<AppState>,
+    Path(client_id): Path<i32>,
+    axum::extract::Json(payload): axum::extract::Json<DownloadClientUpdateRequest>,
 ) -> Result<Json<DownloadClientResource>, ErrorResponse> {
-    todo!("骨架：接插件的部分更新")
+    // **部分更新**：三个字段都可以改，`None` = 没传（见请求体类型上的说明）。
+    let updated = state
+        .download_client_service()
+        .update_client(client_id, payload)
+        .await?;
+    Ok(Json(updated))
 }
 
 /// `DELETE /download-clients/{client_id}` —— **204，无 body**。
@@ -161,7 +148,8 @@ async fn delete_download_client(
 ) -> Result<StatusCode, ErrorResponse> {
     // 同样与插件无关：两道 409（先「名下有任务行」、后「被索引器绑定」）
     // 与删除都在服务层，见那里的文档。
-    DownloadClientService::new(state.db())
+    state
+        .download_client_service()
         .delete_client(client_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
