@@ -23,6 +23,7 @@ use axum::http::request::Parts;
 use chrono::Utc;
 use sm_core::auth::{AuthFailure, InvalidAccessToken};
 use sm_core::jwt;
+use sm_db::repo::api_key::{self, ApiKeyRepository};
 use sm_db::repo::UserRepository;
 
 use crate::error::ErrorResponse;
@@ -51,12 +52,56 @@ impl FromRequestParts<AppState> for CurrentUser {
 
         let token = sm_core::auth::extract_bearer_token(header).map_err(AuthFailure::from)?;
 
+        // 上游 `deps.py:get_current_user`：`sk-` 前缀走 API key，否则走 JWT。
+        if token.starts_with(api_key::API_KEY_PREFIX) {
+            return Self::via_api_key(token, state).await;
+        }
+
         let access = jwt::decode_access_token(token, &state.auth().secret, Utc::now())
             .map_err(AuthFailure::from)?;
 
         // 上游第 4 步：用户不存在同样是 "Invalid access token"。
         let users = UserRepository::new(state.db().clone());
         match users.find_by_id(access.user_id as i32).await {
+            Ok(Some(user)) => Ok(CurrentUser { id: user.id }),
+            Ok(None) => Err(AuthFailure::Invalid(InvalidAccessToken).into()),
+            Err(err) => Err(ErrorResponse::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            )),
+        }
+    }
+
+    /// API key 鉴权。对应用游 `ApiKeyService.authenticate`。
+    ///
+    /// 1. 按 `sha256(raw_key)` 查 `api_keys`，找不到 → 401
+    /// 2. `last_used_at` 超过 5 分钟未更新则刷新（节流写库）
+    /// 3. 取单用户（上游 `User.select().order_by(User.id).first()`），找不到 → 401
+    async fn via_api_key(token: &str, state: &AppState) -> Result<Self, ErrorResponse> {
+        let keys = ApiKeyRepository::new(state.db().clone());
+        let key_hash = api_key::hash_key(token);
+        let row = keys
+            .find_by_hash(&key_hash)
+            .await
+            .map_err(|err| {
+                ErrorResponse::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    err.to_string(),
+                )
+            })?
+            .ok_or_else(|| AuthFailure::Invalid(InvalidAccessToken))?;
+
+        // last_used_at 节流更新。
+        let now = Utc::now().naive_utc();
+        if api_key::needs_touch(row.last_used_at, now) {
+            let _ = keys.touch_last_used(row.id, now).await;
+        }
+
+        // 上游是单用户部署，取第一个用户。
+        let users = UserRepository::new(state.db().clone());
+        match users.find_primary().await {
             Ok(Some(user)) => Ok(CurrentUser { id: user.id }),
             Ok(None) => Err(AuthFailure::Invalid(InvalidAccessToken).into()),
             Err(err) => Err(ErrorResponse::new(

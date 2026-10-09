@@ -169,6 +169,7 @@
 //! 上游 Python 侧不在本仓库内，CI 里 clone。这些问题需要查上游才能定论。
 
 pub mod actor;
+pub mod api_key;
 pub mod asset;
 pub mod collection;
 pub mod ctx;
