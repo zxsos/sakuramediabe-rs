@@ -1,0 +1,28 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Build release
+        run: cargo build --release --bin sm-server
+      
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm-server-linux-x86_64
+          path: target/release/sm-server
+          retention-days: 7
