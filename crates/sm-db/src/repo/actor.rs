@@ -350,6 +350,47 @@ impl ActorRepository {
         .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
+    /// 按 JavDB 资源更新演员那几个**非受保护**字段。`None` = 这一列不动。
+    ///
+    /// 上游 `upsert_actor_from_javdb_resource`（`catalog_import_service.py:880-954`）
+    /// 在建记录后 `save(only=[...])` 的那几列；`gender` **不在**这里 —— 它是
+    /// 受保护字段，必须走
+    /// [`ActorOwnershipGateway::update_host_source`](crate::repo::ActorOwnershipGateway::update_host_source)
+    /// 并带上 `host:javdb` 这个 owner。
+    ///
+    /// # 为什么 `profile_image_id` 也只能「不动」而不能置空
+    ///
+    /// 置空只能写 SQL 字面量 `NULL`（本仓纪律），而这一列什么时候该清空上游
+    /// 没有说（它只在拿不到头像时**不写**）。所以这里不提供清空路径 ——
+    /// 需要时再加一个显式的方法，而不是让 `None` 承担两种含义。
+    pub async fn update_javdb_profile(
+        &self,
+        id: i32,
+        name: Option<&str>,
+        alias_name: Option<&str>,
+        javdb_type: Option<i32>,
+        profile_image_id: Option<i32>,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE actor SET \
+                name = COALESCE($2, name), \
+                alias_name = COALESCE($3, alias_name), \
+                javdb_type = COALESCE($4, javdb_type), \
+                profile_image_id = COALESCE($5, profile_image_id), \
+                updated_at = $6 \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(name.map(str::trim))
+        .bind(alias_name)
+        .bind(javdb_type)
+        .bind(profile_image_id)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 读取订阅同步时间。供同步任务判断是否需要全量。
     pub async fn load_sync_state(&self, id: i32) -> Result<Option<SyncState>, DbError> {
         Ok(sqlx::query_as::<_, SyncState>(

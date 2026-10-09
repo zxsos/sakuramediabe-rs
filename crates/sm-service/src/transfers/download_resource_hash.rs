@@ -136,8 +136,52 @@ fn magnet_hash(source_uri: &str) -> Result<String, ServiceError> {
 /// 「httpx 抓字节 → 交给 `_torrent_hash`」一一对应（上游那边用的是 libtorrent，
 /// 本仓换成 svc-hash，语义等价）。
 async fn torrent_hash(source_uri: &str) -> Result<String, ServiceError> {
-    let _ = source_uri;
-    todo!("骨架：流式 GET（限 10MiB / 5 次重定向）+ libtorrent 解析 infohash")
+    let client = reqwest::Client::builder()
+        // ★ 重定向**必须**限次：上游 `httpx` 默认跟重定向，而种子站的跳转
+        // 环会把一次提交卡死。`MAX_HTTP_REDIRECTS` 是安全边界不是调优项。
+        .redirect(reqwest::redirect::Policy::limited(MAX_HTTP_REDIRECTS))
+        .build()
+        .map_err(|error| {
+            ServiceError::unavailable(
+                "download_client_failed",
+                format!("无法建 HTTP 客户端：{error}"),
+            )
+        })?;
+    let mut response = client.get(source_uri).send().await.map_err(network_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        // ★ 错误码取自 `ResolveError` 那张表（它是 Rust 与 Python 之间的硬
+        // 契约），不在这里重映射 —— 重映射就是第二份契约。
+        let variant = if status.as_u16() == 404 {
+            ResolveError::SourceNotFound
+        } else {
+            ResolveError::SourceUnavailable
+        };
+        return Err(from_resolve_error(variant));
+    }
+    // ★ 限长必须**在流式读取过程中**计数：先下完再判大小就失去意义了
+    // （一个 10 GiB 的畸形种子早就把内存撑爆了）。上限用
+    // `svc_hash::check_torrent_size` 判 —— 它是同一个常量的唯一判据。
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(network_error)? {
+        bytes.extend_from_slice(&chunk);
+        if let Err(error) = svc_hash::check_torrent_size(bytes.len()) {
+            return Err(from_resolve_error(error));
+        }
+    }
+    svc_hash::torrent_v1_info_hash(&bytes).map_err(from_resolve_error)
+}
+
+/// 网络层失败 → `503 download_source_unavailable`。
+///
+/// **拉不到种子是「上游不可用」，不是用户请求写错了** —— 所以是 503 而不是
+/// 422；只有「URI 根本不是 http(s)」才是 422（那一支在
+/// [`resolve_resource_hash`] 里）。
+fn network_error(error: reqwest::Error) -> ServiceError {
+    ServiceError::unavailable(
+        "download_source_unavailable",
+        format!("拉取种子文件失败：{error}"),
+    )
 }
 
 /// 取资源哈希。magnet 走本地，torrent 走出网。

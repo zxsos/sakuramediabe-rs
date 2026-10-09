@@ -9,6 +9,10 @@ sm-core = { workspace = true }
 # 运行期读写配置文件（ConfigService 的原子写盘与重读磁盘快照）
 toml = { workspace = true }
 sm-db = { workspace = true }
+# 插件**契约层**（proto 生成物 + 交付校验 + 错误码）。刻意只依赖契约、
+# 不依赖 `sm-plugins`（宿主实现）：那是 ADR `2026-10-06-plugin-architecture.md`
+# 定的分层 —— 业务层能校验交付、判错误码，但不必拉起整个插件栈。
+sm-plugin-api = { workspace = true }
 # 刻意**不**依赖 sm-plugins：源码里没有任何 `sm_plugins::` 引用，而这一行
 # 会把依赖方向锁死 —— 插件任务要接 cron 触发，需要 `sm-plugins → sm-scheduler
 # → sm-service → sm-plugins` 不成环。等 service 层真要调插件时再按那时的

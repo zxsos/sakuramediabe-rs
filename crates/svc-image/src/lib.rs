@@ -39,6 +39,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod paths;
+pub mod store;
+
 pub mod cover_split;
 pub mod webp;
 

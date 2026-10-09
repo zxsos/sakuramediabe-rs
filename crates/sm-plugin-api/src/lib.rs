@@ -27,6 +27,10 @@ pub mod provider;
 /// 结构化错误的过线方式（见模块文档：为什么用 `Status::details`）。
 pub mod error;
 
+/// `serde_json::Value` 与 `google.protobuf.Struct` 的互转。**两侧都要用**，
+/// 所以规则只有一份（见模块文档）。
+pub mod json_struct;
+
 /// 元数据交付校验。
 ///
 /// **插件与宿主双方**都要遵守的规则，所以放在契约仓而不是宿主实现里：

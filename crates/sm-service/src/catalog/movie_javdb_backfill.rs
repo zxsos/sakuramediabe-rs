@@ -34,9 +34,11 @@ pub const BATCH_SIZE: i64 = 50;
 /// 每条之间的间隔（秒）。⚠️ **不要省**（见模块文档）。
 pub const REQUEST_INTERVAL_SECONDS: u64 = 2;
 
-/// 推后多少天再问一次。上游 `CatalogImportService.JAVDB_CHECK_INTERVAL`
-/// （`catalog_import_service.py:71`）= `timedelta(days=7)`。
-pub const JAVDB_CHECK_INTERVAL_DAYS: i64 = 7;
+/// 推后多少天再问一次。**只有一份定义**，在
+/// [`super::catalog_import::JAVDB_CHECK_INTERVAL_DAYS`] —— 上游这个常量就挂在
+/// `CatalogImportService` 上（`catalog_import_service.py:71`），本仓跟着它，
+/// 不在这里复制第二份（两份 7 会各自漂移，而这两处必须是同一个数）。
+pub use super::catalog_import::JAVDB_CHECK_INTERVAL_DAYS;
 
 /// 进度上报（与 `movie_asset_pack_backfill` 同一个形状）。
 pub type ProgressSink<'a> = Box<

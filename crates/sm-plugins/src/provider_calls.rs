@@ -56,8 +56,10 @@
 
 use sm_plugin_api::v1::storage_provider_client::StorageProviderClient;
 use sm_plugin_api::v1::{
-    generate_thumbnails_response, DeleteMediaRequest, GenerateThumbnailsRequest, LibraryHandle,
-    MediaHandle, ProviderErrorCode, ThumbnailGeneration,
+    generate_thumbnails_response, AbortImportRequest, ComputeFileHashRequest,
+    DeleteImportFileRequest, DeleteMediaRequest, FinalizeImportRequest, GenerateThumbnailsRequest,
+    LibraryHandle, MediaHandle, ProviderErrorCode, ScanImportSourceRequest, SourceDisposition,
+    StageImportFileRequest, ThumbnailGeneration,
 };
 use tonic::transport::Channel;
 use tonic::{Code, Status};
@@ -278,6 +280,223 @@ pub async fn delete_media(
         .await
         .map(|_| ())
         .map_err(|status| classify_status(provider_key, "delete_media", status))
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 导入组（`import_service` 用的那四个 + 指纹）
+//
+// 上游 `StorageProvider.scan_import_source` / `stage_import_file` /
+// `finalize_import` / `abort_import` / `delete_import_file` /
+// `compute_file_hash`。宿主侧的编排在 `sm_service::transfers::import_service`。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 扫描到的一条导入文件（proto `ImportFile`）。
+///
+/// `source_ref` **原样回传**给后续调用 —— 宿主不解释它。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportFileEntry {
+    pub source_ref: serde_json::Value,
+    pub name: String,
+    pub relative_path: String,
+    pub size_bytes: i64,
+    pub is_video: bool,
+}
+
+/// 已暂存的媒体（proto `StagedMedia`）。
+///
+/// ★ `receipt` 是 finalize / abort / 删源的**凭据**，宿主只保存与回传
+/// （`Struct`，不解释）。丢了它就既没法提交也没法回滚 —— 所以暂存之后必须
+/// 立刻把 `receipt` 落到一个「后面一定能拿到」的地方。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagedImport {
+    pub storage_ref: serde_json::Value,
+    pub receipt: serde_json::Value,
+    pub size_bytes: i64,
+    pub duration_seconds: Option<i64>,
+    pub video_info: serde_json::Value,
+    pub resolution: Option<String>,
+}
+
+/// 扫描导入来源（`server stream`）。返回**全部**条目。
+///
+/// # 为什么在这里把流收干成 `Vec`
+///
+/// 上游的 `scan_import_source` 也是「一次性拿到列表」再逐条处理
+/// （`import_service.py:203-215`）：先全部扫描、再做去重与过滤。**中途失败
+/// 就是整批失败** —— 半张列表会让「已索引」的判据拿到不完整的输入。
+///
+/// # 流以什么结束
+///
+/// 空流（`None`）= 正常结束；流中途 `Err` = provider 出错，按 `classify_status`
+/// 分类后冒给调用方。
+pub async fn scan_import_source_all(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    source_ref: &serde_json::Value,
+) -> Result<Vec<ImportFileEntry>, ProviderOperationError> {
+    let mut stream = client
+        .scan_import_source(ScanImportSourceRequest {
+            library: Some(library),
+            source_ref: sm_plugin_api::json_struct::json_to_struct(source_ref),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "scan_import_source", status))?
+        .into_inner();
+    let mut entries = Vec::new();
+    loop {
+        match stream
+            .message()
+            .await
+            .map_err(|status| classify_status(provider_key, "scan_import_source", status))?
+        {
+            None => return Ok(entries),
+            Some(entry) => {
+                let file = entry.file.unwrap_or_default();
+                entries.push(ImportFileEntry {
+                    source_ref: sm_plugin_api::json_struct::struct_to_json(
+                        file.source_ref.as_ref(),
+                    ),
+                    name: file.name,
+                    relative_path: file.relative_path,
+                    size_bytes: file.size_bytes,
+                    is_video: file.is_video,
+                });
+            }
+        }
+    }
+}
+
+/// 暂存一个导入文件。返回凭据。
+///
+/// # ★ `operation_key` 是幂等键
+///
+/// proto 的原话：「同一 operation_key 重复调用必须返回同一结果」。导入会重试
+/// （宿主侧的失败重试、用户手动 retry），没有幂等键就会**复制出第二份媒体**。
+/// 由调用方拼（上游是 `f"{namespace}:{index}"`），本函数只透传。
+///
+/// # ⚠️ 契约缺口：`in_place` 传不过去
+///
+/// proto 的 `SourceDisposition` **只有** `KEEP` / `DELETE_AFTER_COMMIT`
+/// （`proto/common.proto` 里那个 enum 只有这两个值），而上游三方都认
+/// `in_place`。也就是说：**这个 ABI 现在表达不了「原地导入」**。
+/// 宿主侧必须按「不支持」处理（上游的 `in_place_import_unsupported` 那条
+/// 422），而不是塞一个 UNSPECIFIED 蒙混过去 —— UNSPECIFIED 在 provider 侧
+/// 的语义未定义。
+pub async fn stage_import_file_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    source: &ImportFileEntry,
+    placement: &str,
+    disposition: SourceDisposition,
+    operation_key: &str,
+) -> Result<StagedImport, ProviderOperationError> {
+    let staged = client
+        .stage_import_file(StageImportFileRequest {
+            library: Some(library),
+            source: Some(crate::provider_calls::import_file_of(source)),
+            placement: Some(sm_plugin_api::v1::ImportPlacement {
+                relative_path: placement.to_owned(),
+            }),
+            source_disposition: disposition as i32,
+            operation_key: operation_key.to_owned(),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "stage_import_file", status))?
+        .into_inner();
+    Ok(StagedImport {
+        storage_ref: sm_plugin_api::json_struct::struct_to_json(staged.storage_ref.as_ref()),
+        receipt: sm_plugin_api::json_struct::struct_to_json(staged.receipt.as_ref()),
+        size_bytes: staged.size_bytes,
+        duration_seconds: staged.duration_seconds,
+        video_info: sm_plugin_api::json_struct::struct_to_json(staged.video_info.as_ref()),
+        resolution: staged.resolution,
+    })
+}
+
+/// 提交暂存（让 provider 真正落定）。
+pub async fn finalize_import_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    receipt: &serde_json::Value,
+) -> Result<(), ProviderOperationError> {
+    client
+        .finalize_import(FinalizeImportRequest {
+            library: Some(library),
+            receipt: sm_plugin_api::json_struct::json_to_struct(receipt),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "finalize_import", status))
+}
+
+/// 回滚暂存。**失败只记日志** —— 回滚失败不该改变这一条的最终结局
+/// （它反正已经算失败了）。
+pub async fn abort_import_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    receipt: &serde_json::Value,
+) -> Result<(), ProviderOperationError> {
+    client
+        .abort_import(AbortImportRequest {
+            library: Some(library),
+            receipt: sm_plugin_api::json_struct::json_to_struct(receipt),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "abort_import", status))
+}
+
+/// 删掉导入来源文件（`delete_after_commit` 的收尾）。
+pub async fn delete_import_file_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    receipt: &serde_json::Value,
+) -> Result<(), ProviderOperationError> {
+    client
+        .delete_import_file(DeleteImportFileRequest {
+            library: Some(library),
+            receipt: sm_plugin_api::json_struct::json_to_struct(receipt),
+        })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "delete_import_file", status))
+}
+
+/// 算采样指纹。返回 `media-file-hash-v1:<40 hex>`。
+///
+/// 宿主侧用它做「同一份文件是否被导入过两次」的判据，所以算法必须与内置
+/// 实现同源（proto 注释指向 `media-file-hash` crate）。
+pub async fn compute_file_hash_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    media: MediaHandle,
+) -> Result<String, ProviderOperationError> {
+    Ok(client
+        .compute_file_hash(ComputeFileHashRequest {
+            library: Some(library),
+            media: Some(media),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "compute_file_hash", status))?
+        .into_inner()
+        .file_hash)
+}
+
+/// 宿主侧的 [`ImportFileEntry`] → proto 的 `ImportFile`（回传时原样带回去）。
+pub fn import_file_of(entry: &ImportFileEntry) -> sm_plugin_api::v1::ImportFile {
+    sm_plugin_api::v1::ImportFile {
+        source_ref: sm_plugin_api::json_struct::json_to_struct(&entry.source_ref),
+        name: entry.name.clone(),
+        relative_path: entry.relative_path.clone(),
+        size_bytes: entry.size_bytes,
+        is_video: entry.is_video,
+    }
 }
 
 /// 缩略图生成的进度回调：`(文案, 当前, 总数)`。

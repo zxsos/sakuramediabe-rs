@@ -1495,13 +1495,128 @@ impl MovieRepository {
             .await?)
     }
 
+    /// 只写**互动数**那几个非受保护字段。`None` = 这一列不改。
+    ///
+    /// 对应上游 `update_movie_fields` 里"非受保护字段走窄更新"那一支
+    /// （`catalog_import_service.py:518-526`）：受保护字段（title / summary /
+    /// maker_name / director_name）必须走 `MovieOwnershipGateway`，而这几个
+    /// 计数列**不在**受保护名单里 —— 网关也会拒它们。
+    ///
+    /// # 为什么要与热度分开
+    ///
+    /// `heat` 是推导列（上游公式），`recompute_heat_for` 专门管它。这里只碰
+    /// 五个原始计数 —— 写热度会与公式版本打架。
+    ///
+    /// # 返回 0 行 = 影片不存在
+    ///
+    /// 调用方据此报 404，而不是"更新成功但什么都没改"。
+    pub async fn update_interaction_counts(
+        &self,
+        movie_id: i32,
+        score: Option<f64>,
+        score_number: Option<i32>,
+        watched_count: Option<i32>,
+        want_watch_count: Option<i32>,
+        comment_count: Option<i32>,
+    ) -> Result<u64, DbError> {
+        // `COALESCE($n, 列名)`：`None` 表示"这一列不动"，而不是"写成 NULL"。
+        // 置空只能走 SQL 字面量 `NULL`（本仓纪律），不能靠 Option 混进来。
+        let result = sqlx::query(
+            "UPDATE movie SET \
+                score = COALESCE($2, score), \
+                score_number = COALESCE($3, score_number), \
+                watched_count = COALESCE($4, watched_count), \
+                want_watch_count = COALESCE($5, want_watch_count), \
+                comment_count = COALESCE($6, comment_count), \
+                updated_at = $7 \
+              WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(score)
+        .bind(score_number)
+        .bind(watched_count)
+        .bind(want_watch_count)
+        .bind(comment_count)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// JavDB 补录：把 JavDB 那一份写进影片，并**清空**下次检查时间。
+    ///
+    /// 上游 `backfill_plugin_movie`（`catalog_import_service.py:355-481`）结尾
+    /// 那两件事：`javdb_id` 落上、`javdb_next_check_at = NULL`（「不用再问了」）。
+    ///
+    /// # 置空只能写 SQL 字面量 `NULL`
+    ///
+    /// 本仓纪律：把 `Option::None` 绑进参数会与「这一列不动」混淆，所以清空
+    /// 一律写成字面量。其余列的 `None` 是 **COALESCE 语义**（不动这一列）。
+    ///
+    /// # `AND javdb_id IS NULL` 不能省
+    ///
+    /// 并发下这部片可能刚被别的路径接入 JavDB。少了这一条会**覆盖**已有的
+    /// `javdb_id`；返回 0 行让调用方据此判冲突（上游是显式抛 `ValueError`）。
+    pub async fn apply_javdb_backfill(
+        &self,
+        movie_id: i32,
+        javdb_id: Option<&str>,
+        release_date: Option<chrono::NaiveDateTime>,
+        duration_minutes: Option<i32>,
+        series_id: Option<i32>,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE movie SET \
+                javdb_id = COALESCE($2, javdb_id), \
+                javdb_next_check_at = NULL, \
+                release_date = COALESCE($3, release_date), \
+                duration_minutes = COALESCE($4, duration_minutes), \
+                series_id = COALESCE($5, series_id), \
+                updated_at = $6 \
+              WHERE id = $1 AND javdb_id IS NULL",
+        )
+        .bind(movie_id)
+        .bind(javdb_id.map(str::trim))
+        .bind(release_date)
+        .bind(duration_minutes)
+        .bind(series_id)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 插件来源影片入库后补写 `metadata_source` 与下次检查时间。
+    ///
+    /// 上游 `import_plugin_movie`（`:295-352`）在建记录时就带上这两个值，而
+    /// 本仓的 `NewMovie` 是「列的固定子集」（在对拍的豁免名单里），为避免把它
+    /// 撑成第二份表镜像，这两列在建完之后再补写一次。
+    ///
+    /// `source` **不解释、不校验** —— 上游也是整个 dict 透传进 JSONB 列。
+    pub async fn set_plugin_metadata_source(
+        &self,
+        movie_id: i32,
+        source: &serde_json::Value,
+        next_check_at: chrono::NaiveDateTime,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE movie SET metadata_source = $2, javdb_next_check_at = $3, updated_at = $4 \
+              WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(source)
+        .bind(next_check_at)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// 插入。
     ///
     /// `javdb_id` 的空串在此归一为 `None` —— 库里出现空串会让
     /// `WHERE javdb_id = ''` 命中一条「没有 JavDB 编号」的假记录，
     /// 而唯一索引把第二条例外也挡掉了。
-    ///
-    /// # 可选列必须发 DEFAULT 而不是 NULL
     ///
     /// DDL 里 `duration_minutes` / `score` / `heat` 等是 `NOT NULL DEFAULT 0`。
     /// **只有不写该列才会取默认值**；写 `NULL` 就是 NULL，直接违反 NOT NULL。

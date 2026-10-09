@@ -753,6 +753,185 @@ JavDB provider 要插件 ABI），handler 仍未注册。
 ⚠️ 顺带记一条**仍存在的缺口**（登记在 `docs/plugin-abi.md`）：注册期**不**校验
 「声明的能力 ↔ 是否 serve 了对应 service」。
 
+#### 插件打通后的兑现：`metadata_source` 落地（catalog 24 → 21）
+
+「先解决插件」的收益点到了：给 `sm-service` 加**契约层**依赖（`sm-plugin-api`，
+叶子，不成环）之后，`metadata_source` 的 3 处可以从 `todo!()` 变实现（另 2 处
+仍缺 `catalog_import`）：
+
+1. `enabled_plugin_sources(config)`：按 **`plugins.enabled` 的顺序**过滤已注册
+   来源（上游 `:61-69`）。顺序即优先级 —— 兜底链路按它逐个试。
+   端点与数据目录不来自配置（来自注册表与目录约定），所以 `RegisteredSource`
+   由**组合根**构造，这里只负责「配置说启用谁」。
+2. `fetch_plugin` → 新增 `load_plugin`：建 `<data_dir>/metadata-tmp` → 发
+   `FetchMovie` → `found=false` 判「没收录」→ `validate_movie_delivery`（契约仓）
+   → **番号一致性**（`normalize_movie_number`，上游 `:131-134`）→ 闭包消费 →
+   `cleanup_delivery`。
+3. `fetch`：JavDB 优先（**没收录不算错**）→ 按启用顺序逐个试插件
+   （没收录 → 下一个；坏了 → 记进 failures）→ 全试完：有真实失败报
+   `RequestFailed(failures.join("; "))`，否则 `NotFound`。
+
+⚠️ 三处如实登记的缺口：
+- **Pillow 校验**（上游真的把每张图解码一遍）本仓没有图像解码依赖，未实现 ——
+  判据到「是普通文件、在交付目录内」为止；
+- `source` 只存 `"javdb"` / `"plugin:<id>"` 一个串，而上游存
+  `{plugin_id, display_name, source_id, source_url}` 四个键（改它会波及还没
+  落地的 `catalog_import`）；
+- 单次索取给了 30 秒上限（上游无上限），理由写在常量文档里。
+- 另 2 处（`import_by_number` / `match_actors`）仍缺 `catalog_import`。
+
+#### `catalog_import` 落地：兜底链路第一次能真正落库（catalog 21 → 14）
+
+7 处里落了 6 处，另 1 处（`backfill_movie_thin_cover`）被 image store / cv2
+挡住，保留 `todo!()` 并登记。
+
+**先纠错**：骨架期文档写的是「已存在时**只补空字段**」，而上游
+`import_movie_if_missing`（`:115-293`）根本没有这个策略 —— 它的分支是
+「已存在且无 `javdb_id` 且有 `metadata_source` → 转 `backfill_plugin_movie`；
+否则命中就**一个字段都不写**；不存在才建」。上游的"不覆盖用户手改值"是靠
+**主权网关**实现的（受保护字段只在无人接管时才被写），不是靠判断目标列空不空。
+
+内核优先：`update_movie_fields` 是四者的公共底（白名单 + 变更检测 + 分流写 +
+写后重读回流），其余三个只是**字段集与"已存在就返回 / 覆盖"策略不同** ——
+主权校验因此只存在一份，不会四个方法各写一遍而漂移。
+
+- `update_movie_fields`：`fields` 非空 + 去重 + 必须落在
+  `_MOVIE_FIELD_UPDATE_MAP` 那 **9 个**字段内（`:470-480`），否则是调用方 bug；
+  值相等跳过；受保护四列走 `MovieOwnershipGateway::update_host_unowned`、
+  五个计数走 `MovieRepository::update_interaction_counts`；受保护那支写完后
+  **重读该行**把真正变化的字段回流（不虚报，上游 `:536-542` 同）。
+- `backfill_plugin_movie`：番号一致性 + `javdb_id` 冲突两处显式校验 →
+  写 JavDB 那一份 → 清空 `javdb_next_check_at`。
+- `refresh_movie_metadata_strict` = 全 9 字段覆盖式，复用内核。
+- `upsert_actor_from_javdb_resource`：按 `javdb_id` 建或更新；`gender` 只在
+  `update_gender` 且值 ∈ (1,2) 时经 `ActorOwnershipGateway::update_host_source`
+  带 `host:javdb` owner 写（网关拒绝人工 owner）。
+- `CatalogImport` 窄接口改成 `async`（写入要查库），`metadata_source` 的
+  `import_by_number` / `match_actors` 接上 —— **导入必须在 `fetch` 的闭包内做**
+  （插件那支的交付目录在闭包退出后立刻清理）。
+- 常量去重：`JAVDB_CHECK_INTERVAL_DAYS` 只留 `catalog_import` 那一份，
+  `movie_javdb_backfill` 改为 `pub use`。
+
+⚠️ **两处如实登记未接线**：① `force_subscribed`（`NewMovie` 没有订阅两列）；
+② 图片落盘与演员 / 标签 / 剧照关联（缺 image store 与三个关联表写入方法）。
+在那之前**不写** `cover_image_id` —— 宁可没封面，也不指向不存在的文件。
+
+配套仓储方法：`update_interaction_counts` / `apply_javdb_backfill` /
+`set_plugin_metadata_source` / `update_javdb_profile`。
+
+#### 图片落盘层落地：`svc-image::paths/store` + `movie_image`（catalog 14 → 9）
+
+之前一直说「被 image store / cv2 挡住」，实际核下来是**两件不同的事**：
+cv2 的替代（`svc-image::cover_split`，Sobel 书脊检测）**早就有了**；缺的是
+「文件落在磁盘哪儿、怎么落」那一层。这次补的就是它。
+
+1. **`svc-image/src/paths.rs`（新）** —— 落盘布局规则，与上游
+   `common/media_paths.py` 逐字对齐：`movies/<shard>/<番号>/{cover,thin-cover,plot-<i>}<ext>`、
+   `actors/<safe><ext>`、`assets.zip` / `thumbnails.zip` 的包路径判据。
+   ★ **分片拿归一化后的目录名去算**（`sha1[:2]`），先分片再归一会让同一部片
+   散到两个 shard —— 而路径一旦写进 `image.origin` 就不会再改。
+   剧情图**平铺**（30 万规模下不建 30 万个 `plots/` 空目录）。
+2. **`svc-image/src/store.rs`（新）** —— 原子落盘（同目录临时文件 → fsync →
+   rename；跨设备 rename 会退化成拷贝、原子性就没了）、单文件读取、
+   竖图判定、薄封面切割（用 `cover_split`）。
+   ⚠️ **包（zip）读写未实现**：判据在 `paths::image_pack_relative_path` 就位，
+   读写缺 zip 依赖。单文件那一路在任何情况下都正确，包是优化。
+3. **`movie_image`（5 处 todo 全落）**：下载 6 次重试 / 30s 超时（阻塞式出网
+   走 `spawn_blocking`，不占异步线程）→ 临时文件 → 原子落盘 + `ImageRepository::upsert`
+   登记。★ **任一任务彻底失败 → 整体 Err**：`image` 记录一旦建立就没有重试机会
+   （下次导入认为「已有」），少一张图比一张裂图代价小。
+   薄封面「**先切封面**，切不出来才回退前两张剧情图里的第一张竖图」。
+
+⚠️ 仍保留的：`catalog_import::backfill_movie_thin_cover`（要写
+`movie.thin_cover_image_id` 的窄更新 + 重建 assets.zip）；
+`resolve_thin_cover_from_existing_movie` 的剧情图回退分支（缺 `movie_plot_image`
+按影片查询）。
+
+#### transfers 开荒：`download_resource_hash` 落地 + 域内挡点普查（26 → 25）
+
+先落了唯一不依赖 provider 的一处（`torrent_hash`）：reqwest 流式 GET，
+重定向限 5 次、**边读边判** 10 MiB（先下完再判就失去意义：一个 10 GiB 的畸形
+种子早把内存撑爆了），然后交给 `svc_hash::torrent_v1_info_hash`。
+HTTP 状态映射直接取 `ResolveError` 那张表的变体（404 → `SourceNotFound`、
+其余非 2xx → `SourceUnavailable`），**不重映射**。
+
+##### ★ 普查结论：transfers 剩下 25 处几乎全被**同一个**挡点卡住
+
+transfers 的 todo 注释里反复写着「等 provider seam」，这不是敷衍 —— 核下来
+确实如此。宿主→插件那几个 rpc 的 **Rust 侧签名还没有**（`scan_import_source` /
+`stage_import_file` / `finalize_import` / `compute_file_hash` / `browse` /
+`plan_playback` / `submit` / `delete_media`），而它们决定了：
+
+| 文件 | 处 | 卡在哪个 rpc |
+|---|---|---|
+| `download_client.rs` | 5 | `submit` / `delete_media` / 状态快照 |
+| `download_common.rs` | 2 | 客户端解析 + `submit` |
+| `download_sync.rs` | 4 | 下载状态快照 |
+| `media_transfer_task.rs` | 4 | `media.provider` 能力协商 + 复制 |
+| `import_service.rs` | 3 | `scan_import_source` / `stage_import_file` / `finalize_import` |
+| `import_task.rs` | 3 | 按番号搜元数据候选（`metadata_source`） |
+| `auto_download.rs` | 1 | `submit` |
+| `download_request.rs` | 1 | 解析唯一客户端 + `submit` |
+| `download_task.rs` | 1 | provider 删远端 |
+| `provider_browse.rs` | 1 | 解析媒体库的 provider |
+
+##### ★ 已完成：provider seam 的决策与缺口清册
+
+见新 ADR `docs/adr/2026-10-07-provider-seam.md`。核心结论：
+**`sm-service → sm-plugins` 现在不成环**（P0 把 `sm-plugins → sm-scheduler`
+拆掉后，`sm-plugins` 只依赖 `sm-core / sm-plugin-api / sm-db / tonic`，且全
+crate 无 `sm_service` 引用），所以允许 `sm-service` 直接用
+`sm_plugins::provider_calls`，**不必**再靠组合根注入一批窄 trait —— 后者会把
+`ProviderOperationError`（7 个码 + `retryable`）复制成第二份，而调用方分支
+恰恰依赖它。
+
+ADR 里还钉了三条约束（防以后加回去）与**缺口清册**：导入组（Scan/Stage/
+Finalize/Abort/GetIdentity/DeleteImportFile）、指纹组（ComputeFileHash）、
+转存组（8 个含流式）、下载组（5 个）、浏览组（Browse），各自解锁哪些文件。
+⚠️ `ImportFile` / `ImportPlacement` / `StagedMedia` / `MediaHandle` /
+`LibraryHandle` / `SourceDisposition` 定义在 **`common.proto`**（storage.proto
+里只有引用）—— 实施时先读那边。
+
+##### 下一步的两条路（建议选 ①）
+
+1. **先把 provider seam 的 Rust 侧签名钉下来**：读 `proto/provider.proto` 把
+   上面那批 rpc 的 Rust 窄接口（注入 trait）定义好，组合根实现。它一次性
+   解锁约 20 处，且这些签名是**契约**（照 proto 抄），不是猜的。
+2. 先做 `import_service` 的**宿主写入那一半**（`_create_media`：影片先建、
+   媒体后建、`storage_ref` 落 `media.storage_ref`）—— 但 scan/stage/finalize
+   仍要等 ①。
+
+已核实的上游语义（供 ① 之后直接写）：`import_from_source` 的 7 步前置校验与
+错误码、不安全文件名判据、`source_disposition` 三取值、`supports_in_place_import`
+能力名、失败条目字段表、`metadata_import_batch` 用线程池（上限
+`import_metadata_max_workers`）、`retry_failed_file` 按 `source_kind` 分支
+（`plugin` → `import_plugin_movie`，否则 `import_movie_if_missing`，
+两者 `force_subscribed=True`；**没有**骨架注释里那个 `staged` 分支）。
+
+#### `import_service` 三处落地（transfers 26 → 23）
+
+**没有新增 `sm-service → sm-plugins` 依赖**：骨架里那两个 trait
+（`StorageProvider` / `CatalogImport`）本来就是注入缝，直接用它们 —— 组合根
+（sm-server）持有插件连接并实现 trait。这比让业务层直接拿 tonic client 干净，
+也保住了「业务层只依赖契约」。
+
+- **`import_from_source`**：7 步校验按上游顺序（源形状 → disposition → 库 →
+  kind → 合集 → 原地能力；**先挡 422 再挡 404**，反过来会让一个错别字变成
+  「找不到库」）→ scan → 逐条：文件名安全检查 → 认番号 → stage（带幂等键）
+  → 宿主写入（**影片先建、媒体后建**，`storage_ref` 从 **stage** 拿而不是
+  finalize —— 宿主写入发生在 finalize 之前）→ finalize → `delete_after_commit`
+  删源。★ stage 之后到 finalize 之间**任何**失败都 abort。单条失败进
+  `failed`，不整体回滚（一部影片元数据缺失不该让另外 199 部白导）。
+- **`metadata_import_batch`**：逐条失败不中断。⚠️ 上游是线程池并发，本仓顺序
+  执行（并发是优化不是语义；真要并发应在组合根注入执行器）。
+- **`retry_failed_file`**：★ **又订正一处骨架注释** —— 分支依据是
+  `source_kind`（`plugin` → 按候选 id；否则按番号重取），**没有**
+  「`staged=true` 跳过 scan」那一支。两支都 `force_subscribed=True`。
+
+⚠️ **未闭环（如实登记）**：`retry_failed_file` 目前只**重建影片元数据**；
+媒体记录与 provider 定稿那两步要等失败项携带暂存句柄（`ImportFailure` 还没有
+那一列）。另外 `in_place` 因 proto 缺口只能按「能力不支持」处理。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |

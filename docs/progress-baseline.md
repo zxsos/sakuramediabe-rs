@@ -2,13 +2,13 @@
 
 | 指标 | 现在 |
 |---|---|
-| 未实现的方法体（`todo!()`） | **136** 处（`sm-service` 74 + 路由 62）|
+| 未实现的方法体（`todo!()`） | **117** 处（`sm-service` 55 + 路由 62）|
 | 端点（方法级） | 175 / 177 已注册，**其中 62 条仍是 `todo!()`** |
 | 端点（路径级） | 136 / 136（未注册的方法级端点 2 条）|
 | 完成的域 | `collections`、`videos`（2/7 个域） |
-| 待办最多的域 | `transfers` 27 · `catalog` 24 · `playback` 16 |
+| 待办最多的域 | `transfers` 23 · `playback` 16 · `catalog` 9 |
 | worker handler | 5 / 21 |
-| 基线提交 | `22ea79e`（生成时的 HEAD）|
+| 基线提交 | `6df831c`（生成时的 HEAD）|
 
 > 数字由 `pwsh -File scripts/progress.ps1 -Write` 生成（**不要手数**：手数三次错过
 > 分母，126 应为 177）。改完代码就跑 `-Write` 并提交本文件 —— 门禁里有 `-Diff`，
@@ -18,22 +18,22 @@
 
 口径：`todo!(` / `unimplemented!(` 出现次数（剥掉注释）。与「注册了多少」是两件事。
 
-- 全仓合计：**136** 处
+- 全仓合计：**117** 处
 - 其中 `crates/sm-api/src/routes/*.rs`：**62** 处（= 已注册但**未实现**的端点 / 辅助函数）
 
 | crate | `todo!()` |
 |---|---|
-| `sm-service` | 74 |
 | `sm-api` | 62 |
+| `sm-service` | 55 |
 
 ### 按模块目录
 
 | 位置 | `todo!()` |
 |---|---|
 | `sm-api/routes` | 62 |
-| `sm-service/transfers` | 27 |
-| `sm-service/catalog` | 24 |
+| `sm-service/transfers` | 23 |
 | `sm-service/playback` | 16 |
+| `sm-service/catalog` | 9 |
 | `sm-service/system` | 4 |
 | `sm-service/discovery` | 3 |
 
@@ -41,22 +41,20 @@
 
 | 文件 | `todo!()` |
 |---|---|
-| `catalog\catalog_import.rs` | 7 |
 | `playback\media_library.rs` | 6 |
 | `transfers\download_client.rs` | 6 |
-| `catalog\metadata_source.rs` | 5 |
-| `catalog\movie_image.rs` | 5 |
 | `playback\media.rs` | 5 |
 | `catalog\movie_metadata_search.rs` | 4 |
 | `transfers\download_sync.rs` | 4 |
 | `transfers\media_transfer_task.rs` | 4 |
 | `catalog\movie_metadata_refresh.rs` | 3 |
-| `transfers\import_service.rs` | 3 |
 | `transfers\import_task.rs` | 3 |
 | `discovery\moment_recommendation.rs` | 2 |
 | `system\plugin_removal.rs` | 2 |
 | `system\telemetry.rs` | 2 |
 | `transfers\download_common.rs` | 2 |
+| `catalog\catalog_import.rs` | 1 |
+| `catalog\metadata_source.rs` | 1 |
 | `discovery\image_search_space.rs` | 1 |
 | `playback\media_file_hash_backfill.rs` | 1 |
 | `playback\media_metadata_probe.rs` | 1 |
@@ -65,7 +63,6 @@
 | `playback\media_video_info_backfill.rs` | 1 |
 | `transfers\auto_download.rs` | 1 |
 | `transfers\download_request.rs` | 1 |
-| `transfers\download_resource_hash.rs` | 1 |
 | `transfers\download_task.rs` | 1 |
 | `transfers\provider_browse.rs` | 1 |
 
@@ -143,14 +140,14 @@
 
 | 域 | Rust 文件 | Rust 行 | 上游文件 | 上游行 |
 |---|---|---|---|---|
-| catalog | 26 | 10192 | 27 | 7556 |
+| catalog | 26 | 11357 | 27 | 7556 |
 | collections | 4 | 2024 | 5 | 1292 |
 | discovery | 17 | 7113 | 16 | 4485 |
 | playback | 20 | 6223 | 19 | 3741 |
 | system | 19 | 5313 | 19 | 2935 |
-| transfers | 17 | 6905 | 23 | 4248 |
+| transfers | 17 | 7350 | 23 | 4248 |
 | videos | 3 | 1735 | 4 | 927 |
-| **合计** | **106** | **39505** | **113** | **25184** |
+| **合计** | **106** | **41115** | **113** | **25184** |
 
 > ⚠️ **行数比不是完成度**（本仓注释占大头）；看上面的 `todo!()`。
 

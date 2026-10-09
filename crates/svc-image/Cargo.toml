@@ -12,3 +12,5 @@ workspace = true
 
 [dependencies]
 image = { workspace = true }
+# 番号资产目录的分片名（`movies/<sha1 前 2 位>/<番号>`），见 src/paths.rs。
+sha1 = { workspace = true }

@@ -58,6 +58,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use sm_db::repo::{MediaLibraryRepository, MomentCollectionRepository, MovieRepository};
+
 use crate::error::ServiceError;
 
 /// 源文件处置方式（⚠️ **待对齐的第二份定义**，见下）。
@@ -114,6 +116,15 @@ pub struct ImportFailure {
     pub failure_detail: Option<String>,
     /// 是否已 stage 成功。`true` 表示暂存文件还在，重试可以省掉 scan。
     pub staged: bool,
+    /// 来源种类。`"plugin"` 时重试走**候选 id**（上游
+    /// `import_plugin_movie`），否则按番号重取（上游
+    /// `import_movie_if_missing`）。默认 `"javdb"`。
+    #[serde(default = "default_source_kind")]
+    pub source_kind: String,
+}
+
+fn default_source_kind() -> String {
+    "javdb".to_owned()
 }
 
 /// 失败原因码。**唯一一份**在
@@ -145,12 +156,37 @@ pub type ImportProgressCallback<'a> =
     Box<dyn FnMut(serde_json::Value) -> BoxFuture<'a, Result<(), String>> + Send + 'a>;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// 按番号取元数据并入库。**窄接口**，避免本模块依赖 metadata_source 的实现。
+///
+/// 上游 `metadata_import_batch` / `retry_failed_file` 都要「按番号（或候选 id）
+/// 换一份元数据再入库」；本仓那条链路在 [`crate::catalog::metadata_source`]，
+/// 这里只声明要用到的形状。
+pub trait MovieMetadataImporter: Send + Sync {
+    /// 按番号导入，返回**是否新建**。
+    fn import_by_number<'a>(
+        &'a self,
+        movie_number: &'a str,
+        import: &'a dyn CatalogImport,
+        force_subscribed: bool,
+    ) -> BoxFuture<'a, Result<bool, ServiceError>>;
+    /// 按**元数据候选 id** 导入（上游 `import_plugin_movie` 那支）。
+    ///
+    /// 与 `import_by_number` 是两条路：番号那条从 JavDB 取，候选这条直接用
+    /// 插件已交付的那份（手动重试选中的候选）。
+    fn import_by_candidate<'a>(
+        &'a self,
+        candidate_id: &'a str,
+        import: &'a dyn CatalogImport,
+        force_subscribed: bool,
+    ) -> BoxFuture<'a, Result<bool, ServiceError>>;
+}
+
 /// 导入服务。
-// 两个依赖尚未被方法体引用（导入编排还是 `todo!()`），落地后删 allow。
-#[allow(dead_code)]
 pub struct MediaImportService {
+    db: sm_db::Db,
     provider: Option<Box<dyn StorageProvider>>,
     catalog_import: Option<Box<dyn CatalogImport>>,
+    metadata: Option<Box<dyn MovieMetadataImporter>>,
 }
 
 /// 插件的存储能力。**形状待插件 ABI 定型**，这里只声明宿主用到的五个动作。
@@ -160,13 +196,24 @@ pub trait StorageProvider {
         &self,
         parent_ref: &serde_json::Value,
     ) -> Result<Vec<ScannedEntry>, ServiceError>;
-    /// 暂存一个文件。
-    fn stage_import_file(&self, source_ref: &serde_json::Value)
-        -> Result<StagedFile, ServiceError>;
+    /// 暂存一个文件。`operation_key` 是**幂等键**（上游 `f"{ns}:{index}"`）：
+    /// 同一 key 重复调用必须返回同一份暂存，否则重试会复制出第二份媒体。
+    fn stage_import_file(
+        &self,
+        source_ref: &serde_json::Value,
+        operation_key: &str,
+    ) -> Result<StagedFile, ServiceError>;
     /// 定稿（把暂存变成最终记录）。
     fn finalize(&self, staged: &StagedFile) -> Result<FinalizedFile, ServiceError>;
     /// 清理暂存。**失败路径必调。**
     fn abort(&self, staged: &StagedFile) -> Result<(), ServiceError>;
+    /// 删掉导入来源文件（`delete_after_commit` 的收尾）。
+    fn delete_source(&self, staged: &StagedFile) -> Result<(), ServiceError>;
+    /// 是否**支持原地导入**。上游的能力字段叫 `supports_in_place_import`
+    /// （`import_service.py:188` 那支校验）。
+    fn supports_in_place_import(&self) -> bool;
+    /// 算采样指纹（`media-file-hash-v1:<40 hex>`）。用于「同一份文件是否导入过」。
+    fn compute_file_hash(&self, staged: &StagedFile) -> Result<String, ServiceError>;
     /// 拿播放句柄。宿主**只**在最后用它。
     fn media_handle_for(&self, media_id: i64) -> Result<serde_json::Value, ServiceError>;
 }
@@ -196,12 +243,26 @@ pub struct ScannedEntry {
 }
 
 /// 暂存句柄。
+///
+/// # ★ `storage_ref` 来自 **stage**，不是 finalize
+///
+/// 上游 `import_from_source` 的顺序是：stage 拿到 `StagedMedia`
+/// （**含 `storage_ref`**）→ 宿主据此建 `media` 记录 → 最后才 `finalize(receipt)`
+/// 让 provider 落定。也就是**宿主写入发生在 finalize 之前**，而写库需要
+/// `storage_ref`。把它放在 finalize 的返回里就晚了。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagedFile {
+    /// 幂等键兼暂存标识（上游 `operation_key`）。
     pub stage_token: String,
     pub source_ref: serde_json::Value,
     pub file_name: String,
     pub size_bytes: Option<i64>,
+    /// provider 侧的存储引用。宿主**原样存进 `media.storage_ref`，不解析**。
+    pub storage_ref: serde_json::Value,
+    /// 时长（秒）。provider 在 stage 时就探出来了。
+    pub duration_seconds: Option<i64>,
+    /// 分辨率字符串（如 `1920x1080`）。
+    pub resolution: Option<String>,
 }
 
 /// 定稿结果。
@@ -229,11 +290,45 @@ pub struct NewMedia {
 
 impl MediaImportService {
     /// 构造（真实依赖）。
-    pub fn new(provider: Box<dyn StorageProvider>, catalog_import: Box<dyn CatalogImport>) -> Self {
+    pub fn new(
+        db: sm_db::Db,
+        provider: Box<dyn StorageProvider>,
+        catalog_import: Box<dyn CatalogImport>,
+        metadata: Box<dyn MovieMetadataImporter>,
+    ) -> Self {
         Self {
+            db,
             provider: Some(provider),
             catalog_import: Some(catalog_import),
+            metadata: Some(metadata),
         }
+    }
+
+    fn provider(&self) -> Result<&dyn StorageProvider, ServiceError> {
+        self.provider
+            .as_deref()
+            .ok_or_else(|| ServiceError::unavailable("provider_not_installed", "存储插件未安装"))
+    }
+
+    /// 文件名安全检查。上游 `import_service.py` 的
+    /// `502 provider_invalid_response` 一支。
+    ///
+    /// ★ 这道检查**不能省**：文件名最终会进宿主的路径拼接。判据（上游）：
+    /// 非字符串 / 空 / `.` / `..` / 含 `/` `\` `\x00`。
+    fn ensure_safe_file_name(name: &str) -> Result<(), ServiceError> {
+        let unsafe_name = name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0');
+        if unsafe_name {
+            return Err(ServiceError::unavailable(
+                "provider_invalid_response",
+                format!("插件返回了不安全的文件名：{name:?}"),
+            ));
+        }
+        Ok(())
     }
 
     /// ★ 从一个源导入。上游 `import_from_source`（`:…`，最大方法）。
@@ -263,15 +358,224 @@ impl MediaImportService {
         collection_id: Option<i64>,
         mut progress: Option<ImportProgressCallback<'_>>,
     ) -> Result<ImportResult, ServiceError> {
-        let _ = (
-            source_ref,
-            library_id,
-            media_kind,
+        // ★ 校验顺序照上游：源形状 → disposition → 库 → kind → 合集 → 原地能力。
+        // 顺序有意义的：先把「调用方写错了」的几支（422）挡在「库里没有」
+        // （404）之前 —— 反过来会让一个错别字变成「找不到库」。
+        if !source_ref.is_object() {
+            return Err(ServiceError::validation(
+                "invalid_import_source",
+                "源引用必须是对象",
+            ));
+        }
+        if !matches!(
             source_disposition,
-            collection_id,
-            &mut progress,
-        );
-        todo!("骨架：scan -> 逐条 stage -> 宿主写入 -> finalize；stage 之后必 abort 兜底")
+            "keep" | "delete_after_commit" | "in_place"
+        ) {
+            return Err(ServiceError::validation(
+                "invalid_source_disposition",
+                format!("非法的源处置方式：{source_disposition}"),
+            ));
+        }
+        let library = MediaLibraryRepository::new(self.db.clone())
+            .find_by_id(library_id as i32)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(
+                    "media_library_not_found",
+                    "媒体库不存在",
+                    "library_id",
+                    library_id as i32,
+                )
+            })?;
+        if !matches!(media_kind, "jav" | "video") {
+            return Err(ServiceError::validation(
+                "invalid_media_kind",
+                format!("非法的媒体种类：{media_kind}"),
+            ));
+        }
+        if let Some(collection_id) = collection_id {
+            let exists = MomentCollectionRepository::new(self.db.clone())
+                .find_by_id(collection_id as i32)
+                .await?
+                .is_some();
+            if !exists {
+                return Err(ServiceError::validation(
+                    "invalid_collection",
+                    format!("合集不存在：{collection_id}"),
+                ));
+            }
+        }
+        let provider = self.provider()?;
+        // ⚠️ 契约缺口：`in_place` 传不过去（proto 的 `SourceDisposition` 只有
+        // KEEP / DELETE_AFTER_COMMIT）。上游三方都认它，所以这里**按能力判断**
+        // 而不是直接判非法 —— 哪天 ABI 补上枚举值，本分支自动生效。
+        if source_disposition == "in_place" && !provider.supports_in_place_import() {
+            return Err(ServiceError::validation(
+                "in_place_import_unsupported",
+                "该存储插件不支持原地导入",
+            ));
+        }
+
+        let entries = provider
+            .scan_import_source(source_ref)
+            .map_err(|_| ServiceError::unavailable("provider_scan_failed", "插件扫描导入源失败"))?;
+
+        let mut result = ImportResult::default();
+        for (index, entry) in entries.iter().enumerate() {
+            if let Err(error) = Self::ensure_safe_file_name(&entry.file_name) {
+                result.failed.push(Self::failure_of(
+                    &entry.source_ref,
+                    entry.suggested_movie_number.as_deref().unwrap_or_default(),
+                    media_kind,
+                    failure_reason::MEDIA_IMPORT_FAILED,
+                    Some(error.code().to_owned()),
+                    false,
+                ));
+                continue;
+            }
+            let Some(movie_number) = entry.suggested_movie_number.as_deref() else {
+                result.failed.push(Self::failure_of(
+                    &entry.source_ref,
+                    "",
+                    media_kind,
+                    failure_reason::MOVIE_NUMBER_NOT_FOUND,
+                    None,
+                    false,
+                ));
+                continue;
+            };
+            // 幂等键：上游 `f"{namespace}:{index}"`。重试必须命中同一个暂存。
+            let operation_key = format!("import:{library_id}:{index}");
+            let staged = match provider.stage_import_file(&entry.source_ref, &operation_key) {
+                Ok(staged) => staged,
+                Err(_) => {
+                    result.failed.push(Self::failure_of(
+                        &entry.source_ref,
+                        movie_number,
+                        media_kind,
+                        failure_reason::MEDIA_IMPORT_FAILED,
+                        None,
+                        false,
+                    ));
+                    continue;
+                }
+            };
+            // ★ stage 之后到 finalize 之间的**任何**失败都要 abort，
+            // 否则暂存文件泄漏在 provider 侧。
+            let outcome = self
+                .commit_one(
+                    &library,
+                    media_kind,
+                    source_disposition,
+                    collection_id,
+                    movie_number,
+                    &staged,
+                )
+                .await;
+            match outcome {
+                Ok(()) => result.imported += 1,
+                Err(reason) => {
+                    let _ = provider.abort(&staged);
+                    result.failed.push(Self::failure_of(
+                        &entry.source_ref,
+                        movie_number,
+                        media_kind,
+                        &reason,
+                        None,
+                        true,
+                    ));
+                }
+            }
+            if let Some(reporter) = progress.as_mut() {
+                let _ = reporter(serde_json::json!({
+                    "index": index,
+                    "total": entries.len(),
+                    "movie_number": movie_number,
+                }))
+                .await;
+            }
+        }
+        Ok(result)
+    }
+
+    /// 单条的「宿主写入 → finalize → 收尾」。返回失败原因码。
+    ///
+    /// 宿主写入的顺序是**影片先建、媒体后建**（上游 `_create_media`）：
+    /// `media` 的外键指向影片，反过来写就要先建一个空壳。
+    async fn commit_one(
+        &self,
+        library: &sm_db::playback::media::MediaLibrary,
+        media_kind: &str,
+        source_disposition: &str,
+        collection_id: Option<i64>,
+        movie_number: &str,
+        staged: &StagedFile,
+    ) -> Result<(), String> {
+        let catalog = self
+            .catalog_import
+            .as_deref()
+            .ok_or_else(|| failure_reason::MEDIA_IMPORT_FAILED.to_owned())?;
+        let metadata = self
+            .metadata
+            .as_deref()
+            .ok_or_else(|| failure_reason::METADATA_FETCH_FAILED.to_owned())?;
+        // ① 元数据 → 影片记录。
+        metadata
+            .import_by_number(movie_number, catalog, true)
+            .await
+            .map_err(|_| failure_reason::METADATA_FETCH_FAILED.to_owned())?;
+        // ② 媒体记录，`storage_ref` 原样落库。**影片先建、媒体后建**。
+        let (movie_id, _is_new) = catalog
+            .import_movie(movie_number, &serde_json::json!({}))
+            .map_err(|_| failure_reason::METADATA_FETCH_FAILED.to_owned())?;
+        let _file_hash = self.provider_or()?.compute_file_hash(staged).ok();
+        catalog
+            .import_media(&NewMedia {
+                movie_id,
+                library_id: i64::from(library.id),
+                file_name: staged.file_name.clone(),
+                storage_ref: staged.storage_ref.clone(),
+                size_bytes: staged.size_bytes,
+                duration_seconds: staged.duration_seconds.or(Some(0)),
+                media_kind: media_kind.to_owned(),
+                collection_id,
+            })
+            .map_err(|_| failure_reason::MEDIA_IMPORT_FAILED.to_owned())?;
+        // ③ 让 provider 落定。
+        self.provider_or()?
+            .finalize(staged)
+            .map_err(|_| failure_reason::MEDIA_IMPORT_FAILED.to_owned())?;
+        // ④ `delete_after_commit`：定稿之后才删源（删早了定稿会找不到文件）。
+        if source_disposition == "delete_after_commit" {
+            let _ = self.provider_or()?.delete_source(staged);
+        }
+        Ok(())
+    }
+
+    /// provider 未安装 → 失败原因码（本方法返回 `String` 而非 `ServiceError`）。
+    fn provider_or(&self) -> Result<&dyn StorageProvider, String> {
+        self.provider
+            .as_deref()
+            .ok_or_else(|| failure_reason::MEDIA_IMPORT_FAILED.to_owned())
+    }
+
+    fn failure_of(
+        source_ref: &serde_json::Value,
+        movie_number: &str,
+        media_kind: &str,
+        failure_reason: &str,
+        failure_detail: Option<String>,
+        staged: bool,
+    ) -> ImportFailure {
+        ImportFailure {
+            source_ref: source_ref.clone(),
+            movie_number: movie_number.to_owned(),
+            media_kind: media_kind.to_owned(),
+            failure_reason: failure_reason.to_owned(),
+            failure_detail,
+            staged,
+            source_kind: "javdb".to_owned(),
+        }
     }
 
     /// 批量导入元数据（并发）。上游 `metadata_import_batch`（生成器）。
@@ -283,22 +587,117 @@ impl MediaImportService {
         &self,
         movie_numbers: &[String],
     ) -> Result<Vec<MetadataImportResult>, ServiceError> {
-        let _ = movie_numbers;
-        todo!("骨架：并发按番号取元数据；逐条失败不中断（结果里带 failure_reason）")
+        // ⚠️ 上游是**线程池**并发（上限 `import_metadata_max_workers`），本仓
+        // 顺序执行：这里没有线程池，而上游的并发是「同时取多个番号」的优化，
+        // 不是语义的一部分 —— 顺序做**结果一致**，只是慢。真要并发时应在
+        // 组合根注入一个并发执行器，而不是在本模块里起线程。
+        let metadata = self
+            .metadata
+            .as_deref()
+            .ok_or_else(|| ServiceError::unavailable("metadata_unavailable", "元数据链路未接线"))?;
+        let catalog = self.catalog_import.as_deref().ok_or_else(|| {
+            ServiceError::unavailable("catalog_unavailable", "目录写入链路未接线")
+        })?;
+        let mut results = Vec::with_capacity(movie_numbers.len());
+        for movie_number in movie_numbers {
+            // ★ 逐条失败不中断 —— 一个番号取不到不能让整批白做。
+            match metadata
+                .import_by_number(movie_number, catalog, false)
+                .await
+            {
+                Ok(_created) => {
+                    let movie_id = MovieRepository::new(self.db.clone())
+                        .find_by_number(movie_number)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|movie| movie.id as i64);
+                    results.push(MetadataImportResult {
+                        movie_number: movie_number.clone(),
+                        movie_id,
+                        failure_reason: None,
+                        failure_detail: None,
+                    });
+                }
+                Err(error) => results.push(MetadataImportResult {
+                    movie_number: movie_number.clone(),
+                    movie_id: None,
+                    failure_reason: Some(failure_reason::METADATA_FETCH_FAILED.to_owned()),
+                    failure_detail: Some(error.code().to_owned()),
+                }),
+            }
+        }
+        Ok(results)
     }
 
     /// 重试一条失败项。上游 `retry_failed_file`。
     ///
-    /// 错误码：`422 invalid_retry_media_kind` / `422 invalid_retry_file` /
-    /// `409 failed_item_source_unavailable`（源已被清理）。
+    /// ⚠️ **已修正骨架语义**：分支依据是 `source_kind`，**不是** `staged`
+    /// —— 上游没有「`staged=true` 时跳过 scan」这一支。
+    ///
+    /// ⚠️ **未闭环**：本方法目前只**重建影片元数据**（换候选 / 按番号重取）。
+    /// 媒体记录与 provider 定稿那两步要等失败项携带暂存句柄 —— 上游的失败项
+    /// 里带 `source_ref` 之外的暂存信息，本仓的 [`ImportFailure`] 还没有那一列。
+    /// 在那之前重试能把影片补上，却不会重建媒体记录（登记在此，不假装完成）。
     pub async fn retry_failed_file(
         &self,
         failure_item: &ImportFailure,
         candidate_id: &str,
         operation_key: &str,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (failure_item, candidate_id, operation_key);
-        todo!("骨架：复用已暂存的文件（staged=true 时跳过 scan）-> 换元数据候选 -> 重新写入")
+        // ⚠️ 纠正骨架注释：上游**没有**「`staged=true` 时跳过 scan」这条分支
+        // —— retry 不重新 scan，它本来就用失败项里那份已保存的 `source_ref`
+        // 直接重新走导入。分支依据是 **`source_kind`**，不是 `staged`。
+        if !matches!(failure_item.media_kind.as_str(), "jav" | "video") {
+            return Err(ServiceError::validation(
+                "invalid_retry_media_kind",
+                format!("无法重试的媒体种类：{}", failure_item.media_kind),
+            ));
+        }
+        // ★ 「源不可用」是 409 而不是 404：冲突的不是资源不存在，而是
+        // 「这条记录所指的源已经被清理，重试这个动作本身无法完成」。
+        if !failure_item.source_ref.is_object()
+            || failure_item
+                .source_ref
+                .as_object()
+                .is_some_and(|map| map.is_empty())
+        {
+            return Err(ServiceError::conflict(
+                "failed_item_source_unavailable",
+                "失败项的源引用已不可用",
+                None,
+            ));
+        }
+        let metadata = self
+            .metadata
+            .as_deref()
+            .ok_or_else(|| ServiceError::unavailable("metadata_unavailable", "元数据链路未接线"))?;
+        let catalog = self.catalog_import.as_deref().ok_or_else(|| {
+            ServiceError::unavailable("catalog_unavailable", "目录写入链路未接线")
+        })?;
+        // 上游两支都带 `force_subscribed=True`（用户手动重试 = 明确要它进订阅）。
+        let movie_number = if failure_item.source_kind == "plugin" {
+            metadata
+                .import_by_candidate(candidate_id, catalog, true)
+                .await
+                .map_err(|error| {
+                    ServiceError::validation("invalid_retry_file", error.code().to_owned())
+                })?;
+            failure_item.movie_number.clone()
+        } else {
+            let created = metadata
+                .import_by_number(&failure_item.movie_number, catalog, true)
+                .await
+                .map_err(|error| {
+                    ServiceError::validation("invalid_retry_file", error.code().to_owned())
+                })?;
+            let _ = created;
+            failure_item.movie_number.clone()
+        };
+        Ok(serde_json::json!({
+            "movie_number": movie_number,
+            "operation_key": operation_key,
+        }))
     }
 }
 
@@ -370,6 +769,7 @@ mod tests {
             failure_reason: failure_reason::MOVIE_NUMBER_NOT_FOUND.to_owned(),
             failure_detail: None,
             staged: false,
+            source_kind: "javdb".to_owned(),
         };
         let json = serde_json::to_value(&failure).expect("可序列化");
         assert!(json.get("movie_number").is_some(), "键必须存在");
@@ -389,6 +789,7 @@ mod tests {
             failure_reason: failure_reason::METADATA_FETCH_FAILED.to_owned(),
             failure_detail: None,
             staged: true,
+            source_kind: "javdb".to_owned(),
         };
         assert!(failure.staged, "暂存成功过 -> 可跳过 scan");
         failure.staged = false;
