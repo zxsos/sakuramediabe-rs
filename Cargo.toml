@@ -1,0 +1,56 @@
+[package]
+name = "plugin-more-movies"
+version = "0.1.0"
+description = "更多影片 / 更多影片榜单插件：JavDB 最新影片同步任务 + Minnano AV / JavLibrary 榜单来源的 Rust 实现"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死（与 plugin-javbus-metadata 同一手法）。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖而不是
+# branch：按 branch 会让本插件与宿主静默漂移到不同版本的契约，症状是注册不上
+# 而不报错。tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# 相对 URL 按详情页基址解析（上游 urljoin）。
+url = "2"
+# JavDB API 的 jdsignature（上游 javdb.py:_get_sign 的 md5）。
+md5 = "0.8"
+# 品番形状校验（上游 _PRODUCT_CODE_PATTERN）。
+regex = "1"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde_json = "1"
+# prost_types::Struct / Value：params_schema 与 MovieSnapshot.values 的取值。
+prost = "0.14"
+prost-types = "0.14"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它
+# （见 sakuramediabe-rs 的 docs/adr/2026-10-05-plugin-lifecycle.md 第 5 节）。
+# 一个仓库两个插件 id：同步任务与榜单来源是两个独立的上游插件，
+# 共用抓取与解析代码，各自有独立的二进制与 plugin_id。
+[[bin]]
+name = "sakuramedia_more_movies"
+path = "src/bin/sakuramedia_more_movies.rs"
+
+[[bin]]
+name = "sakuramedia_more_rank_movies"
+path = "src/bin/sakuramedia_more_rank_movies.rs"
+
+[dev-dependencies]
+# 页面交给本地假服务，测试不许联网。
+wiremock = "0.6"
+tokio = { version = "1", features = ["full"] }
