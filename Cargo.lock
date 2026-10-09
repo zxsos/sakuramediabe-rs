@@ -61,6 +61,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -706,6 +728,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -779,6 +813,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -974,6 +1018,15 @@ version = "0.1.0"
 
 [[package]]
 name = "hashlink"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7382cf6263419f2d8df38c55d7da83da5c18aef87fc7a7fc1fb1e344edfe14c1"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "hashlink"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
@@ -1016,6 +1069,12 @@ checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "html-escape"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "http"
@@ -1429,10 +1488,11 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1487,6 +1547,16 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
@@ -1494,6 +1564,12 @@ dependencies = [
  "cfg-if",
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "md5"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "media-file-hash"
@@ -1819,6 +1895,119 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "plugin-115-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "prost-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sm-plugin-api",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "plugin-actor-metadata"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "fs2",
+ "futures",
+ "md-5 0.10.6",
+ "prost-types",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sm-plugin-api",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "unicode-normalization",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "plugin-javbus-metadata"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "sm-plugin-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "plugin-javdb-ranking"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sm-plugin-api",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "plugin-judge-collection"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "prost-types",
+ "serde_json",
+ "sm-plugin-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "wiremock",
+]
+
+[[package]]
+name = "plugin-more-movies"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "md5",
+ "prost",
+ "prost-types",
+ "regex",
+ "reqwest",
+ "serde_json",
+ "sm-plugin-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "plugin-ref-local"
 version = "0.1.0"
 dependencies = [
@@ -1832,6 +2021,48 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "plugin-scrape-translate"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "html-escape",
+ "prost-types",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sm-plugin-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "plugin-subtitlecat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "prost-types",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sm-plugin-api",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -2265,6 +2496,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -2291,6 +2523,20 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink 0.10.0",
+ "libsqlite3-sys",
+ "smallvec",
 ]
 
 [[package]]
@@ -2785,6 +3031,14 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "plugin-115-provider",
+ "plugin-actor-metadata",
+ "plugin-javbus-metadata",
+ "plugin-javdb-ranking",
+ "plugin-judge-collection",
+ "plugin-more-movies",
+ "plugin-scrape-translate",
+ "plugin-subtitlecat",
  "prost-types",
  "reqwest",
  "serde_json",
@@ -2900,7 +3154,7 @@ dependencies = [
  "futures-io",
  "futures-util",
  "hashbrown 0.16.1",
- "hashlink",
+ "hashlink 0.11.1",
  "indexmap",
  "log",
  "memchr",
@@ -3008,7 +3262,7 @@ dependencies = [
  "hmac",
  "itoa",
  "log",
- "md-5",
+ "md-5 0.11.0",
  "memchr",
  "rand 0.10.3",
  "serde",

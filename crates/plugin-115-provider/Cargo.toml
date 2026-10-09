@@ -1,0 +1,25 @@
+[package]
+name = "plugin-115-provider"
+version = "0.1.0"
+description = "115 网盘 StorageProvider 插件：目录浏览、影片导入、离线下载、播放代理、缩略图（进程内版本）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sm-plugin-api = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

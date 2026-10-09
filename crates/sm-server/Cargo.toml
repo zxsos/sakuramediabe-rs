@@ -39,6 +39,16 @@ chrono = { workspace = true }
 # 之前刻意不加（进程侧没落地，而一个不引用的依赖就是 ADR §6 说的幽灵配置——
 # 它会让「插件已接上」看起来成立）。现在拉起与看门狗都有了，加回来。
 sm-plugins = { workspace = true }
+# 进程内插件（vendored）：直接调用，不起进程、不走 gRPC。
+# 9 个插件全部 vendoring 进 workspace，共用同一份 sm-plugin-api。
+plugin-javdb-ranking = { workspace = true }
+plugin-javbus-metadata = { workspace = true }
+plugin-actor-metadata = { workspace = true }
+plugin-115-provider = { workspace = true }
+plugin-judge-collection = { workspace = true }
+plugin-more-movies = { workspace = true }
+plugin-scrape-translate = { workspace = true }
+plugin-subtitlecat = { workspace = true }
 # 插件注册响应的类型（`RegisterResponse`）来自契约层；组合根要把它留在内存里，
 # 以便插件重启后重建三张注册表。
 sm-plugin-api = { workspace = true }

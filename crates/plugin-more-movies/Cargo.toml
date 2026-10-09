@@ -1,0 +1,29 @@
+[package]
+name = "plugin-more-movies"
+version = "0.1.0"
+description = "更多影片 / 更多影片榜单插件：JavDB 最新影片同步任务 + Minnano AV / JavLibrary 榜单来源的 Rust 实现（进程内版本）"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sm-plugin-api = { workspace = true }
+tonic = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+md5 = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"

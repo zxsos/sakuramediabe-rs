@@ -8,6 +8,14 @@ members = [
     "crates/svc-probe",
     "crates/parity-cli",
     "crates/plugin-ref-local",
+    "crates/plugin-javdb-ranking",
+    "crates/plugin-actor-metadata",
+    "crates/plugin-judge-collection",
+    "crates/plugin-more-movies",
+    "crates/plugin-scrape-translate",
+    "crates/plugin-subtitlecat",
+    "crates/plugin-javbus-metadata",
+    "crates/plugin-115-provider",
     "crates/sm-core",
     "crates/sm-db",
     "crates/sm-plugin-api",
@@ -34,6 +42,14 @@ svc-hash = { path = "crates/svc-hash" }
 svc-image = { path = "crates/svc-image" }
 svc-probe = { path = "crates/svc-probe" }
 plugin-ref-local = { path = "crates/plugin-ref-local" }
+plugin-javdb-ranking = { path = "crates/plugin-javdb-ranking" }
+plugin-javbus-metadata = { path = "crates/plugin-javbus-metadata" }
+plugin-actor-metadata = { path = "crates/plugin-actor-metadata" }
+plugin-115-provider = { path = "crates/plugin-115-provider" }
+plugin-judge-collection = { path = "crates/plugin-judge-collection" }
+plugin-more-movies = { path = "crates/plugin-more-movies" }
+plugin-scrape-translate = { path = "crates/plugin-scrape-translate" }
+plugin-subtitlecat = { path = "crates/plugin-subtitlecat" }
 sm-core = { path = "crates/sm-core" }
 sm-db = { path = "crates/sm-db" }
 sm-plugin-api = { path = "crates/sm-plugin-api" }
@@ -86,7 +102,7 @@ prost-types = "0.14"
 qdrant-client = "1.19"
 
 # HTTP 客户端（替代 httpx）
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart", "form", "query"] }
 
 # 时间与标识
 chrono = { version = "0.4", features = ["serde"] }
@@ -144,6 +160,17 @@ base64 = "0.23"
 percent-encoding = "2"
 url = "2"
 regex = "1"
+# JavDB API 的 jdsignature（more-movies 插件，上游 javdb.py:_get_sign 的 md5）。
+md5 = "0.8"
+# 进程内插件的本地状态（scrape-translate 插件，上游 state.py 的 sqlite3）。
+# bundled：纯 Rust 构建，离线 NAS 编译不受影响。
+# 与 plugin-actor-metadata 对齐（0.37）：`links = "sqlite3"` 全 workspace
+# 只能出现一份，版本必须一致。
+rusqlite = { version = "0.37", features = ["bundled"] }
+# HTML 字符引用解码（scrape-translate 插件，上游 html.unescape）。
+html-escape = "0.2"
+# run_job 的进度流（scrape-translate 插件）。
+async-stream = "0.3"
 # 番号资产目录的分片名（`movies/<sha1 前 2 位>/<番号>`）。
 #
 # **必须是 SHA-1**：分片名要上游算出来一模一样，否则同一部影片在迁移后的

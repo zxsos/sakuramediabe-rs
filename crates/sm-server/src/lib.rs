@@ -45,6 +45,8 @@ pub mod provider_gateway;
 // 排行取数网关 + 同步服务的延迟填槽。理由同 `provider_gateway`（依赖倒置），
 // 另加一条时序约束：端点起得比排行源目录早。
 pub mod ranking_gateway;
+// 进程内插件调用：vendored 插件直接实例化，不起进程、不走 gRPC。
+pub mod inprocess_plugins;
 
 use std::path::PathBuf;
 use std::sync::Arc;
