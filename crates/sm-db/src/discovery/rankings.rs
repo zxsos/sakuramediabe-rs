@@ -77,7 +77,7 @@ pub struct DailyRecommendationItem {
     /// 名次，**全表唯一**（见模块文档）。
     pub rank: i32,
     /// 综合得分。
-    pub score: f32,
+    pub score: f64,
     /// 理由代码数组，JSON 文本。`JsonTextField`，默认 `[]`。
     pub reason_codes: Option<String>,
     /// 理由文案数组，JSON 文本。默认 `[]`。
@@ -149,8 +149,8 @@ pub struct MomentRecommendation {
     pub id: i32,
     /// 名次，**全表唯一**（与 `daily_recommendation_item.rank` 同理）。
     pub rank: i32,
-    /// 综合得分。
-    pub score: f32,
+    /// 综合得分。`f64` 对应 DDL 的 `double precision`；用 f32 会读不出来。
+    pub score: f64,
     /// 推荐策略标识，有索引。
     pub strategy: String,
     /// 可读的推荐理由。
@@ -170,9 +170,9 @@ pub struct MomentRecommendation {
     /// 种子来源影片（影片相似度路径）。
     pub source_movie_id: Option<i64>,
     /// 视觉相似度分量得分。无视觉依据时为空。
-    pub visual_score: Option<f32>,
+    pub visual_score: Option<f64>,
     /// 影片相似度分量得分。无影片依据时为空。
-    pub movie_similarity_score: Option<f32>,
+    pub movie_similarity_score: Option<f64>,
     pub generated_at: NaiveDateTime,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
