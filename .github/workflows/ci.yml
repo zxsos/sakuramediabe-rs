@@ -48,7 +48,6 @@ jobs:
           - svc-hash
           - svc-image
           - svc-probe
-          - parity-cli
           - plugin-ref-local
     steps:
       - uses: actions/checkout@v4
