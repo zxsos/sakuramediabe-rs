@@ -195,16 +195,19 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 
 /// 推荐服务。
 pub struct MovieRecommendationService {
-    store: MovieSimilarityStore,
+    // ★ 共享句柄，不是按值持有：它内部缓存「别名是否就绪」，而每请求现造一个
+    // store 会让那个缓存永远从 false 开始。`Arc` 也让 HTTP 层与后台任务
+    // 共用同一份就绪缓存。
+    store: std::sync::Arc<MovieSimilarityStore>,
     features: MovieFeatureRepository,
 }
 
 impl MovieRecommendationService {
-    /// 构造。
-    ///
-    /// `store` **按值**持有而 `similarity.rs` 里的 `search_many` 是 `&self` ——
-    /// 所以克隆成本只是 `Arc` 计数。
-    pub fn new(store: MovieSimilarityStore, features: MovieFeatureRepository) -> Self {
+    /// 构造。`store` 是**共享句柄**（见字段文档）。
+    pub fn new(
+        store: std::sync::Arc<MovieSimilarityStore>,
+        features: MovieFeatureRepository,
+    ) -> Self {
         Self { store, features }
     }
 

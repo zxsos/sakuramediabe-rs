@@ -86,6 +86,18 @@ pub struct AppState {
     /// 所以读它的地方用 [`AppState::plugin_admin`]，它会把 `None` 报成 500
     /// 而不是让插件页面空着。
     plugins: Option<Arc<dyn PluginAdmin>>,
+    /// 影片相似度的 Qdrant 存储。`None` = **没启用**（`movie_similarity_enabled`
+    /// 为假）或端点没配。
+    ///
+    /// # 为什么是「活的」而不是快照
+    ///
+    /// 它内部缓存「别名是否就绪」，而别名会被原子替换 —— 每次请求现造一个
+    /// store 会让那个缓存永远从 false 开始，于是**每次请求都多探一次就绪**。
+    ///
+    /// `None` 的语义是「这台机器没开影片相似度」，调用方据此**返回空列表**
+    /// 而不是报错（上游的降级语义，见
+    /// `sm_service::discovery::recommendation::search_similar_movies`）。
+    similarity: Option<Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>>,
 }
 
 impl AppState {
@@ -102,6 +114,7 @@ impl AppState {
             downloads: None,
             media_libraries: None,
             plugins: None,
+            similarity: None,
         }
     }
 
@@ -122,6 +135,22 @@ impl AppState {
         self.plugins
             .as_deref()
             .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
+    }
+
+    /// 挂上影片相似度存储。**只有组合根会调**。
+    pub fn with_movie_similarity(
+        mut self,
+        store: Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>,
+    ) -> Self {
+        self.similarity = Some(store);
+        self
+    }
+
+    /// 影片相似度存储。`None` = 没启用 —— 调用方返回**空列表**，不报错。
+    pub fn movie_similarity(
+        &self,
+    ) -> Option<&Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>> {
+        self.similarity.as_ref()
     }
 
     /// 挂上任务目录。只有组合根会调 —— 它才知道有哪些插件任务。

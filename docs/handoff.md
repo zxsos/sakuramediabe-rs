@@ -5,20 +5,20 @@
 ## 一、当前状态
 
 > **数字以 `docs/progress-baseline.md` 为准** —— 跑 `pwsh -File scripts/progress.ps1 -Diff`
-> 核对，漂移即失败。下表同步到 **2026-10-07 晚**（HEAD `7933f56`）。
+> 核对，漂移即失败。下表同步到 **2026-10-07 晚**（HEAD `803337f`）。
 
 | 项 | 值 |
 |---|---|
 | 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
 | 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
-| 端点方法体 | **实测 `todo!()` 共 71 个**：`sm-service` **32** + `sm-api` **39**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
-| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **39 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
-| 完成的域 | `collections`、`videos`（2/7） |
+| 端点方法体 | **实测 `todo!()` 共 63 个**：`sm-service` **30** + `sm-api` **33**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
+| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **33 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
+| 完成的域 | `collections`、`system`、**`videos`（3/7）** —— `system` 本轮清零 |
 | 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 6/21** |
 | 门禁 | `verify.ps1 -Tier full` **全绿**（fmt / doc / clippy / 单测 / 真库集成 / 对拍 / **契约两仓同步** / 进度基线，共 12 项） |
 | 提交 | 推送状态以 `git status -sb` 为准（`cnb` 从未推过） |
 
-**下一步看 §七「交接快照（2026-10-07）」与 §八「接下来做什么」** —— 前者是剩余 71 条的
+**下一步看 §七「交接快照（2026-10-07）」与 §八「接下来做什么」** —— 前者是剩余 63 条的
 **卡点表**与待拍板项，后者是可立即开工的**执行清单**。§一之二以下的数字是**历史计划**，
 别照它开工。**部署形态与瘦身目标见 [`deployment.md`](deployment.md)。**
 
@@ -1683,24 +1683,26 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
   真调用要 DB 与图片目录。该函数落地后**必须换成真实调用**，
   否则这条用例会一直「绿着但什么都没验」。同类占位用例在做 parity 时一并排查。
 
-## 七、交接快照（2026-10-07，HEAD `7933f56`）
+## 七、交接快照（2026-10-07，HEAD `803337f`）
 
 **开工前先做两件事**：`pwsh -File scripts/progress.ps1 -Diff`（应回 `OK`）与
 `cargo clippy --workspace --all-targets -- -D warnings`（应 exit 0）。
-工作区干净、门禁绿、`todo!()` **71** 个（口径见 `docs/progress-baseline.md`）。
+工作区干净、门禁绿、`todo!()` **63** 个（口径见 `docs/progress-baseline.md`）。
 
 ### 7.1 这一批刚落地的（最近 8 个提交）
 
 | 提交 | 内容 |
 |---|---|
+| `c3bbdb7` | **feat(catalog)：JavDB provider 的三个核心方法**（搜索 / 详情 / 图片 URL 归一）+ `MetadataProvider` 转 async |
+| `803337f` | **feat(movies)：单片订阅 / 退订 / 相似影片三条端点**（66 → 63） |
+| `2b06074` | **feat(plugins)：卸载端点**（69 → 66，`system` 域清零）+ **纠正骨架期自造的「四步清理」**（见 §7.2d） |
+| `8656a21` | **feat(plugins)：安装 / 升级两条端点**（71 → 69）+ 流式上传 + 版本比较子集 |
 | `7933f56` | **feat(plugins)：`/system/plugins` 的列表 / 详情 / 启停三条落地**（74 → 71），并新增 `PluginAdmin` 契约层 + `installer::publish` + `inventory` |
 | `0c0ef57` | feat(plugins)：插件包安装的核心机制（`manifest` 解析 + 安全解压） |
 | `6a3d7d5` | docs(readme)：测试数与进度表对齐实测 |
 | `aeff054` | **feat(catalog)：`import_by_number` 落地** —— 入库路径第一段通了（窄接口补两支 + `DeliverySource` 枚举） |
 | `6020a8e` | **feat(abi)：`ABI_MAJOR` → 2 + 契约两仓同步门禁**（`parity/check_contract_sync.py` 接进 verify） |
 | `a15a09b` | docs(tasks)：proto P1 缺口提案（纠正「三个待决策」的认知，指出契约分叉是 P0） |
-| `7f08e3f` | docs(deployment)：部署形态与瘦身路线 + handoff §八 执行清单 |
-| `8e0c11c` | docs(handoff)：交接快照更新到 2026-10-07 晚（75 个 `todo!()`） |
 
 ⚠️ 推送状态以 `git status -sb` 为准（`cnb` 从头到尾没推过；`origin` 推不推由你定）。
 
@@ -1737,22 +1739,152 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
    `sm_plugins::admin` 的模块文档里 —— 补它需要一条「supervisor 运行时状态 →
    管理接口」的通道。**别把它当已完成**：插件页现在不会显示「进程没起来」。
 
-### 7.3 剩余 71 条的**卡点表**（按卡点而非按文件归类）
+### 7.2c 安装 / 升级这批的四个决定（照做，别回退）
+
+1. **上传走 `extract::receive_to_file`（流式落盘），不用 `extract::Multipart`。**
+   后者是「整字段读进 `Vec<u8>` + 8 MiB 上限」；插件包上限 **100 MiB**，几台并发
+   上传就能把 NAS 的内存吃掉几百 MiB。上游也是 `copyfileobj` 到临时文件。
+   `receive_to_file` 的总量上限是**整个请求**的（文件 + 文本字段）——只算文件的话，
+   一个巨型普通字段就是绕过闸门的路。
+2. **超限的码是 `plugin_too_large`（413），不是通用提取器的 `http_error`。**
+   `Content-Length` 预检在**读 body 之前**（上游 `_check_upload_size`）；
+   分块传输与非法 `Content-Length` 一律放行，由 `receive_to_file` 兜底。
+3. **版本比较是 PEP 440 的常用子集**（`sm_plugins::versions`），不是 semver、
+   也不用 `version_compare` 之类的依赖。不支持 epoch（`1!2.0`）与本地标记
+   （`1.0+local`）—— 那两个形态的后果写在模块文档里，结论是「不会静默把在用的
+   插件换成旧代码」。**比较要分两趟**（先全部数字段、再后缀），一趟会在
+   `1.0.1` vs `1.0.post9` 上判反。
+4. **`enable` 的布尔解析用 pydantic 语义**（`1/true/t/yes/y/on` 为真），与
+   `sm_server::config::parse_bool`（`slow_log` 的白名单）**不是同一套**。
+   混用会让 `enable=yes` 在一个端点上生效、在另一个上变成 `false`。
+
+### 7.2d 卸载这批的一个**纠正**（照做，别把自造的加回去）
+
+骨架期 `plugin_removal.rs` 的模块文档写「卸载一个插件要做**四件事**：停进程 → 释放
+字段主权 → 清扩展点数据 → 删配置行」，并据此造了一个七字段的
+`PluginRemovalReport`（含 `incomplete` / `mark_incomplete`）与两条单元测试。
+
+**那四步在上游不存在。** 逐条核对 `plugin_removal_service.py:43-48`，
+`remove()` 只有两步：
+
+```python
+cls._ensure_not_in_use(manager, plugin_id)   # 1. 占用检查 → 409 plugin_in_use
+manager.remove(plugin_id)                    # 2. 停用 + 删代码（保留 data/）
+```
+
+| 骨架声称要做 | 上游实况 |
+|---|---|
+| 停插件进程 | **不是卸载的一部分**。`remove` 只删文件 + 写 `enabled`；进程等重启（路由回 `pending_restart: ["api","aps"]`）|
+| 释放 `field_owners` | `release_plugin_owners` 全仓**只有一个**调用点：`commands.py:524`，一个 CLI 子命令（`movie_ownership_gateway.py:189` 写着「清理端点，CLI 调用」）。没有 HTTP 路由，卸载路径零调用 |
+| 清扩展点数据 | `ranking_source` / `metadata_source` 的删除在卸载路径**零命中** |
+| 删配置行 | 只有 `manager.remove` 内部那次 `_set_enabled(False)` |
+
+**为什么这次纠正重要**：多做的那些事会**改变行为** —— 卸载时顺手释放字段主权，
+等于替管理员做了一个他没要求的、影响**所有影片**的动作（`release_plugin_owners`
+是全表 UPDATE）。所以这不是「简化」，是修一个会误伤数据的实现。CLI 那条路仍是
+它自己的入口；将来若要做，应该照上游做成独立命令，别塞进
+`DELETE /system/plugins/{id}`。
+
+### 7.2e 卸载的**占用检查目前不生效**（★ 已知缺口，别当它做好了）
+
+`DELETE` 会先问「这个插件的 provider 还挂着媒体库吗」，被引用就 409
+`plugin_in_use`（details 五个键与上游 `PluginInUseError.details` 逐字一致：
+`plugin_id` / `provider_keys` / `library_ids` / `media_count` /
+`download_client_count`）。DB 那半是完整的、也有真库测试。
+
+但那个问题要「`plugin_id` → `provider_key`」的**反向索引**才答得上来，
+而上游的两条来源在 Rust 侧都不可用：
+
+| 上游来源（`:74-93`） | Rust 侧 |
+|---|---|
+| `MEDIA_PROVIDER_REGISTRY.provider_keys_for_plugin()` | `MediaLibraryRegistry` **全仓没有实现**（§7.2），连 `library_for(provider_key)` 那一向都没人接 |
+| 回落到 `check_plugin_dir()` 试加载插件目录、扫 `MEDIA_PROVIDER_EXTENSION_KEY` | Rust 没有「import 插件」；要拿扩展点得**拉起进程**问它 `Register` |
+
+所以路由传的是 [`NoProviderKeys`](crates/sm-service/src/system/plugin_removal.rs)
+（恒空）→ **检查形同虚设，一个仍被媒体库引用的插件能被删掉**。
+
+⚠️ **这与上游不完全等价**：上游在「插件目录加载失败」时也会返回 `()` 放行，
+但一个**正在服役**的插件在上游是走第一支的、查得到键。
+
+补它的前置只有一件事：**provider 注册表带上反向索引**。本仓那条 seam
+（`ProviderKeyIndex`）就是为了那时能接上；`tests/plugin_removal.rs` 里有一条
+**故意断言「空索引会放行」**的测试 —— 哪天注册表接上了，那条测试会失败，
+正好把它改成断言 409。
+
+### 7.2f ★ JavBus provider **整个不存在**（阻塞 6 条端点，不只是 SSE）
+
+2026-10-07 查清。它不是「SSE 麻烦」，而是**一整块外部客户端没写**：
+
+| 上游 | 规模 | Rust 侧 |
+|---|---|---|
+| `src/metadata/_providers/javdb.py` `JavdbProvider` | **975 行** | **无**（`crates/` 里搜不到任何 JavBus 客户端）|
+
+Rust 侧**已经有**接缝，缺的只是实现：
+
+- `catalog::metadata_source::MetadataProvider`（`fetch_movie` 等）与
+  `MetadataSourceService` / `RegisteredSource` **都在**；
+- `movie_metadata_search.rs` 的 `resolve_candidate_reference` /
+  `javdb_candidate_id` / `cleanup_search_assets` **都已实现且有测试**；
+- 只差「按番号搜 / 按 javdb_id 取详情 / 封面 URL 归一」这三个动作。
+
+被它阻塞的端点（6 条）：
+
+| 端点 | 需要 JavDB 的哪部分 |
+|---|---|
+| `GET /metadata/javdb/search` | `_search_movie`（`javdb.py:386`）|
+| `POST /movies/{}/metadata/refresh` | `get_movie_detail`（`:441`）|
+| `POST /movies/search/javdb/stream`（SSE）| 同上 + 逐部入库 |
+| `POST /actors/search/javdb/stream`（SSE）| `search_actor` / `search_actors`（`:326`/`:373`）|
+| `GET /movies/{}/reviews` | `get_movie_reviews_by_javdb_id`（`:444`）|
+| （间接）`ranking` 的两个榜单源 | `get_rank_numbers` / `get_playback_rank_numbers`（`:483`/`:611`）|
+
+⚠️ 别把它当「照抄一个 HTTP 调用」：上游那个类还带**设备指纹 + 登录态**
+（`_device_payload` `:503`、`_ensure_logged_in` `:508`）、**图片 URL 归一**
+（`_normalize_image_url` `:125`，把 `covers/…` 换成 `c0.jdbstatic.com`）以及
+多种资源（封面/样本图/头像）的分支。照抄要连带 Cookie 与 UA 处理。
+
+****第二步的两个新发现（2026-10-07 晚，`c3bbdb7` 之后查的）** —— provider 有了，
+但「接端点」比预想的多两道：
+
+1. **`metadata-refresh` 的响应是 `MovieDetailResource`**
+   （上游 `movies.py:207` `@router.post("/{movie_number}/metadata-refresh",
+   response_model=MovieDetailResource)`）。而本仓的
+   `MovieService::get_movie_detail` **不存在**（`movies.rs:774` 只有路由骨架）。
+   也就是说这条端点**同时**卡在 JavBus **与** 详情汇合点上 —— 只解 JavBus
+   不够。
+2. **上游没有 `javdb.host` 这个配置键**（`config.py` 里搜不到 `javdb`），
+   而 Rust 的 `sm_core::config_schema` 里也没有。所以「provider 用哪个 host」
+   是**一个还没答案的问题** —— 要先把上游那个 host 是从哪来的查清
+   （可能是插件配置或硬编码），不能凭空在配置表里加一个键。
+
+**第一步已落地**（见 §7.1 最新一条提交）：`catalog::javdb::JavdbProvider`
+实现了那三个方法，并把 `MetadataProvider` 转成 `async`（原来同步，而出网客户端是
+reqwest —— 同步签名会被逼成 `block_on`）。**还没接端点**：它目前没有被组合根
+构造出来；`search_actors` 显式报「尚未移植」而不是返回空列表（空列表会让
+调用方报「导入 0 个」，那是谎报）。
+
+**建议的切法（剩下的部分）****：先只做 `_search_movie` + `get_movie_by_javdb_id` +
+`_normalize_image_url` 三个（够 `GET /metadata/javdb/search` 与
+`metadata-refresh` 两条**非 SSE** 端点），并用回环 HTTP 服务打桩做可测的
+部分（见 `tests/embedding_http.rs` 与 `wiremock` 的用法），再接 SSE。
+登录态（`_ensure_logged_in`）**先不做** —— 未登录也能拿到这三条要的数据。
+
+### 7.3 剩余 63 条的**卡点表**（按卡点而非按文件归类）
 
 > 总数与分域计数以 `docs/progress-baseline.md` 为准（那份由脚本生成）；下表按
 > **卡点**归类，只用来判断「下一步该动哪一块」。
 
-**路由 39 条：**
+**路由 33 条：**
 
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
 | **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、下载器注册表 |
-| **`MovieService` 方法不存在** | `movies.rs` 9 | `get_movie_detail` / `get_movie_reviews` / `set_subscription` / `unsubscribe_movie` / `get_merged_playback` 在服务层**根本没有** |
+| **`MovieService` 方法不存在** | `movies.rs` 6 | 详情（10 个子资源的汇合点）/ reviews / merged-playback（要 provider）/ metadata-refresh + 2 条 SSE（要 JavBus）。`set_subscription` 与 `unsubscribe_movie` **已落地**（`803337f`）|
 | **Qdrant / 嵌入探测客户端缺失** | `image_search.rs` 7、`status.rs` 2 | 上游会 probe 嵌入服务与 Qdrant（`status_service.py:410-443`） |
-| **插件管理的剩余 5 条** | `plugins.rs` 5 | 安装 / 升级 / 卸载 / 两个 settings。**目录层已就位**（`installer::publish` / `inventory` / `manifest`），settings 要先定「Rust 插件怎么声明设置项」 |
-| 待核 | `actors.rs` 1 | 还没查卡点 |
+| **插件管理的剩余 2 条** | `plugins.rs` 2 | 两个 settings。它们**不是接线**：上游的 `schema`/`defaults` 来自插件的 pydantic `settings_model`，要先定「Rust 插件怎么声明自己的设置项」 |
+| 待核 | `actors.rs` 1 | 卡点已查清（见 §7.2f）：SSE，阻塞在 JavBus provider 缺失 |
 | ~~service IO 编排缺失~~ | ~~`recommendations.rs` 3~~ | ✅ **已解决**：读侧 `c801441` + 生成侧 `2655f4d` |
-| ~~插件 zip 上传~~ | ~~`plugins.rs` 3~~ | ✅ **列表 / 详情 / 启停已落地**（本轮） |
+| ~~插件 zip 上传~~ | ~~`plugins.rs` 5~~ | ✅ **六条已落地**：列表 / 详情 / 启停 / 安装 / 升级（`7933f56`、`8656a21`）+ 卸载（`2b06074`） |
 
 **服务层 35 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 / `import_task` 3 /
 其余各 1：`auto_download` / `download_common` / `download_request` / `download_task` /

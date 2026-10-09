@@ -170,6 +170,21 @@ impl MovieActorRepository {
         }
     }
 
+    /// 某部影片的全部演员 id（**不分页**，按 `movie_actor.id` 升序）。
+    ///
+    /// 上游详情页的 `_actors(movie)` 是 `MovieActor.select().where(movie=...)`，
+    /// **不分页** —— 一部片的演员是几位到十几位，分页只会让调用方被迫翻页。
+    /// 复用上面那个分页方法去翻页也能拿到，但那要把「详情页」这个只读场景
+    /// 变成多次查询；详情是一次性读全部的场景。
+    pub async fn actor_ids_for_movie(&self, movie_id: i32) -> Result<Vec<i32>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT actor_id FROM movie_actor WHERE movie_id = $1 ORDER BY id")
+                .bind(movie_id)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     paged_list! {
         /// 列出某位演员出演的全部影片。**分页。**
         ///
@@ -311,6 +326,25 @@ impl MovieTagRepository {
             count = "SELECT COUNT(*) FROM movie_tag WHERE movie_id = $1",
             items = "SELECT * FROM movie_tag WHERE movie_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
         }
+    }
+
+    /// 某部影片的全部标签 `(tag_id, name)`（**不分页**，按 `tag.id` 升序）。
+    ///
+    /// 上游详情页：`Tag.select(Tag).join(MovieTag).where(MovieTag.movie == movie)
+    /// .order_by(Tag.id)` —— 显式按 `Tag.id` 排序，不是按关联表顺序。
+    ///
+    /// # 为什么直接 join 出 name，而不是先取关联行再逐个查标签
+    ///
+    /// 详情页要的是**名字**，一条 join 就够；逐个查会变成 N+1 次查询。
+    pub async fn tags_for_movie(&self, movie_id: i32) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT t.id, t.name FROM movie_tag mt \
+             JOIN tag t ON t.id = mt.tag_id \
+             WHERE mt.movie_id = $1 ORDER BY t.id",
+        )
+        .bind(movie_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     paged_list! {

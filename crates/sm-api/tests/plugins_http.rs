@@ -707,6 +707,77 @@ async fn upgrading_an_unknown_plugin_is_a_404() {
     assert!(!fixture.root.join("ghost").exists(), "404 时不该把它装进来");
 }
 
+// ================================================================ 卸载
+
+/// ★ `DELETE /system/plugins/{id}` —— **200 + body**（不是 204），
+/// 且 **`data/` 保留**、版本取自删除**前**的那份。
+#[tokio::test]
+async fn deleting_a_plugin_returns_200_with_the_version_and_keeps_data() {
+    let db = TestDb::require().await;
+    let fixture = Fixture::new("remove", "");
+    let token = seed_token(&db).await;
+
+    let package = plugin_package("local", "2.3.4");
+    let (status, _) = send(
+        app(&db, &fixture),
+        upload_request(
+            "POST",
+            "/system/plugins",
+            &token,
+            multipart_body(&[], Some(("file", "local.zip", &package))),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let data = fixture.root.join("local").join("data");
+    std::fs::create_dir_all(&data).expect("建 data 目录");
+    std::fs::write(data.join("state.json"), b"user data").expect("写用户数据");
+
+    let (status, response) = send(
+        app(&db, &fixture),
+        request("DELETE", "/system/plugins/local", &token),
+    )
+    .await;
+
+    // 本仓库其他 delete 都回 204 无 body，**这里不是**。
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["plugin_id"], "local");
+    // 代码已删，所以版本只能取自删除前 —— 上游也是先 get_plugin 再 remove。
+    assert_eq!(response["version"], "2.3.4");
+    // 上游对卸载**硬编**这两个目标（不像安装那样按 dependencies 分叉）。
+    assert_eq!(response["pending_restart"], json!(["api", "aps"]));
+
+    assert!(!fixture.root.join("local").join("manifest.json").exists());
+    assert!(data.join("state.json").is_file(), "★ data/ 必须保留");
+
+    // 列表里不再有它。
+    let (_, listed) = send(
+        app(&db, &fixture),
+        request("GET", "/system/plugins", &token),
+    )
+    .await;
+    assert_eq!(listed, json!([]));
+}
+
+/// 删一个没装的插件 → 404。
+#[tokio::test]
+async fn deleting_an_unknown_plugin_is_a_404() {
+    let db = TestDb::require().await;
+    let fixture = Fixture::new("remove-unknown", "");
+    let token = seed_token(&db).await;
+
+    let (status, response) = send(
+        app(&db, &fixture),
+        request("DELETE", "/system/plugins/ghost", &token),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(response["error"]["code"], "plugin_not_found");
+}
+
 // ================================================================ 鉴权
 
 #[tokio::test]

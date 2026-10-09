@@ -27,6 +27,8 @@
 //! "movie_not_found"`。改成 404 会让整批失败，而用户勾了 20 部、其中 1 部
 //! 已被删除时，他要的是「另外 19 部订上」。
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, patch, post, put};
@@ -34,18 +36,21 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use sm_core::pagination::Paginated;
+use sm_db::repo::recommendation::MovieFeatureRepository;
+use sm_service::catalog::actor::ActorService;
 use sm_service::catalog::movie::{
-    parse_movie_number_query, MovieCollectionMarkResponse, MovieCollectionStatus, MovieListParams,
-    MovieNumberParseResult, MovieService, SubscriptionBatchResponse, SubscriptionSkippedItem,
-    COLLECTION_TYPE_COLLECTION, COLLECTION_TYPE_SINGLE,
+    parse_movie_number_query, MovieCard, MovieCollectionMarkResponse, MovieCollectionStatus,
+    MovieListParams, MovieNumberParseResult, MovieService, SubscriptionBatchResponse,
+    SubscriptionSkippedItem, COLLECTION_TYPE_COLLECTION, COLLECTION_TYPE_SINGLE,
 };
 use sm_service::catalog::movie_subtitle::MovieSubtitleService;
 use sm_service::catalog::movie_task::MovieTaskService;
+use sm_service::discovery::recommendation::MovieRecommendationService;
 use sm_service::error::details_of;
 use sm_service::system::jobs::ManualJobTriggerResponse;
 
 use crate::auth::CurrentUser;
-use crate::dto::MovieListItemResource;
+use crate::dto::{ActorResource, MovieListItemResource, TagResource};
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
@@ -768,12 +773,97 @@ async fn unblacklist_movies(
 /// 响应含：影片基本信息（`catalog`）+ 媒体与进度（`playback`）+ 打点
 /// （`playback`）+ 榜单名次（`discovery::ranking`）。三域都铺完后才铺它。
 async fn get_movie_detail(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let _ = movie_number;
-    todo!("骨架：接 MovieService::get_movie_detail（catalog + playback 进度/打点 + ranking 名次）")
+    let detail = MovieService::new(state.db())
+        .get_movie_detail(&movie_number)
+        .await?;
+
+    // 演员：`ActorResource` 要签名头像，所以装配只能在这一层做（服务层不能
+    // 反向依赖 `sm-api`）。逐个取 `ActorView` —— 一部片的演员是十几位以内。
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let actor_service = ActorService::new(state.db());
+    let mut actors = Vec::with_capacity(detail.actor_ids.len());
+    for actor_id in &detail.actor_ids {
+        let view = actor_service.detail(*actor_id).await?;
+        actors.push(ActorResource::from_view(&view, &secret, now));
+    }
+
+    let tags: Vec<TagResource> = detail
+        .tags
+        .iter()
+        .map(|(tag_id, name)| TagResource {
+            tag_id: *tag_id,
+            name: name.clone(),
+        })
+        .collect();
+    let playlists: Vec<serde_json::Value> = detail
+        .playlists
+        .iter()
+        .map(|(playlist_id, name)| serde_json::json!({ "playlist_id": playlist_id, "name": name }))
+        .collect();
+
+    // 基座用**列表项资源**：上游 `MovieDetailResource` 就是列表项 + 子资源，
+    // 而 `MovieListItemResource` 是本仓唯一已经过对拍验证的影片资源形状。
+    // （服务层的 `Movie` 模型不是 `Serialize`，不能直接 `to_value`。）
+    let card = MovieService::new(state.db())
+        .load_cards(&[detail.movie.id])
+        .await?
+        .into_iter()
+        .next();
+    let mut object = match card {
+        Some(card) => {
+            serde_json::to_value(MovieListItemResource::from_movie_card(&card, &secret, now))
+                .map_err(|error| {
+                    ErrorResponse::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        format!("影片详情序列化失败：{error}"),
+                    )
+                })?
+        }
+        None => {
+            return Err(ErrorResponse::new(
+                StatusCode::NOT_FOUND,
+                "movie_not_found",
+                "影片不存在",
+            ))
+        }
+    };
+
+    // 媒体：`MediaSummary` 不是 `Serialize`（它是服务层的投影），手工投影出
+    // 详情页要的那几个字段 —— 不含 `storage_ref`（可能含凭据）与
+    // `video_info`（可能很大），理由与 `MediaSummary` 的文档一致。
+    let media_items: Vec<serde_json::Value> = detail
+        .media_items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "media_id": item.media_id,
+                "library_id": item.library_id,
+                "library_name": item.library_name,
+                "provider_key": item.provider_key,
+                "file_name": item.file_name,
+                "resolution": item.resolution,
+                "file_size_bytes": item.file_size_bytes,
+                "duration_seconds": item.duration_seconds,
+            })
+        })
+        .collect();
+
+    object["actors"] = serde_json::to_value(&actors).unwrap_or_default();
+    object["tags"] = serde_json::to_value(&tags).unwrap_or_default();
+    object["media_items"] = serde_json::Value::Array(media_items);
+    object["media_count"] = serde_json::Value::from(detail.media_count);
+    object["can_play"] = serde_json::Value::from(detail.can_play);
+    object["rankings"] = serde_json::to_value(&detail.rankings).unwrap_or_default();
+    object["playlists"] = serde_json::Value::Array(playlists);
+    // ★ `plot_images` / `merge_playback_candidates` **不带这两个键**：
+    // 它们是「本仓还没接」而不是「这部片没有」，给空数组会让客户端误判。
+    Ok(Json(object))
 }
 
 /// `GET /movies/{movie_number}/reviews` 的查询参数。
@@ -852,7 +942,7 @@ async fn get_movie_subtitles(
 }
 
 /// `limit` 的边界是 `0..=100`（**下界 0**，见 handler 文档）。
-// `limit` 还没接上（handler 体是 `todo!()`），但它是契约的一部分。落地后删 allow。
+// `limit` 已接上：传给 `MovieRecommendationService::list_similar`。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SimilarMoviesQuery {
@@ -873,13 +963,64 @@ struct SimilarMoviesQuery {
 /// 相似影片依赖 Qdrant 稀疏索引；索引未就绪时返回**空列表**而不是报错
 /// （见 `discovery::recommendation` 的降级语义）。
 async fn list_similar_movies(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
     EnvelopeQuery(query): EnvelopeQuery<SimilarMoviesQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, ErrorResponse> {
-    let _ = (movie_number, query);
-    todo!("骨架：接 MovieRecommendationService::list_similar_resources；索引不可用 -> 空列表")
+    let movies = MovieService::new(state.db());
+    // 番号校验**在**降级判断之前。上游 `list_similar_resources` 也是先解析番号
+    // （`list_similar` → 取影片）再查相似度，所以「番号不存在」永远是 404，
+    // 与 Qdrant 通不通无关。反过来会让不存在的番号回 200 + 空列表。
+    let (movie, _canonical) = movies.require_by_normalized_number(&movie_number).await?;
+
+    // ★ 没启用相似度 -> **空列表**，不是 503、不是 404。
+    //
+    // 上游的降级语义（`recommendation_service.py:341-348`）：Qdrant 不可用只降级
+    // 相似度信号，不让详情页整体报错。没启用比「不可用」更弱 —— 一条相似影片都
+    // 给不出，返回空列表就是它的完整表现。
+    let Some(store) = state.movie_similarity() else {
+        return Ok(Json(Vec::new()));
+    };
+
+    let service = MovieRecommendationService::new(
+        std::sync::Arc::clone(store),
+        MovieFeatureRepository::new(state.db().clone()),
+    );
+    // `NotReady` 在这里变成 503（「索引在建，重试有意义」）；
+    // `Unavailable` 由服务层降级成空列表。
+    let similar = service
+        .list_similar(i64::from(movie.id), query.limit)
+        .await?;
+
+    // 卡片按 id 索引回去 —— `load_cards` 的返回**顺序不保证**与入参一致。
+    let ids: Vec<i32> = similar
+        .iter()
+        .map(|item| i32::try_from(item.movie_id).unwrap_or_default())
+        .collect();
+    let mut by_id: HashMap<i32, MovieCard> = movies
+        .load_cards(&ids)
+        .await?
+        .into_iter()
+        .map(|card| (card.movie.id, card))
+        .collect();
+
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let items: Vec<serde_json::Value> = similar
+        .iter()
+        .filter_map(|item| {
+            let card = by_id.remove(&i32::try_from(item.movie_id).ok()?)?;
+            // 上游 `SimilarMovieListItemResource` = `MovieListItemResource` +
+            // 一个 `similarity_score`，所以这里是「卡片 + 追加一个键」。
+            let mut object =
+                serde_json::to_value(MovieListItemResource::from_movie_card(&card, &secret, now))
+                    .ok()?;
+            object["similarity_score"] = serde_json::Value::from(f64::from(item.score));
+            Some(object)
+        })
+        .collect();
+    Ok(Json(items))
 }
 
 /// `GET /movies/{movie_number}/merged-playback` 的查询参数。
@@ -943,22 +1084,26 @@ async fn recompute_movie_heat(
 /// 成功时**不返回资源**。别返回 `Json<...>` —— 那会让 204 带 body，
 /// 而多数 HTTP 客户端会忽略它，白白序列化一遍。
 async fn subscribe_movie(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let _ = movie_number;
-    todo!("骨架：接 MovieService::set_subscription(true)；成功 204 不带 body")
+    MovieService::new(state.db())
+        .set_subscription(&movie_number)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /movies/{movie_number}/subscription` —— ★ **204，无 body**。
 async fn unsubscribe_movie(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let _ = movie_number;
-    todo!("骨架：接 MovieService::unsubscribe_movie；成功 204 不带 body")
+    MovieService::new(state.db())
+        .unsubscribe_movie(&movie_number)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /movies/search/javdb/stream` —— **SSE 流**。

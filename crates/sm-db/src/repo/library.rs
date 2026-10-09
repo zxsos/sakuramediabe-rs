@@ -238,6 +238,36 @@ impl MediaLibraryRepository {
         }
     }
 
+    /// 按 `provider_key` **集合**取库 id（**不分页**）。
+    ///
+    /// 上游 `PluginRemovalService._ensure_not_in_use`
+    /// （`plugin_removal_service.py:56-61`）：
+    ///
+    /// ```python
+    /// MediaLibrary.select(MediaLibrary.id).where(
+    ///     MediaLibrary.provider_key.in_(provider_keys))
+    /// ```
+    ///
+    /// # 为什么不能用 [`Self::list_by_provider`] 挨个查
+    ///
+    /// 那个是**分页**的（默认一页 20）。漏掉第 21 个库就等于漏掉一个仍在
+    /// 引用的库 —— 而那正是这个检查要拦下的东西。它另外还返回整行，这里只要 id。
+    pub async fn ids_by_provider_keys(
+        &self,
+        provider_keys: &[String],
+    ) -> Result<Vec<i32>, DbError> {
+        if provider_keys.is_empty() {
+            // 空集合的 `= ANY('{}')` 本就零行，早返回省一次往返。
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM media_library WHERE provider_key = ANY($1) ORDER BY id",
+        )
+        .bind(provider_keys)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 删库。返回是否真的删掉了一行。
     ///
     /// 已被 `media` 引用的库会怎样由 schema 的 `on_delete` 决定；这里

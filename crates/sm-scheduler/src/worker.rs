@@ -772,7 +772,7 @@ fn build_movie_similarity_service(
     let store = MovieSimilarityStore::connect(base, deps.qdrant.api_key.as_deref())
         .map_err(|error| format!("向量库连接失败：{}", error.code()))?;
     Ok(Some(MovieRecommendationService::new(
-        store,
+        std::sync::Arc::new(store),
         sm_db::repo::recommendation::MovieFeatureRepository::new(db.clone()),
     )))
 }

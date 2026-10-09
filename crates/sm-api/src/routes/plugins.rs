@@ -58,13 +58,25 @@
 //! | `PATCH /{plugin_id}` | ✅ `PluginAdmin::set_enabled`（写 `plugins.enabled`） |
 //! | `POST ""` | ✅ `PluginAdmin::install_zip`（**201**）|
 //! | `POST /{plugin_id}/upgrade` | ✅ `PluginAdmin::upgrade_zip`（200）|
+//! | `DELETE /{plugin_id}` | ✅ `PluginRemovalService::remove`（**200 + body**）|
 //! | `GET /{plugin_id}/settings` | ⏳ 待做（要插件的 settings schema，见下） |
 //! | `PUT /{plugin_id}/settings` | ⏳ 待做 |
-//! | `DELETE /{plugin_id}` | ⏳ 待做（还缺 `PluginRemovalService` 的四步清理） |
 //!
-//! 已实现的五条都走 `AppState::plugin_admin()` —— **没注入时 500
+//! 已实现的六条都走 `AppState::plugin_admin()` —— **没注入时 500
 //! `plugin_admin_unavailable`，不是空列表**（「组合根漏了接线」与「没装插件」
 //! 必须能区分开）。
+//!
+//! # ★ 卸载的占用检查目前**不生效**（已知缺口）
+//!
+//! `DELETE` 会先问「这个插件的 provider 还挂着媒体库吗」，被引用就 409
+//! `plugin_in_use`（details 五个键与上游逐字一致）。但那个问题要
+//! 「plugin_id → provider_key」的反向索引才能回答，而上游的两条来源在 Rust 侧
+//! 都还没有 —— provider 注册表**全仓没有实现**，「试加载插件目录」在 Rust 里
+//! 要拉起进程问它。
+//!
+//! 所以路由现在传 [`NoProviderKeys`]：**检查形同虚设**，一个仍被引用的插件能被
+//! 删掉。**这不是「上游也这样」** —— 上游对正在服役的插件是查得到键的。
+//! 原因、前置与影响都记在 [`PluginRemovalService`] 的模块文档里。
 //!
 //! # 上传是**流式落盘**，不是全缓冲
 //!
@@ -91,7 +103,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use sm_service::error::ServiceError;
-use sm_service::system::plugins::PLUGIN_TOO_LARGE;
+use sm_service::system::plugin_removal::{NoProviderKeys, PluginRemovalService};
+use sm_service::system::plugins::{PLUGIN_TOO_LARGE, RESTART_API_AND_APS};
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -417,10 +430,31 @@ fn parse_form_bool(raw: Option<&str>, default: bool) -> Result<bool, ErrorRespon
 }
 
 /// `DELETE /{plugin_id}` —— **200 + body**，不是 204。
+///
+/// 本仓库其他所有 delete 都回 204 无 body，**这里不是** —— 客户端要读卸载结果
+/// （上游 `plugins.py:190-206`）。
 async fn remove_plugin(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginInstallResponse>, ErrorResponse> {
-    todo!("骨架：删除返回 200 + 卸载结果")
+    let admin = state.plugin_admin()?;
+    // ★ 卸载**之后**就读不到版本了（代码已删），所以先取详情。
+    // 上游也是先 `get_plugin` 再 `remove`，`version` 取自删除前的那份。
+    let Some(detail) = admin.detail(&plugin_id)? else {
+        return Err(unknown_plugin(&plugin_id));
+    };
+
+    PluginRemovalService::remove(state.db(), admin, &NoProviderKeys, &plugin_id).await?;
+
+    Ok(Json(PluginInstallResponse {
+        plugin_id,
+        version: detail.summary.version,
+        // 上游对卸载**硬编** `["api","aps"]`（`plugins.py:205`），不像安装那样
+        // 按 `dependencies` 分叉。这里照抄。
+        pending_restart: RESTART_API_AND_APS
+            .iter()
+            .map(|target| (*target).to_owned())
+            .collect(),
+    }))
 }

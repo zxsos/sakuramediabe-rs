@@ -184,6 +184,24 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .with_ranking_sources(ranking_sources)
         .with_storage_gateway(gateway)
         .with_plugin_admin(plugin_admin);
+    // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
+    //
+    // **没启用就不挂**，路由据此返回**空列表**而不是 503 —— 那正是上游的降级
+    // 语义（`recommendation_service.py:341-348`：「Qdrant 故障只降级相似度信号，
+    // 不让详情页整体报错」）。
+    //
+    // 建连失败也只 warn 不失败：Qdrant 不可用时相似影片是空的，其余功能正常。
+    let state = match build_similarity_store(&config_service) {
+        Ok(Some(store)) => state.with_movie_similarity(store),
+        Ok(None) => state,
+        Err(error) => {
+            tracing::warn!(
+                code = error.code(),
+                "影片相似度存储不可用：相似影片端点将返回空列表",
+            );
+            state
+        }
+    };
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
@@ -381,6 +399,35 @@ pub async fn connect_pool(config: &ServerConfig) -> Result<sm_db::Db, sqlx::Erro
 /// 关闭时**不挂**而不是「挂了但内部不记」—— 上游是
 /// `if slow_log_enabled(): app.add_middleware(...)`，而每次请求多一次 future
 /// 包装与两次时钟读正是那条注释要避免的。
+/// 影片相似度存储的共享句柄（组合根构造，注入 `AppState`）。
+type SimilarityStore =
+    std::sync::Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>;
+
+/// 构造影片相似度的 Qdrant 存储。**没启用返回 `Ok(None)`（合法状态）。**
+///
+/// 与 `sm_scheduler::worker` 里那个同名 helper 的差别：**这里不把「配置矛盾」
+/// 报成错**。那个任务是「维护相似度索引」，离了 Qdrant 什么也做不了；这个
+/// 端点只是**读**索引，读不到就少一个推荐理由，别的照常，所以只 warn。
+fn build_similarity_store(
+    config: &sm_service::system::config::ConfigService,
+) -> Result<Option<SimilarityStore>, sm_service::error::ServiceError> {
+    use sm_service::discovery::qdrant::similarity::MovieSimilarityStore;
+    use sm_service::system::optional_services::movie_similarity_enabled;
+
+    let snapshot = config.snapshot()?;
+    if !movie_similarity_enabled(&snapshot) {
+        return Ok(None);
+    }
+    let endpoint = sm_scheduler::worker::QdrantEndpoint::from_snapshot(&snapshot);
+    if !endpoint.is_configured() {
+        tracing::warn!("movie_similarity 已启用但 qdrant.url 为空，相似影片将返回空列表");
+        return Ok(None);
+    }
+    let base = endpoint.url.trim_end_matches('/');
+    MovieSimilarityStore::connect(base, endpoint.api_key.as_deref())
+        .map(|store| Some(std::sync::Arc::new(store)))
+}
+
 fn with_optional_slow_log(app: axum::Router, raw_env: Option<&str>) -> axum::Router {
     match SlowLogConfig::from_env_with(
         raw_env,

@@ -249,6 +249,29 @@ impl DownloadClientRepository {
         }
     }
 
+    /// 这些库下有多少个下载客户端（**不分页**）。
+    ///
+    /// 上游 `PluginRemovalService._ensure_not_in_use` 的
+    /// `DownloadClient.select().where(DownloadClient.library.in_(library_ids)).count()`
+    /// （`plugin_removal_service.py:65-69`）。
+    ///
+    /// # 它和 `media_count` 一起进 409 的 details，缺一不可
+    ///
+    /// 上游把两个数一起报出来（`PluginInUseError` 的 message 里都有）。只报
+    /// 媒体数会让「库下只有下载器、没有媒体」的实例看到一个 `media_count = 0`
+    /// 的冲突响应 —— 那看起来像「没有东西引用它，为什么不让删」。
+    pub async fn count_in_libraries(&self, library_ids: &[i32]) -> Result<i64, DbError> {
+        if library_ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_client WHERE library_id = ANY($1)")
+                .bind(library_ids)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     /// 列出全部下载器客户端，**不分页**，按 `created_at DESC, id DESC`。
     ///
     /// 上游 `DownloadClientService.list_clients`（`client_config_service.py:257-265`）

@@ -496,6 +496,26 @@ impl MediaRepository {
     }
 
     /// 按主键查询。
+    /// 这些库下有多少个媒体（**不分页**）。
+    ///
+    /// 上游 `PluginRemovalService._ensure_not_in_use` 的
+    /// `Media.select().where(Media.library.in_(library_ids)).count()`
+    /// （`plugin_removal_service.py:62-64`）。
+    ///
+    /// 只用来填 409 的 `details.media_count` —— 客户端据此显示「这个插件下还有
+    /// N 个媒体」，所以它必须是**真实计数**而不是「第一页有几条」。
+    pub async fn count_in_libraries(&self, library_ids: &[i32]) -> Result<i64, DbError> {
+        if library_ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE library_id = ANY($1)")
+                .bind(library_ids)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn find_by_id(&self, id: i32) -> Result<Option<Media>, DbError> {
         Ok(
             sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = $1")

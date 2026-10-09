@@ -194,6 +194,23 @@ pub trait PluginAdmin: Send + Sync {
         zip_path: &std::path::Path,
         sha256: Option<&str>,
     ) -> Result<PluginInstallOutcome, ServiceError>;
+
+    /// 删除插件**代码**并把它从 `plugins.enabled` 摘掉，**保留 `data/`**。
+    /// 上游 `PluginManager.remove`（`manager.py:323-343`）。
+    ///
+    /// 未安装 → **404 [`PLUGIN_NOT_FOUND`]**。
+    ///
+    /// # 它只管「删代码」，不管「能不能删」
+    ///
+    /// 占用检查（插件是否还被媒体库引用）在
+    /// [`crate::system::plugin_removal::PluginRemovalService`] —— 那个要查库，
+    /// 而本 trait 的实现只碰文件系统与配置。上游也是这个分工。
+    ///
+    /// # 保留 `data/` 是为了「删了再装回来」
+    ///
+    /// 用户的数据不该因为一次误删或一次排查就消失，而重装时 `publish` 会把
+    /// 旧 `data/` 搬进新安装 ✓（见 `crate::installer::publish`）。
+    fn remove_code(&self, plugin_id: &str) -> Result<(), ServiceError>;
 }
 
 #[cfg(test)]

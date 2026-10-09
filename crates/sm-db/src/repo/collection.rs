@@ -1375,6 +1375,26 @@ impl PlaylistMovieRepository {
         .await?)
     }
 
+    /// 包含这部影片的播放单 `(playlist_id, name)`（**不分页**，按 `p.id` 升序）。
+    ///
+    /// 上游 `PlaylistService.list_movie_playlists(movie)`。详情页展示「这部片在
+    /// 哪些播放单里」—— 与 [`Self::list_by_playlist`] 是**反向**的那一半。
+    ///
+    /// # 只投影两列
+    ///
+    /// 详情页只需要 id 与名字。`SELECT *` 会把 `provider_config` 之类可能含
+    /// 凭据的字段带出来，而它根本不会被渲染。
+    pub async fn list_for_movie(&self, movie_id: i32) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT p.id, p.name FROM playlist_movie pm \
+             JOIN playlist p ON p.id = pm.playlist_id \
+             WHERE pm.movie_id = $1 ORDER BY p.id",
+        )
+        .bind(movie_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 「最近播放」列表里、属于**候选集**的影片，取最近的 N 部。**只返回 id。**
     ///
     /// 对应上游 `_load_recent_seed_ids`（`daily_recommendation_service.py:156-169`）：

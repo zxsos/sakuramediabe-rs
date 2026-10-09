@@ -65,19 +65,34 @@ pub enum MetadataSourceError {
 }
 
 /// JavDB 查询能力。**出网**。
+///
+/// # 为什么是 `async`
+///
+/// 上游是同步的（Python `requests`），而本仓的出网客户端是 `reqwest` ——
+///
+/// 同步签名会被逼成 `block_on`，那会在异步上下文里阻塞线程池线程（而这个
+/// provider 是**出网**的，阻塞时间不可控）。
+///
+/// `#[tonic::async_trait]` 而不是原生 `async fn in trait`：本仓的 provider
+/// 存放在 `Box<dyn MetadataProvider>`（见 [`MetadataSourceService`]），原生
+/// async trait **不是对象安全的**。
+#[tonic::async_trait]
 pub trait MetadataProvider {
     /// 按番号取影片详情。
-    fn get_movie_by_number(
+    async fn get_movie_by_number(
         &self,
         movie_number: &str,
     ) -> Result<Option<serde_json::Value>, MetadataSourceError>;
     /// 按 JavDB id 取影片详情。
-    fn get_movie_by_javdb_id(
+    async fn get_movie_by_javdb_id(
         &self,
         javdb_id: &str,
     ) -> Result<Option<serde_json::Value>, MetadataSourceError>;
     /// 搜演员。
-    fn search_actors(&self, keyword: &str) -> Result<Vec<serde_json::Value>, MetadataSourceError>;
+    async fn search_actors(
+        &self,
+        keyword: &str,
+    ) -> Result<Vec<serde_json::Value>, MetadataSourceError>;
 }
 
 /// 插件交付的元数据。**只在闭包内有效**。
@@ -293,7 +308,7 @@ impl MetadataSourceService {
         // ① 先 JavDB。上游 `except MetadataNotFoundError: pass` ——
         // 「没收录」不算错，继续往下试插件。
         if let Some(provider) = &self.provider {
-            match provider.get_movie_by_number(movie_number) {
+            match provider.get_movie_by_number(movie_number).await {
                 Ok(Some(detail)) => {
                     return Ok(consume(PluginDelivery {
                         javdb_detail: Some(detail),
@@ -460,7 +475,7 @@ impl MetadataSourceService {
             .as_ref()
             .ok_or(MetadataSourceError::NotFound)?;
         let mut imported = 0_usize;
-        for resource in provider.search_actors(keyword)? {
+        for resource in provider.search_actors(keyword).await? {
             import_service
                 .upsert_actor(&resource)
                 .await

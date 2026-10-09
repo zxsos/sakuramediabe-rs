@@ -71,6 +71,7 @@ pub mod actor;
 pub mod actor_merge;
 pub mod catalog_import;
 pub mod image_cleanup;
+pub mod javdb;
 // 路径原语与图片包字节原语。上游在 `common/media_paths.py` 与
 // `common/image_store.py`，本仓没有 `common` 层，而它们的用户
 // （`image_cleanup` / `movie_asset_pack` / 未来的 `media_thumbnail_service`）

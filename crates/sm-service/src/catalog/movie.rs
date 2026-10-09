@@ -44,13 +44,18 @@ use sm_db::common::Page;
 use sm_db::repo::collection::SortDirection;
 use sm_db::repo::gateway::{FieldPatch, MovieOwnershipGateway};
 use sm_db::repo::movie::{MovieListFilter, MovieListSort};
-use sm_db::repo::{ImageRepository, MediaRepository, MovieRepository, MovieSeriesRepository};
+use sm_db::repo::{
+    ImageRepository, MediaRepository, MovieActorRepository, MovieRepository, MovieSeriesRepository,
+    MovieTagRepository, PlaylistMovieRepository,
+};
+
 use sm_db::Db;
 
 use crate::catalog::resolution;
+use crate::discovery::ranking::{MovieRankingResource, RankingCatalogService};
 use crate::error::{details_of, ServiceError};
 use crate::movie_numbers::movie_number_lookup_values;
-use crate::playback::media_summary::{attach_movie_list_media, MovieMediaAttachment};
+use crate::playback::media_summary::{attach_movie_list_media, MediaSummary, MovieMediaAttachment};
 
 /// 入参番号在库里找不到。
 pub const SKIP_MOVIE_NOT_FOUND: &str = "movie_not_found";
@@ -106,6 +111,31 @@ pub struct MovieService {
     series: MovieSeriesRepository,
     /// 受保护字段（`is_collection` / `is_blacklisted` …）只能经它写。
     gateway: MovieOwnershipGateway,
+}
+
+/// 影片详情的聚合结果（上游 `get_movie_detail` 的非资源形态）。
+///
+/// 字段与上游详情页要的**数据**一一对应；资源装配在路由层做 —— 那里才有签名
+/// 密钥与 `sm-api` 的资源类型。
+///
+/// # 不含 `plot_images` / `merge_playback_candidates`
+///
+/// 见 [`MovieService::get_movie_detail`] 的说明：那两项是「还没接」而不是
+/// 「这部片没有」，所以**不带这两个字段**，让客户端能区分开。
+#[derive(Debug, Clone)]
+pub struct MovieDetail {
+    pub movie: Movie,
+    /// 演员 id（升序）。资源装配要 `ActorService::detail` 逐个取。
+    pub actor_ids: Vec<i32>,
+    /// `(tag_id, name)`，按 `tag.id` 升序。
+    pub tags: Vec<(i32, String)>,
+    pub media_items: Vec<MediaSummary>,
+    pub media_count: i64,
+    /// 至少一条**有效**媒体。
+    pub can_play: bool,
+    pub rankings: Vec<MovieRankingResource>,
+    /// `(playlist_id, name)`，按 `playlist.id` 升序。
+    pub playlists: Vec<(i32, String)>,
 }
 
 impl MovieService {
@@ -559,6 +589,125 @@ impl MovieService {
             updated_count: matched.len() as i64,
             skipped_count: skipped.len() as i64,
             skipped,
+        })
+    }
+
+    /// `PUT /movies/{movie_number}/subscription` —— ★ **204，无 body**。
+    ///
+    /// 上游 `MovieService.set_subscription`（`movie_service.py:927-953`）。
+    ///
+    /// # 与批量那条**同一口径**的「真订阅」判定
+    ///
+    /// 「原本没订」或「订阅时间为空」才算真订阅：只有这时才覆盖 `subscribed_at`
+    /// 并重置检索状态。重复点订阅不该把订阅时间推到现在（客户端用它排「最近
+    /// 订阅」），也不该把一个正在重试中的抓取任务打回起点。
+    ///
+    /// # 拉黑的影片**不能**订阅（409）
+    ///
+    /// 那是「先解除黑名单」的前置检查，错误码与批量那条一致。
+    pub async fn set_subscription(&self, movie_number: &str) -> Result<(), ServiceError> {
+        let (movie, canonical) = self.require_by_normalized_number(movie_number).await?;
+        if movie.is_blacklisted {
+            return Err(ServiceError::conflict(
+                "movie_is_blacklisted",
+                "影片已在黑名单中，请先解除黑名单",
+                Some(details_of("movie_number", Json::from(canonical))),
+            ));
+        }
+        let fresh = !movie.is_subscribed || movie.subscribed_at.is_none();
+        self.movies.mark_subscribed(movie.id, fresh).await?;
+        Ok(())
+    }
+
+    /// `DELETE /movies/{movie_number}/subscription` —— ★ **204，无 body**。
+    ///
+    /// 上游 `MovieService.unsubscribe_movie`（`movie_service.py:981-1001`）。
+    ///
+    /// # ★ 有本地媒体时**拒绝退订**（409 `movie_subscription_has_media`）
+    ///
+    /// 理由照上游注释：「避免把『停止追踪影片』和『删除本地资源』混成一个
+    /// 动作」。退订之后影片不再被追踪，而媒体文件还在 —— 用户会以为「资源被
+    /// 回收了」，实际它只是没人管了。
+    ///
+    /// `details` 是 `{movie_number, media_count}`，与上游逐字一致。
+    ///
+    /// # 批量那条**不**做这个检查（改为「跳过」）
+    ///
+    /// 批量里报错会让整批失败；单条里用户就看着那一部，能看见原因。两个口径
+    /// 不同是有意的（见 [`Self::batch_unsubscribe_movies`] 的注释）。
+    pub async fn unsubscribe_movie(&self, movie_number: &str) -> Result<(), ServiceError> {
+        let (movie, canonical) = self.require_by_normalized_number(movie_number).await?;
+        let numbers = vec![canonical.clone()];
+        let media = attach_movie_list_media(self.movies.pool(), &numbers).await?;
+        let media_count = media.get(&canonical).map_or(0, |item| item.media_count);
+        if media_count > 0 {
+            let mut details = details_of("movie_number", Json::from(canonical));
+            details.insert("media_count".to_owned(), Json::from(media_count));
+            return Err(ServiceError::conflict(
+                "movie_subscription_has_media",
+                "影片存在媒体文件，无法取消订阅",
+                Some(details),
+            ));
+        }
+        self.movies.clear_subscription(movie.id).await?;
+        Ok(())
+    }
+
+    /// `GET /movies/{movie_number}` —— 影片详情的**聚合**。
+    ///
+    /// 上游 `MovieService.get_movie_detail`（`movie_service.py`）：一部片的详情页
+    /// 要同时拿到演员 / 标签 / 媒体 / 播放单 / 榜单，**按详情页各自独立查询**，
+    /// 而不是一次大 join（上游注释：避免重复行与复杂去重）。
+    ///
+    /// # 为什么返回的是聚合结构而不是资源
+    ///
+    /// `ActorResource` 在 `sm-api`（要签名头像），而服务层**不能反向依赖**
+    /// API 层。所以这里只出**数据**，资源装配在路由层做。
+    ///
+    /// # 两项**本批留空**并记在文档里
+    ///
+    /// | 子资源 | 为什么留空 |
+    /// |---|---|
+    /// | `plot_images` | 本仓没有剧情图那一层（`plot_image_search` 的会话产物未落库） |
+    /// | `merge_playback_candidates` | 要 provider 的 `playback_deliveries` —— 与那 13 条端点同一阻塞 |
+    ///
+    /// 它们被**省略**而不是给空数组：给空数组会让客户端以为「这部片没有剧照」，
+    /// 而真实情况是「这一层还没接」。
+    pub async fn get_movie_detail(&self, movie_number: &str) -> Result<MovieDetail, ServiceError> {
+        let (movie, _canonical) = self.require_by_normalized_number(movie_number).await?;
+        let movie_id = movie.id;
+        let pool = self.movies.pool();
+
+        let actor_ids = MovieActorRepository::new(pool.clone())
+            .actor_ids_for_movie(movie_id)
+            .await?;
+        let tags = MovieTagRepository::new(pool.clone())
+            .tags_for_movie(movie_id)
+            .await?;
+        let playlists = PlaylistMovieRepository::new(pool.clone())
+            .list_for_movie(movie_id)
+            .await?;
+
+        // 媒体：`attach_movie_list_media` 一次给出 items / count / can_play。
+        let numbers = vec![movie.movie_number.clone()];
+        let mut attachments = attach_movie_list_media(pool, &numbers).await?;
+        let attachment = attachments.remove(&movie.movie_number);
+
+        let rankings = RankingCatalogService::new(pool.clone())
+            .list_movie_rankings(i64::from(movie_id))
+            .await?;
+
+        Ok(MovieDetail {
+            movie,
+            actor_ids,
+            tags,
+            media_items: attachment
+                .as_ref()
+                .map_or_else(Vec::new, |a| a.media_items.clone()),
+            media_count: attachment.as_ref().map_or(0, |a| a.media_count),
+            can_play: attachment.as_ref().is_some_and(|a| a.can_play),
+            rankings,
+            playlists,
         })
     }
 

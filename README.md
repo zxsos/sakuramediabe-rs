@@ -29,15 +29,15 @@ SakuraMedia 后端的 Rust 重写实现。
 | `sm-core` | JWT / Argon2 / 签名 URL / 分页原语 / 统一错误信封 | — | 127 |
 | `sm-db` | **模型映射 40/40 + 仓储层 + DDL 生成器** | `model/` + 部分 Peewee → sqlx | 426 |
 | `sm-plugin-api` | 插件 gRPC 契约（prost/tonic 生成）+ 插件侧默认实现层 | 插件 ABI（进程内 import → 独立进程） | 20 |
-| `sm-plugins` | 插件宿主：拉起 / 注册校验 / 看门狗 / 扩展点与 provider 调用面 / **插件包安装与盘点** | `src/plugins/` | 100 |
-| `sm-service` | 业务规则（**7 个域里 6 个有代码**） | 114 个 service 文件中的 106 个 | 859 |
-| `sm-api` | 错误信封 / 鉴权 / CORS / 端点 / multipart / **query 信封** / SSE 骨架 | FastAPI 路由层 | 312 |
+| `sm-plugins` | 插件宿主：拉起 / 注册校验 / 看门狗 / 扩展点与 provider 调用面 / **插件包的安装、升级、卸载与盘点** | `src/plugins/` | 128 |
+| `sm-service` | 业务规则（**7 个域里 6 个有代码**） | 114 个 service 文件中的 106 个 | 881 |
+| `sm-api` | 错误信封 / 鉴权 / CORS / 端点 / multipart / **query 信封** / SSE 骨架 | FastAPI 路由层 | 330 |
 | `sm-scheduler` | cron 解析 + 到点幂等入队 | APScheduler 的调度那一半 | 32 |
 | `sm-server` | 组合根（配置/池/日志/HTTP/调度器/优雅关闭） | uvicorn + 独立 APS 进程 | 44 |
 | `plugin-ref-local` | gRPC 参考插件（把本地目录包成 StorageProvider） | 插件 ABI 可行性验证 | 18 |
 | `parity-cli` | 对拍入口（开发工具） | — | — |
 
-- `cargo test`：**2015 passed / 0 failed**，113 个 suite（含真实 PostgreSQL 集成测试与 Qdrant）
+- `cargo test`：**2083 passed / 0 failed**，116 个 suite（含真实 PostgreSQL 集成测试与 Qdrant）
 - `python parity/compare.py`：**44/44** Rust 与 Python 逐条一致
 - `python parity/compare_core.py`：**64/64** 核心原语逐条一致
 - `python parity/compare_schema.py`：**40/40** 张表列名/类型/可空性一致

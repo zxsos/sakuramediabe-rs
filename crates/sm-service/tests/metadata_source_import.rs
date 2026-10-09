@@ -38,8 +38,9 @@ struct FakeJavdb {
     detail: Option<serde_json::Value>,
 }
 
+#[tonic::async_trait]
 impl MetadataProvider for FakeJavdb {
-    fn get_movie_by_number(
+    async fn get_movie_by_number(
         &self,
         _movie_number: &str,
     ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
@@ -47,14 +48,17 @@ impl MetadataProvider for FakeJavdb {
         Ok(self.detail.clone())
     }
 
-    fn get_movie_by_javdb_id(
+    async fn get_movie_by_javdb_id(
         &self,
         _javdb_id: &str,
     ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
         Ok(None)
     }
 
-    fn search_actors(&self, _keyword: &str) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
+    async fn search_actors(
+        &self,
+        _keyword: &str,
+    ) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
         Ok(Vec::new())
     }
 }

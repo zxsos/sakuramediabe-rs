@@ -325,6 +325,56 @@ impl PluginAdmin for PluginAdminService {
         // （`manager.py:273`）—— 升级不该把一个被停用的插件顺带启用。
         Ok(outcome(plugin_id.to_owned(), manifest.version, restart))
     }
+
+    fn remove_code(&self, plugin_id: &str) -> Result<(), ServiceError> {
+        let scanned = self.require_installed(plugin_id)?;
+        // **先停用，再删代码**：反过来的话，删到一半失败会在配置里留下一个
+        // 「启用中但目录已残缺」的插件 —— 下次启动会照 enabled 去找它。
+        self.write_enabled(&scanned.plugin_id, false)?;
+        remove_code_in(&scanned.dir).map_err(|error| {
+            ServiceError::from_status(
+                500,
+                "internal_error",
+                format!("删除插件代码失败 {}: {error}", scanned.dir.display()),
+            )
+        })
+    }
+}
+
+/// 删掉插件目录里除 `data/` 之外的一切（上游 `PluginManager._remove_locked`，
+/// `manager.py:327-343`）。
+///
+/// # 两个分支的差别在「有没有 data/」
+///
+/// | 有 `data/` | 动作 |
+/// |---|---|
+/// | 有 | 只删**目录里的其它东西**，目录本身与 `data/` 留着 |
+/// | 没有 | 连目录一起删 |
+///
+/// 留着空壳目录不是疏忽：重装时 `publish` 正是靠 `<root>/<id>/data` 把用户数据
+/// 接回去的。而它**不会被误认为「装了」** —— [`crate::inventory`] 要求目录里
+/// 有 `manifest.json` 才算装了，那个已经被删掉了。
+fn remove_code_in(dir: &Path) -> std::io::Result<()> {
+    let data = dir.join(installer::DATA_DIR_NAME);
+    if !data.is_dir() {
+        return std::fs::remove_dir_all(dir);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == data {
+            continue;
+        }
+        // 符号链接按**文件**删（`remove_dir_all` 会跟着链接走进去，把包外的
+        // 东西删掉）。上游同样先判 `is_symlink()`。
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// 安装结果。
@@ -907,6 +957,97 @@ mod tests {
             first.extension().is_some_and(|ext| ext == "zip"),
             "扩展名要是 .zip：{first:?}"
         );
+    }
+
+    // ============================================================ 卸载
+
+    /// ★ 删代码但**保留 `data/`**，并把它从 `enabled` 摘掉。
+    ///
+    /// 「保留 data/」是这步的全部要点：用户的数据不该因为一次误删消失，而重装时
+    /// `publish` 会把它接回去。
+    #[test]
+    fn removing_a_plugin_keeps_the_data_directory_and_disables_it() {
+        let (root, admin) = service("remove", "enabled = [\"local\"]\n");
+        let zip_path = package_in(&root, "local-1.0.0", "local", "1.0.0");
+        admin.install_zip(&zip_path, None, true).expect("安装");
+
+        let data = root.join("local").join(installer::DATA_DIR_NAME);
+        std::fs::create_dir_all(&data).expect("建 data 目录");
+        std::fs::write(data.join("state.json"), b"user data").expect("写用户数据");
+
+        admin.remove_code("local").expect("卸载");
+
+        assert!(
+            !root.join("local").join("manifest.json").exists(),
+            "代码要删"
+        );
+        assert!(!root.join("local").join("local").exists(), "入口文件也要删");
+        assert!(data.join("state.json").is_file(), "★ data/ 必须留下");
+        assert!(
+            admin.list().expect("列插件").is_empty(),
+            "删掉 manifest 之后就不再算「装了」"
+        );
+        assert_eq!(
+            admin.config.snapshot().expect("读配置")["plugins"]["enabled"],
+            json!([]),
+            "要从 enabled 里摘掉"
+        );
+    }
+
+    /// 没有 `data/` 时整个目录都删掉（不留空壳）。
+    #[test]
+    fn removing_a_plugin_without_data_takes_the_whole_directory() {
+        let (root, admin) = service("remove-nodata", "");
+        let zip_path = package_in(&root, "local-1.0.0", "local", "1.0.0");
+        admin.install_zip(&zip_path, None, true).expect("安装");
+
+        admin.remove_code("local").expect("卸载");
+
+        assert!(!root.join("local").exists(), "没有 data/ 就该整个删掉");
+    }
+
+    /// 删了再装回来：用户数据接回新安装。
+    ///
+    /// 这是「保留 `data/`」的**目的** —— 单看上一个测试只是「没删 data 目录」，
+    /// 这一条才证明它有用。
+    #[test]
+    fn reinstalling_after_removal_picks_the_data_back_up() {
+        let (root, admin) = service("remove-reinstall", "");
+        let first = package_in(&root, "local-1.0.0", "local", "1.0.0");
+        admin.install_zip(&first, None, true).expect("首次安装");
+        let data = root.join("local").join(installer::DATA_DIR_NAME);
+        std::fs::create_dir_all(&data).expect("建 data 目录");
+        std::fs::write(data.join("state.json"), b"user data").expect("写用户数据");
+
+        admin.remove_code("local").expect("卸载");
+        let again = package_in(&root, "local-1.0.0-again", "local", "1.0.0");
+        admin.install_zip(&again, None, true).expect("重装");
+
+        assert_eq!(
+            std::fs::read(data.join("state.json")).expect("data 必须接回来"),
+            b"user data"
+        );
+    }
+
+    /// 没装的插件 → 404（上游 `_remove_locked` 开头就判 `manifest.json` 在不在）。
+    #[test]
+    fn removing_an_unknown_plugin_is_a_404() {
+        let (root, admin) = service("remove-unknown", "");
+        install(&root, "local");
+
+        let error = admin.remove_code("ghost").expect_err("没装该 404");
+        assert_eq!(error.status, 404);
+        assert_eq!(error.code(), PLUGIN_NOT_FOUND);
+    }
+
+    /// 非法插件 id 同样 404（不拼路径出去）。
+    #[test]
+    fn removing_a_malformed_plugin_id_is_a_404() {
+        let (_, admin) = service("remove-malformed", "");
+        for bad in ["../../etc", "Local", "..", ""] {
+            let error = admin.remove_code(bad).expect_err("非法 id 该 404");
+            assert_eq!(error.status, 404, "{bad}");
+        }
     }
 
     /// ★ 超过 24 小时的残留上传会被清掉，新的不会被清。

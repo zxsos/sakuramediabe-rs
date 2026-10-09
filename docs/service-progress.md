@@ -279,7 +279,7 @@ service 又要一份 —— 三处互不依赖的 crate 共用一个字符串常
 - 刷新时取用户用 `find_primary`（照搬上游的 `User.select().order_by(id).first()`），
   因为 `user_refresh_tokens` **没有 `user_id` 列** —— 改不了的是 schema，不是这里。
 
-## `plugin_removal` —— 被插件 ABI 阻塞
+## `plugin_removal` —— 已完成（`2b06074`），但占用检查有一个已知缺口
 
 上游 95 行。数据库那一半（给定 `provider_keys` → 查 `media_library` /
 `media` / `download_client` 的占用计数 → 抛带 details 的 `PluginInUseError`）
@@ -291,9 +291,20 @@ service 又要一份 —— 三处互不依赖的 crate 共用一个字符串常
 provider registry 不存在。
 
 只落数据库那一半会得到一个**没有调用方的**服务 —— `remove()` 的第一步就是
-`_provider_keys`。所以整体记为阻塞，等阶段 8。
+`_provider_keys`。原先因此记为阻塞；**2026-10-07 晚（`2b06074`）已按上游重写并落地**。
 
-**2026-10-07 更新（前提变了，结论没变）**：上面「`sm-plugins` 仍是一行注释」
+同时**删掉了骨架期自造的 `PluginRemovalReport`**（七字段，含 `incomplete` /
+`mark_incomplete`）与那两条测试：上游的卸载路径不释放 `field_owners`、不清
+扩展点数据、不停进程。逐条核对见 [`handoff.md`](handoff.md) 的 §7.2d。
+
+**当前缺口**：占用检查要「plugin_id → provider_key」的反向索引，上游两条来源
+（活跃注册表 / 试加载插件目录）在 Rust 侧都不可用，所以路由传
+`NoProviderKeys`（恒空）→ **这一条安全检查目前不生效**，一个仍被媒体库引用的
+插件能被删掉。这与上游不完全等价（上游对正在服役的插件查得到键）。补它的前置
+是 provider 注册表带上反向索引；`tests/plugin_removal.rs` 里有一条**故意断言
+「空索引会放行」**的测试，注册表接上时它会失败，正好改成断言 409。
+
+**2026-10-07 更新（前提变了，结论也变了）**：上面「`sm-plugins` 仍是一行注释」
 **已经过时** —— 宿主现在是完整的（拉起 / 注册校验 / 看门狗 / 扩展点）。
 本轮又落了**插件管理**（上游 `src/plugins/manager.py`，不属于 `src/service/`
 所以不在本文件的汇总口径里）的下面这几块：
@@ -301,19 +312,29 @@ provider registry 不存在。
 | 上游 | Rust | 状态 |
 |---|---|---|
 | `PluginInstaller.unpack`（安全解压 + sha256） | `sm_plugins::installer::unpack` | ✅ `0c0ef57` |
-| `PluginManager._publish_staging_locked` | `sm_plugins::installer::publish` | ✅ 本轮（4 测试） |
-| `PluginManager.list_plugins` 的目录扫描那一半 | `sm_plugins::inventory` | ✅ 本轮（8 测试） |
-| `list_plugins` / `get_plugin` / `set_enabled` 的编排 | `sm_plugins::admin::PluginAdminService` | ✅ 本轮（11 测试） |
-| 三个端点的 HTTP 层 | `sm-api/routes/plugins.rs` | ✅ 本轮（8 个 HTTP 契约测试） |
-| `install_zip` / `upgrade_zip` / `settings` | —— | ⏳ 目录层已就位，只差接线 |
+| `PluginManager._publish_staging_locked` | `sm_plugins::installer::publish` | ✅ `7933f56`（4 测试） |
+| `PluginManager.list_plugins` 的目录扫描那一半 | `sm_plugins::inventory` | ✅ `7933f56`（8 测试） |
+| `list_plugins` / `get_plugin` / `set_enabled` 的编排 | `sm_plugins::admin::PluginAdminService` | ✅ `7933f56`（11 测试） |
+| `install_zip` / `upgrade_zip` / `_upload_temp_path` | 同上（`+` `versions` 版本比较） | ✅ `8656a21`（23 测试） |
+| 五条端点的 HTTP 层 | `sm-api/routes/plugins.rs` | ✅ `7933f56` + `8656a21`（18 个 HTTP 契约测试） |
+| `PluginManager.remove`（停用 + 删代码、保留 `data/`） | `sm_plugins::admin::remove_code` | ✅ `2b06074`（5 测试） |
+| `PluginRemovalService.remove`（占用检查） | `sm_service::system::plugin_removal` | ✅ `2b06074`（6 真库测试） |
+| 第六条端点 `DELETE /{id}` | `sm-api/routes/plugins.rs` | ✅ `2b06074`（200 + body） |
+| `set_plugin_settings` / `get_plugin_settings` | —— | ⏳ 见下 |
 
-**但 `plugin_removal` 依然阻塞**，卡点换了一个位置：`_provider_keys` 现在不缺
+**还剩两条 settings 端点，它们不是「接线」**：上游的 `schema` / `defaults`
+来自插件的 pydantic `settings_model`（`get_plugin_settings_definition`），
+Rust 侧没有对应物 —— 要做就得先定「Rust 插件怎么声明自己的设置项」。
+`plugins.settings` 这一节本身早就能读写（`ConfigService::update_plugins_section`，
+`7933f56` 加的），缺的是**校验与表单描述**。
+
+**但 `plugin_removal` 已落地（`2b06074`）**，剩下的卡点只剩一个：`_provider_keys` 现在不缺
 「加载插件」的能力（宿主有了），缺的是**扩展点 → provider key 的映射**（
-`MEDIA_PROVIDER_EXTENSION_KEY`）—— 那要 provider 注册表那批。另外
-`PluginRemovalService::remove()` 的第一步「停插件进程」也需要一条
-「supervisor → 服务层」的通道（与 `load_status` 的缺口是同一件事）。
+`MEDIA_PROVIDER_EXTENSION_KEY`）—— 那要 provider 注册表那批。
+（**更正**：原文此处还写「`remove()` 第一步要停插件进程，需要 supervisor 通道」——
+那也是自造的：上游卸载不停进程，进程等重启。）
 
-`PluginInUseError` 的 details 形状值得先记下来，将来照抄：
+`PluginInUseError` 的 details 形状已照抄落地（`plugin_removal.rs` 的 `in_use()`，含中文文案）：
 `{plugin_id, provider_keys, library_ids, media_count, download_client_count}`，
 message 是「插件仍被 N 个媒体库引用（M 个媒体、K 个下载客户端），无法删除；
 请先迁移或删除相关媒体库。」
