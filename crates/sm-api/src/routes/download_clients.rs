@@ -37,7 +37,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
-use crate::extract::Query as EnvelopeQuery;
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 

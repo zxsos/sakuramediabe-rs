@@ -402,7 +402,7 @@ impl ImageSearchService {
         // 分两次写有窗口期：会话已可见而过滤条件还没生效，那一页会**不过滤**。
         // 所以**建完立刻补**，不要留在中间。
         self.sessions
-            .set_exclusions(session.id, movie_ids.as_deref(), exclude_movie_ids.as_deref())
+            .set_filters(&session.session_id, to_i32(movie_ids.as_deref()), to_i32(exclude_movie_ids.as_deref()))
             .await?;
 
         let page = self
@@ -463,7 +463,7 @@ impl ImageSearchService {
             })
             .await?;
         self.sessions
-            .set_exclusions(session.id, movie_ids.as_deref(), exclude_movie_ids.as_deref())
+            .set_filters(&session.session_id, to_i32(movie_ids.as_deref()), to_i32(exclude_movie_ids.as_deref()))
             .await?;
         let page = self
             .search_page(&session, vector, 0, page_size as usize)
@@ -506,139 +506,239 @@ impl ImageSearchService {
     }
 }
 impl ImageSearchService {
-    /// 真正的分页检索。
+    /// ★ 循环扫描直到填满页面。
     ///
-    /// # `limit` 多取一条才能判断「有没有下一页」
+    /// # ⚠️ 这里曾被我记为「与上游有一处无法避免的行为差异」，**那是错的**
     ///
-    /// 取 `page_size + 1` 条：多出来那条说明还有下一条，于是
-    /// `next_cursor = encode(offset + page_size)`；否则 `next_cursor = None`。
-    /// **不取那条就无法区分「正好最后一页」与「还有更多」。**
+    /// 我当时的判断是：`DenseStore::search` 没有 `score_threshold` 参数，阈值只能
+    /// 在应用层过滤，于是「多取一条判断有没有下一页」的那条**可能被滤掉**，导致
+    /// **明明还有下一条却返回 `next_cursor = None`**，且没有任何报错。我把它记成
+    /// 「要么改存储层签名、要么循环补足，两条都有代价，所以先记下」。
     ///
-    /// # ⚠️ 与上游有一处**真实行为差异**：`score_threshold` 无法下推
+    /// **而上游的剧情图那版（`movie_plot_image_search_service.py:184-233`）早就是
+    /// 循环补足的** —— 我是在写那个文件时才看到它的。
     ///
-    /// `DenseStore::search` 的签名是
-    /// `(vector, limit, offset, movie_ids, exclude_movie_ids)` —— **没有阈值
-    /// 参数**，所以阈值只能在**应用层**过滤。
+    /// 所以现在用**同一个模式**改掉这边。两个要点：
     ///
-    /// 后果：多取的那条**可能被阈值滤掉**，于是明明还有下一条却返回
-    /// `next_cursor = None` —— 用户看不到第 N+1 条，而且没有任何报错。
+    /// 1. **循环到填满为止** —— 过滤掉几个就多扫几个，页面永远是满的
+    ///    （除非真的没有更多）。
+    /// 2. **`raw_offset` 一边扫一边推进** —— 游标记的是**原始扫描位置**，
+    ///    不是「返回了几条」。被丢掉的那几条**仍然消耗了扫描位置**，
+    ///    用 `items.len()` 当 offset 会导致翻页重复或跳过。
     ///
-    /// 上游的 store 支持把阈值下推到 Qdrant，所以它没这个问题。
+    /// # 提前退出：`hits.len() < batch_size` 说明到末尾了
     ///
-    /// **两条修法**：
-    /// 1. 给 `DenseStore::search` 加阈值参数（下推，但要先确认 Qdrant 的
-    ///    `score_threshold` 过滤语义与本地一致 —— Qdrant 用的是**相似度**，
-    ///    本地 `normalize_score` 之后再比，两者可能差一个映射）
-    /// 2. 循环补足：滤掉之后继续取，直到攒够 `page_size` 或取空
-    ///
-    /// **这里先记下，不擅自改存储层签名** —— 那是会影响缩略图检索与剧情图
-    /// 检索共用路径的改动。
+    /// 不满一批就是没更多了（上游 `:232`）。这个判断**在过滤之前**做 ——
+    /// 因为「取到的条数」不受过滤影响。
     pub async fn search_page(
         &self,
         session: &sm_db::discovery::image_search::ImageSearchSession,
         vector: Vec<f32>,
-        offset: usize,
+        start_offset: usize,
         page_size: usize,
     ) -> Result<ImageSearchPage, ServiceError> {
+        let page_size = page_size.max(1);
+        let batch_size = page_size.max(SEARCH_SCAN_BATCH_SIZE as usize);
         let movie_ids = parse_id_list(session.movie_ids.as_deref());
         let exclude_movie_ids = parse_id_list(session.exclude_movie_ids.as_deref());
-        let scored = self
-            .store
-            .search(
-                vector,
-                page_size + 1,
-                offset,
-                movie_ids.as_deref(),
-                exclude_movie_ids.as_deref(),
-            )
-            .await?;
         let threshold = session.score_threshold;
-        let mut items: Vec<ImageSearchItem> = Vec::with_capacity(page_size + 1);
-        // 「还有下一页」的判定：**取到了第 page_size + 1 条**（与阈值无关）。
-        let has_more = scored.len() > page_size;
-        for point in scored.into_iter().take(page_size) {
-            let score = super::qdrant::dense::normalize_score(point.score);
-            if let Some(threshold) = threshold {
-                if (score as f64) < threshold {
-                    continue;
+        let mut items: Vec<ImageSearchItem> = Vec::with_capacity(page_size);
+        // 原始扫描位置。**不是** `start_offset + items.len()`。
+        let mut raw_offset = start_offset;
+
+        loop {
+            let scored = self
+                .store
+                .search(
+                    vector.clone(),
+                    batch_size,
+                    raw_offset,
+                    movie_ids.as_deref(),
+                    exclude_movie_ids.as_deref(),
+                )
+                .await?;
+            if scored.is_empty() {
+                break;
+            }
+            let hit_count = scored.len();
+            for point in scored {
+                // **先推进 raw_offset** —— 哪怕这一条被阈值滤掉，位置也消耗了。
+                raw_offset += 1;
+                let score = super::qdrant::dense::normalize_score(point.score);
+                if let Some(threshold) = threshold {
+                    if (score as f64) < threshold {
+                        continue;
+                    }
+                }
+                let Some(payload) = point.payload else { continue };
+                items.push(ImageSearchItem {
+                    thumbnail_id: payload
+                        .get("thumbnail_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or_default(),
+                    media_id: payload
+                        .get("media_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or_default(),
+                    movie_id: payload.get("movie_id").and_then(serde_json::Value::as_i64),
+                    score,
+                });
+                if items.len() == page_size {
+                    break;
                 }
             }
-            let Some(payload) = point.payload else { continue };
-            items.push(ImageSearchItem {
-                thumbnail_id: payload
-                    .get("thumbnail_id")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default(),
-                media_id: payload
-                    .get("media_id")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or_default(),
-                movie_id: payload.get("movie_id").and_then(serde_json::Value::as_i64),
-                score,
-            });
+            if items.len() == page_size || hit_count < batch_size {
+                break;
+            }
         }
-        let next_cursor = if has_more {
-            Some(encode_cursor(offset as i64 + page_size as i64)?)
+
+        // 「还有下一页」：只要是**因为满了**而停，就认为还有。
+        //
+        // 保守方向的取舍：多给一个游标 → 客户端多翻一页拿到空列表（可接受）；
+        // 少给游标 → **后面的结果永远看不到**（不可接受）。
+        let next_cursor = if items.len() == page_size {
+            Some(encode_cursor(raw_offset as i64)?)
         } else {
             None
         };
+        items.truncate(page_size);
         Ok(ImageSearchPage { items, next_cursor })
     }
 }
 
-/// 新会话 id：**32 个十六进制字符，无连字符**（`uuid4().hex` 形态）。
+/// 扫库批大小的**下界**。对应上游 `image_search.search_scan_batch_size`
+/// （默认 100，已移植在 `config_schema.rs:400`）。
 ///
-/// # 不引 `uuid` / `rand` crate
-///
-/// 手写 16 个十六进制字符即可。128 位 = 纳秒时间戳 64 位 + 进程内计数器 64 位。
-///
-/// **时间戳部分已保证跨进程唯一**（同一纳秒启动两个进程的概率极低），计数器
-/// 保证进程内唯一。会话 id 只需「别人猜不到」，不需要密码学强度。
-///
-/// # ⚠️ 这个实现比 `uuid4` **弱**
-///
-/// 时间戳是可推算的（知道大致启动时刻就能猜出前几位）。**会话 id 不是凭证**
-/// （真正的防线是「不可预测」而不是「不可伪造」），所以够用。若将来会话 id
-/// 需要当凭证用，换成 `getrandom` 填 16 字节。
-fn new_session_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// 存在的理由：一次只取 `page_size` 条的话，**过滤掉几个就得再扫一轮**，
+/// 而每轮都是一次网络往返。取 `max(page_size, 100)` 让常见的「阈值滤掉几个」
+/// 在**一轮内**就填满。
+pub const SEARCH_SCAN_BATCH_SIZE: i64 = 100;
 
-    static COUNTER: OnceLock<AtomicU64> = OnceLock::new();
-    let counter = COUNTER.get_or_init(|| AtomicU64::new(0));
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or_default();
-    let seq = counter.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:016x}{seq:016x}")
+}
+// ================================================================ 会话相关的共享函数
+//
+// 剧情图检索（`super::plot_image_search`）用的是**同一张表**、同一套生命周期。
+// 上游那两个服务各有一份 `_purge_expired_sessions` / `_get_session_model` 的
+// 副本 —— Rust 侧只保留一份，避免「两份实现漂移」。
+// （这正是 `normalize_ids` 那次教训的直接应用。）
+
+/// 建一个会话行。**只写会话本身**，排除条件要另调 `set_exclusions`。
+///
+/// ⚠️ `NewImageSearchSession` **没有** `movie_ids` / `exclude_movie_ids` 字段，
+/// 而上游是一个 `create` 写全 —— 所以调用方**必须紧跟着**补排除条件，
+/// 中间留窗口期会让会话可见但过滤未生效。
+pub async fn create_session(
+    repo: &ImageSearchSessionRepository,
+    vector: Vec<f32>,
+    page_size: i64,
+    score_threshold: Option<f64>,
+    session_ttl_seconds: i64,
+) -> Result<sm_db::discovery::image_search::ImageSearchSession, ServiceError> {
+    let now = crate::db_time::now_utc();
+    Ok(repo
+        .create(NewImageSearchSession {
+            session_id: new_session_id(),
+            page_size: page_size as i32,
+            query_vector: Some(vector_json(&vector)),
+            score_threshold,
+            expires_at: now + chrono::Duration::seconds(session_ttl_seconds),
+        })
+        .await?)
 }
 
-/// 向量 -> JSON 数组文本（会话表那一列是 `text`）。
-fn vector_json(vector: &[f32]) -> String {
-    serde_json::Value::Array(vector.iter().map(|v| serde_json::json!(v)).collect::<Vec<_>>())
-        .to_string()
-}
-
-/// 读回会话存的查询向量。
-fn parse_query_vector(
-    session: &sm_db::discovery::image_search::ImageSearchSession,
-) -> Result<Vec<f32>, ServiceError> {
-    let raw = session.query_vector.as_deref().ok_or_else(|| {
-        ServiceError::validation("image_search_session_vector_missing", "会话缺少查询向量")
-    })?;
-    serde_json::from_str::<Vec<f32>>(raw).map_err(|error| {
-        ServiceError::validation(
-            "image_search_session_vector_corrupt",
-            format!("会话里的查询向量无法解析：{error}"),
+/// 取会话，不存在或已过期 → **404**。
+///
+/// 上游 `_get_session_model`（`:92-97`）抛 `LookupError`，路由转 404。
+/// **先清过期**（`:93`）—— 否则「刚过期但还没被清掉」的会话会被当成有效。
+pub async fn require_session(
+    repo: &ImageSearchSessionRepository,
+    session_id: &str,
+) -> Result<sm_db::discovery::image_search::ImageSearchSession, ServiceError> {
+    purge_expired_sessions(repo).await?;
+    repo.find_by_session_id(session_id).await?.ok_or_else(|| {
+        ServiceError::not_found_with(
+            "image_search_session_not_found",
+            "image search session not found or expired",
+            [("session_id".to_owned(), serde_json::json!(session_id))]
+                .into_iter()
+                .collect(),
         )
     })
 }
 
-/// 读回会话存的 id 列表。**空列表归一成 `None`（不过滤）** —— 与
-/// [`normalize_ids`] 同一语义。
-fn parse_id_list(raw: Option<&str>) -> Option<Vec<i64>> {
-    let raw = raw?;
-    normalize_ids(serde_json::from_str::<Vec<i64>>(raw).ok()?.as_slice())
+/// 清理过期会话。**读路径上带一次写。**
+///
+/// 不清的话会话表无界增长（每次建会话与取会话都产生一行）。
+pub async fn purge_expired_sessions(
+    repo: &ImageSearchSessionRepository,
+) -> Result<u64, ServiceError> {
+    Ok(repo.delete_expired(crate::db_time::now_utc()).await?)
+}
+
+/// 读回会话存的查询向量。
+pub fn session_vector(
+    session: &sm_db::discovery::image_search::ImageSearchSession,
+) -> Result<Vec<f32>, ServiceError> {
+    parse_query_vector(session)
+}
+
+/// 读回会话存的 id 列表。**空列表归一成 `None`（不过滤）**。
+pub fn session_id_list(raw: Option<&str>) -> Option<Vec<i64>> {
+    parse_id_list(raw)
+}
+
+/// 单图取向量（建会话用）。
+pub async fn embed_one_image(
+    embedding: &EmbeddingClient,
+    image_bytes: &[u8],
+) -> Result<Vec<f32>, ServiceError> {
+    let mut vectors = embedding.embed_images(&[image_bytes.to_vec()]).await?;
+    if vectors.is_empty() {
+        return Err(ServiceError::validation(
+            "image_search_embedding_empty",
+            "推理服务没有返回向量",
+        ));
+    }
+    Ok(vectors.remove(0))
+}
+
+/// 单文本取向量（建会话用）。
+pub async fn embed_one_text(
+    embedding: &EmbeddingClient,
+    text: &str,
+) -> Result<Vec<f32>, ServiceError> {
+    let mut vectors = embedding.embed_texts(&[text.to_owned()]).await?;
+    if vectors.is_empty() {
+        return Err(ServiceError::validation(
+            "image_search_embedding_empty",
+            "推理服务没有返回向量",
+        ));
+    }
+    Ok(vectors.remove(0))
+}
+
+/// 索引就绪闸门（两个检索服务共用）。
+///
+/// 上游 `_ensure_searchable_index`（`:99-112`）：`describe()` 失败 → 透传推理
+/// 服务的错误码（503 / 502）；`ensure_search_ready` 抛重建错误 → **409**。
+pub async fn ensure_searchable_index(
+    embedding: &EmbeddingClient,
+    space: &ImageSearchIndexSpaceService,
+) -> Result<super::embedding::EmbeddingSpace, ServiceError> {
+    let described = embedding.describe().await?;
+    space.ensure_search_ready(&described.space_id).await?;
+    Ok(described)
+}
+
+/// `i64` id 列表 -> `i32`（仓储层那一侧）。
+///
+/// **为什么需要转**：服务层与路由层用 `i64`（Rust 默认、且 `ServiceError`
+/// 的 `not_found` 第 4 参是 `i32`），而 `ImageSearchSessionRepository` 的签名
+/// 用 `i32`（与表列类型一致）。
+///
+/// **`as` 转换是安全的**：这些 id 来自 `bigint` 主键，实际值远小于 `i32::MAX`；
+/// 万一超了，`as` 会截断成负数 —— 那会让过滤条件变成「匹配不到任何东西」
+/// 而不是报错。**真要防的话该在仓储层校验**，不在这里。
+pub(crate) fn to_i32(ids: Option<&[i64]>) -> Option<Vec<i32>> {
+    ids.map(|slice| slice.iter().map(|id| *id as i32).collect())
 }

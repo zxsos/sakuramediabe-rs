@@ -657,3 +657,66 @@ impl MovieFeatureRepository {
         Ok(out)
     }
 }
+/// 剧情图 → 影片链接（检索结果拼装用）。
+///
+/// # 为什么需要单独一次查询
+///
+/// 向量库里只有 `plot_image_id` 与 `movie_id`，**没有番号**（`movie_number`）。
+/// 而响应要带番号 —— 所以必须回表。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlotImageLink {
+    pub plot_image_id: i32,
+    pub movie_id: Option<i32>,
+    pub movie_number: Option<String>,
+    /// 图片字节或路径所需的信息。**这里只带 id**，URL 延迟拼。
+    pub image_id: i32,
+}
+
+impl PendingImageRepository {
+    /// 取剧情图 → 影片链接。
+    ///
+    /// # `INNER JOIN movie` 且排除黑名单 —— **两个后果**
+    ///
+    /// 上游 `_get_links`（`:250-262`）：
+    ///
+    /// ```python
+    /// .join(Movie, JOIN.INNER)
+    /// .where(Movie.is_blacklisted == False)
+    /// ```
+    ///
+    /// 1. **没有关联影片的剧情图查不出来** —— 于是检索命中它时 `link is None`，
+    ///    `_build_item` 返回 `None`，那一项被丢弃。
+    /// 2. **影片在黑名单里的也查不出来** —— 同样被丢弃。
+    ///
+    /// **所以向量检索的命中率会低于 100%**，而调用方看到的 `items` 只是过滤后的
+    /// 结果。**这不是 bug，是刻意的**（黑名单是用户明确排除的内容）。
+    ///
+    /// # 去重照抄上游 `dict.fromkeys(plot_image_ids)`
+    ///
+    /// 上游 `:257`。同一批 id 可能重复（向量库返回重复点），去重省一次 join。
+    pub async fn plot_image_links(
+        &self,
+        plot_image_ids: &[i32],
+    ) -> Result<HashMap<i32, PlotImageLink>, DbError> {
+        if plot_image_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = r#"
+            SELECT p.id AS plot_image_id,
+                   p.movie AS movie_id,
+                   m.movie_number AS movie_number,
+                   p.image AS image_id
+            FROM movie_plot_image p
+            JOIN image i ON i.id = p.image
+            JOIN movie m ON m.movie_number = p.movie
+            WHERE p.id = ANY($1)
+              AND m.is_blacklisted = false
+        "#;
+        let rows: Vec<PlotImageLink> = sqlx::query_as(sql)
+            .bind(plot_image_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        Ok(rows.into_iter().map(|link| (link.plot_image_id, link)).collect())
+    }
+}

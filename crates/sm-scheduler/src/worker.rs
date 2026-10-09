@@ -396,6 +396,47 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
         }),
     );
 
+    // `movie_similarity_recompute` —— 影片相似度全量重算。
+    //
+    // **第三个落地的 handler**，与 `image_search_index` 共用 Qdrant 端点但走
+    // **另一条通路**：`image_search` 用稠密向量（`DenseStore`），这里用
+    // **稀疏向量**（`MovieSimilarityStore`，带蓝绿集合切换）。
+    //
+    // # 为什么这个任务的失败后果比图搜更大
+    //
+    // 相似度索引是**每日推荐的主信号**（权重 8/19）。它坏掉时每日推荐不会
+    // 报错 —— 那一路信号降级成 0，所有推荐退化成冷启动（见
+    // `daily_recommendation` 的三种制度）。所以**这个任务静默失败比报错更
+    // 糟**，不能像图搜那样「未启用就跳过」——
+    // `job_disabled_reason("movie_similarity_recompute", …)` 已经在领取前
+    // 拦住了未启用的情况，走到工厂里就说明**该跑**。
+    registry.register(
+        "movie_similarity_recompute",
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&deps);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    // Qdrant 没配端点 = 配置自相矛盾（`qdrant.enabled` 为真
+                    // 却没 url），**报错**而不是跳过 —— 见
+                    // `build_image_search_service` 里同一条的说明。
+                    let service = build_movie_similarity_service(db, &deps)?;
+                    let mut sink: sm_service::discovery::recommendation::ProgressSink<'_> =
+                        Box::new(move |current, total, text, patch| {
+                            Box::pin(async move { reporter.emit(current, total, Some(text), patch).await })
+                        });
+                    let stats = service
+                        .recompute_all(Some(&mut sink))
+                        .await
+                        .map_err(|error| format!("影片相似度重算失败：{}", error.code()))?;
+                    // 键名与上游逐字一致 —— 会进 `signal_scores` 一类的列。
+                    serde_json::to_value(stats)
+                        .map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
     registry
 }
 
@@ -491,6 +532,46 @@ fn build_image_search_service(
         Arc::new(embedding()?),
         sm_db::repo::discovery::PendingImageRepository::new(db.clone()),
         sm_db::repo::discovery::ImageSearchIndexStateRepository::new(db.clone()),
+    )))
+}
+
+/// 构造 `MovieRecommendationService`。Qdrant 未启用时返回 `None`。
+///
+/// # 与 [`build_image_search_service`] 的三处差别
+///
+/// | | `image_search_index` | `movie_similarity_recompute` |
+/// |---|---|---|
+/// | 能力开关 | `image_search_enabled`（两个开关） | `movie_similarity_enabled`（只要 Qdrant） |
+/// | 构造失败 | `None`（未启用，正常跳过） | **不适用** —— 走到这里必然已启用 |
+/// | 推理服务 | 需要（`EmbeddingClient`） | **不需要** —— 稀疏向量全在 DB 侧算 |
+///
+/// 第三行是这个函数**不需要** `EmbeddingClient` 的原因：相似度用的是
+/// 演员/标签的 **IDF 加权稀疏向量**（`recommendation::build_sparse_vector`），
+/// 没有图片，自然没有推理这一跳。
+fn build_movie_similarity_service(
+    db: &Db,
+    deps: &HandlerDeps,
+) -> Result<Option<sm_service::discovery::recommendation::MovieRecommendationService>, String> {
+    use sm_service::discovery::qdrant::similarity::MovieSimilarityStore;
+    use sm_service::discovery::recommendation::MovieRecommendationService;
+
+    // 与 `build_image_search_service` 同一条理由：读不到配置按「未启用」处理，
+    // 不让整个 worker 因配置读失败而把任务判失败。
+    let Ok(snapshot) = deps.config.snapshot() else {
+        return Ok(None);
+    };
+    if !sm_service::system::optional_services::movie_similarity_enabled(&snapshot) {
+        return Ok(None);
+    }
+    if !deps.qdrant.is_configured() {
+        return Err("movie_similarity 已启用但 qdrant.url 为空：配置不一致".to_owned());
+    }
+    let base = deps.qdrant.url.trim_end_matches('/');
+    let store = MovieSimilarityStore::connect(base, deps.qdrant.api_key.as_deref())
+        .map_err(|error| format!("向量库连接失败：{}", error.code()))?;
+    Ok(Some(MovieRecommendationService::new(
+        store,
+        sm_db::repo::recommendation::MovieFeatureRepository::new(db.clone()),
     )))
 }
 

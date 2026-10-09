@@ -153,6 +153,7 @@ pub mod gateway;
 pub mod image;
 pub mod library;
 pub mod media;
+pub mod moment;
 pub mod movie;
 pub mod playback;
 pub mod recommendation;

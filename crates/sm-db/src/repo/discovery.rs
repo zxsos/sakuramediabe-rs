@@ -1064,3 +1064,56 @@ impl PendingImageRepository {
         Ok(result.rows_affected())
     }
 }
+impl ImageSearchSessionRepository {
+    /// 写入会话的**两个**过滤字段。
+    ///
+    /// # 为什么需要这个方法（而不是复用 `set_exclusions`）
+    ///
+    /// `set_exclusions`（`:406`）只写 **`exclude_movie_ids`**，而
+    /// `movie_ids`（包含范围）**没有任何写入方法** —— 但模型上有这一列，
+    /// 上游的 `create` 也是两个一起写的。
+    ///
+    /// 所以图搜与剧情图搜建会话时都需要这个方法。**已有的 `set_exclusions`
+    /// 保留**（它是只改排除条件的窄操作，语义清晰）。
+    ///
+    /// # `None` 与「写成空数组」不同
+    ///
+    /// - `None` -> 写 SQL `NULL` -> **不过滤**（服务层的 `normalize_ids` 把空
+    ///   列表也归一成 `None`，所以两者等价）
+    /// - `Some(&[])` -> 写 `[]` -> `parse_id_list` 读回来又归一成 `None`
+    ///
+    /// **两条路都通向「不过滤」**，与上游的 `_normalize_ids` 语义一致。
+    /// 统一在服务层归一，这里不重复判断。
+    pub async fn set_filters(
+        &self,
+        session_id: &str,
+        movie_ids: Option<&[i32]>,
+        exclude_movie_ids: Option<&[i32]>,
+    ) -> Result<bool, DbError> {
+        let now = crate::common::time::now_utc();
+        let encode = |ids: Option<&[i32]>| -> Result<Option<String>, DbError> {
+            match ids {
+                None => Ok(None),
+                // 上游存的是 JSON 数组文本（模型字段是 `Option<String>`）。
+                Some(list) => serde_json::to_string(list).map(Some).map_err(|e| {
+                    DbError::business(SESSION_ENTITY, format!("序列化过滤条件失败: {e}"))
+                }),
+            }
+        };
+        let movie_json = encode(movie_ids)?;
+        let exclude_json = encode(exclude_movie_ids)?;
+        let result = sqlx::query(
+            "UPDATE image_search_session \
+             SET movie_ids = $2, exclude_movie_ids = $3, updated_at = $4 \
+             WHERE session_id = $1",
+        )
+        .bind(session_id.trim())
+        .bind(movie_json)
+        .bind(exclude_json)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(SESSION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+}

@@ -22,8 +22,11 @@
 //! 上游返回 200，本仓库返回 422。照抄。
 //!
 //! **2. 分页响应形态。** daily/hot-actress 用泛型 `PageResponse[T]`（带 `total`），
-//! moment 用专用 `MomentRecommendationPageResource`（**不带 `total`**）。
-//! 所以 [`MomentRecommendationPage`] 的形状与另两个不同 —— 不是漏字段。
+//! moment 用专用 `MomentRecommendationPageResource` —— 形状不同，**但不是
+//! 「少一个 total」**：专用资源里 `total` 与 `generated_at` 都在（见
+//! `upstream/sakuramediabe/src/schema/discovery/moment_recommendations.py:21-26`）。
+//! 真实差别是 moment **多一个 `generated_at`**，且 `items` 的元素是嵌套的
+//! `image` + `movie` 对象而非扁平字段。
 
 use axum::extract::State;
 use axum::routing::get;
@@ -32,9 +35,10 @@ use serde::{Deserialize, Serialize};
 use sm_service::discovery::daily_recommendation::DailyRecommendationItem;
 use sm_db::repo::discovery::HotActressReleaseRepository;
 use sm_service::discovery::hot_actress_release::{HotActressReleaseItem, HotActressReleaseQuery};
-use sm_service::discovery::moment_recommendation::MomentRecommendationItem;
+use sm_service::discovery::moment_recommendation::MomentRecommendationRow;
 
 use crate::auth::CurrentUser;
+use crate::dto::{ImageResource, MovieListItemResource};
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
@@ -97,24 +101,62 @@ struct UnboundedPageQuery {
     page_size: i64,
 }
 
-/// 瞬时推荐响应 —— **不带 `total`**。
+/// 瞬时推荐单条（上游 `MomentRecommendationItemResource`）。
 ///
-/// 上游用专用资源而非 `PageResponse[T]`，所以没有总数字段。
-/// **不是漏字段**，照抄。
+/// # 与另两个列表的 item **形状不同**
+///
+/// daily / hot-actress 的元素是**扁平**影片字段，而这里是
+/// `image` + `movie` 两个**嵌套对象**（上游 `:8-18`）。所以不能用同一个
+/// 泛型 `PageResponse<T>` —— 那会把 `movie` 拍平，客户端反序列化直接失败。
+#[derive(Debug, Serialize)]
+struct MomentRecommendationItemResource {
+    recommendation_id: i64,
+    rank: i64,
+    score: f64,
+    strategy: String,
+    reason: String,
+    media_id: i64,
+    thumbnail_id: i64,
+    offset_seconds: i64,
+    /// 该时刻的缩略图。**`origin` 要签名**（见 [`ImageResource`]）。
+    image: ImageResource,
+    movie: MovieListItemResource,
+}
+
+/// 瞬时推荐分页（上游 `MomentRecommendationPageResource`）。
+///
+/// # `total` **不是**表里的总行数
+///
+/// 上游 `:513-520` 的 `total` 与分页都带 `Media.valid == True` 且
+/// `Movie.is_blacklisted == False` 两个条件 —— 失效的媒体与黑名单影片**不占
+/// 分页槽位**。用 `COUNT(*)` 会让最后一页的条目数少于 `page_size` 却仍然
+/// 报一个偏大的总数。
+///
+/// # `generated_at` 与 `items` 可能**不一致**
+///
+/// `generated_at` 取的是**全表**按时间倒序的第一行（`:521-528`），没有
+/// 「有效」过滤。所以池子里最新的那批若全是失效媒体，`generated_at` 仍会
+/// 显示那个时间，而 `items` 是空的。照抄，别「修正」成一致。
 #[derive(Debug, Serialize)]
 struct MomentRecommendationResponse {
-    items: Vec<MomentRecommendationItem>,
+    items: Vec<MomentRecommendationItemResource>,
     page: i64,
     page_size: i64,
+    total: i64,
+    generated_at: Option<String>,
 }
 
 /// `GET /moment-recommendations`
+///
+/// 上游用 `validate_page(..., error_code="invalid_moment_recommendation_filter")`
+/// （`moment_recommendation_service.py:511`）—— **专用错误码**，与
+/// hot-actress 的那个区分开。
 async fn list_moment_recommendations(
     State(_state): State<AppState>,
     _user: CurrentUser,
     axum::extract::Query(_query): axum::extract::Query<UnboundedPageQuery>,
 ) -> Result<Json<MomentRecommendationResponse>, ErrorResponse> {
-    todo!("骨架：接 MomentRecommendationService::list_items")
+    todo!("骨架：接 MomentRecommendationService::list_items + PageContext 补 image/movie")
 }
 
 /// `GET /hot-actress-releases`

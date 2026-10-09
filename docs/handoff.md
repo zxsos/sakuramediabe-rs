@@ -6,13 +6,17 @@
 
 | 项 | 值 |
 |---|---|
-| API 端点 | **76 / 126（~60%）** —— 方法级口径，实测 2026-10-05 |
-| 服务域 | 6 个域有代码（`system` 17 文件 / `catalog` 7 / `playback` 6 / `collections` 4 / `transfers` 3 / `videos` 3），`discovery` 未开工 |
-| 调度 | 19 个内建任务，cron **16/16 全注册**（3 个是 `manual_only`，按 `contracts.py:43-49` 本就不该有 cron）；worker 骨架已落地，**handler 1/21** |
-| 门禁 | 七道全绿（fmt / doc / clippy / workspace test / schema 40-40 对拍 / hash 44-44 / core 64-64 / paged wrappers） |
+| API 端点 | 方法级口径 **110 / 136**（唯一路径级）—— 上游 32 个 router 模块**已全部铺完骨架**，`sm-api/src/routes/` 32 文件 |
+| 服务域 | 6 个域有代码（`system` 17 文件 / `catalog` 7 / `playback` 6 / `collections` 4 / `transfers` 3 / `videos` 3）+ `discovery` 13 文件（16 个上游服务已铺满） |
+| 调度 | 19 个内建任务，cron **16/16 全注册**（3 个是 `manual_only`，按 `contracts.py:43-49` 本就不该有 cron）；worker 骨架已落地，**handler 3/19**（`activity_record_cleanup` / `image_search_index` / `movie_similarity_recompute`） |
+| 门禁 | ⚠️ **当前不可声称全绿** —— 现处于「只铺骨架、不编译」阶段（用户明确要求），本轮改动**未跑任何门禁**。最后一次全绿见提交 `0024ef3` 之前 |
 | 代码量 | `sm-service` src 43 文件 / 13,715 行；tests 15 文件 / 6,809 行 |
 
-开工前先跑一遍 `bash scripts/verify.sh` 确认基线是绿的，再动手。
+**当前阶段：只铺骨架与签名，不编译、不跑门禁**（用户明确要求，有问题集中到后面再调）。
+所以接手时**不要**先跑 `scripts/verify.sh` —— 现在的树本来就编不过，跑了只会
+一路修编译错误、进度停滞。要验证时用最便宜的方式（单个 `cargo check`），
+汇报时如实标注哪些改动没验证过。
+
 **`upstream/` 是目录联接（junction）**指向 `../sakuramediabe` 等真实仓库，
 不占额外磁盘 —— 别把它当成副本删掉。
 
@@ -62,9 +66,16 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 
 ### 卡死的（不用试）
 
-- `GET /movies/{n}/subtitles` —— 要读媒体文件系统（provider 族）
+- ~~`GET /movies/{n}/subtitles`~~ —— **已解阻塞**（2026-10-05）。原判断「要读媒体
+  文件系统（provider 族）」是**错的**：读字幕只读宿主自己的字幕目录，provider 参与
+  的是「把字幕搬过来」那一步（写侧 `subtitle_asset.rs`）。读侧
+  `movie_subtitle.rs` 已铺，其中两处不变量：10 MiB 上限**先 stat 再读**、
+  路径逃逸校验要在 `canonicalize` 之后做（只查字符串前缀会被软链绕过）。
 - `GET /movies/{n}` 详情 —— 要 playback 的进度/打点 + rankings
-- `discovery` —— 要 Qdrant
+
+（`discovery` 已不再是卡死项：Qdrant 稠密/稀疏两侧都已落地，`sm-service` 16 个上游服务
+已全部铺完，路由与 worker handler 已接上 3 个。剩下的是 `generate_recommendations`
+与 `list_items` 两个依赖 `repo/discovery.rs` 里三张新表的 IO 部分。）
 
 ## 四、纪律（踩过坑才定的）
 

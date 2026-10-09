@@ -28,10 +28,13 @@
 //!
 //! # 已落地与未落地
 //!
-//! [`worker::builtin_handlers`] 目前只注册了 `activity_record_cleanup` ——
-//! 21 个任务里其余 20 个的 service 还没写（`docs/service-progress.md` 有
-//! 逐条阻塞原因）。未注册的任务被领到时会**明确 `failed`** 并写清原因，
-//! 而不是静默跳过；理由见 [`worker`] 模块文档。
+//! [`worker::builtin_handlers`] 目前注册了 3 个：
+//! `activity_record_cleanup`、`image_search_index`、`movie_similarity_recompute`
+//! —— 三者都只依赖**已就位**的 service。19 个内建任务里其余 16 个的 service
+//! 还没写（`docs/service-progress.md` 有逐条阻塞原因）。
+//!
+//! 未注册的任务被领到时会**明确 `failed`** 并写清原因，而不是静默跳过；
+//! 理由见 [`worker`] 模块文档。
 //!
 //! # 启动引导任务（`trigger_type = "startup"`）不在本批
 //!

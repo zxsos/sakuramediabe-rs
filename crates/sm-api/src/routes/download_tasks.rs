@@ -100,20 +100,16 @@ pub struct DeleteTaskQuery {
 async fn delete_download_task(
     _user: CurrentUser,
     State(_state): State<AppState>,
-    Path(_task_id): Path<i64>,
+    Path(task_id): Path<i64>,
     EnvelopeQuery(query): EnvelopeQuery<DeleteTaskQuery>,
 ) -> Result<StatusCode, ErrorResponse> {
     // 顺序不能反：先查确认，再动手。确认过了才允许碰磁盘。
-    if query.delete_files && !query.confirm_delete_files {
-        return Err(sm_service::error::ServiceError::validation_with(
-            "download_task_delete_confirmation_required",
-            "Deleting downloaded files requires explicit confirmation",
-            [("task_id".to_owned(), serde_json::json!(_task_id))]
-                .into_iter()
-                .collect(),
-        )
-        .into());
-    }
+    //
+    // 契约本体在 service 层（`sm_service::transfers::download_task::
+    // ensure_delete_confirmed`）—— 这里是**调用**它而不是重写一遍，
+    // 因为错误码、状态码与 `details.task_id` 三者是一个整体，两处各写一份
+    // 迟早会漂移。
+    sm_service::transfers::download_task::ensure_delete_confirmed(task_id, &query)?;
     todo!("骨架：接任务台账删除（成功 204 不带 body）")
 }
 

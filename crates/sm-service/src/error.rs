@@ -207,6 +207,31 @@ impl ServiceError {
         }
     }
 
+    /// **任意**状态码 + 错误码。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 现有构造器每个都把状态码写死（`validation` = 422、`conflict` = 409 …），
+    /// 适合「本层自己产生的错误」。但有两类错误的状态码是**外部决定的**：
+    ///
+    /// | 场景 | 状态码来源 |
+    /// |---|---|
+    /// | provider 操作失败 | `ProviderOperationError.code` 经映射表得出（401/404/409/422/503/502） |
+    /// | 远端 HTTP 错误 | 远端响应本身 |
+    ///
+    /// 这两类若只能「挑一个最近的构造器」，就得先把状态码**降级**再表达 ——
+    /// 于是「provider 报了 401」会变成 422，客户端拿到的状态码与上游不一致，
+    /// 而它正是靠这个区分「该重新登录」与「该改请求」。
+    ///
+    /// 因此这里给一个**不做任何翻译**的入口。调用方要自己保证 `status` 与
+    /// `code` 搭配合理 —— 那是协议层的责任，不是本类型的责任。
+    pub fn from_status(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            api: Box::new(ApiError::new(code, message)),
+        }
+    }
+
     /// 取底层错误码，便于测试断言。
     pub fn code(&self) -> &str {
         &self.api.code
