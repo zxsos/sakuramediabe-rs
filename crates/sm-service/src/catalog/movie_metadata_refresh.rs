@@ -397,12 +397,19 @@ impl MovieMetadataRefreshService {
                 "title": detail.get("title").cloned().unwrap_or(Value::Null),
                 "cover_image": detail.get("cover_image").cloned().unwrap_or(Value::Null),
             }),
-            (None, Some(plugin)) => serde_json::json!({
-                "javdb_id": Value::Null,
-                "movie_number": plugin.movie_number,
-                "title": plugin.title,
-                "cover_image": Value::Null,
-            }),
+            (None, Some(plugin)) => {
+                let num = if plugin.movie_number.trim().is_empty() {
+                    normalized.clone()
+                } else {
+                    plugin.movie_number.clone()
+                };
+                serde_json::json!({
+                    "javdb_id": Value::Null,
+                    "movie_number": num,
+                    "title": plugin.title,
+                    "cover_image": Value::Null,
+                })
+            }
             _ => {
                 serde_json::json!({"javdb_id": Value::Null, "movie_number": normalized, "title": Value::Null, "cover_image": Value::Null})
             }
@@ -432,7 +439,21 @@ impl MovieMetadataRefreshService {
                 _,
             ) => match &delivery.plugin_delivery {
                 Some(plugin) => {
-                    let detail = import_detail_of(plugin);
+                    let mut detail = import_detail_of(plugin);
+                    // 插件可能不返回番号，用搜索的番号补上
+                    if detail
+                        .get("movie_number")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true)
+                    {
+                        if let Some(obj) = detail.as_object_mut() {
+                            obj.insert(
+                                "movie_number".to_owned(),
+                                serde_json::Value::String(normalized.clone()),
+                            );
+                        }
+                    }
                     let source_identity = source_identity_of(plugin_id, display_name, plugin);
                     self.import
                         .import_plugin_movie(&detail, &source_identity, false)
