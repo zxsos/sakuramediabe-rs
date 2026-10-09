@@ -72,7 +72,9 @@ impl FromRequestParts<AppState> for CurrentUser {
             )),
         }
     }
+}
 
+impl CurrentUser {
     /// API key 鉴权。对应用游 `ApiKeyService.authenticate`。
     ///
     /// 1. 按 `sha256(raw_key)` 查 `api_keys`，找不到 → 401
