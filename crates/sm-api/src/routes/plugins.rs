@@ -122,6 +122,8 @@ pub fn routes() -> Router<AppState> {
                 .post(install_plugin)
                 .fallback(method_not_allowed),
         )
+        // 插件包最大 100 MiB，Axum 默认 2 MiB 不够
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .route(
             "/system/plugins/{plugin_id}",
             get(get_plugin)
