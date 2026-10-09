@@ -307,9 +307,10 @@ pub fn parse_product_code(content: &str) -> Result<String, MinnanoError> {
                 }
             }
             Event::End(name) => {
-                if name.eq_ignore_ascii_case("td") && row.is_some() && cell.is_some() {
-                    let c = cell.take().unwrap();
-                    row.as_mut().unwrap().push(c);
+                if name.eq_ignore_ascii_case("td") {
+                    if let (Some(r), Some(c)) = (row.as_mut(), cell.take()) {
+                        r.push(c);
+                    }
                 } else if name.eq_ignore_ascii_case("tr") {
                     finish_row(&mut row, &mut cell, &mut data_code);
                 }
