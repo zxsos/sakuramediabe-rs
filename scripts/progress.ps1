@@ -394,7 +394,11 @@ if ($Diff) {
         exit 1
     }
     $current = [System.IO.File]::ReadAllText($baselinePath)
-    $strip = { param($t) (($t -split "`n") | Where-Object { $_ -notmatch '^- 提交：' }) -join "`n" }
+    # 比对时**剥掉那一行 commit 哈希**：它按设计就是「上次生成时的 HEAD」，
+    # 而基线是在提交**之前**生成的 —— 拿它参与比对会让门禁在**任何一次提交之后**
+    # 必然漂移（旧正则是 `^- 提交：`，与第 292 行 `| 基线提交 | ... |` 的格式根本
+    # 对不上，等于从没剥掉过；2026-10-07 修）。
+    $strip = { param($t) (($t -split "`n") | Where-Object { $_ -notmatch '基线提交' }) -join "`n" }
     if ((& $strip $current) -eq (& $strip $report)) {
         Write-Host 'OK  baseline matches current code'
         exit 0

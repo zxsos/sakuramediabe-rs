@@ -545,6 +545,92 @@ impl MediaPointRepository {
         .await?)
     }
 
+    /// 跨媒体的时刻列表（上游 `_point_query_with_image` + `list_media_points`）。
+    ///
+    /// `kind`：`jav` = 有番号（`movie_number IS NOT NULL`）；`video` = 有视频条目
+    /// （`video_item_id IS NOT NULL`）；`None` = 不限。**归属性由快照列判断**，
+    /// 因为媒体可能已被删除而时刻还在（两列都是无外键的快照）。
+    ///
+    /// `exclude_collection_id`：排除**已经在那个合集里**的时刻
+    /// （上游 `:504-511`），用于「把还没归档的时刻挑出来」。
+    pub async fn list_filtered(
+        &self,
+        kind: Option<&str>,
+        keyword: Option<&str>,
+        exclude_collection_id: Option<i32>,
+        order_sql: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<MediaPoint>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT p.* FROM media_point p \
+               LEFT JOIN video_item vi ON vi.id = p.video_item_id",
+        );
+        Self::push_point_where(&mut builder, kind, keyword, exclude_collection_id);
+        builder.push(" ORDER BY ");
+        builder.push(order_sql);
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_as::<MediaPoint>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 与 [`Self::list_filtered`] **同一份**条件的计数。
+    pub async fn count_filtered(
+        &self,
+        kind: Option<&str>,
+        keyword: Option<&str>,
+        exclude_collection_id: Option<i32>,
+    ) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM media_point p \
+               LEFT JOIN video_item vi ON vi.id = p.video_item_id",
+        );
+        Self::push_point_where(&mut builder, kind, keyword, exclude_collection_id);
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    /// 条件拼接的**唯一**处（两个查询共用）。
+    fn push_point_where(
+        builder: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+        kind: Option<&str>,
+        keyword: Option<&str>,
+        exclude_collection_id: Option<i32>,
+    ) {
+        builder.push(" WHERE 1 = 1");
+        let kind_fragment = match kind {
+            Some("jav") => Some(" AND p.movie_number IS NOT NULL"),
+            Some("video") => Some(" AND p.video_item_id IS NOT NULL"),
+            _ => None,
+        };
+        if let Some(fragment) = kind_fragment {
+            builder.push(fragment);
+        }
+        if let Some(keyword) = keyword.map(str::trim).filter(|raw| !raw.is_empty()) {
+            // JAV 匹配番号、video 匹配条目标题 —— 两条都要，因为同一个列表
+            // 可以同时装两类时刻。
+            let pattern = format!("%{keyword}%");
+            builder.push(" AND (p.movie_number ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR vi.title ILIKE ");
+            builder.push_bind(pattern);
+            builder.push(")");
+        }
+        if let Some(collection_id) = exclude_collection_id {
+            builder.push(
+                " AND NOT EXISTS (SELECT 1 FROM moment_collection_item mci \
+                   WHERE mci.collection_id = ",
+            );
+            builder.push_bind(collection_id);
+            builder.push(" AND mci.point_id = p.id)");
+        }
+    }
+
     paged_list! {
         /// 列出某条 Media 的时刻点，按时刻升序。**分页。**
         pub async fn list_by_media(

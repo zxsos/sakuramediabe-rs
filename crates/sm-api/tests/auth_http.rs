@@ -298,3 +298,79 @@ async fn the_login_route_is_reachable_without_any_credentials() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 }
+
+// ---------------------------------------------------------------- docs-token
+
+/// 发一个 form 编码的 `POST /auth/docs-token`。
+async fn post_form(router: axum::Router, body: String) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/docs-token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    read(router, request).await
+}
+
+async fn read(router: axum::Router, request: Request<Body>) -> (StatusCode, Value) {
+    let response = router.oneshot(request).await.expect("oneshot 失败");
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+            panic!(
+                "响应体不是 JSON: {err}; {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    (status, json)
+}
+
+/// ★ 表单登录，**只回两个字段**、状态码是 **200**（不是 `/auth/tokens` 的 201）。
+///
+/// 上游回的是内联 dict（`access_token` + 写死 `"bearer"`），**没有**
+/// `refresh_token` / `expires_*` / `user`。多回一个字段，就等于把这个 Swagger
+/// 后门当成了正式契约 —— 前端误用它就拿不到刷新令牌。
+#[tokio::test]
+async fn docs_token_is_a_form_login_with_only_two_fields() {
+    let (db, username) = setup().await;
+    let (status, body) = post_form(
+        app(&db),
+        format!(
+            "username={username}&password={}",
+            PASSWORD.replace(' ', "+")
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert!(!body["access_token"].as_str().unwrap_or_default().is_empty());
+    assert_eq!(body["token_type"], "bearer", "上游字段写死小写 bearer");
+    for absent in ["refresh_token", "expires_in", "expires_at", "user"] {
+        assert!(
+            body.get(absent).is_none(),
+            "docs-token 不该带 {absent}: {body}"
+        );
+    }
+}
+
+/// ★ 请求体不是 form（JSON）→ 422 信封，而不是 axum 原生的 415 纯文本。
+///
+/// 这才是补 `crate::extract::Form` 的理由：上游 `OAuth2PasswordRequestForm`
+/// 的校验失败是 422 + 信封。
+#[tokio::test]
+async fn docs_token_rejects_a_json_body_with_a_validation_envelope() {
+    let (db, username) = setup().await;
+    let (status, body) = post(
+        app(&db),
+        "/auth/docs-token",
+        json!({"username": username, "password": PASSWORD}),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+    assert_eq!(code_of(&body), "validation_error");
+}

@@ -20,24 +20,32 @@
 //! | 类 | 例子 | 写法 |
 //! |---|---|---|
 //! 需要 JWT | `/playlists/*`、`/auth/token-refreshes` | handler 带 `CurrentUser` 参数 |
-//! 不需要鉴权 | `/auth/tokens` | 无 `CurrentUser` 参数 |
+//! 不需要鉴权 | `/auth/tokens`、`/auth/docs-token` | 无 `CurrentUser` 参数 |
 //! **旁路签名** | `/files/*`、`/media/{id}/play/{path}` | `sm_core::signing`，不是 JWT |
 //!
 //! # 尚未接入（不要以为已经好了）
 //!
 //! - **SSE**：13 个事件 / 3 个流，用 axum 自带 `response::sse`，未接。
-//! - **签名 URL 的路由**：`sm_core::signing` 与 403 的三个错误码已就位
-//!   （见 [`error::ErrorResponse`] 的 `From<SignatureError>`），但
-//!   `files/*` 与 `/media/{id}/play/{path}` 这两条**旁路签名**路由还没接 —
-//!   它们要读 provider 的 `playback_deliveries`，属插件 ABI 那批。
-//! - **multipart**：提取器已就绪（[`extract::Multipart`]），但没有调用它的
-//!   路由 —— 上传插件 zip / 图片要等插件与 provider 资源。
+//! - **`/media/{id}/play/{path}` 签名路由**：`sm_core::signing` 与 403 的
+//!   三个错误码已就位（见 [`error::ErrorResponse`] 的 `From<SignatureError>`），
+//!   但这条**旁路签名**要读 provider 的 `playback_deliveries`，属插件 ABI 那批，
+//!   仍未接。⚠️ `/files/*` 那条**已经接了**（见下），别一起列成缺失。
+//! - **multipart**：提取器已就绪（[`extract::Multipart`]），但还没有**运行时**
+//!   调用它的路由（`routes::plugins` 的 install/upgrade 签名用了它，handler
+//!   却仍是 `todo!()`）—— 上传插件 zip / 图片要等插件与 provider 资源。
 //!
 //! # 已闭合的坑（别再写成缺口）
 //!
 //! **405 走信封**：axum 的方法不匹配不经过 router fallback，所以每条
 //! `MethodRouter` 都挂了 [`routes::method_not_allowed`]，回归测试见
 //! `tests/method_not_allowed_http.rs`。
+//!
+//! **`/files/*` 签名旁路已接**：`/files/images/{*path}` 与
+//! `/files/subtitles/{subtitle_id}` 都已落地（见 [`routes::files`]）——
+//! 别再把它列进「尚未接入」。留着的只有 `/media/{id}/play/{path}`。
+//!
+//! **form 提取器已用上**：`crate::extract::Form`（保留错误信封）由
+//! `/auth/docs-token` 使用 —— axum 原生 `Form` 的 415/422 是纯文本。
 
 #![forbid(unsafe_code)]
 

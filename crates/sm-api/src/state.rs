@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use sm_db::Db;
 use sm_service::discovery::ranking::RankingSourceCatalog;
+use sm_service::playback::media_library::{MediaLibraryRegistry, MediaLibraryService};
 use sm_service::playback::provider_helpers::StorageGateway;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
@@ -66,6 +67,11 @@ pub struct AppState {
     /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 写方法报
     /// 503 `provider_not_installed`（不是「假装配置合法」）。
     downloads: Option<Arc<dyn sm_service::transfers::download_client::DownloadCapabilityRegistry>>,
+    /// provider 的**媒体库能力**（`library_config_fields` / `prepare_library`）。
+    ///
+    /// 与 `downloads` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 写方法报
+    /// 503 `provider_not_installed`、provider 目录返回空表（不是「假装配置合法」）。
+    media_libraries: Option<Arc<dyn MediaLibraryRegistry>>,
 }
 
 impl AppState {
@@ -80,6 +86,7 @@ impl AppState {
             ranking: RankingSourceCatalog::default(),
             storage: None,
             downloads: None,
+            media_libraries: None,
         }
     }
 
@@ -114,6 +121,23 @@ impl AppState {
     ) -> Self {
         self.downloads = Some(downloads);
         self
+    }
+
+    /// 挂上媒体库能力。**只有组合根会调** —— 只有它看得见 `sm-plugins`。
+    pub fn with_media_library_registry(mut self, registry: Arc<dyn MediaLibraryRegistry>) -> Self {
+        self.media_libraries = Some(registry);
+        self
+    }
+
+    /// ★ 媒体库服务。**路由不要自己拼** —— 拼漏了注入的表现是：`POST` / 改配置
+    /// **一律 503**、provider 目录**空表**，而不是「缺哪个插件报哪个错」。
+    pub fn media_library_service(&self) -> MediaLibraryService {
+        match self.media_libraries.as_ref() {
+            Some(registry) => {
+                MediaLibraryService::new_with_registry(self.db(), Arc::clone(registry))
+            }
+            None => MediaLibraryService::new(self.db()),
+        }
     }
 
     /// ★ 下载器客户端服务。**路由不要自己拼** —— 拼漏了 `with_downloads` 的表现是

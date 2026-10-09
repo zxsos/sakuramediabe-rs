@@ -36,10 +36,18 @@
 //! 形状由插件决定，本仓库无法预先建模。照抄用 `serde_json::Value`。
 //! **不要**为常见插件猜一套结构 —— 第二个插件出现时那会变成错误的抽象。
 //!
-//! # install / upgrade 需要 **multipart**，要开 axum 的 `form` feature
+//! # install / upgrade 是 **multipart** —— `form` feature 早就是开的
 //!
-//! 与 `routes/image_search.rs` 同一个前置。`sha256` 是**可选**完整性校验 ——
-//! 给了就校验，不给就跳过。**别**改成必填。
+//! 骨架写「要开 axum 的 `form` feature」（与 `routes/image_search.rs` 同一处
+//! 假前置）：**错**。本仓没关 axum 的 default features，而 `form` 是 default
+//! 的一部分，`Form` / `Multipart` 一直可用。
+//!
+//! 表单字段（`plugins.py` 的签名）：
+//! - `POST ""`：`file`（必填）+ `sha256`（**可选**）+ `enable`（**默认 `true`**）；
+//! - `POST /{plugin_id}/upgrade`：`file`（必填）+ `sha256`（可选），**没有** `enable`。
+//!
+//! `sha256` 给了就校验、不给就跳过，**别**改成必填。两个上传端点都先按
+//! `Content-Length` 拦超限包（`MAX_ARCHIVE_BYTES`）→ **413 `plugin_too_large`**。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -81,6 +89,12 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// 插件概要。
+///
+/// ⚠️ 骨架期字段是**自造**的 `{plugin_id, name, version, enabled}` —— 上游
+/// `PluginSummaryResource`（`schema/system/plugins.py`）是
+/// `{plugin_id, display_name, version, host_api_version: int, enabled,
+/// load_status: str = "ok", load_error?, release_api_url?}`：`name` 应为
+/// `display_name`，且缺四个字段。实现本文件时一并改。
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginSummaryResource {
     pub plugin_id: String,
@@ -90,6 +104,10 @@ pub struct PluginSummaryResource {
 }
 
 /// 插件详情。
+///
+/// ⚠️ 骨架期是 `flatten(summary) + description + abi_version` —— 上游
+/// `PluginDetailResource` 是 `PluginSummaryResource` 再加 `requires_python?`、
+/// `author?`、`homepage?`、`manifest: dict`、`data_dir: str`。**字段几乎全不同。**
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginDetailResource {
     #[serde(flatten)]
@@ -100,12 +118,21 @@ pub struct PluginDetailResource {
 }
 
 /// 插件设置响应 —— **所有 None 字段都不输出**。
+///
+/// ⚠️ 骨架期是**空结构体**（序列化成 `{}`）。上游 `PluginSettingsResource`
+/// 是 `{settings: dict, schema?: dict（别名 `schema`）, defaults?: dict}`；
+/// 而 `PUT` 回的是它的子类 `PluginSettingsUpdateResource`（多一个
+/// `pending_restart: list[str]`）—— 骨架把 `PUT` 的返回类型也写成了
+/// `PluginSettingsResource`，实现时要换成 `PluginSettingsUpdateResource`。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PluginSettingsResource {
     // 形状由插件决定。实现时按插件 schema 动态生成并逐字段 skip_serializing_if。
 }
 
 /// 安装 / 升级 / 卸载的响应。
+///
+/// ⚠️ 骨架期字段 `{plugin_id, action, requires_reload}` 是**自造**的 —— 上游
+/// `PluginInstallResponse` 是 `{plugin_id, version, pending_restart: list[str]}`。
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginInstallResponse {
     pub plugin_id: String,
@@ -162,7 +189,9 @@ async fn install_plugin(
     State(_state): State<AppState>,
     _payload: axum::extract::Multipart,
 ) -> Result<(StatusCode, Json<PluginInstallResponse>), ErrorResponse> {
-    todo!("骨架：需 axum form feature；sha256 可选")
+    todo!(
+        "骨架：multipart（file 必填 + sha256 可选 + enable 默认 true）；先按 Content-Length 拦 413"
+    )
 }
 
 /// `POST /{plugin_id}/upgrade` —— 200 + multipart。
@@ -172,7 +201,7 @@ async fn upgrade_plugin(
     Path(_plugin_id): Path<String>,
     _payload: axum::extract::Multipart,
 ) -> Result<Json<PluginInstallResponse>, ErrorResponse> {
-    todo!("骨架：需 axum form feature")
+    todo!("骨架：multipart（file 必填 + sha256 可选）；先按 Content-Length 拦 413")
 }
 
 /// `PATCH /{plugin_id}?enabled=...` —— **query 参数**。

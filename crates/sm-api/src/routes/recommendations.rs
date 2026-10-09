@@ -71,12 +71,29 @@ struct PageResponse<T> {
 }
 
 /// `GET /daily-recommendations`
+///
+/// ⚠️ **这不是「接线没做」，是服务层的读、写两侧都缺**（见
+/// [`sm_service::discovery::daily_recommendation`] 顶部的说明）：
+///
+/// 1. **读侧**：`DailyRecommendationService::list_items` 不存在。要加仓储分页查询
+///    （`DailyRecommendationItem ⋈ Movie(is_blacklisted=False) ORDER BY rank`），
+///    并把 `catalog::movie::MovieService::load_cards` 从**私有改公开**（现在外部
+///    拿不到卡片），再拼卡片；
+/// 2. **生成侧**：`generate_latest_snapshot` 与它的四个 IO 装载器不存在
+///    （调度任务 `daily_recommendation_generate_cron`）；Qdrant 相似度失败要
+///    **只跳过该信号**、不整体失败；
+/// 3. **形状**：下面的 `PageResponse<DailyRecommendationItem>` 用的是**缩过的、
+///    名不对的**元素。上游是 `PageResponse[DailyRecommendationMovieResource]`，
+///    元素 = 完整影片卡片 + `{snapshot_date, generated_at, rank,
+///    recommendation_score, reason_codes, reason_texts, signal_scores, is_stale}`，
+///    且**没有页级 `snapshot_date`**。落地时一并换掉（复用
+///    [`crate::dto::MovieListItemResource`] + `#[serde(flatten)]`）。
 async fn list_daily_recommendations(
     State(_state): State<AppState>,
     _user: CurrentUser,
     axum::extract::Query(_query): axum::extract::Query<BoundedPageQuery>,
 ) -> Result<Json<PageResponse<DailyRecommendationItem>>, ErrorResponse> {
-    todo!("骨架：接 DailyRecommendationService::list_items")
+    todo!("骨架：需先实现 DailyRecommendationService 的 list_items / generate_latest_snapshot 与公开 load_cards（见上）")
 }
 
 /// 瞬时推荐分页查询 —— **刻意无上下界**。

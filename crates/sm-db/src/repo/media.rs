@@ -113,6 +113,13 @@ pub struct MediaListFilter<'a> {
     /// JOIN 会让「多个演员都演这部片」时主查询出现**重复行**。
     pub movie_numbers: Option<&'a [String]>,
     pub thumbnail_generation_state: Option<&'a str>,
+    /// 只看有效 / 只看失效（`Some(false)` = 失效媒体列表）。
+    pub require_valid: Option<bool>,
+    /// 关键词。**四个字段任一命中**：影片番号 / 影片标题 / 视频标题 / 文件名
+    /// （上游 `list_invalid_media`，`:766-773`）。
+    pub search: Option<&'a str>,
+    /// 只看这几个文件哈希（重复媒体分组用）。
+    pub file_hashes: Option<&'a [String]>,
 }
 
 impl MediaListFilter<'_> {
@@ -121,15 +128,15 @@ impl MediaListFilter<'_> {
         // ★ 所有值都走 `push_bind`，**没有一处**把外部数据拼进 SQL 字符串。
         builder.push(" WHERE 1 = 1");
         let kind_fragment = match self.kind {
-            Some("jav") => Some(" AND movie_number IS NOT NULL"),
-            Some("video") => Some(" AND video_item_id IS NOT NULL"),
+            Some("jav") => Some(" AND m.movie_number IS NOT NULL"),
+            Some("video") => Some(" AND m.video_item_id IS NOT NULL"),
             _ => None,
         };
         if let Some(fragment) = kind_fragment {
             builder.push(fragment);
         }
         if let Some(library_id) = self.library_id {
-            builder.push(" AND library_id = ");
+            builder.push(" AND m.library_id = ");
             builder.push_bind(library_id);
         }
         if let Some(numbers) = self.movie_numbers {
@@ -138,14 +145,42 @@ impl MediaListFilter<'_> {
             if numbers.is_empty() {
                 builder.push(" AND FALSE");
             } else {
-                builder.push(" AND movie_number = ANY(");
+                builder.push(" AND m.movie_number = ANY(");
                 builder.push_bind(numbers.to_vec());
                 builder.push(")");
             }
         }
         if let Some(state) = self.thumbnail_generation_state {
-            builder.push(" AND thumbnail_generation_state = ");
+            builder.push(" AND m.thumbnail_generation_state = ");
             builder.push_bind(state);
+        }
+        if let Some(valid) = self.require_valid {
+            builder.push(if valid {
+                " AND m.valid"
+            } else {
+                " AND NOT m.valid"
+            });
+        }
+        if let Some(hashes) = self.file_hashes {
+            if hashes.is_empty() {
+                builder.push(" AND FALSE");
+            } else {
+                builder.push(" AND m.file_hash = ANY(");
+                builder.push_bind(hashes.to_vec());
+                builder.push(")");
+            }
+        }
+        if let Some(search) = self.search.map(str::trim).filter(|raw| !raw.is_empty()) {
+            let pattern = format!("%{search}%");
+            builder.push(" AND (mv.movie_number ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR mv.title ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR vi.title ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR m.file_name ILIKE ");
+            builder.push_bind(pattern);
+            builder.push(")");
         }
     }
 }
@@ -229,7 +264,9 @@ impl MediaRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Media>, DbError> {
-        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT * FROM media");
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT m.* FROM media m LEFT JOIN movie mv ON mv.movie_number = m.movie_number LEFT JOIN video_item vi ON vi.id = m.video_item_id",
+        );
         filter.push_where(&mut builder);
         builder.push(" ORDER BY ");
         builder.push(order_sql);
@@ -248,10 +285,30 @@ impl MediaRepository {
     /// ★ 两份 WHERE 必须来自同一个 [`MediaListFilter`] —— 计数与分页各写一遍
     /// 条件，改一处漏一处时会得到「总数 200、翻到第 3 页没东西」。
     pub async fn count_filtered(&self, filter: &MediaListFilter<'_>) -> Result<i64, DbError> {
-        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT COUNT(*) FROM media");
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM media m LEFT JOIN movie mv ON mv.movie_number = m.movie_number LEFT JOIN video_item vi ON vi.id = m.video_item_id",
+        );
         filter.push_where(&mut builder);
         let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
         Ok(row.0)
+    }
+
+    /// 受管媒体的聚合：`(文件数, 总字节)`，**只算 `valid = true`**。
+    ///
+    /// 上游 `TelemetryService._managed_media_metrics`（`telemetry_service.py:164-174`）：
+    /// `COUNT(Media.id)` 与 `COALESCE(SUM(Media.file_size_bytes), 0)`，条件
+    /// `Media.valid == True`。空库返回 `(0, 0)`（COALESCE 保证）。
+    ///
+    /// ★ `SUM(bigint)` 在 PostgreSQL 里返回 **`numeric`** 而不是 `bigint`，
+    /// 直接按 `i64` 解码会失败 —— 所以这里显式 `::bigint`。上游是 Peewee 的
+    /// `fn.SUM(...)` 再由 Python `int(...)` 收敛，那一步在 Rust 侧没有，必须用 SQL 表达。
+    pub async fn valid_media_metrics(&self) -> Result<(i64, i64), DbError> {
+        Ok(sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(id)::bigint, COALESCE(SUM(file_size_bytes), 0)::bigint \
+             FROM media WHERE valid = true",
+        )
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     /// ★ 同番号多文件：按番号分组，**只要 `count > 1` 的组**。
@@ -294,6 +351,62 @@ impl MediaRepository {
             .build_query_scalar::<String>()
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    /// ★ 重复媒体：**按文件哈希分组，只保留出现 >1 次的组**，分页返回哈希。
+    ///
+    /// 上游 `list_duplicate_media_groups`（`media_service.py:365-401`）：
+    ///
+    /// - 只算 `file_hash IS NOT NULL AND file_hash <> ''` —— 空哈希在库里是
+    ///   「还没算出来」而不是「这些文件的哈希都相同」。把它们分到一组等于
+    ///   声称一批不相关的文件重复。
+    /// - 排序按组内 `MAX(updated_at) DESC`（最近变动的组在前），再按哈希升序
+    ///   做稳定 tie-break。
+    pub async fn duplicate_hash_groups(
+        &self,
+        kind: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT m.file_hash FROM media m \
+              WHERE m.file_hash IS NOT NULL AND m.file_hash <> ''",
+        );
+        Self::push_kind(&mut builder, kind);
+        builder.push(" GROUP BY m.file_hash HAVING COUNT(m.id) > 1");
+        builder.push(" ORDER BY MAX(m.updated_at) DESC, m.file_hash ASC");
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 上面那个分组的**总数**（用于分页的 `total`）。
+    pub async fn count_duplicate_hash_groups(&self, kind: Option<&str>) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM (\
+               SELECT m.file_hash FROM media m \
+              WHERE m.file_hash IS NOT NULL AND m.file_hash <> ''",
+        );
+        Self::push_kind(&mut builder, kind);
+        builder.push(" GROUP BY m.file_hash HAVING COUNT(m.id) > 1) AS groups");
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    /// `jav` = 有番号；`video` = 有视频条目；其余（`all`）不限。
+    fn push_kind(builder: &mut sqlx::QueryBuilder<sqlx::Postgres>, kind: Option<&str>) {
+        if let Some(fragment) = match kind {
+            Some("jav") => Some(" AND m.movie_number IS NOT NULL"),
+            Some("video") => Some(" AND m.video_item_id IS NOT NULL"),
+            _ => None,
+        } {
+            builder.push(fragment);
+        }
     }
 
     /// 同上分组的**总数**。

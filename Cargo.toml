@@ -158,6 +158,14 @@ quick-xml = "0.42"
 # 读包同样不需要任何压缩特性：STORED 的条目就是原始字节。
 zip = { version = "8", default-features = false }
 
+# 系统信息（替代 psutil）：遥测心跳的 CPU 型号与内存总量。
+#
+# 版本照 ADR `2026-10-04-tech-selection.md` 选定的 0.39.6。
+# `default-features = false` 是硬要求：默认特性 = component + disk + network +
+# system + user，而本仓只用 `System`（CPU + 内存）—— 多开的四类会拖进
+# WMI / objc2-io-kit / objc2-open-directory 等平台绑定，与「纯 Rust、离线可编」冲突。
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
 # 图像（替代 Pillow + OpenCV）
 #
 # `default-features = false` 是硬要求：默认特性 = rayon + default-formats，

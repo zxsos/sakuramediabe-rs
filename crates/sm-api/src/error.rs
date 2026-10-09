@@ -30,7 +30,7 @@
 //! 客户端才显形。所以 `tests/method_not_allowed_http.rs` 对**每一条**已注册
 //! 路由逐个发方法不匹配的请求并断言信封形状。
 
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -111,17 +111,34 @@ impl From<SignatureError> for ErrorResponse {
 impl From<JsonRejection> for ErrorResponse {
     /// 请求体解析失败 → 422 `validation_error`，与上游 `RequestValidationError` 对应。
     fn from(value: JsonRejection) -> Self {
-        let mut details = serde_json::Map::new();
-        details.insert(
-            "detail".to_owned(),
-            serde_json::Value::from(value.body_text()),
-        );
-        Self::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "validation_error",
-            "Request validation failed",
-        )
-        .with_details(details)
+        body_rejection(value.body_text())
+    }
+}
+
+/// 请求体解析失败（JSON / form **共用**）→ 422 `validation_error`。
+///
+/// `details.detail` 带 axum 的原始描述（哪个字段、什么值、为什么不行），与查询串
+/// 那边（[`query_rejection`]）同一口径。上游 FastAPI 的 body 校验失败也是
+/// 422 + 信封，所以 form 那条也走同一个映射 —— 两个 `from` 别各写一份。
+fn body_rejection(detail: String) -> ErrorResponse {
+    let mut details = serde_json::Map::new();
+    details.insert("detail".to_owned(), serde_json::Value::from(detail));
+    ErrorResponse::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+        "Request validation failed",
+    )
+    .with_details(details)
+}
+
+impl From<FormRejection> for ErrorResponse {
+    /// 表单解析失败 → 422 `validation_error`（同 [`body_rejection`]）。
+    ///
+    /// axum 的 `FormRejection` 对「content-type 不是 form」默认回 **415**、对
+    /// 字段缺失回 422，且都是纯文本。两者都收敛到这里 —— 上游 `OAuth2PasswordRequestForm`
+    /// 的校验失败是同一个 `RequestValidationError`（422）。
+    fn from(value: FormRejection) -> Self {
+        body_rejection(value.body_text())
     }
 }
 

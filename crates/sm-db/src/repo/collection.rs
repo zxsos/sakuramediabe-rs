@@ -1018,6 +1018,34 @@ impl_ordered_member_repo!(
     "ClipCollectionItem"
 );
 
+impl MomentCollectionItemRepository {
+    /// ★ 「这个时刻属于哪些合集」—— 该点所属合集的 `(id, name)`。
+    ///
+    /// 上游 `MomentCollectionService.list_point_collections`
+    /// （`moment_collection_service.py`）：按成员表反查，**顺序是合集的
+    /// `updated_at DESC, id DESC`** —— 也就是「最近动过的合集排前面」，
+    /// 与合集列表的排序一致。
+    ///
+    /// 一次三表 JOIN 而不是「取成员再逐个查合集」：成员表在 `point_id` 上
+    /// 有索引，一个点通常只属于极少几个合集，但逐个查是 N+1。
+    ///
+    /// 返回元组而不是具名结构体 —— 投影行（见本文件其它查询的约定）。
+    pub async fn list_collections_for_point(
+        &self,
+        point_id: i32,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT c.id, c.name FROM moment_collection_item i \
+               JOIN moment_collection c ON c.id = i.collection_id \
+              WHERE i.point_id = $1 \
+              ORDER BY c.updated_at DESC, c.id DESC",
+        )
+        .bind(point_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+}
+
 /// `playlist_movie` 表仓储：JAV 播放列表的成员。
 ///
 /// **本表没有 `position`** —— 唯一索引是 `(playlist_id, movie_id)`。

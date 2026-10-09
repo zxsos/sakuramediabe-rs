@@ -640,6 +640,17 @@ pub struct MomentCollectionWithCount {
     pub cover: Option<sm_db::catalog::asset::Image>,
 }
 
+/// 一个时刻合集的最简摘要 —— 上游 `MomentCollectionSummary`。
+///
+/// **只有 `id` 与 `name`**：`GET /media-points/{point_id}/collections` 用它回显
+/// 「这个时刻已在哪些合集里」。带 `item_count` / 封面是**多余的** —— 那个端点
+/// 只回答归属，不回答规模。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MomentCollectionSummary {
+    pub id: i32,
+    pub name: String,
+}
+
 /// 一个时刻合集成员，连同它的点位与图片。
 ///
 /// 三张表（`moment_collection_item` / `media_point` / `image`）在 **Rust 侧
@@ -791,6 +802,31 @@ impl MomentCollectionService {
                     cover,
                 }
             })
+            .collect())
+    }
+
+    /// `GET /media-points/{point_id}/collections` —— 该点所属的合集摘要。
+    ///
+    /// 上游 `MomentCollectionService.list_point_collections`：先 `_require_point`
+    /// 再反查成员表。
+    ///
+    /// ⚠️ 「点不存在」的详情键是 **`point_id`**（上游那个方法显式传了
+    /// `error_details_key="point_id"`），而 `MediaService::delete_point_by_id`
+    /// 用的是默认的 `media_point_id` —— 两个方法的详情键**确实不同**，
+    /// 两边都是上游原文如此。
+    pub async fn list_point_collections(
+        &self,
+        point_id: i32,
+    ) -> Result<Vec<MomentCollectionSummary>, ServiceError> {
+        // `require_member` 是宏生成的私有方法：码 `media_point_not_found`、
+        // 详情键 `point_id` —— 正是这条路径要的 404。
+        self.require_member(point_id).await?;
+        Ok(self
+            .members
+            .list_collections_for_point(point_id)
+            .await?
+            .into_iter()
+            .map(|(id, name)| MomentCollectionSummary { id, name })
             .collect())
     }
 

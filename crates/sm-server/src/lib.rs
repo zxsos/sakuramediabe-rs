@@ -42,7 +42,9 @@ pub mod plugins;
 // （依赖方向会成环），而 `sm-server` 同时看得见两边。见模块文档。
 pub mod provider_gateway;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sm_api::middleware::slow_log::SlowLogConfig;
 use sm_scheduler::{Scheduler, SchedulerHandle, TaskWorker, TaskWorkerHandle, WorkerConfig};
@@ -61,7 +63,12 @@ struct Background {
     /// 看门狗的停止标志。abort 之外还要它：看门狗可能正睡在退避里，
     /// abort 直接打断即可，但标志让「为什么停」在日志里是可解释的。
     watchdog_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// 匿名遥测心跳（**独立循环，不走任务队列**，见下）。`None` = 被 env 关闭。
+    telemetry: Option<tokio::task::JoinHandle<()>>,
 }
+
+/// 遥测心跳的间隔。上游 `scheduler.add_job(..., hours=1)`（`start/aps.py:365-374`）。
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// 装配并运行。返回进程退出码。
 ///
@@ -157,6 +164,11 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读
     //    `job_disabled_reason` 需要的配置快照，而它是 move 进 AppState 的。
+    // ⚠️ 还有两个注入 seam **故意没接**（不是漏了）：`.with_downloads(...)` 与
+    //    `.with_media_library_registry(...)`。它们的 trait 是活的，但**没有实现** ——
+    //    要由插件 ABI 那批补上（见 docs/handoff.md）。在那之前的表现是契约化的：
+    //    `/media-libraries` 的写方法一律 503 `provider_not_installed`、providers 目录
+    //    空表；`/download-clients` 三个写方法同样 503。
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
@@ -233,11 +245,31 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             }
         };
 
+        // 6c. 匿名遥测心跳。上游把它挂在 APScheduler 上（`start/aps.py:365-374`，
+        //     `interval hours=1` + `next_run_time=runtime_now()`），但它**不是队列
+        //     任务** —— 直接发一次 HTTP、不产生 `background_task_run`。所以这里起
+        //     一个独立循环，而不是塞进 `Scheduler`（后者只做「cron → 入队」）。
+        //     env 关闭时**连循环都不起**（上游 `if is_enabled(): add_job(...)`）。
+        let telemetry = if sm_service::system::telemetry::is_enabled() {
+            Some(spawn_telemetry_heartbeat(
+                pool.clone(),
+                config.config_path.clone(),
+                Arc::clone(&plugins),
+            ))
+        } else {
+            tracing::info!(
+                env = sm_service::system::telemetry::ENABLED_ENV_KEY,
+                "遥测心跳已关闭，不上报"
+            );
+            None
+        };
+
         Some(Background {
             scheduler: handle,
             worker,
             watchdog,
             watchdog_stop,
+            telemetry,
         })
     } else {
         tracing::info!("调度器已被配置关闭");
@@ -272,6 +304,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             .watchdog_stop
             .store(true, std::sync::atomic::Ordering::Relaxed);
         background.watchdog.abort();
+        // 心跳只发一次 HTTP，没有「在飞行中必须等完」的语义 —— 直接 abort。
+        if let Some(telemetry) = background.telemetry {
+            telemetry.abort();
+        }
         background.scheduler.shutdown().await?;
         tracing::info!("调度器已停止");
         if let Some(worker) = background.worker {
@@ -287,6 +323,31 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     pool.close().await;
     tracing::info!("退出完成");
     Ok(())
+}
+
+/// 遥测心跳循环：**启动即跑一次，之后每小时一次**（上游 `next_run_time=runtime_now()`
+/// + `interval hours=1`）。
+///
+/// 每轮先取一份**活**的插件快照（与看门狗共享同一把锁），再上报 —— 插件重启会
+/// 换版本号，快照过期就报错了。失败只记日志，不中断循环（下个小时照跑）。
+fn spawn_telemetry_heartbeat(
+    db: sm_db::Db,
+    config_path: PathBuf,
+    plugins: Arc<tokio::sync::Mutex<plugins::Plugins>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let service = sm_service::system::telemetry::TelemetryService::new(db, &config_path);
+        let mut ticker = tokio::time::interval(TELEMETRY_INTERVAL);
+        // 跳过错过的 tick 而不是补跑：停机一整天不该在恢复时瞬间发 24 次。
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let heartbeats = plugins.lock().await.plugin_heartbeats();
+            if let Err(error) = service.report(heartbeats).await {
+                tracing::warn!(code = error.code(), "遥测心跳失败：{}", error.api.message);
+            }
+        }
+    })
 }
 
 /// 建连接池。

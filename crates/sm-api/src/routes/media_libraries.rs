@@ -10,6 +10,17 @@
 //! | `PATCH /media-libraries/{library_id}` | 200 |
 //! | `DELETE /media-libraries/{library_id}` | **204** |
 //!
+//! # 请求 / 响应形状**直接复用服务层那一份**
+//!
+//! `MediaLibraryResource` / `MediaLibraryCreateRequest` / `MediaLibraryUpdateRequest`
+//! 都来自 [`sm_service::playback::media_library`]（上游 `schema/playback/media_libraries.py`）。
+//! ⚠️ 骨架期这里有**两份自造本地副本**（`MediaLibraryResponse` 用
+//! `{provider, handle, enabled}`、`MediaLibraryProviderResponse` 用 `kinds`）——
+//! 与上游毫无交集，已删除。provider 目录的形状由服务层的
+//! `ProviderCatalogEntry`（`provider_key` / `display_name` /
+//! `library_config_fields` / `playback_deliveries` / `download_config_fields`）
+//! 序列化而来。
+//!
 //! # 用 `PATCH` 而不是 `PUT` —— 语义是「部分更新」
 //!
 //! 上游是 `PATCH /{library_id}`。所以 `MediaLibraryUpdateRequest` 的字段
@@ -34,11 +45,17 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, patch};
 use axum::{Json, Router};
-use serde::Serialize;
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
+// ⚠️ 用包装过的 `Json`：axum 原生的 rejection 是 422 纯文本，而项目契约是
+// 422 + 错误信封（见 `crate::extract` 的说明）。
+use crate::extract::Json as EnvelopeJson;
 use crate::state::AppState;
+
+use sm_service::playback::media_library::{
+    MediaLibraryCreateRequest, MediaLibraryResource, MediaLibraryUpdateRequest,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -56,74 +73,110 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// 媒体库条目。
-#[derive(Debug, Serialize)]
-pub struct MediaLibraryResponse {
-    pub id: i64,
-    pub name: String,
-    pub provider: String,
-    /// provider 侧的库标识（路径 / remote id 等），**由插件解释**。
-    pub handle: String,
-    pub enabled: bool,
-}
-
-/// 媒体库 provider 条目。
-#[derive(Debug, Serialize)]
-pub struct MediaLibraryProviderResponse {
-    pub provider: String,
-    pub display_name: String,
-    /// 该 provider 支持的库类型。
-    pub kinds: Vec<String>,
-}
-
-/// `GET /media-libraries`
+/// `GET /media-libraries` —— 上游 `:21-24`。排序 `created_at DESC, id DESC`。
 async fn list_media_libraries(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-) -> Result<Json<Vec<MediaLibraryResponse>>, ErrorResponse> {
-    todo!("骨架：接媒体库列表")
+) -> Result<Json<Vec<MediaLibraryResource>>, ErrorResponse> {
+    Ok(Json(state.media_library_service().list_libraries().await?))
 }
 
-/// `GET /media-libraries/providers`
+/// `GET /media-libraries/providers` —— 上游 `:27-29`。
 ///
 /// 列出**可用的 provider 类型**。这份数据来自**插件注册表**（`sm-plugins`），
-/// 不是数据库 —— 没有插件时返回空列表而**不是 503**。
+/// 不是数据库 —— 没有注入注册表时返回**空列表**而**不是 503**
+/// （「没装插件」与「装了但一个都没注册」表现一致，上游亦然）。
+///
+/// 每项的形状由服务层的 `ProviderCatalogEntry` 序列化而来（`serde_json::Value`，
+/// 因为目录是**插件自定**的，且服务层还要把它喂给状态端点）。
 async fn list_media_library_providers(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-) -> Result<Json<Vec<MediaLibraryProviderResponse>>, ErrorResponse> {
-    todo!("骨架：接插件注册表（无插件时返回空列表，不 503）")
+) -> Result<Json<Vec<serde_json::Value>>, ErrorResponse> {
+    Ok(Json(
+        state
+            .media_library_service()
+            .list_provider_catalog()
+            .await?,
+    ))
 }
 
 /// `POST /media-libraries` —— **201 Created**。
+///
+/// 服务层在**落库之前**先 `prepare_library`（provider 建目录失败时不留
+/// 「库存在但用不了」的记录）；未注入注册表 → **503 `provider_not_installed`**。
 async fn create_media_library(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    _payload: axum::extract::Json<serde_json::Value>,
-) -> Result<(StatusCode, Json<MediaLibraryResponse>), ErrorResponse> {
-    todo!("骨架：接媒体库创建；成功返回 201 + body")
+    EnvelopeJson(payload): EnvelopeJson<MediaLibraryCreateRequest>,
+) -> Result<(StatusCode, Json<MediaLibraryResource>), ErrorResponse> {
+    let created = state
+        .media_library_service()
+        .create_library(payload)
+        .await?;
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 /// `PATCH /media-libraries/{library_id}` —— 部分更新。
 ///
-/// 库不存在 → **404**。
+/// 库不存在 → **404 `media_library_not_found`**（details `library_id`）。
+/// `exclude_unset` 之后**一个字段都没给** → **422 `empty_media_library_update`**
+/// （`media_library_service.py:291-292`）—— 不是「原样返回」。
 async fn update_media_library(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_library_id): Path<i64>,
-    _payload: axum::extract::Json<serde_json::Value>,
-) -> Result<Json<MediaLibraryResponse>, ErrorResponse> {
-    todo!("骨架：接媒体库部分更新（不传 = 不改，见模块文档）")
+    Path(library_id): Path<i64>,
+    EnvelopeJson(payload): EnvelopeJson<MediaLibraryUpdateRequest>,
+) -> Result<Json<MediaLibraryResource>, ErrorResponse> {
+    let resource = state
+        .media_library_service()
+        .update_library(narrow_library_id(library_id)?, payload)
+        .await?;
+    Ok(Json(resource))
 }
 
 /// `DELETE /media-libraries/{library_id}` —— **204，无 body**。
 ///
-/// 库不存在时**仍然 204**：删除是幂等的语义。库非空时**不**级联删媒体 ——
-/// 那个决定要看上游怎么做，实现时照上游。
+/// ⚠️ 骨架期这里写「库不存在时**仍然 204**：删除是幂等的」—— **错**。上游
+/// `delete_library`（`media_library_service.py:313-326`）先 `_require_library`：
+///
+/// - 库不存在 → **404 `media_library_not_found`**（details `library_id`）
+///   —— **不幂等**，别照抄本仓其它 delete 的 204 语义；
+/// - 仍被 `Media` 或 `DownloadClient` 引用 → **409 `media_library_in_use`**
+///   （details `library_id`）—— **不**级联删媒体，也不删下载客户端。
+///
+/// 只有「存在且未被引用」才走到 204。
 async fn delete_media_library(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_library_id): Path<i64>,
+    Path(library_id): Path<i64>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接媒体库删除（幂等；成功返回 204 不带 body）")
+    state
+        .media_library_service()
+        .delete_library(narrow_library_id(library_id)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 路径里的 id 是 `i64`（axum 的整数解析），而库里的列是 `i32`。
+///
+/// # 超出 `i32` 时是 **404，不是 400**
+///
+/// 上游是 Python 的 `int`，**没有上界** —— 那种 id 会一路走到查询、查不到、
+/// 报「不存在」。用 `Path<i32>` 会在提取阶段就变成 400，与上游不一致。
+/// 所以这里保留 `i64` 再显式收窄，溢出按「不存在」处理。
+///
+/// 详情键是 `library_id`（上游 `require_by_id(..., error_details_key="library_id")`，
+/// `media_library_service.py:37-44`）—— 与 [`crate::routes::media::narrow_media_id`]
+/// 用的是**不同**的键，别混。
+fn narrow_library_id(library_id: i64) -> Result<i32, ErrorResponse> {
+    i32::try_from(library_id).map_err(|_| {
+        let mut details = serde_json::Map::new();
+        details.insert("library_id".to_owned(), serde_json::Value::from(library_id));
+        ErrorResponse::from(sm_service::error::ServiceError::not_found_with(
+            "media_library_not_found",
+            "Media library not found",
+            details,
+        ))
+    })
 }

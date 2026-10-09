@@ -28,6 +28,9 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# 签名图片端点要按扩展名推断 `Content-Type`（上游 `mimetypes.guess_type`）。
+# 这个 crate 已在依赖树里（`reqwest` 间接依赖它），这里只是显式引用，不新增下载。
+mime_guess = "2"
 
 [dev-dependencies]
 # 集成测试用 oneshot 直接驱动 Router，不起端口、不依赖运行时

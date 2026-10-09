@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use sm_db::repo::{MediaLibraryRepository, MediaRepository, NewMediaLibrary};
+use sm_db::repo::{
+    DownloadClientRepository, MediaLibraryRepository, MediaRepository, NewMediaLibrary,
+};
 use sm_db::Db;
 
 use super::provider_helpers::SpaceUsage;
@@ -441,13 +443,21 @@ impl MediaLibraryService {
     /// 删库不会删里面的媒体，那些媒体会变成「指向不存在的库」的孤儿行。
     pub async fn delete_library(&self, library_id: i32) -> Result<(), ServiceError> {
         let library = self.require(library_id).await?;
+        // ★ 上游（`:317-320`）拦两件事：库里有**媒体** *或* 有**下载器客户端**。
+        // 只查 Media 会让「仅被下载器引用的库」被删掉，下载器随后指向不存在的库。
         let has_media = !MediaRepository::new(self.db.clone())
             // 只看「有没有」，取第一页 1 条即可。
             .list_by_library(library.id, sm_db::common::page::PageRequest::first_page(1)?)
             .await?
             .items
             .is_empty();
-        if has_media {
+        let has_download_client = !DownloadClientRepository::new(self.db.clone())
+            // 与 Media 那个一样是 `paged_list!` 生成的，同样要 page。
+            .list_by_library(library.id, sm_db::common::page::PageRequest::first_page(1)?)
+            .await?
+            .items
+            .is_empty();
+        if has_media || has_download_client {
             self.forget_space_usage(&library);
             return Err(ServiceError::conflict(
                 "media_library_in_use",

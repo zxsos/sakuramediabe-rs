@@ -18,7 +18,8 @@
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{
-    FromRequest, Json as AxumJson, Multipart as AxumMultipart, Query as AxumQuery, Request,
+    Form as AxumForm, FromRequest, Json as AxumJson, Multipart as AxumMultipart,
+    Query as AxumQuery, Request,
 };
 use axum::http::StatusCode;
 // 重复 query 参数的解析器（`serde_html_form`）—— 只 [`HtmlFormQuery`] 用。
@@ -116,6 +117,33 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match AxumExtraQuery::<T>::from_request(request, state).await {
             Ok(AxumExtraQuery(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ErrorResponse::from(rejection)),
+        }
+    }
+}
+
+/// 表单提取器（`application/x-www-form-urlencoded`）：解析失败时产出上游形状的 422。
+///
+/// # 为什么也要包
+///
+/// 与 [`Json`] 同一个漏洞：axum 的 `FormRejection` **不经过错误信封**，而且
+/// 「content-type 不是 form」回 415、「字段缺失」回 422，都是纯文本。上游
+/// `POST /auth/docs-token` 收的是 `OAuth2PasswordRequestForm`（表单），校验失败
+/// 走的是同一个 `RequestValidationError`（422 + 信封）。
+///
+/// 用法与 [`Json`] 相同：`EnvelopeForm(f): EnvelopeForm<F>`。
+pub struct Form<T>(pub T);
+
+impl<T, S> FromRequest<S> for Form<T>
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = ErrorResponse;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumForm::<T>::from_request(request, state).await {
+            Ok(AxumForm(value)) => Ok(Self(value)),
             Err(rejection) => Err(ErrorResponse::from(rejection)),
         }
     }

@@ -9,9 +9,11 @@
 //! 本模块的 [`task_queue`] 是队列本体：互斥（coalesce）、领取、租约、回收。
 //! 阶段 7 的 worker 只缺「handler 分发」—— 队列侧的地基已经在这了。
 //!
+//! `telemetry`(188) 已从「待做」里去掉：它被建错了概念（骨架期的
+//! `TaskTelemetry` 在上游不存在），已按上游的**匿名心跳**整体重写。
+//!
 //! 其余按体量从小到大排：`optional_services`(38，功能开关) →
-//! `plugin_removal`(95) → `telemetry`(188) → `indexer_settings`(304) →
-//! `status`(602)。
+//! `plugin_removal`(95) → `indexer_settings`(304) → `status`(602)。
 //!
 //! `optional_services`(38) 是功能开关（`job_disabled_reason` /
 //! `movie_similarity_enabled`），不落它会让「任务为什么没跑」无法解释 ——

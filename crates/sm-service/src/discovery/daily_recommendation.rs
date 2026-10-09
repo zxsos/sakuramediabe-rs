@@ -469,7 +469,43 @@ pub fn snapshot_date(target: Option<chrono::NaiveDate>) -> chrono::NaiveDate {
     target.unwrap_or_else(|| chrono::Local::now().date_naive())
 }
 
+// ⚠️ 【本文件缺了两个入口，`GET /daily-recommendations` 因此没法接线】
+//
+// 这不是「`todo!()` 待填」，是 `list_items` / `generate_latest_snapshot`
+// **根本没写** —— 本文件只有纯打分函数（`score_movies` 及其零件）。
+//
+// * 上游 `list_items`（`daily_recommendation_service.py:414-476`）只做**读**：
+//   `DailyRecommendationItem ⋈ Movie(is_blacklisted=False)` → `validate_page(page,
+//   page_size, error_code="invalid_daily_recommendation_filter")` → 按 `rank`
+//   分页 → 取这批影片的卡片（`with_movie_card_relations` +
+//   `attach_movie_list_media`）→ 组装。
+// * 上游 `generate_latest_snapshot`（`:347-412`，调度任务
+//   `daily_recommendation_generate_cron`）是**生成**侧：全库候选投影 → 打分 →
+//   清空重写该表。它还缺四个 IO 装载器：`_load_candidate_movies` /
+//   `_load_recent_seed_ids` / `_load_subscribed_actor_movie_ids` /
+//   `_load_ranking_scores`，以及 Qdrant 相似度 `_load_similarity_scores`
+//   （**失败时只跳过该信号**、不整体失败，`:196-199`）。
+//
+// 所以这是一个**功能**，不是一次接线：要（a）仓储分页查询；（b）把
+// `catalog::movie::MovieService::load_cards` 从私有改公开（现在外部拿不到卡片）；
+// （c）换掉下面两个缩过的形状；（d）生成侧四个装载器。
+// 详见 `routes/recommendations.rs` 里 `list_daily_recommendations` 的 ⚠️。
+
 /// 单条每日推荐（响应体）。
+///
+/// ⚠️ **这是一个「缩过的、且名不对」的形状，与上游不一致。** 上游响应元素是
+/// `DailyRecommendationMovieResource`（`schema/discovery/daily_recommendations.py`）：
+/// 它**继承完整的影片卡片** `MovieListItemResource`，再挂
+/// `{snapshot_date, generated_at, rank, recommendation_score, reason_codes,
+/// reason_texts, signal_scores, is_stale}`。
+///
+/// 即：本结构体**缺** 除 `title`/`poster_url` 外的全部卡片字段（番号、演员、
+/// 标签、`can_play` …），且缺 `rank` / `signal_scores` / `snapshot_date` /
+/// `generated_at` / `is_stale`；`score` / `reasons` 应分别叫
+/// `recommendation_score` / `reason_texts`。
+///
+/// 实现时要换成**卡片形状**（复用 [`crate::catalog::movie::MovieCard`]，由路由层
+/// `MovieListItemResource::from_movie_card` 组装）—— 别只改字段名了事，卡片才是主体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyRecommendationItem {
     pub movie_id: i64,
@@ -483,6 +519,12 @@ pub struct DailyRecommendationItem {
 }
 
 /// 分页。
+///
+/// ⚠️ 与上游有一处结构差异：上游是**泛型** `PageResponse[DailyRecommendationMovieResource]`，
+/// **没有页级的 `snapshot_date`** —— 快照日期是**元素级**字段（`:457-468` 的
+/// `is_stale = row.snapshot_date < today` 也是元素级）。本结构多出来的
+/// `snapshot_date` 是自造的，落地时删掉（`items` 的元素形状见
+/// [`DailyRecommendationItem`] 的 ⚠️）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyRecommendationPage {
     pub items: Vec<DailyRecommendationItem>,

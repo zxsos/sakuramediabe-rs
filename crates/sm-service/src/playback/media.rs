@@ -28,7 +28,9 @@
 //! 否则 Postgres 默认 `NULLS LAST FOR ASC` / `NULLS FIRST FOR DESC` 会让
 //! 「按热度降序」变成「没热度的排最前」。
 
+use sm_db::repo::media::MediaListFilter;
 use sm_db::repo::playback::MediaProgressRepository;
+use sm_db::repo::MovieRepository;
 use sm_db::repo::{
     ImageRepository, MediaPointRepository, MediaRepository, MediaThumbnailRepository,
 };
@@ -65,48 +67,70 @@ pub mod media_point_kind {
     pub const ALL: &str = "all";
 }
 
-/// 缩略图生成状态。
-pub mod thumbnail_state {
-    /// 待生成。
-    pub const PENDING: i32 = 0;
-    /// 失败。
-    pub const FAILED: i32 = 1;
-    /// 成功。
-    pub const SUCCESS: i32 = 2;
-    /// 跳过。
-    pub const SKIPPED: i32 = 3;
-}
-
 /// 排序字段白名单。**不在表里的一律 422**。
-pub const MEDIA_LIST_SORT_FIELD_MAP: [(&str, &str); 4] = [
-    ("created_at", "m.created_at"),
-    ("updated_at", "m.updated_at"),
-    ("file_name", "m.file_name"),
-    ("heat", "m.heat"),
+/// ★ 排序白名单**只有两项**，且 `heat` 在 **`movie` 表上**
+/// （`media_service.py:94-97`）：
+///
+/// ```python
+/// MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": Movie.heat}
+/// ```
+///
+/// ⚠️ 骨架期这里有四项（多出 `created_at` / `updated_at` / `file_name`），
+/// 而且把 `heat` 写成 media 自己的列 —— 都是自造的。media 表**没有** heat。
+///
+/// # 别名约定
+///
+/// `m` = media，`mv` = movie。排序要 `LEFT JOIN movie`，因为非 JAV 视频没有
+/// 影片、heat 恒空；所以 `heat` 排序必须 `NULLS LAST`（见
+/// [`MEDIA_LIST_NULLABLE_SORT_FIELDS`]）。
+pub const MEDIA_LIST_SORT_FIELD_MAP: [(&str, &str); 2] = [
+    ("file_size_bytes", "m.file_size_bytes"),
+    ("heat", "mv.heat"),
 ];
 
 /// 可空的排序字段。排序时要显式 `NULLS LAST`。
 pub const MEDIA_LIST_NULLABLE_SORT_FIELDS: [&str; 1] = ["heat"];
 
-/// 解析排序字段。`None`/空 → `None`；不在白名单 → **422**。
+/// 解析排序表达式。`None`/空 → `None`（用默认排序）；不合法 → **422**。
 ///
-/// **不夹到默认值** —— 上游 FastAPI 的 `Literal` 校验就是 422。
+/// # ★ 形状是 `field:direction`，**不是 `-field`**
+///
+/// 上游 `resolve_sort_expression(value, MEDIA_LIST_SORT_FIELD_MAP, ...)`
+/// （`service_helpers.py`）：先 `strip().lower()`，再按 **`:`** 切出字段名与
+/// 方向，方向只认 `asc` / `desc`，字段名要在白名单里 —— 任何一步不满足都是
+/// `422 invalid_media_filter`（`details.sort`）。
+///
+/// ⚠️ 骨架期这里收 `-field` 前缀表示降序 —— 那是**自造**的约定，客户端按上游
+/// 发 `heat:desc` 会被判成「未知字段」。已纠正为 `:` 形式（与同域的片段列表
+/// [`crate::playback::media_clip`] 的 `MEDIA_CLIP_SORT_FIELDS` 一致）。
+///
+/// **不夹到默认值** —— 非法值就是 422，不是「悄悄用默认排序」。
 pub fn resolve_sort(value: Option<&str>) -> Result<Option<(&'static str, bool)>, ServiceError> {
     let Some(raw) = value.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(None);
     };
-    let field = raw.strip_prefix('-').unwrap_or(raw);
+    // 归一化 `strip().lower()`：`HEAT:DESC` 与 `heat:desc` 等价。
+    let normalized = raw.to_ascii_lowercase();
+    let invalid = || {
+        ServiceError::validation_with(
+            "invalid_media_filter",
+            "Invalid sort expression",
+            details_of("sort", raw),
+        )
+    };
+    let Some((field, direction)) = normalized.split_once(':') else {
+        return Err(invalid());
+    };
+    if direction != "asc" && direction != "desc" {
+        return Err(invalid());
+    }
     let Some((_, column)) = MEDIA_LIST_SORT_FIELD_MAP
         .iter()
         .find(|(name, _)| *name == field)
     else {
-        return Err(ServiceError::validation(
-            "invalid_media_filter",
-            format!("未知的排序字段：{raw}"),
-        ));
+        return Err(invalid());
     };
-    // 升序 = 无前缀；降序 = `-` 前缀。
-    Ok(Some((*column, raw.starts_with('-'))))
+    Ok(Some((*column, direction == "desc")))
 }
 
 /// `GET /media` 的查询参数。
@@ -117,8 +141,10 @@ pub struct MediaListQuery {
     pub library_id: Option<i64>,
     /// **CSV** 形态（`?actor_ids=1,2`）—— 与 transfers 的重复参数不同。
     pub actor_ids: Option<String>,
-    /// 缩略图生成状态。
-    pub thumbnail_generation_state: Option<i32>,
+    /// 缩略图生成状态。**状态字面量**（`pending` / `retry_wait` / `terminal` /
+    /// `succeeded`）—— 骨架期这里写成 i32，而列是文本（见
+    /// `sm_db::playback::media::thumbnail_state`）。
+    pub thumbnail_generation_state: Option<String>,
     pub sort: Option<String>,
     pub page: Option<i64>,
     pub page_size: Option<i64>,
@@ -323,8 +349,105 @@ impl MediaService {
     /// `kind` **有默认值**（`all`），而 `/media/duplicates` 的 `kind`
     /// **必填** —— 见 `routes/media.rs` 的说明。
     pub async fn list_media(&self, query: &MediaListQuery) -> Result<MediaListPage, ServiceError> {
-        let _ = query;
-        todo!("骨架：kind/library_id/actor_ids/缩略图状态 过滤 + 白名单排序(heat 用 NULLS LAST) + 分页")
+        let page = query.page.unwrap_or(1);
+        let page_size = query.page_size.unwrap_or(20);
+        sm_core::pagination::validate_page(page, page_size)
+            .map_err(|error| ServiceError::validation("invalid_media_filter", error.message()))?;
+        let offset = sm_core::pagination::page_offset(page, page_size);
+
+        // ★ `actor_ids` 是 CSV，要先解析成 id，再（带墓碑解析）换成番号。
+        // 空名单由仓储处理成「命中不了任何媒体」，不退化成不过滤。
+        let actor_numbers = match query.actor_ids.as_deref() {
+            Some(csv) => {
+                let ids: Result<Vec<i32>, _> = csv
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(|part| part.parse::<i32>())
+                    .collect();
+                let ids = ids.map_err(|_| {
+                    ServiceError::validation("invalid_media_filter", "actor_ids 必须是整数列表")
+                })?;
+                if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    MovieRepository::new(self.pool.clone())
+                        .numbers_for_actor_ids(&ids)
+                        .await?
+                }
+            }
+            None => Vec::new(),
+        };
+
+        let order_sql = match resolve_sort(query.sort.as_deref())? {
+            Some((column, desc)) => {
+                // ★ `heat` 是唯一可空字段：NULLS LAST **不受排序方向影响**
+                // （非 JAV 视频没有影片、heat 恒空，永远垫底）。
+                let nullable = MEDIA_LIST_NULLABLE_SORT_FIELDS
+                    .iter()
+                    .any(|name| column.ends_with(name));
+                format!(
+                    "{} {}{}, m.id ASC",
+                    column,
+                    if desc { "DESC" } else { "ASC" },
+                    if nullable { " NULLS LAST" } else { "" }
+                )
+            }
+            None => "m.created_at DESC, m.id DESC".to_owned(),
+        };
+
+        let filter = MediaListFilter {
+            kind: query.kind.as_deref(),
+            library_id: query.library_id.map(|id| id as i32),
+            movie_numbers: query.actor_ids.as_ref().map(|_| actor_numbers.as_slice()),
+            thumbnail_generation_state: query.thumbnail_generation_state.as_deref(),
+            require_valid: None,
+            search: None,
+            file_hashes: None,
+        };
+        let repo = &self.media;
+        let total = repo.count_filtered(&filter).await?;
+        let rows = repo
+            .list_filtered(&filter, &order_sql, page_size, offset)
+            .await?;
+        let items = self.to_list_items(&rows).await?;
+        Ok(MediaListPage {
+            items,
+            page,
+            page_size,
+            total,
+        })
+    }
+
+    /// 一批媒体行 → 列表项。影片 id 按番号补（每页最多 100 条）。
+    async fn to_list_items(
+        &self,
+        rows: &[sm_db::playback::media::Media],
+    ) -> Result<Vec<MediaListItemResource>, ServiceError> {
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let movie = match row.movie_number.as_deref() {
+                Some(number) => MovieRepository::new(self.pool.clone())
+                    .find_by_number(number)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            items.push(MediaListItemResource {
+                id: i64::from(row.id),
+                library_id: i64::from(row.library_id),
+                file_name: row.file_name.clone(),
+                movie_id: movie.as_ref().map(|movie| i64::from(movie.id)),
+                movie_number: row.movie_number.clone(),
+                duration_seconds: i64::from(row.duration_seconds),
+                resolution: row.resolution.clone(),
+                file_size_bytes: row.file_size_bytes,
+                valid: row.valid,
+                created_at: row.created_at.map(|at| at.to_string()),
+            });
+        }
+        Ok(items)
     }
 
     /// `GET /media/multi-version` —— 同番号多文件。
@@ -335,8 +458,72 @@ impl MediaService {
         include_vr: bool,
         include_fc2: bool,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (page, page_size, include_vr, include_fc2);
-        todo!("骨架：按番号分组 HAVING count > 1；VR/FC2 走番号前缀过滤")
+        // ★ 只按番号分组，取回**这些番号下的全部媒体**（不分页）—— 上游
+        // `media_service.py:345-359` 也是先取组、再一次性取回组内媒体，
+        // 因为「一个番号有几个文件」在取组时还不知道。
+        sm_core::pagination::validate_page(page, page_size)
+            .map_err(|error| ServiceError::validation("invalid_media_filter", error.message()))?;
+        let offset = sm_core::pagination::page_offset(page, page_size);
+        let total = self
+            .media
+            .count_multi_version_movies(include_vr, include_fc2)
+            .await?;
+        let numbers = self
+            .media
+            .multi_version_movie_numbers(include_vr, include_fc2, page_size, offset)
+            .await?;
+        let filter = MediaListFilter {
+            kind: None,
+            library_id: None,
+            movie_numbers: Some(numbers.as_slice()),
+            thumbnail_generation_state: None,
+            require_valid: None,
+            search: None,
+            file_hashes: None,
+        };
+        let rows = self
+            .media
+            .list_filtered(&filter, "m.created_at ASC, m.id ASC", i64::MAX, 0)
+            .await?;
+
+        // 按番号归堆，**保持分组查询返回的顺序**（上游按 `MAX(updated_at) DESC`）。
+        let mut by_number: Vec<(String, Vec<MediaListItemResource>)> = Vec::new();
+        let items = self.to_list_items(&rows).await?;
+        for (row, item) in rows.iter().zip(items) {
+            let Some(number) = row.movie_number.clone() else {
+                continue;
+            };
+            match by_number.iter_mut().find(|(key, _)| *key == number) {
+                Some((_, group)) => group.push(item),
+                None => by_number.push((number, vec![item])),
+            }
+        }
+        // ★ 上游只保留 `len(items) > 1` 的组（`:359`）：建组到取媒体之间可能
+        // 有并发删除，那时这个番号只剩一个文件，不该再算「多版本」。
+        let mut groups = Vec::new();
+        for (number, media) in by_number {
+            if media.len() <= 1 {
+                continue;
+            }
+            let movie_id = MovieRepository::new(self.pool.clone())
+                .find_by_number(&number)
+                .await
+                .ok()
+                .flatten()
+                .map(|movie| i64::from(movie.id));
+            groups.push(serde_json::json!({
+                "movie_number": number,
+                "media_count": media.len(),
+                "media_items": media,
+                "movie_id": movie_id,
+            }));
+        }
+        Ok(serde_json::json!({
+            "items": groups,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }))
     }
 
     /// ★ `GET /media/duplicates` —— 按哈希分组。**`kind` 必填**。
@@ -349,8 +536,76 @@ impl MediaService {
         page: i64,
         page_size: i64,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (media_kind, page, page_size);
-        todo!("骨架：GROUP BY file_hash（缺失的用退化键单独分组并标 Degraded）")
+        sm_core::pagination::validate_page(page, page_size)
+            .map_err(|error| ServiceError::validation("invalid_media_filter", error.message()))?;
+        if !matches!(media_kind, "jav" | "video") {
+            return Err(ServiceError::validation(
+                "invalid_media_filter",
+                "kind 只能是 jav 或 video",
+            ));
+        }
+        let offset = sm_core::pagination::page_offset(page, page_size);
+        let kind = Some(media_kind);
+        let total = self.media.count_duplicate_hash_groups(kind).await?;
+        let hashes = self
+            .media
+            .duplicate_hash_groups(kind, page_size, offset)
+            .await?;
+        if hashes.is_empty() {
+            return Ok(serde_json::json!({
+                "items": [],
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+            }));
+        }
+        let filter = MediaListFilter {
+            kind,
+            file_hashes: Some(hashes.as_slice()),
+            ..Default::default()
+        };
+        let rows = self
+            .media
+            // 组内排序：哈希升序 → 入库时间升序 → id 升序（上游 `:413`）。
+            .list_filtered(
+                &filter,
+                "m.file_hash ASC, m.created_at ASC, m.id ASC",
+                // 一次取回这些哈希下的**全部**媒体：组内条数在取组时未知。
+                i64::MAX,
+                0,
+            )
+            .await?;
+        let items = self.to_list_items(&rows).await?;
+
+        // 按哈希归堆，**保持取组的顺序**（`total` 与页序都按那个顺序）。
+        let mut groups = Vec::new();
+        for hash in &hashes {
+            let media: Vec<MediaListItemResource> = rows
+                .iter()
+                .zip(items.iter())
+                .filter(|(row, _)| row.file_hash.as_deref() == Some(hash.as_str()))
+                .map(|(_, item)| item.clone())
+                .collect();
+            if media.is_empty() {
+                // 取组与取媒体之间被并发删空 —— 跳过，不返回一个空组。
+                continue;
+            }
+            groups.push(serde_json::json!({
+                "dedup_key": hash,
+                // ⚠️ 目前**只会是** `hash`：本仓 `DuplicateKeyKind::Degraded`
+                // （按「文件名+大小」猜重复）上游没有对应的分组查询，尚未启用。
+                "key_kind": "hash",
+                "kind": media_kind,
+                "media_count": media.len(),
+                "media_items": media,
+            }));
+        }
+        Ok(serde_json::json!({
+            "items": groups,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }))
     }
 
     /// `GET /media-points` —— 时刻列表。`kind` 默认 `jav`。
@@ -363,15 +618,87 @@ impl MediaService {
         keyword: Option<&str>,
         exclude_collection_id: Option<i64>,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (
-            page,
-            page_size,
-            sort,
-            media_kind,
-            keyword,
-            exclude_collection_id,
-        );
-        todo!("骨架：按 created_at DESC, id DESC 排序；keyword 匹配文件名与番号")
+        sm_core::pagination::validate_page(page, page_size).map_err(|error| {
+            ServiceError::validation("invalid_media_point_filter", error.message())
+        })?;
+        let offset = sm_core::pagination::page_offset(page, page_size);
+        // ★ 上游 `MEDIA_POINT_SORT_FIELDS` **只有两种取值**
+        // （`media_service.py:89-92`）：`created_at:desc` / `created_at:asc`，
+        // 默认 desc。归一化是 `strip().lower()`（`resolve_sort`），所以
+        // `CREATED_AT:ASC` 合法；空串走默认。
+        //
+        // ⚠️ 骨架期这里还接受裸 `asc` / `desc` —— 上游**不认**这两个字面量，
+        // 收了等于把非法输入当合法（契约被放宽，客户端会依赖它）。
+        let order_sql = match sort.map(str::trim).filter(|raw| !raw.is_empty()) {
+            None => "p.created_at DESC, p.id DESC",
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "created_at:desc" => "p.created_at DESC, p.id DESC",
+                "created_at:asc" => "p.created_at ASC, p.id ASC",
+                _ => {
+                    return Err(ServiceError::validation_with(
+                        "invalid_media_point_filter",
+                        "Invalid sort expression",
+                        details_of("sort", raw),
+                    ))
+                }
+            },
+        };
+        // `kind` 默认 `jav`（上游签名），`all` 表示不限。
+        let kind = media_kind.unwrap_or("jav");
+        let kind = if kind == "all" { None } else { Some(kind) };
+        let exclude_collection_id = exclude_collection_id.map(|id| id as i32);
+
+        let total = self
+            .points
+            .count_filtered(kind, keyword, exclude_collection_id)
+            .await?;
+        let points = self
+            .points
+            .list_filtered(
+                kind,
+                keyword,
+                exclude_collection_id,
+                order_sql,
+                page_size,
+                offset,
+            )
+            .await?;
+
+        // 图片批量取回（与 [`Self::list_points`] 同一个模式，避免逐行 N+1）。
+        let image_ids: Vec<i32> = {
+            let mut ids: Vec<i32> = points.iter().map(|point| point.image_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        let images = self.images.find_by_ids(&image_ids).await?;
+
+        let mut items = Vec::with_capacity(points.len());
+        for point in &points {
+            // `image_id` NOT NULL 且外键 RESTRICT —— 查不到只可能是并发删图。
+            let Some(image) = images.get(&point.image_id) else {
+                continue;
+            };
+            items.push(serde_json::json!({
+                "point_id": point.id,
+                "media_id": point.media_id,
+                "movie_number": point.movie_number,
+                "video_item_id": point.video_item_id,
+                "thumbnail_id": point.thumbnail_id,
+                "offset_seconds": point.offset_seconds,
+                // ★ 与 [`MediaPointValue`] 同一约定：这一层给 **id 与未签名路径**，
+                // 由 API 层组装成可用的 `ImageResource`。
+                "image_id": image.id,
+                "image_origin": image.origin,
+                "created_at": point.created_at.map(|at| at.to_string()),
+            }));
+        }
+        Ok(serde_json::json!({
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }))
     }
 
     /// 某媒体的全部时刻。**按 `id` 升序**。
@@ -908,8 +1235,28 @@ impl MediaService {
         page_size: i64,
         search: Option<&str>,
     ) -> Result<serde_json::Value, ServiceError> {
-        let _ = (page, page_size, search);
-        todo!("骨架：查 valid = false 的媒体；search 匹配文件名与番号")
+        sm_core::pagination::validate_page(page, page_size)
+            .map_err(|error| ServiceError::validation("invalid_media_filter", error.message()))?;
+        let offset = sm_core::pagination::page_offset(page, page_size);
+        let filter = MediaListFilter {
+            require_valid: Some(false),
+            search,
+            ..Default::default()
+        };
+        let total = self.media.count_filtered(&filter).await?;
+        let rows = self
+            .media
+            // 上游排序：`updated_at DESC, id DESC`（`:775`）—— 失效媒体按
+            // **最近变动**在前，用户最关心刚坏掉的那些。
+            .list_filtered(&filter, "m.updated_at DESC, m.id DESC", page_size, offset)
+            .await?;
+        let items = self.to_list_items(&rows).await?;
+        Ok(serde_json::json!({
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }))
     }
 }
 
@@ -975,15 +1322,29 @@ mod tests {
     }
 
     /// ★ 排序字段是**白名单**，自由字符串 → 422（不夹到默认值）。
+    ///
+    /// 形状是上游的 **`field:direction`**（不是 `-field`），且归一化是
+    /// `strip().lower()` —— `HEAT:DESC` 与 `heat:desc` 等价。
     #[test]
     fn sort_fields_come_from_the_allow_list() {
         assert_eq!(resolve_sort(None).expect("缺省不排序"), None);
         assert_eq!(resolve_sort(Some("  ")).expect("空串不排序"), None);
-        let (column, desc) = resolve_sort(Some("-heat"))
+        let (column, desc) = resolve_sort(Some("heat:desc"))
             .expect("heat 可排")
             .expect("有值");
-        assert_eq!(column, "m.heat");
-        assert!(desc, "`-` 前缀 = 降序");
+        assert_eq!(column, "mv.heat");
+        assert!(desc, "`desc` = 降序");
+        // 归一化：大写也认。
+        assert_eq!(
+            resolve_sort(Some("FILE_SIZE_BYTES:ASC"))
+                .expect("大写合法")
+                .map(|(column, _)| column),
+            Some("m.file_size_bytes")
+        );
+        // ★ 骨架期的 `-heat` 约定**已废除**：它现在必须是非法值。
+        assert!(resolve_sort(Some("-heat")).is_err());
+        // 方向只能是 asc / desc。
+        assert!(resolve_sort(Some("heat:sideways")).is_err());
         let error = resolve_sort(Some("id; DROP TABLE media")).expect_err("注入应被拒");
         assert_eq!(error.code(), "invalid_media_filter");
     }
@@ -1021,19 +1382,21 @@ mod tests {
         assert_ne!(group.key_kind, DuplicateKeyKind::Hash);
     }
 
-    /// 缩略图生成状态是四个固定值。
+    /// ★ 缩略图状态字面量**只有一个来源**：`sm-db` 的文本常量。
+    ///
+    /// ⚠️ 骨架期本模块另有一个 i32 版本的 `thumbnail_state`（0/1/2/3），与库里
+    /// 实际存的**文本列**对不上 —— 自造的第二份定义。它已被删除，`/media` 的
+    /// `thumbnail_generation_state` 过滤直接吃 `sm_db` 那四个字面量。
+    ///
+    /// 🔴 这个测试盯着的是**「别再长出第二份」**：谁再往本模块加 `thumbnail_state`，
+    /// 这个引用就会指向它而不是 `sm-db`，值一变即失败。
     #[test]
-    fn the_thumbnail_states_are_four() {
-        let states = [
-            thumbnail_state::PENDING,
-            thumbnail_state::FAILED,
-            thumbnail_state::SUCCESS,
-            thumbnail_state::SKIPPED,
-        ];
-        assert_eq!(states.len(), 4);
-        let mut sorted = states.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 4, "四个状态互不相同");
+    fn thumbnail_states_have_a_single_source() {
+        use sm_db::playback::media::thumbnail_state as states;
+        assert_eq!(states::PENDING, "pending");
+        assert_eq!(states::RETRY_WAIT, "retry_wait");
+        assert_eq!(states::TERMINAL, "terminal");
+        assert_eq!(states::SUCCEEDED, "succeeded");
+        assert_eq!(states::ALL.len(), 4);
     }
 }

@@ -37,6 +37,7 @@ use sm_plugins::loader::collect_providers;
 use sm_plugins::registry::ProviderRegistry;
 use sm_plugins::supervisor::{launch, restart_backoff, LaunchSpec, PluginProcess};
 use sm_scheduler::JobSpec;
+use sm_service::system::telemetry::PluginHeartbeat;
 use sm_service::system::{JobCatalog, JobCatalogEntry};
 
 /// 等插件就绪的上限。
@@ -380,6 +381,24 @@ impl Plugins {
     /// 活的**：插件重启会换端点，快照会过期。
     pub fn provider_registry(&self) -> Arc<std::sync::Mutex<ProviderRegistry>> {
         Arc::clone(&self.providers)
+    }
+
+    /// 已加载插件的 `{id, version}` 快照，供匿名遥测心跳用。
+    ///
+    /// ⚠️ **与上游有一处偏差**（登记在
+    /// `sm_service::system::telemetry` 的模块文档第 4 条）：上游
+    /// `PluginManager().list_plugins()`（`manager.py:103`）扫的是 `root_dir` 下的
+    /// **全部**插件目录（含未启用 / 加载失败的），版本取自 `manifest.json`。
+    /// 本仓还没有 manifest 解析（见 `PluginConfig::launch_spec` 的注释），所以
+    /// 只能报**已成功启动**的插件，版本取注册响应的 `version`。
+    pub fn plugin_heartbeats(&self) -> Vec<PluginHeartbeat> {
+        self.loaded
+            .iter()
+            .map(|plugin| PluginHeartbeat {
+                id: plugin.plugin_id.clone(),
+                version: plugin.registration.version.clone(),
+            })
+            .collect()
     }
 
     /// 从**全部**已加载插件的注册声明重建三张注册表。

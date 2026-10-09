@@ -11,21 +11,20 @@
 //! | `GET /image-search/plot-sessions/{session_id}/results`（`:128`） | query | 同上 |
 //! | `POST /image-search/plot-text-sessions`（`:147`） | **form** | 同上 |
 //!
-//! # 一处**必须先解掉的前置**：axum 的 `form` feature 未启用
+//! # ⚠️ 骨架期说「axum 的 `form` feature 未启用」—— **是错的**
 //!
-//! 六个端点里**四个是 form 编码**（`Form()` / `File()`），不是 JSON。而
-//! `axum::extract` 只有 `Json` / `Query` / `Multipart`，`form` feature 没开。
+//! 本仓的 `axum` 依赖**没关** default features（见 `crates/sm-api/Cargo.toml`），
+//! 而 axum 0.8 的 default 里**就含 `form`**。所以 `axum::extract::Form` /
+//! `Multipart` 一直都在 —— `extract.rs` 里那个 `Form` 信封包装能编译即为证。
+//! 这里**没有**任何 feature 前置要解。
 //!
-//! 这正是我当初判定 `POST /auth/docs-token` **不实现**的理由（见
-//! `routes/auth.rs` 的模块文档）—— 但**那条理由在这里不成立**：
+//! 骨架还把那段写成了 `POST /auth/docs-token`「不实现」的论据（「form 编码
+//! 在本仓库不可用」）—— **不成立**：那条理由是关于**消费方**的（本仓无
+//! Swagger UI），与 form 编码无关；而且该端点**现已照上游实现**（见
+//! `routes/auth.rs`）。
 //!
-//! | | docs-token | 这四个 |
-//! |---|---|---|
-//! | 有消费方 | ❌ 本仓库无 Swagger UI | ✅ 前端就是消费方 |
-//! | 结论 | 不实现（用没有调用方的端点凑数会让指标失真） | **必须实现**，顺带把 feature 打开 |
-//!
-//! 也就是说 docs-token 那条「不实现」的理由是**关于消费方的，不是关于 form
-//! 编码本身**。别把它误读成「form 编码在本仓库不可用」。
+//! 这四个 form 端点真正要做的一件事：用 [`crate::extract::Form`]（保留错误
+//! 信封）而不是 axum 原生 `Form`。
 //!
 //! # 错误码是 **400**，不是仓库惯例的 422
 //!
@@ -134,7 +133,7 @@ async fn create_image_search_session(
     _user: CurrentUser,
     _payload: axum::extract::Multipart,
 ) -> Result<Json<ImageSearchSessionResponse>, ErrorResponse> {
-    todo!("骨架：需先启用 axum 的 form feature；照上游 `:34-58` 实现（ValueError -> 400）")
+    todo!("骨架：照上游 `:34-58` 实现（multipart；ValueError -> 400）")
 }
 
 /// `GET /image-search/sessions/{session_id}/results`
@@ -149,13 +148,17 @@ async fn get_image_search_results(
     todo!("骨架：接 ImageSearchService::list_results（404 / 400 两种错误）")
 }
 
-/// `POST /image-search/text-sessions` —— form 编码。
+/// `POST /image-search/text-sessions` —— **form 编码**。
+///
+/// ⚠️ 骨架期签名收的是 `Json<SearchFilters>` —— **传输形态就错了**（上游是
+/// `Form`，字段还是 CSV 字符串，见模块文档）。实现时换成
+/// [`crate::extract::Form`] + 表单专用 DTO，别沿用 `SearchFilters`。
 async fn create_text_image_search_session(
     State(_state): State<AppState>,
     _user: CurrentUser,
     _payload: axum::extract::Json<SearchFilters>,
 ) -> Result<Json<ImageSearchSessionResponse>, ErrorResponse> {
-    todo!("骨架：改用 Form 提取器（需 form feature）；照上游 `:74-92` 实现")
+    todo!("骨架：用 EnvelopeForm + 表单 DTO；照上游 `:74-92` 实现")
 }
 
 /// `POST /image-search/plot-sessions` —— multipart。
@@ -177,13 +180,16 @@ async fn get_plot_image_search_results(
     todo!("骨架：接 MoviePlotImageSearchService::list_results")
 }
 
-/// `POST /image-search/plot-text-sessions` —— form 编码。
+/// `POST /image-search/plot-text-sessions` —— **form 编码**。
+///
+/// ⚠️ 同 [`create_text_image_search_session`]：骨架的 `Json<SearchFilters>`
+/// 传输形态错了，实现时换 `EnvelopeForm` + 表单 DTO。
 async fn create_plot_text_search_session(
     State(_state): State<AppState>,
     _user: CurrentUser,
     _payload: axum::extract::Json<SearchFilters>,
 ) -> Result<Json<PlotImageSearchSessionResponse>, ErrorResponse> {
-    todo!("骨架：改用 Form 提取器（需 form feature）；照上游 `:147-165` 实现")
+    todo!("骨架：用 EnvelopeForm + 表单 DTO；照上游 `:147-165` 实现")
 }
 
 /// CSV 正整数解析。

@@ -376,16 +376,28 @@ async fn get_capabilities(
 
 /// `GET /status/image-search` —— 图搜索引状态。
 ///
-/// # 读**数据库单例表**，不是问 Qdrant
+/// # ⚠️ 骨架期这里写着「读数据库单例表，**不问 Qdrant**」—— 写反了
 ///
-/// 理由与 `discovery::image_search_space` 相同：`/status/*` 是高频轮询接口，
-/// 每次问 Qdrant 是一次网络往返。状态是「索引记录在哪个嵌入空间」这件事，
-/// 由 `image_search_index_state`（id 恒为 1）持有。
+/// 上游 `StatusService.get_image_search_status`（`status_service.py:410-443`）
+/// 在**图搜已启用**时会发起网络探测：
+///
+/// 1. `_probe_embedding_service()`（`:525`）—— `get_embedding_client().describe()`；
+/// 2. `_probe_image_search_vector_store()`（`:549`）—— `get_qdrant_thumbnail_store().inspect_status()`；
+/// 3. `_indexing_status()`（`:576`）—— 读 `MediaThumbnail` 的待处理/失败计数；
+/// 4. `ImageSearchIndexSpaceService.get_status(...)` —— **这才轮到**
+///    `image_search_index_state` 单例表。
+///
+/// 也就是说「单例表」只是返回体里 `index_space` 这一项的来源，**不是整个端点**。
+/// 只有图搜**未启用**（`image_search_enabled()` 为假）时才是纯静态响应
+/// （`:411-423`），不发任何网络请求。
+///
+/// 结论：本端点**卡在 Qdrant / 嵌入服务客户端**上，不是「读张表就行」——
+/// 与 `sm_service::system::status` 模块文档的说法一致。
 async fn get_image_search_status(
     State(_state): State<AppState>,
     _user: CurrentUser,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接 StatusService::get_image_search_status（读单例表，不问 Qdrant）")
+    todo!("骨架：需 Qdrant / 嵌入服务探测客户端；照上游 status_service.py:410-443（未启用时为纯静态）")
 }
 
 /// `GET /status/metadata-providers/{provider}/test` —— 探测元数据源。

@@ -507,6 +507,79 @@ impl MediaPointResource {
     }
 }
 
+/// `GET /media-points` 的列表项 —— 上游 `MediaPointListItemResource`
+/// （`schema/playback/media.py`）。
+///
+/// 与 [`MediaPointResource`] 的区别：后者是**某个媒体下的**点（`/media/{id}/points`），
+/// 这个是**全局**的时刻列表项，多带 `movie_number` / `video_item_id` 供前端区分归属。
+///
+/// ⚠️ 骨架期 `routes/media_points.rs` 里有一个**自造的** `MediaPointListItem`
+/// （`id` / `kind` / `offset_seconds` / `title`）—— 字段集合与上游毫无交集，
+/// 且没有图片。已删除，改用本类型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaPointListItemResource {
+    pub point_id: i32,
+    /// 来源媒体。**可为 `None`** —— 来源被删后置空，时刻点仍在。
+    pub media_id: Option<i32>,
+    /// 非 JAV 媒体没有番号。
+    pub movie_number: Option<String>,
+    /// 供前端区分归属的非 JAV 条目 id。
+    pub video_item_id: Option<i32>,
+    pub thumbnail_id: Option<i32>,
+    pub offset_seconds: i32,
+    pub image: ImageResource,
+    /// 上游非可空（`datetime`）而 DB 列可空 —— 缺失输出空串，与其余 DTO 一致。
+    pub created_at: String,
+}
+
+impl MediaPointListItemResource {
+    /// 由 `MediaService::list_media_points` 的 JSON 行组装。
+    ///
+    /// `now` 由调用方传入 —— 一批必须用同一个时间戳，否则同一页里的 URL
+    /// 生效时刻不一致（前端缓存命中率会掉）。
+    ///
+    /// 缺 `point_id` 返回 `None`：那是 service 输出形状变了，宁可漏一条也
+    /// 不要伪造一个 `point_id: 0` —— 客户端会拿它去删一个不存在的点。
+    pub fn from_list_item(secret: &str, now: i64, value: &Value) -> Option<Self> {
+        Some(Self {
+            point_id: i32::try_from(value.get("point_id")?.as_i64()?).ok()?,
+            media_id: value
+                .get("media_id")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok()),
+            movie_number: value
+                .get("movie_number")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            video_item_id: value
+                .get("video_item_id")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok()),
+            thumbnail_id: value
+                .get("thumbnail_id")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok()),
+            offset_seconds: i32::try_from(value.get("offset_seconds")?.as_i64()?).ok()?,
+            image: ImageResource {
+                id: i32::try_from(value.get("image_id")?.as_i64()?).ok()?,
+                origin: sign_image_origin(
+                    secret,
+                    value
+                        .get("image_origin")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    now,
+                ),
+            },
+            created_at: value
+                .get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        })
+    }
+}
+
 /// 播放进度 —— 上游 `MediaProgressResource`。
 // `last_watched_at` 是 `String`（带堆分配），所以**不能** derive `Copy`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

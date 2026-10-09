@@ -4,15 +4,22 @@
 
 ## 一、当前状态
 
+> **数字以 `docs/progress-baseline.md` 为准** —— 跑 `pwsh -File scripts/progress.ps1 -Diff`
+> 核对，漂移即失败。下表同步到 **2026-10-07**（HEAD `ce88fd1`）。
+
 | 项 | 值 |
 |---|---|
-| 铺开阶段 | ✅ **已全部完成**（2026-10-05）。路由模块 32/32、端点路径 **117/117**、服务层 **104/113** 文件（缺的全是空 `__init__.py` 与一处刻意不落地） |
-| 验证阶段 | ✅ **编译 + clippy + rustdoc 三门全绿**（2026-10-05）。`cargo check/clippy --workspace --all-targets --all-features -- -D warnings` 与 `RUSTDOCFLAGS=-D warnings cargo doc` 全部 exit 0；`cargo fmt --all` 已跑（原本 81 个文件不整齐） |
-| 端点方法体 | **实测 `todo!()` 共 199 个**：`sm-service` **126** + `sm-api` **73**。`sm-db` 与 `sm-scheduler` **各 0 个**（原 247：… + 缩略图任务计数/重置 4 + `generate_pending_thumbnails` 1 已落地） |
-| 已清零的文件 | `sm-db` 全部、`thumbnails/artifacts.rs`、`image_cleanup.rs`、`movie_asset_pack.rs`；`sm-api` 侧 media / videos / moment-collections / video-collections 四族全通 |
-| 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 3/19**（`activity_record_cleanup` / `image_search_index` / `movie_similarity_recompute`） |
-| 门禁 | ✅ **六道全绿**（2026-10-05）：`fmt` / `doc -D warnings` / `clippy --all-targets --all-features -D warnings` / `compare_schema.py` / `compare.py` / `compare_core.py`（64/64）/ `check_paged_wrappers.py`。**只剩测试未跑**（按用户要求不主动跑套件） |
-| 提交 | 24 个，全部已推 `cnb/main`。`origin`（GitHub）**未推**，一直只推 `cnb` |
+| 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
+| 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
+| 端点方法体 | **实测 `todo!()` 共 78 个**：`sm-service` **35** + `sm-api` **43**。`sm-db` / `sm-scheduler` / `sm-core` **各 0 个** |
+| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **43 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
+| 完成的域 | `collections`、`videos`（2/7） |
+| 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 5/21** |
+| 门禁 | 六道 + `progress.ps1 -Diff` 全绿。**测试未跑**（按用户要求不主动跑套件） |
+| 提交 | 本地 `main` 比 `cnb/main` **领先 39 个提交（未推）**；`origin`（GitHub）一直未推 |
+
+**下一步看 §七「交接快照（2026-10-07）」** —— 那一节是权威的开工入口，含剩余 78 条的**卡点表**
+与两个待拍板项。§一之二以下的数字是**历史计划**，别照它开工。
 
 ## 一之一、`cargo check` 全绿是怎么来的（错误分布）
 
@@ -132,16 +139,20 @@ python parity/compare.py ; python parity/compare_core.py ; python parity/check_p
 转发给 clippy-driver**（报 `Unrecognized option`）—— 要么放在 `--` 之前，
 要么干脆不加。
 
-## 一之二、下一步：**继续接方法体（238 个 `todo!()`）**
+## 一之二、下一步：**继续接方法体**（⚠️ 本节数字是历史计划，已过时）
+
+> **别照本节开工。** 本节写下时是 238 个 `todo!()`；**当前（2026-10-07）是 78 个**。
+> **权威清单看 `docs/progress-baseline.md` 与 §七「交接快照」。** 下面的分块列表保留为
+> **原计划**（哪些族已接、接的时候要补什么下层）—— 大部分已落地，剩余项的卡点见 §七.3。
 
 验证阶段已收口。接下来的活只有一件：把 `todo!()` 换成真实实现。
 
-| 位置 | `todo!()` | 备注 |
+| 位置 | 写下时 | 现状（2026-10-07） |
 |---|---|---|
-| `sm-service` | **150** | 业务规则主场 |
-| `sm-api` | **88** | 大多是「取参数 → 调 service → 拼响应」的薄壳 |
-| `sm-db` | **0** | ✅ 全部实现完 |
-| `sm-scheduler` | **0** | ✅ |
+| `sm-service` | 150 | **35** |
+| `sm-api` | 88 | **43** |
+| `sm-db` | 0 | ✅ 0 |
+| `sm-scheduler` | 0 | ✅ 0 |
 
 ### 已接完的（按族记）
 
@@ -1046,6 +1057,57 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 `multi_version_movie_numbers` / `count_multi_version_movies` + `MediaListFilter`
 （WHERE 唯一拼接处，全部走 `push_bind`，无字符串插值）。服务层两个方法**还没接**。
 
+#### `media` 列表三处落地（101 → 96，playback 10 → 5）
+
+`list_duplicate_media_groups` / `list_media_points` / `list_invalid_media` 三处齐了。
+仓储侧扩了「筛选面」：`MediaListFilter` 新增 `require_valid` / `search` /
+`file_hashes`，`MediaPointRepository` 新增时刻列表的 `list_filtered` /
+`count_filtered`（条件拼接各只有一处，两个查询共用）。
+
+★ **两处骨架期自造，已按上游纠回**：
+
+1. `list_invalid_media` 的 search 是**四个字段任一命中**（影片番号 / 影片标题 /
+   视频标题 / 文件名，`:766-773`），骨架注释只写了「文件名与番号」。差异化的是
+   非 JAV 媒体 —— 它们的番号恒空，只按番号搜会把整类失效视频筛没。
+2. `list_media_points` 的排序**只有 `created_at:desc` / `created_at:asc`** 两种
+   （`MEDIA_POINT_SORT_FIELDS`，`:89-92`），别的值 422。骨架注释只说「按
+   created_at DESC」像是随便排。
+
+⚠️ **`DuplicateKeyKind::Degraded` 暂未启用**（只输出 `key_kind: "hash"`）：上游是
+**只按 `file_hash` 分组**且只算非空哈希的（`:379-388`）。「按文件名+大小猜重复」
+会直接误导用户删文件，所以不自己发明分组与分页语义 —— 要用得先定清它跟哈希组
+怎么共同分页（两者顺序、`total` 怎么算）。类型与单测都留着，只差实现。
+
+⚠️ 未做：重复组里 video 项的 `collections`（上游 `:415-443` 带合集引用）需要
+合集侧查询面，还没有。
+
+#### `movie_metadata_search`：候选 id 编解码 + 缓存清理（96 → 94）
+
+★ **顺手消掉同 crate 的两份同名类型**：本文件自己声明过
+`MetadataCandidate { candidate_id, title, date, preview_url, confidence, source }`，
+而 `transfers::import_task` 里那份才是上游形状（`media_import.py:76-86`，10 个字段，
+**没有 `confidence` / `date` / `preview_url`**，有 `source_name` / `duration_minutes`
+/ `cover_url`）。两份都活着，客户端拿到哪份取决于走哪条路。现在
+`movie_metadata_search` 只做转出口。**再不要**往这里加第二份 wire 类型。
+
+落了两处：
+- `resolve_candidate_reference(candidate_id, plugin_enabled)` —— 判据**只有两条**：
+  段数 = 3、前缀是 `javdb` / `plugin`。★ 不校验番号形状：上游不校验（真伪由
+  fetch 时 `_ensure_candidate_number` 兜），自造格式规则会把上游能接受的重试挡掉。
+  `plugin_enabled` 做成**参数**：插件可能已卸载而候选 id 还在客户端手里（搜索
+  结果缓存数小时），不查就会放行一个必然失败的重试。做成参数也让这条规则能脱离
+  插件栈单测。另落 `javdb_candidate_id` / `plugin_candidate_id` 两个编码器 ——
+  与解码是一对，只写一边就会出现「搜索给的 id 重试解不出来」。
+- `cleanup_search_assets(root)` —— **接 root 参数**（组合根知道图片根目录），
+  因此可脱离配置单测。★ 两处 `symlink_metadata` 判断是**安全**要求：目录名虽是
+  uuid，但条目可能被换成指向别处的链接，跟进去 `remove_dir_all` 会删掉别处。
+  边界：恰好 24h **算过期**（上游 `now - mtime > MAX_AGE`）。
+
+⚠️ 仍未落：`search_by_number` / `fetch_candidate` —— 要元数据 provider seam
+（JavDB 取详情 + 枚举已启用插件来源）与图片落盘（根目录 + 下载器 + 解码校验）。
+`sm_core::signing::build_signed_image_url` 与 `svc-image` 都在，缺的是
+「图片根目录怎么解析」与 provider 侧取数。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |
@@ -1136,6 +1198,59 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 
 在那之前，映射**集中在 `classify_status` 一个函数里**并标注了每个分支的依据，
 将来迁移只改那一处。
+
+#### 媒体/时刻列表 8 条路由接线（94 → 86）
+
+把上一段已经写好的服务方法接上路由，**顺带纠了四处骨架期的错**：
+
+1. ★ **`/media` 的 `sort` 形状是 `field:direction`，不是 `-field`**。上游
+   `resolve_sort_expression`（`service_helpers.py`）：`strip().lower()` → 按 `:`
+   切字段与方向 → 方向只认 `asc`/`desc` → 字段要在白名单里，任一不满足都是
+   `422 invalid_media_filter`（`details.sort`）。骨架的 `-heat` 是**自造**约定 ——
+   客户端按上游发 `heat:desc` 会被判成「未知字段」。
+2. 同一处：路由注释写「`sort` 非法值**降级**」—— 与 1 是同一个错的两种说法。
+3. **时刻列表的 `sort` 收裸 `asc`/`desc`** —— 上游 `MEDIA_POINT_SORT_FIELDS`
+   只有 `created_at:desc` / `created_at:asc` 两个取值，裸方向词应 422。
+   收下来等于把非法输入当合法，客户端会依赖它。
+4. `/media-points` 的查询**少了三个上游参数**：`kind`（默认 `jav`）、`keyword`、
+   `exclude_collection_id`（`ge=1`）。少参数不是「功能少一点」—— 按上游发的
+   `?kind=video` 被静默忽略，「筛选视频」的结果里混着 JAV。另外 `GET /media-points`
+   的 `MomentCollectionSummary` 被自造地加了 `item_count`（上游只有 `id`/`name`）。
+
+**两个「静默错误」也一并堵上**：`/media` 的 `kind` 与 `thumbnail_generation_state`
+是上游的**枚举**，非法取值该 422；而服务层对 `kind` 是 `_ => {}`（认不出 =
+不过滤）—— `?kind=bogus` 会返回全部媒体。校验放在路由层（枚举是 query 参数的事）。
+
+**接线**（`routes/media.rs` 5 条 + `routes/media_points.rs` 3 条）：
+
+| 端点 | 服务方法 |
+|---|---|
+| `GET /media` | `MediaService::list_media` |
+| `GET /media/invalid` | `list_invalid_media` |
+| `GET /media/duplicates` | `list_duplicate_media_groups`（`kind` 必填 + 枚举） |
+| `GET /media/multi-version-movies` | `list_multi_version_movies` |
+| `POST /media/thumbnail-generation/reset` | `MediaThumbnailTaskService::reset_terminal_media` |
+| `GET /media-points` | `list_media_points`（★ 结果要**签名**，见下） |
+| `GET /media-points/{id}/collections` | **新增** `MomentCollectionService::list_point_collections` |
+| `DELETE /media-points/{id}` | `MediaService::delete_point_by_id` |
+
+- ★ `GET /media-points` 必须把服务层给的**未签名** `image_origin` 换成签名 URL，
+  否则客户端拿裸路径取图会 403。为此在 `dto.rs` 新增 `MediaPointListItemResource`
+  （上游同名），并**删掉**路由层那份自造的 `MediaPointListItem`
+  （`id`/`kind`/`title`，字段与上游毫无交集且没有图片）。
+- 新增 `sm-db` 查询 `MomentCollectionItemRepository::list_collections_for_point`
+  （三表 JOIN，顺序 `c.updated_at DESC, c.id DESC`，与合集列表一致）。
+  ★ 「点不存在」的详情键是 **`point_id`**（上游 `_require_point` 显式传的），
+  而 `DELETE` 那条走 `MediaService` 的默认键 `media_point_id` —— **两个键确实不同**。
+- 这 8 条查询端点从 `axum::extract::Query` 换成 `crate::extract::Query`：原生
+  rejection 是 **400 + 纯文本**，项目契约是 422 + 错误信封。
+- 顺带删掉 `routes/media.rs` 里**本地重复**的 `secret()`/`now_seconds()`
+  （`crate::signing` 早就是那份共享实现），以及 `sm-service` 里**第二份**
+  `thumbnail_state`（i32 版，与库里实际存的文本列对不上；四处状态字面量在
+  sm-db 已有一份）。改由服务层的 `MediaListQuery` 直接复用，不再有路由副本。
+
+⚠️ 仍未做：`routes/movies.rs` 的刷新、`media_libraries` 5 条（等插件字段表）、
+`download_tasks` 2 条（等插件注册表）。
 
 ### 下一批（承接插件 ABI）
 
@@ -1504,11 +1619,107 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 
 ## 六、待确认/待办
 
+### 2026-10-07 新增（两条要拍板，别自己决定）
+
+- **★ `system/telemetry.rs` 去留未定**（骨架期把整个文件建错了概念）。三条走法见
+  §七.5 第 1 条。该文件两个 `todo!()` 已标注「**未定夺**」—— 别照字面实现。
+- **`/daily-recommendations` 是「一个功能」，不是「接线」**。清单见 §七.5 第 2 条，
+  实证见提交 `ce88fd1`。
+
+### 更早登记、仍未清
+
 - ~~`scripts/run-tests.sh`（未跟踪）引用了不存在的 `scripts/test_targets.py`~~ —— **已失效**：工作区 0 个未跟踪文件，`scripts/run-tests.sh` 本身已不存在。
-- `stash@{0}` 还在，内容**不是**上面那条 —— 是「契约层拆仓」那批（根 `Cargo.toml` 改 `git + tag = "v0.1.0"` 依赖、删 `crates/sm-plugin-api/` 与 `proto/`，10 文件 -2315 行）。契约 crate 本身已验证能编译，**三个引用方（`sm-plugins` / `sm-server` / `plugin-ref-local`）当时未验证**就存起来了。取出前先跑一遍那三个 crate 的 `cargo check`。
+- `stash@{0}` 还在（**2026-10-07 复核：仍在**），内容**不是**上面那条 —— 是「契约层拆仓」那批（根 `Cargo.toml` 改 `git + tag = "v0.1.0"` 依赖、删 `crates/sm-plugin-api/` 与 `proto/`，10 文件 -2315 行）。契约 crate 本身已验证能编译，**三个引用方（`sm-plugins` / `sm-server` / `plugin-ref-local`）当时未验证**就存起来了。取出前先跑一遍那三个 crate 的 `cargo check`。
 - 前端契约对拍还没做（前端已在 `upstream/sakuramedia`）。已知两处可能与前端不一致：分页响应多一个 `synced_at: null`；时间戳是 naive UTC 而上游是运行时本地时区。
 - **占位用例**：`catalog/movie_asset_pack.rs` 的
   `a_movie_without_images_is_not_an_error` 目前只是**类型级的钉子**
   （`matches!(Ok(false))`）—— 因为 `rebuild_movie_asset_pack` 还是 `todo!()`，
   真调用要 DB 与图片目录。该函数落地后**必须换成真实调用**，
   否则这条用例会一直「绿着但什么都没验」。同类占位用例在做 parity 时一并排查。
+
+## 七、交接快照（2026-10-07，HEAD `ce88fd1`）
+
+**开工前先做两件事**：`pwsh -File scripts/progress.ps1 -Diff`（应回 `OK`）与
+`cargo clippy --workspace --all-targets -- -D warnings`（应 exit 0）。
+工作区干净、门禁绿、`todo!()` **78** 个。
+
+### 7.1 这一批刚落地的（最近 8 个提交）
+
+| 提交 | 内容 |
+|---|---|
+| `ce88fd1` | docs：记清 `/daily-recommendations` 的**真实缺口**（不是接线，是一个功能） |
+| `ff85cf1` | docs：纠「描述与代码/上游不符」两处（`media_points` 查询参数、`telemetry` 整文件） |
+| `ff77980` | **feat：接 `/media-libraries` 五个端点**（83 → 78），并换掉骨架期两个自造 DTO |
+| `a695c5f` | docs：修 `lib.rs` 三处过时说法（`/files/*` 已接、docs-token 免鉴权、form 提取器已用） |
+| `fa41fc6` | docs：纠骨架文档错误一批（plugins / media_libraries，含 6 个自造 DTO 的上游字段清单） |
+| `3228589` | feat：接 `/auth/docs-token` 表单登录；纠三处骨架文档错误（84 → 83） |
+| `672013c` | fix：进度门禁 `-Diff` 的「必漂移」**既有 bug**（剥行正则与报告格式对不上，从没剥掉过） |
+| `b19a7c0` | feat：接签名图片端点 `/files/images`（86 → 84） |
+
+⚠️ **本地领先 `cnb/main` 39 个提交（未推）**。推不推由你定；`origin`（GitHub）一直未推。
+
+### 7.2 `/media-libraries` 这批的两个决定（照做，别回退）
+
+1. **`DELETE` 不幂等**：不存在 → `404 media_library_not_found`；被 `Media` **或**
+   `DownloadClient` 引用 → `409 media_library_in_use`。骨架期写的「不存在仍 204、删除幂等」
+   是错的。服务层 `delete_library` 也补上了「被下载器引用也算 in_use」（原来只查 `Media`，
+   会把仅被下载器引用的库删成孤儿行）。
+2. **`MediaLibraryRegistry` 全仓没有实现**：`AppState::with_media_library_registry` 这个 seam
+   是活的，但组合根**故意没接**（`sm-server/src/lib.rs:160-163` 有注释）。所以生产里
+   `POST /media-libraries` 现在**一律 503 `provider_not_installed`**、`providers` 目录**空表**；
+   只有 DB-only 路径（列表 / PATCH / DELETE）可用。**别**把它当 bug「修」成 200 ——
+   要真能用，得照上游实现注册表（属插件 ABI 那批）。
+
+### 7.3 剩余 78 条的**卡点表**（按卡点而非按文件归类）
+
+**路由 43 条：**
+
+| 卡点 | 文件（条数） | 说明 |
+|---|---|---|
+| **插件 ABI / provider 无实现** | `plugins.rs` 8、`media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、插件 zip 上传、下载器注册表 |
+| **`MovieService` 方法不存在** | `movies.rs` 9 | `get_movie_detail` / `get_movie_reviews` / `set_subscription` / `unsubscribe_movie` / `get_merged_playback` 在服务层**根本没有** |
+| **Qdrant / 嵌入探测客户端缺失** | `image_search.rs` 7、`status.rs` 2 | 上游会 probe 嵌入服务与 Qdrant（`status_service.py:410-443`） |
+| **service IO 编排缺失** | `recommendations.rs` 3 | `DailyRecommendationService::list_items` 不存在（§七.5 第 2 条） |
+| 待核 | `actors.rs` 1 | 还没查卡点 |
+
+**服务层 35 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 / `import_task` 3 /
+其余各 1：`auto_download` / `download_common` / `download_request` / `download_task` /
+`provider_browse`）、`catalog` 7（`movie_metadata_refresh` 3 / `movie_metadata_search` 2 /
+`catalog_import` 1 / `metadata_source` 1）、`playback` 5（五个 worker 装载器各 1：
+`media_file_hash_backfill` / `media_metadata_probe` / `media_thumbnail_pack_backfill` /
+`media_validity_scan` / `media_video_info_backfill`）、`system` 4（`plugin_removal` 2 /
+`telemetry` 2）、`discovery` 3（`moment_recommendation` 2 / `image_search_space` 1）。
+
+### 7.4 结论：**逐条「接线」已经没有空间了**
+
+剩下的路由几乎每一条都压在**一个尚未实现的 service / 仓储 / 插件 ABI** 上。
+建议改成**按功能纵向推进**：挑一个端点，把「仓储 → 服务 → 路由 → 测试」一口气做完。
+`daily-recommendations` 是现成的好切口（依赖已齐：表、纯打分 `score_movies`、
+卡片组装 `attach_movie_list_media` 都有）。
+
+### 7.5 两个**待拍板**项（详版）
+
+1. **`system/telemetry.rs` 去留未定（★）**。骨架期把整个文件建错了概念：上游
+   `TelemetryService` 是**匿名心跳上报** —— env `SAKURAMEDIA_TELEMETRY_ENABLED` 控制，
+   APScheduler 每小时一次（`start/aps.py:365-374`），把 `instance_id` / `plugins` /
+   `managed_media_*` / CPU·内存 POST 到 Supabase 外部端点，**没有 HTTP 路由**、不碰 `task_runs`。
+   而本文件的 `TaskTelemetry` / `TaskTelemetryByKey` / `success_rate` 在上游**从不存在**
+   （上游 grep `success_rate` / `task_stats` 零命中）；系统级「磁盘占用 / 图搜状态」属于
+   `StatusService.get_status()`（`status_service.py:353`）。三条走法：
+   **(a)** 照上游重写成心跳（env **默认开** = 默认向第三方上报，需 `sysinfo` 新依赖 + 调度注册）；
+   **(b)** 同 (a) 但 **env 默认关**；**(c)** 删掉该文件。
+2. **`/daily-recommendations` 是一个功能**，要 (a) 仓储分页查询
+   `DailyRecommendationItem ⋈ Movie(is_blacklisted=False) ORDER BY rank`；(b)
+   `MovieService::load_cards` 从**私有改公开**；(c) 响应形状换成完整影片卡片
+   （`DailyRecommendationMovieResource` = `MovieListItemResource` + 8 个推荐字段，且
+   **没有页级 `snapshot_date`**）；(d) 生成侧四个 IO 装载器 + Qdrant 相似度（**失败只跳过该信号**）。
+   建议分两个提交：先**读侧**（可测：直接塞快照行），再**生成侧**。
+
+### 7.6 纪律（照 §四，别松）
+
+- **绝不凭印象写数值 / 字段名**：打开 `upstream/sakuramediabe/…` 读原文并写行号。
+- 改完跑 `pwsh -File scripts/progress.ps1 -Write` 并**一起提交** `docs/progress-baseline.md`
+  （门禁 `-Diff` 会拦）。
+- **不主动跑测试套件**（需真 PostgreSQL）；新增 HTTP 用例做**编译级**验证
+  （`cargo check --all-targets` + `clippy`）即可。
+- 一批一提交；提交信息写清「上游行号 + 为什么」。

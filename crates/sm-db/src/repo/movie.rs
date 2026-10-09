@@ -2086,3 +2086,23 @@ impl MovieSeriesRepository {
         Ok(rows.into_iter().map(|row| (row.id, row)).collect())
     }
 }
+
+impl MovieRepository {
+    /// ★ 演员 id → 番号，**带墓碑解析**（`merged_into_id`）。
+    ///
+    /// 上游 `list_media`（`media_service.py:281-290`）先把 `actor_ids` 解析成正规
+    /// id（`COALESCE(merged_into, id)`）再换成番号。这里一次性做完，避免每个
+    /// actor_id 一次额外查询。
+    pub async fn numbers_for_actor_ids(&self, actor_ids: &[i32]) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT m.movie_number FROM movie m \
+               JOIN movie_actor ma ON ma.movie_id = m.id \
+              WHERE ma.actor_id IN (SELECT COALESCE(a.merged_into_id, a.id) \
+                                      FROM actor a WHERE a.id = ANY($1))",
+        )
+        .bind(actor_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(number,)| number).collect())
+    }
+}

@@ -18,6 +18,8 @@ pub mod ordered;
 pub mod playlist;
 pub mod plugin;
 
-pub use ordered::{ClipCollectionService, CollectionUpdate, MomentCollectionService};
+pub use ordered::{
+    ClipCollectionService, CollectionUpdate, MomentCollectionService, MomentCollectionSummary,
+};
 pub use playlist::{PlaylistService, PlaylistUpdate};
 pub use plugin::PluginCollectionService;
