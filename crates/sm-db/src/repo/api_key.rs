@@ -16,6 +16,9 @@ pub const API_KEY_PREFIX: &str = "sk-";
 /// 对应上游 `_LAST_USED_REFRESH_INTERVAL = timedelta(minutes=5)`。
 const LAST_USED_REFRESH_SECS: i64 = 300;
 
+/// 实体名，用于错误分类。
+const ENTITY: &str = "ApiKey";
+
 /// API key 仓储。
 pub struct ApiKeyRepository {
     pool: PgPool,
@@ -35,7 +38,7 @@ impl ApiKeyRepository {
         .bind(key_hash)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| DbError::query("ApiKey", e.to_string()))?;
+        .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
         Ok(row)
     }
 
@@ -46,7 +49,7 @@ impl ApiKeyRepository {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|e| DbError::query("ApiKey", e.to_string()))?;
+            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
         Ok(())
     }
 }
