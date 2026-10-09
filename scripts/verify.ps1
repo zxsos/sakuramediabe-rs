@@ -123,6 +123,19 @@ if ($runParity) {
     # 会让函数体返回 ()。编译器会报，但指向宏展开处而不是真正的错误位置。
     # 这个错在本次重构里犯了五次，每一次都要等编译失败才发现。
     Step 'paged wrappers' { python (Join-Path $parity 'check_paged_wrappers.py') }
+
+    # 第八道门：**进度基线漂移**。改了代码却没重跑 `scripts/progress.ps1 -Write`
+    # 就会在这里失败 —— 这正是本仓库对「检查」的一贯要求：一个要靠人记得跑的
+    # 检查不是检查（见本文件开头那段）。
+    #
+    # 用 pwsh/powershell **子进程**跑，而不是 `& progress.ps1`：那个脚本在漂移时
+    # `exit 1`，同进程调用会把整个 verify 一起干掉。
+    Write-Host 'progress'
+    $progressHost = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' }
+    else { 'powershell' }
+    Step 'progress baseline (-Diff)' {
+        & $progressHost -NoProfile -File (Join-Path $PSScriptRoot 'progress.ps1') -Diff
+    }
 }
 else {
     Write-Host 'parity'

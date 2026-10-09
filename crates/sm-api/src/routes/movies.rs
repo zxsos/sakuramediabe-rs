@@ -40,7 +40,9 @@ use sm_service::catalog::movie::{
     COLLECTION_TYPE_COLLECTION, COLLECTION_TYPE_SINGLE,
 };
 use sm_service::catalog::movie_subtitle::MovieSubtitleService;
+use sm_service::catalog::movie_task::MovieTaskService;
 use sm_service::error::details_of;
+use sm_service::system::jobs::ManualJobTriggerResponse;
 
 use crate::auth::CurrentUser;
 use crate::dto::MovieListItemResource;
@@ -926,12 +928,14 @@ async fn refresh_movie_metadata(
 /// 错误码：影片不存在 → 404；**已有同名任务在跑 → 409**
 /// `movie_heat_recompute_conflict`（不排队）。
 async fn recompute_movie_heat(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
-) -> Result<(StatusCode, Json<serde_json::Value>), ErrorResponse> {
-    let _ = movie_number;
-    todo!("骨架：接 MovieTaskService::recompute_movie_heat；202 + task_run_id；已在跑 -> 409")
+) -> Result<(StatusCode, Json<ManualJobTriggerResponse>), ErrorResponse> {
+    let response = MovieTaskService::new(state.db())
+        .recompute_movie_heat(&movie_number)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 /// `PUT /movies/{movie_number}/subscription` —— ★ **204，无 body**。

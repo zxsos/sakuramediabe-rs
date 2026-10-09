@@ -360,6 +360,119 @@ impl ActorRepository {
         .fetch_optional(&self.pool)
         .await?)
     }
+
+    /// 本次同步要处理的**已订阅演员**，按 id 升序，**整行**。
+    ///
+    /// 对应上游 `SubscribedActorMovieSyncService.sync_subscribed_actor_movies`
+    /// 的 `Actor.select().where(is_subscribed == True, merged_into.is_null())`
+    /// （`subscribed_actor_movie_sync_service.py:22-26`）—— 连 `select()` 不带
+    /// 字段列表这一点都照抄：调用方要读 `javdb_id` / `javdb_type` /
+    /// 两个同步时刻，投影成另一套字段只会让「上游读了哪些列」看不出来。
+    ///
+    /// # 为什么还排除墓碑
+    ///
+    /// 合并在打墓碑时**顺手清掉订阅状态**（见 [`Self::mark_merged`]），
+    /// 所以墓碑本来就不会带 `is_subscribed`。这个条件防的是历史数据里
+    /// 「既订阅又是墓碑」的行：它们的作品会经保留记录的 `targets` 路径同步
+    /// （见 [`Self::list_merged_source_targets`]），在这里再来一遍是重复劳动。
+    pub async fn list_subscribed_for_sync(&self) -> Result<Vec<Actor>, DbError> {
+        Ok(sqlx::query_as::<_, Actor>(
+            "SELECT * FROM actor \
+              WHERE is_subscribed = TRUE AND merged_into_id IS NULL \
+              ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 保留记录的**墓碑来源**：`(javdb_id, javdb_type)`，按 id 升序。
+    ///
+    /// 上游 `_sync_actor` 的 `merged_sources`
+    /// （`subscribed_actor_movie_sync_service.py:66-72`）：合并进来的演员
+    /// 自己不再被同步，作品靠保留记录**代它抓一遍** —— 否则合并会让
+    /// 「来源演员的那些作品」永远不再补录。
+    ///
+    /// # 一处**有意**差异：空串 `javdb_id` 的墓碑被过滤掉
+    ///
+    /// 上游不筛，直接把 `javdb_id` 交给 provider；空 id 查不出东西，
+    /// provider 抛错，于是**整位演员**被计入 `failed_actors`、两个时间戳都不
+    /// 推进 —— 一个空 id 的墓碑能让这位演员每晚都失败。这里跳过它：那种墓碑
+    /// 没有可查的 id，而它的作品本来就已经经保留记录同步过了。
+    ///
+    /// （`javdb_id` 列是 **NOT NULL**，所以只需要判空串。）
+    pub async fn list_merged_source_targets(
+        &self,
+        actor_id: i32,
+    ) -> Result<Vec<(String, i32)>, DbError> {
+        Ok(sqlx::query_as::<_, (String, i32)>(
+            "SELECT javdb_id, javdb_type FROM actor \
+              WHERE merged_into_id = $1 AND javdb_id <> '' \
+              ORDER BY id",
+        )
+        .bind(actor_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 记下「订阅影片已同步到此刻」。返回受影响行数。
+    ///
+    /// 对应上游 `_sync_actor` 的结尾（`:136-140`）：
+    ///
+    /// ```python
+    /// actor.subscribed_movies_synced_at = synced_at          # 总是推进
+    /// if mode == "full" and actor.subscribed_movies_full_synced_at is None:
+    ///     actor.subscribed_movies_full_synced_at = synced_at
+    /// ```
+    ///
+    /// 第二行那个「只在原本为 `NULL` 时写」用 `COALESCE` 表达 ——
+    /// **不要**把读到的值再传回来：那样会在并发下把别人刚写上的全量时刻
+    /// 覆盖成 `NULL`（读→写之间隔着整个同步过程，可能几分钟）。
+    ///
+    /// # 不动 `updated_at`
+    ///
+    /// 上游 `save(only=[...])` 只写这两列。`updated_at` 的语义是「这行被改过」，
+    /// 而每天一次的同步不该让整表看起来刚被改过。
+    pub async fn mark_subscribed_movies_synced(
+        &self,
+        id: i32,
+        synced_at: NaiveDateTime,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE actor \
+                SET subscribed_movies_synced_at = $2, \
+                    subscribed_movies_full_synced_at = \
+                        COALESCE(subscribed_movies_full_synced_at, $2) \
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(synced_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 这位演员名下是否已经有这部影片（按**影片的 `javdb_id`** 判重）。
+    ///
+    /// 对应上游 `_actor_movie_exists`（`:154-163`）：增量同步靠它决定
+    /// 「翻到库里已有的那部就停」。用 `javdb_id` 而不是番号：番号会被人工改，
+    /// 而 `javdb_id` 是外部数据源的稳定键。
+    pub async fn has_actor_movie(
+        &self,
+        actor_id: i32,
+        movie_javdb_id: &str,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM movie_actor ma \
+                   JOIN movie m ON m.id = ma.movie_id \
+                  WHERE ma.actor_id = $1 AND m.javdb_id = $2 \
+             )",
+        )
+        .bind(actor_id)
+        .bind(movie_javdb_id.trim())
+        .fetch_one(&self.pool)
+        .await?)
+    }
 }
 
 /// 订阅同步状态。只读投影 —— 用它避免把整行 `Actor` 拉出来。

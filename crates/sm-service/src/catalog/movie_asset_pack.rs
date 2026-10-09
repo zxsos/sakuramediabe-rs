@@ -72,7 +72,10 @@ pub fn pack_entry_name(relative_path: &str) -> String {
 /// # 它需要 `Db` 与 `ConfigService`（骨架期是无状态单元结构体）
 ///
 /// 活跃集要从 `image` 表查（`Db`），包路径要从图片根算（`ConfigService`）。
-/// 全仓**没有任何调用点**，所以改形状零风险。
+///
+/// 调用方：[`super::movie_asset_pack_backfill`]（存量回填）、
+/// [`super::image_cleanup`]（删完图之后按活跃集重建包）。
+#[derive(Debug, Clone)]
 pub struct MovieAssetPackService {
     db: Db,
     config: ConfigService,

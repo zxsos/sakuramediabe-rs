@@ -39,7 +39,7 @@ pub use activity::{
 };
 pub use activity_cleanup::{ActivityCleanupService, ActivityCleanupStats, RetentionPolicy};
 pub use config::ConfigService;
-pub use jobs::{JobCatalog, JobCatalogEntry};
+pub use jobs::{JobCatalog, JobCatalogEntry, ManualJobTriggerResponse};
 pub use optional_services::{
     capabilities, capabilities_of, image_search_enabled, job_disabled_reason,
     movie_similarity_enabled, require_image_search, require_job_enabled, Capabilities,

@@ -20,6 +20,30 @@
 //! - `params_schema`：只带「有没有」，不带 schema 正文（正文是 proto 的
 //!   `google.protobuf.Struct`，转成 `serde_json::Value` 的那一层还没写）。
 
+/// 手动触发的响应。上游 `schema/system/jobs.py:21-24`。
+///
+/// # 为什么放在这里（骨架期它被定义过**两次**，而且两份不一样）
+///
+/// | 位置 | 字段 |
+/// |---|---|
+/// | `catalog/movie_task.rs` | `{ task_run_id, task_name, trigger_type }` —— **上游没有后两个键** |
+/// | `sm-api/routes/jobs.rs` | `{ task_run_id, task_key, state }` ✓ |
+///
+/// 前者的 `task_name` / `trigger_type` 是编的：`trigger_type` 在**请求**那一侧
+/// 就定了（这个端点恒为 `manual`），回显它没有信息量；客户端真正要的是
+/// `task_key`（拿它去查目录里的任务元数据）与 `state`（入队后的初始状态）。
+///
+/// 现在只留这一份，路由层 `use` 它。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManualJobTriggerResponse {
+    /// 任务运行 id。**轮询它**看进度。
+    pub task_run_id: i32,
+    /// 任务键。
+    pub task_key: String,
+    /// 入队后的初始状态，手动触发恒为 `pending`（`queued` 是 worker 领取时那一步）。
+    pub state: String,
+}
+
 /// 目录里的一项。字段与上游 `JobMetadataResource` 同名同义。
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobCatalogEntry {
@@ -92,5 +116,28 @@ mod tests {
         // 否则手动触发会把它判成「未知任务」。
         assert_eq!(catalog.get("b").map(|e| e.cron_expr.clone()), Some(None));
         assert!(catalog.get("nope").is_none());
+    }
+
+    /// 手动触发响应**只有**上游那三个键。
+    ///
+    /// 骨架期那份多出来的 `task_name` / `trigger_type` 会把契约带偏：
+    /// 客户端按 `task_key` 查目录、按 `state` 轮询，而多余的两个键永远不会
+    /// 被读到 —— 直到有人以为「既然有 task_name 就不必再查目录了」。
+    #[test]
+    fn the_manual_trigger_response_has_exactly_three_keys() {
+        let response = ManualJobTriggerResponse {
+            task_run_id: 7,
+            task_key: "movie_heat_update".to_owned(),
+            state: "pending".to_owned(),
+        };
+        let value = serde_json::to_value(&response).expect("可序列化");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["state", "task_key", "task_run_id"]);
     }
 }

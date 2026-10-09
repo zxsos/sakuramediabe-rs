@@ -602,6 +602,122 @@ task run 走 `notify`（**不去重**，通用入口的旧行为）。
 `download_task_id`）；传的是 `reporter.task_run_id`；**提醒失败不能让导入失败**
 （上游把整个调用包在 `try/except` 里只记 warning）。
 
+#### `movie_asset_pack_backfill` 落地（catalog 33 → 31）+ 第 4 个 worker handler
+
+上游 `catalog/movie_asset_pack_backfill_service.py`(181) —— 又是一处**自造形状**：
+
+| 骨架期 | 上游 |
+|---|---|
+| `BackfillCandidate { movie_id, movie_number, movie_dir_relative, image_record_count }` + `should_backfill(记录数, 包在否)` 纯函数判据 | 候选只有**番号**：**库**决定候选（封面 / 薄封面 / 剧照三处并集去重），**磁盘**决定这一部怎么处理 |
+| `PackBackfillStats { examined, packed, skipped_missing_files, failed }` | 六个键：`candidate_movies` / `packed_movies` / `cleaned_movies` / `already_packed_movies` / `skipped_missing_files` / `failed_movies` |
+
+三档必须分开：**新建包**、**已有包但清了残留散文件**、**干净跳过**。
+混起来就看不出回填到底在「建包」还是在「擦屁股」。缺文件仍是**跳过**
+（等 `image_cleanup` 清理），只有重建失败才计 `failed_movies`。
+
+顺带三件：
+- `MovieRepository::list_numbers_with_asset_images()`：三次往返 → 一条 `UNION`；
+- `sm-scheduler` 注册第 4 个 handler（**3 → 4**）。它是**纯本地**的长任务
+  （不依赖 Qdrant / 推理 / 插件），而且 `manual_only`（无 cron）—— 不注册
+  handler 等于这个功能完全不存在；
+- `MovieAssetPackService` 补 `Debug + Clone`，并改掉它文档里「全仓没有任何
+  调用点」那句（现在有两个调用方）。
+
+`loose_files`（列散文件）与 `movie_asset_pack::remove_loose_files`（删散文件）
+**刻意不合并**：判据差一个比特 —— 删除那版还认符号链接（上游两处本来就不同）。
+
+新增 `crates/sm-service/tests/movie_asset_pack_backfill.rs`（5 条，真库 + 真图片根）。
+
+#### 手动触发链路收口 + 互动数同步编排（catalog 31 → 28，handler 4 → 5）
+
+四处，都在这条「cron / 手动任务」线上：
+
+1. **`movie_task.rs`（2 处）**：`recompute_movie_heat` 按番号定位（404）→ 以
+   `ConflictPolicy::Raise` 入队 → 撞上在跑的同类任务 **409
+   `movie_heat_recompute_conflict`**（details 带 `blocking_task_run_id`，取不到时
+   是 JSON null）；`execute_movie_heat` 返回上游那四个键。
+   ★ 入队参数是**番号**不是 id：骨架期注释写反了（「执行时不该再按番号查」），
+   上游 `:23` / `:42` 恰恰是**两次按番号查** —— 任务会排队，而排队期间合并会让
+   `movie.id` 换行，`movie_number` 才稳定。
+   `POST /movies/{n}/heat-recompute` 顺带从 `todo!()` 接到 202。
+2. **`ManualJobTriggerResponse` 三份定义合一**。上游只有
+   `{task_run_id, task_key, state}`，而骨架期 `catalog/movie_task.rs` 那份是
+   `{task_run_id, task_name, trigger_type}` —— **后两个键上游没有**，且
+   `trigger_type` 在请求侧就定了（这个端点恒为 manual），回显没有信息量。
+   现在定义只有一份（`system/jobs.rs`），`routes/jobs.rs` 与 `movie_task` 都用它。
+3. **`movie_interaction_sync::run()` 落地**：候选 SQL（上游那个四路 OR +
+   `javdb_id IS NOT NULL`）搬进 `MovieRepository::list_interaction_sync_candidate_ids`；
+   单部失败不中断、失败 id 进 `failed_movie_ids`；八项计数与进度文案逐字对齐上游。
+   ★ **「JavDB 上查不到」记 `failed_movies`** —— 骨架期自造了一个 `not_found`
+   键，而上游 `:123-130` 是把它计入 failed 的（日志写 skipped、计数是 failed）。
+   按错形状接线会让运维看到「失败 0」而实际有一批影片没同步。
+   ⚠️ 两个 trait（provider / writer）**还没有宿主实现**（要插件 ABI 与
+   `catalog_import`），所以它的 handler 仍未注册 —— 接线时只需实现那两个 trait，
+   本文件一行不用改。
+4. **第 5 个 worker handler：`movie_heat_update`** —— 有 `params` 只算一部、
+   没有则全表（上游 `_run_movie_heat` 的两分支，`params` 的「空」按非空对象判）。
+   两条分支缺一不可：少了前者，手动重算会变成扫 30 万行。
+
+#### 订阅演员影片同步落地（catalog 28 → 27）
+
+`subscribed_actor_movie_sync::sync_subscribed_actor_movies` + 四个演员仓储方法
+（`list_subscribed_for_sync` / `list_merged_source_targets` /
+`mark_subscribed_movies_synced` / `has_actor_movie`）：
+
+- **全量/增量判据不是时间**：`subscribed_movies_full_synced_at` 为 `NULL` → 全量；
+  否则增量靠「翻到库里已有关联的那部就停」。骨架期那个 trait 签名带
+  `after: Option<NaiveDateTime>`（「上次同步到的时间」）—— **上游没有这个入参**，
+  已改成上游的 `(javdb_actor_id, actor_type, page)`。
+- **合并来源演员的作品也要抓**：`targets` = 保留记录 + 以它为目标墓碑的演员，
+  否则合并会让来源演员的作品永远不再补录。
+- **单片失败按影片跳过**（记 warn 继续），那位演员仍算成功；
+  「取详情 + 入库」两处都失败才少一部 `imported_movies`。
+- ★ 统计改成上游那四个键（`total_actors` / `success_actors` / `failed_actors` /
+  `imported_movies`）—— 骨架期那套把**演员数**与**影片数**混在一个 `actors` 里，
+  于是「失败了几个演员」这个数字根本不存在（它的 `failed` 记的是影片）。
+- 两个时间戳的写法：`subscribed_movies_synced_at` 总是推进；
+  full 用 `COALESCE(full, $2)` 表达上游「只在原本为 NULL 时写」——
+  **不要**把读到的值传回来（读→写之间隔着整个同步过程，会覆盖别人的值）。
+  `updated_at` 不动（上游 `save(only=[...])`）。
+- ⚠️ 两个 trait（provider / importer）**还没有宿主实现**（要插件 ABI 与
+  `catalog_import`），所以 `actor_subscription_sync` 的 handler 仍未注册。
+
+#### 竖封面回填 + JavDB 补录（catalog 27 → 24）
+
+两个 backfill 任务的编排落地，配套五个仓储方法（`list_missing_thin_cover` /
+`list_javdb_backfill_pending` / `find_javdb_backfill_pending` /
+`list_javdb_backfill_candidate_ids` / `postpone_javdb_check`）：
+
+1. **`movie_thin_cover_backfill`**：统计改成上游那四个键
+   （`scanned/updated/skipped/failed_movies`）；trait 参数 `movie_id` 由 `i64`
+   改成 **`i32`**（`movie.id` 是 integer，骨架期写成 i64 会在调用点漂移）；
+   ★ 上游这个方法**没有 reporter 参数**，所以也不收 progress。
+2. **`movie_javdb_backfill`**（2 处）：
+   - `pending()` **不含** `next_check_at` 条件 —— 那是 `run()` 才叠的
+     （上游 `pending()` 返回的是未执行的查询）；删掉自造的 `last_attempt_at`
+     （`movie` 表上只有 `javdb_next_check_at`，那是**下次**检查时间）。
+   - `run()`：条间 sleep 2s（**第一条不 sleep**，上游 `if current > 1`）、
+     ★ **推后检查时间在 `finally`（成功/未收录/失败三档都推后 7 天）** ——
+     少了它，一条死掉的影片会每轮都占掉 50 个名额之一；
+     「已不再是候选」的那条 `continue`（不计数、不推后）。
+   - 统计改成上游四键（`candidate/succeeded/not_found/failed_movies`）。
+   - 进度文案的「已完成」是**循环计数**而不是三项之和（有 `continue` 分支，
+     用和会倒退）。
+
+⚠️ 这两个任务的 trait 同样**没有宿主实现**（竖封面要 image store；
+JavDB provider 要插件 ABI），handler 仍未注册。
+
+##### catalog 剩下的 24 处：两条硬依赖
+
+| 被挡的 | 处 | 挡它的 |
+|---|---|---|
+| `metadata_source`(5) · `movie_metadata_search`(3/4) | 8 | **插件数据面接缝**：`fetch_movie` 要「向插件索取 → 交付目录 → `use(delivery)`」，`sm-plugins` 还没接住那份载荷 |
+| `catalog_import`(7) · `movie_metadata_refresh`(3) · `movie_metadata_search`(1) | 11 | 上游的 `CatalogImportService`（详情 → 入库），它自己又依赖 provider 详情模型与主权网关 |
+| `movie_image`(5) | 5 | **image store**：下载/落盘/切割（cv2）本仓还没有这一层（同 `moment_recommendation` 的阻塞项） |
+
+在这两条落地之前，这 24 处只能**凭印象写** —— 与本项目「上游是唯一权威」
+的硬约束冲突，所以不做。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |
@@ -981,8 +1097,16 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
     定义一处。
 21. ★ **别用全文批量替换去改字段访问**。我做 `item.thumbnail_id` →
     `*thumbnail_id` 时误伤了另一个函数里同名的表达式（那个循环没有解构），
-    靠 `cargo check` 才发现。批量替换前先确认那个字符串在本文件里只出现在
-    你想到的作用域中。
+   靠 `cargo check` 才发现。批量替换前先确认那个字符串在本文件里只出现在
+   你想到的作用域中。
+22. ★ **每落完一块就跑 `pwsh -File scripts/progress.ps1 -Write` 并提交
+   `docs/progress-baseline.md`。** 它是**唯一权威**的进度数字
+   （`docs/service-progress.md` 是叙述，数字会滞后）；`scripts/verify.ps1|sh`
+   里新加了一条 `-Diff` 门禁，改了代码不更新基线**会在门禁里失败**。
+   **报进度必须两个数一起给**：已注册端点数 **与** 其中 handler 还是
+   `todo!()` 的条数。2026-10-06 实测：端点 175/177「已注册」，但 63 条
+   handler 还是 `todo!()` —— 只报前一个数字就是「99% 完成」这种假进度。
+   同理，行数比**不是**完成度（本仓注释占大头），要判断完成度看 `todo!()`。
 
 ## 四之二、验证阶段的教训
 

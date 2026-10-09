@@ -9,16 +9,23 @@
 
 ## 汇总
 
-| 域 | 上游文件 | 行数 | 状态 |
-|---|---|---|---|
-| `collections` | 5 | 1,292 | **完成** |
-| `videos` | 4 | 927 | **完成** |
-| `system` | 19 | 2,935 | 进行中（`auth` / `account` / `activity_cleanup` / `config` / `task_queue` / `optional_services` / `status` / `indexer_settings` 完成，剩 11 个） |
-| `playback` | 19 | 3,738 | 进行中（见下节，**能做的已做完**） |
-| `catalog` | 27 | 7,556 | 进行中（`movie_resolution_service` 的档位部分 + `actor_service` / `actor_merge_service` / `movie_service` 的订阅状态流转均已落；**两个 ownership gateway 已落** —— 在 `sm-db::repo::gateway`，不在 service 层） |
-| `transfers` | 23 | 4,235 | 进行中（`torznab` 客户端与 `download_service` 的候选搜索已落：解锁 `system/indexer-settings/test` 与 `GET /download-candidates`） |
-| `discovery` | 16 | ~48,000 | **框架 12/16 铺完**（2026-10-05），方法体待实现 |
-| **合计** | **113** | **25,169** | 2/7 域完成 + 3 域部分 |
+> 数字全部来自 [`progress-baseline.md`](progress-baseline.md)（脚本生成，
+> **不要手数**）；下面的逐域叙述讲「为什么这么做」，数字可能滞后，**以基线为准**。
+
+| 域 | 上游文件 | 上游行 | 本仓 `todo!()` | 状态 |
+|---|---|---|---|---|
+| `collections` | 5 | 1,292 | 0 | **完成** |
+| `videos` | 4 | 927 | 0 | **完成** |
+| `system` | 19 | 2,935 | 4 | 12 个 service 已落；剩 `telemetry`(2)、`plugin_removal`(2) |
+| `playback` | 19 | 3,741 | 16 | **能做的已做完**，剩 5 个文件卡 provider / PyAV / zip |
+| `catalog` | 27 | 7,556 | 33 | 演员子域 + 影片订阅 / 列表 / 黑名单 / 合集态 + 两个 ownership gateway（在 `sm-db`）已落；剩 9 个文件 |
+| `transfers` | 23 | 4,248 | 27 | 契约层 + 台账 + 入队 + 失败项读取 + 导入提醒已落；剩 10 个文件**几乎全卡插件 ABI** |
+| `discovery` | 16 | 4,485 | 3 | ⚠️ 下面「框架 12/16 铺完、方法体待实现」的说法**已过时** —— 后续多轮落了方法体，现在只剩 3 处 |
+| **合计** | **113** | **25,184** | **83** | 另：`sm-api` 路由层 63 处 `todo!()` |
+
+**端点：两个数一起报才不误导** —— 方法级 175/177 已**注册**（路径级 136/136），
+但其中 **63 条的 handler 仍是 `todo!()`**。所以「99% 完成」是假的：
+注册只说明路由表里有这一条。
 
 行数口径与 `crates/sm-service/src/lib.rs` 的表格一致。推进次序沿用那里的
 约定：**最小且完整的域先定型**，之后照此推进。

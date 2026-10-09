@@ -121,6 +121,21 @@ step 'core' python3 "$PARITY/compare_core.py"
 # The compiler catches it, but points at the macro expansion, not the mistake.
 step 'paged wrappers' python3 "$PARITY/check_paged_wrappers.py"
 
+# The eighth gate: progress-baseline drift. Edit the code without re-running
+# `scripts/progress.ps1 -Write` and this fails -- same reasoning as the header
+# of this file: a check you have to remember to run is not a check.
+#
+# The generator is PowerShell, so this needs pwsh. When it is missing we WARN
+# rather than fail (CI images without PowerShell still have every other gate),
+# but the warning names what did not run -- a silent skip would read as a pass.
+echo 'progress'
+if command -v pwsh > /dev/null 2>&1; then
+  step 'progress baseline (-Diff)' pwsh -NoProfile -File "$REPO_ROOT/scripts/progress.ps1" -Diff
+else
+  echo '  WARN  pwsh not found -- progress baseline drift NOT checked'
+  echo '        (run: pwsh -File scripts/progress.ps1 -Write, then commit the file)'
+fi
+
 echo
 if [ "${#failed[@]}" -gt 0 ]; then
   printf 'FAILED: %s\n' "$(IFS=', '; echo "${failed[*]}")"

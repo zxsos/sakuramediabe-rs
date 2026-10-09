@@ -53,6 +53,9 @@ use std::time::Duration;
 use serde_json::Value;
 use sm_db::repo::TaskLanes;
 use sm_db::Db;
+use sm_service::catalog::movie_asset_pack_backfill::MovieAssetPackBackfillService;
+use sm_service::catalog::movie_heat::MovieHeatService;
+use sm_service::catalog::movie_task::MovieTaskService;
 use sm_service::system::activity::{run_task, TaskHandler, TaskRunError, TaskRunService};
 use sm_service::system::activity_cleanup::RetentionPolicy;
 use sm_service::system::optional_services::job_disabled_reason;
@@ -275,20 +278,23 @@ impl HandlerRegistry {
 
 /// 已落地的内建处理器。
 ///
-/// # 现在有两个
+/// # 现在有四个
 ///
-/// 21 个任务里 19 个的 service 还没写（zip / provider 各挡一批，
+/// 21 个任务里 17 个的 service 还没写（zip / provider 各挡一批，
 /// 见 `docs/service-progress.md`）。**不注册就没有处理器**，那些任务被领到
 /// 时会明确 `failed` 并写清「未在处理器注册表中」，而不是静默跳过。
 ///
 /// | task_key | service 域 | 外部依赖 |
 /// |---|---|---|
 /// | `activity_record_cleanup` | `system` | 无 |
+/// | `movie_asset_pack_backfill` | `catalog` | 无（只读库 + 本地图片根）|
 /// | `image_search_index` | `discovery` | 推理服务 + Qdrant（都已在 `sm-service` 侧就位）|
+/// | `movie_similarity_recompute` | `discovery` | Qdrant（稀疏向量通路）|
 ///
-/// `activity_record_cleanup` 用它把链路端到端跑通；`image_search_index` 是第一个
-/// 带外部依赖的 handler，它的 service（`discovery::image_search_index`）与依赖
-/// 通路（[`HandlerDeps`]）都已落地。
+/// `activity_record_cleanup` 先把链路端到端跑通；`image_search_index` 是第一个
+/// 带外部依赖的 handler（依赖通路 [`HandlerDeps`] 就是为它加的）；
+/// `movie_asset_pack_backfill` 则是第一个**纯本地**的长任务 ——
+/// 它同时是 `manual_only`，所以「不注册 handler」对它等于功能完全不存在。
 ///
 /// # 依赖怎么进的 handler
 ///
@@ -450,6 +456,83 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
         }),
     );
 
+    // `movie_asset_pack_backfill` —— 存量影片图片打包回填。
+    //
+    // **第四个落地的 handler，也是第一个不依赖任何外部服务的**：它只读库 +
+    // 读写本地图片根（`movie_asset_pack` / `media_paths` 的构件早已落地），
+    // 不需要 Qdrant、推理服务或插件。
+    //
+    // # 它是 `manual_only`，所以「没 handler」比别处更致命
+    //
+    // 上游它是三条无 cron 的任务之一（另两条是 `media_video_info_backfill`
+    // 与 `media_thumbnail_pack_backfill`）：**只能手动触发**。没注册 handler
+    // 的话，手动触发也只会以 `NoHandler` 失败 —— 等于这个功能完全不存在
+    // （而它修的是「早期版本没建包」的存量数据）。
+    let backfill_deps = Arc::clone(&deps);
+    registry.register(
+        "movie_asset_pack_backfill",
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&backfill_deps);
+            let db = Db::clone(db);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    let service = MovieAssetPackBackfillService::new(&db, &deps.config);
+                    let sink = progress_sink_for(&reporter);
+                    let stats = service
+                        .backfill(Some(sink))
+                        .await
+                        .map_err(|error| format!("影片图片打包回填失败：{}", error.code()))?;
+                    // 键名与上游 `backfill` 返回的 dict 逐字一致（会进
+                    // `result_summary`，客户端按那些键读数字）。
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
+    // `movie_heat_update` —— 热度重算。`params` 有内容就只算那一部，没有就全表。
+    //
+    // 上游的注册项（`scheduler/registry.py:55-60`）就是这个两分支：
+    //
+    // ```python
+    // def _run_movie_heat(reporter, params):
+    //     return (MovieTaskService.execute_movie_heat(reporter, params)
+    //             if params else MovieHeatService.update_movie_heat())
+    // ```
+    //
+    // **两个分支缺一不可**：手动触发带 `{movie_number}` 走单部（
+    // `POST /movies/{n}/heat-recompute`），cron 那条不带参数走全表。
+    // 只实现一支的话，另一条入口会静默地做错事 —— 比如把「重算一部」
+    // 变成「扫 30 万行」。
+    //
+    // `params` 的"空"按**非空对象**判（Python 里空 dict 是 falsy）。
+    registry.register(
+        "movie_heat_update",
+        Box::new(move |db: &Db, params: &Value| {
+            let db = Db::clone(db);
+            let params = params.clone();
+            let handler: TaskHandler = Box::new(move |_reporter| {
+                Box::pin(async move {
+                    let service = MovieTaskService::new(&db);
+                    let is_single_movie =
+                        params.as_object().is_some_and(|object| !object.is_empty());
+                    if is_single_movie {
+                        return service
+                            .execute_movie_heat(&params)
+                            .await
+                            .map_err(|error| format!("影片热度重算失败：{}", error.code()));
+                    }
+                    let stats = MovieHeatService::new(&db)
+                        .update_movie_heat()
+                        .await
+                        .map_err(|error| format!("影片热度重算失败：{}", error.code()))?;
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
     registry
 }
 

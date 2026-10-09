@@ -40,7 +40,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
 use sm_db::repo::BackgroundTaskRunRepository;
 use sm_service::system::{
     job_disabled_reason, require_job_enabled, ConflictPolicy, EnqueueOutcome, JobCatalogEntry,
@@ -53,13 +52,12 @@ use crate::error::ErrorResponse;
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
-/// 手动触发的响应。字段与上游 `ManualJobTriggerResponse` 一致。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ManualJobTriggerResponse {
-    pub task_run_id: i32,
-    pub task_key: String,
-    pub state: String,
-}
+/// 手动触发的响应。**定义只有一份**，在 service 侧
+/// （[`sm_service::system::jobs::ManualJobTriggerResponse`]）。
+///
+/// 骨架期这里有第二份同形结构体，而 `catalog/movie_task.rs` 还有第三份
+/// **字段是错的**（`task_name` / `trigger_type`）。现在路由层只转发。
+pub use sm_service::system::jobs::ManualJobTriggerResponse;
 
 pub fn routes() -> Router<AppState> {
     Router::new()

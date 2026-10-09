@@ -419,6 +419,205 @@ impl MovieRepository {
         .await?)
     }
 
+    /// 互动数同步的**候选影片 id**，按 id 升序。
+    ///
+    /// 对应上游 `MovieInteractionSyncService._candidate_ids`
+    /// （`catalog/movie_interaction_sync_service.py:39-63`）—— 那个四路 OR 的
+    /// `due` 条件逐字搬到这里：
+    ///
+    /// | 支 | 条件 | 为什么 |
+    /// |---|---|---|
+    /// | 1 | `interaction_synced_at IS NULL` | 从没同步过 |
+    /// | 2 | `is_subscribed AND subscribed_at > interaction_synced_at` | 刚订阅 —— 订阅是个强信号，值得立刻刷一次 |
+    /// | 3 | 新片（发行 ≤ 60 天）且上次同步超过 **2 天** | 新片互动数变化快 |
+    /// | 4 | 中段（60~180 天）且上次同步超过 **7 天** | 变化慢 |
+    ///
+    /// 再加上 `javdb_id IS NOT NULL`：没有 JavDB id 就没法查互动数，
+    /// 放进候选只会让 `failed_movies` 白涨。
+    ///
+    /// # 三处时间参数由**调用方**给
+    ///
+    /// `recent_since` / `middle_since` / 两个「上次同步早于此时刻」的阈值
+    /// 都与「现在」有关，而本层不取时间（测试要能固定时间）。
+    /// 间隔常量（2 天 / 7 天 / 60 天 / 180 天）在 service 层，不在这里重复。
+    ///
+    /// # 单条 SQL，不是「拉全表再在 Rust 里筛」
+    ///
+    /// 30 万行的影片表全拉出来再筛会把内存和往返都拖垮，而**这条判据本来就
+    /// 是 SQL 表达得清楚的**。第 4 支的 `release_date < recent_since` 不能省：
+    /// 少了它，新片会被第 4 支**同时**命中，两支的间隔不同，语义就糊了。
+    pub async fn list_interaction_sync_candidate_ids(
+        &self,
+        recent_since: chrono::NaiveDateTime,
+        middle_since: chrono::NaiveDateTime,
+        recent_cutoff: chrono::NaiveDateTime,
+        middle_cutoff: chrono::NaiveDateTime,
+    ) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM movie \
+              WHERE javdb_id IS NOT NULL \
+                AND ( \
+                     interaction_synced_at IS NULL \
+                  OR (is_subscribed = TRUE AND subscribed_at IS NOT NULL \
+                      AND subscribed_at > interaction_synced_at) \
+                  OR (release_date >= $1 AND interaction_synced_at <= $2) \
+                  OR (release_date >= $3 AND release_date < $1 AND interaction_synced_at <= $4) \
+                ) \
+              ORDER BY id",
+        )
+        .bind(recent_since)
+        .bind(recent_cutoff)
+        .bind(middle_since)
+        .bind(middle_cutoff)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// **缺竖封面**的影片 `(id, movie_number)`，按 id 升序。
+    ///
+    /// 上游 `MovieThinCoverBackfillService.backfill_missing_thin_cover_images`
+    /// （`movie_thin_cover_backfill_service.py:20`）：
+    /// `Movie.select().where(Movie.thin_cover_image.is_null(True)).order_by(Movie.id)`。
+    ///
+    /// 带番号是为了**日志**：上游失败时打
+    /// `movie_id={} movie_number={}`，只有 id 的话运维得再查一次库。
+    pub async fn list_missing_thin_cover(&self) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT id, movie_number FROM movie \
+              WHERE thin_cover_image_id IS NULL \
+              ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 待接入 JavDB 的插件影片 `(id, movie_number)`，按 id 升序。
+    ///
+    /// 上游 `MovieJavdbBackfillService.pending()`
+    /// （`movie_javdb_backfill_service.py:22-26`）：
+    /// `javdb_id IS NULL AND metadata_source IS NOT NULL`。
+    ///
+    /// 第二条的语义是「**来源是插件**」—— 只有插件来源的影片才需要「过一阵子
+    /// 再问 JavDB 收没收」。JavDB 自己来的影片本体就带着 `javdb_id`。
+    pub async fn list_javdb_backfill_pending(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT id, movie_number FROM movie \
+              WHERE javdb_id IS NULL AND metadata_source IS NOT NULL \
+              ORDER BY id LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 本轮补录的候选 id：`pending()` 之外**再加**「检查时间已到」，按
+    /// `javdb_next_check_at, id` 升序，取 `limit` 条。
+    ///
+    /// 上游 `run()` 是在 `pending()` 上再叠三个条件
+    /// （`:29-35`）。**顺序照抄**：先按下次检查时间、再按 id ——
+    /// 只按 id 会让同一批里「最久没查过的」排到后面。
+    ///
+    /// # `javdb_next_check_at IS NULL` 的影片**不会被选中**
+    ///
+    /// 上游是 `javdb_next_check_at <= now`，而 `NULL <= x` 在 SQL 里是
+    /// **unknown** —— 那些行被排除。这是上游行为，不是 bug 漏写：
+    /// 插件来源的影片在**入库时**就被写成 `now + 7 天`
+    /// （`catalog_import_service.py:328`），所以不需要靠 NULL 兜底。
+    /// 这里**不**加 `IS NULL` 分支 —— 加了就会把「还没排到时间的」一起拉进来，
+    /// 一天 50 条的限量会被它们占满。
+    pub async fn list_javdb_backfill_candidate_ids(
+        &self,
+        now: chrono::NaiveDateTime,
+        limit: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM movie \
+              WHERE javdb_id IS NULL AND metadata_source IS NOT NULL \
+                AND javdb_next_check_at <= $1 \
+              ORDER BY javdb_next_check_at, id \
+              LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按 id 取一条**仍符合** `pending()` 条件的影片。
+    ///
+    /// 上游 `run()` 里 `self.pending().where(Movie.id == movie_id).get_or_none()`
+    /// （`movie_javdb_backfill_service.py:62`）：本轮 id 是**先批量取**的，
+    /// 取 id 与处理之间这部片可能已被别的路径接入 JavDB —— 那时它不再是候选，
+    /// 上游 `continue`（不计数、也不推后检查时间）。
+    pub async fn find_javdb_backfill_pending(
+        &self,
+        movie_id: i32,
+    ) -> Result<Option<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT id, movie_number FROM movie \
+              WHERE id = $1 AND javdb_id IS NULL AND metadata_source IS NOT NULL",
+        )
+        .bind(movie_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// 把下次检查时间推后到 `at`。返回受影响行数。
+    ///
+    /// 上游 `run()` 的 `finally`（`:89-93`）：**无论成功失败都要推后** ——
+    /// 失败的那条不该在下一轮立刻再占一个名额。
+    ///
+    /// `AND javdb_id IS NULL` 那条**不能省**：并发下这条影片可能刚被别的路径
+    /// 接入 JavDB，此时再写检查时间等于把它「退回到待补录」。
+    pub async fn postpone_javdb_check(
+        &self,
+        movie_id: i32,
+        at: chrono::NaiveDateTime,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE movie SET javdb_next_check_at = $2 \
+              WHERE id = $1 AND javdb_id IS NULL",
+        )
+        .bind(movie_id)
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// **有图片资产**（封面 / 薄封面 / 剧照）的影片番号，去重后按番号升序。
+    ///
+    /// 对应上游 `MovieAssetPackBackfillService._candidate_movie_numbers`
+    /// （`movie_asset_pack_backfill_service.py:30-53`）：它查三次
+    /// （`Movie.cover_image` 非空、`Movie.thin_cover_image` 非空、
+    /// `MoviePlotImage` 里出现过的番号）再取并集 `sorted(...)`。
+    /// 这里用一条 `UNION` 拿同一个集合 —— 三次往返换成一次，集合与顺序不变
+    /// （`UNION` 自带去重，正对上 Python 的 set 并集）。
+    ///
+    /// # 为什么是「有图」而不是「有包」
+    ///
+    /// 「这一部要不要真的重建」由**磁盘状态**决定（包在不在、有没有残留散文件），
+    /// 库看不出包的存在。所以这一步只回答「哪些影片有图可打」。
+    ///
+    /// `movie_plot_image.movie_id` 指向 `movie.id`（不是番号），所以剧照那一支
+    /// 要连一次 `movie`。
+    pub async fn list_numbers_with_asset_images(&self) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT movie_number FROM movie WHERE cover_image_id IS NOT NULL \
+             UNION \
+             SELECT movie_number FROM movie WHERE thin_cover_image_id IS NOT NULL \
+             UNION \
+             SELECT m.movie_number FROM movie_plot_image p \
+                 JOIN movie m ON m.id = p.movie_id \
+             ORDER BY 1",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 影片列表的一页 id（按 `filter` 筛、按 `sort` 排）。
     ///
     /// 用 [`QueryBuilder`] 而不是拼字符串：占位符编号由它维护，15 个可选筛选位
