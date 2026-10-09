@@ -2700,6 +2700,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "prost-types",
  "reqwest",
  "serde_json",
  "sm-api",
@@ -2723,6 +2724,7 @@ version = "0.1.0"
 dependencies = [
  "bcrypt",
  "chrono",
+ "hashing",
  "media-file-hash",
  "qdrant-client",
  "quick-xml",

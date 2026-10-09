@@ -37,27 +37,32 @@ pub fn write_pack(pack_path: &Path, entries: &[(String, Vec<u8>)]) -> Result<(),
         std::fs::create_dir_all(parent).map_err(|error| pack_error(pack_path, error))?;
     }
     let file = std::fs::File::create(pack_path).map_err(|error| pack_error(pack_path, error))?;
-    {
-        let mut archive = zip::ZipWriter::new(file);
-        // 显式点名 `Stored`：`FileOptions::default()` 的方式会随 crate 缺省特性
-        // 变化（开了 deflate 特性就变成 Deflated），而这条约定是**硬要求**。
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-        for (entry_name, bytes) in entries {
-            archive
-                .start_file(entry_name.as_str(), options)
-                .map_err(|error| pack_error(pack_path, error))?;
-            archive
-                .write_all(bytes)
-                .map_err(|error| pack_error(pack_path, error))?;
-        }
-        // `finish` 才写出中央目录 —— 少了它的包是**打不开的**，不是「缺几条」。
+    let mut archive = zip::ZipWriter::new(file);
+    // 显式点名 `Stored`：`FileOptions::default()` 的方式会随 crate 缺省特性
+    // 变化（开了 deflate 特性就变成 Deflated），而这条约定是**硬要求**。
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (entry_name, bytes) in entries {
         archive
-            .finish()
+            .start_file(entry_name.as_str(), options)
+            .map_err(|error| pack_error(pack_path, error))?;
+        archive
+            .write_all(bytes)
             .map_err(|error| pack_error(pack_path, error))?;
     }
+    // `finish` 才写出中央目录 —— 少了它的包是**打不开的**，不是「缺几条」。
+    // 它同时把内部的 `File` 交还出来，而我们**正要**一个写句柄来 fsync。
+    let handle = archive
+        .finish()
+        .map_err(|error| pack_error(pack_path, error))?;
     // 落盘之后再 fsync：见模块文档。
-    let handle = std::fs::File::open(pack_path).map_err(|error| pack_error(pack_path, error))?;
+    //
+    // ⚠️ **别用 `File::open` 重新开一个句柄**：那是只读的，而 `sync_all()` 在
+    // Windows 上走 `FlushFileBuffers`，**要求句柄有写权限** —— 只读句柄直接
+    // ERROR_ACCESS_DENIED（os error 5），表现为「写包在 Windows 上必然失败、
+    // 在 Linux 上一切正常」。上游 `image_store.py:55` 是
+    // `os.open(path, os.O_RDWR)`，特意用**读写**打开，同一个道理；
+    // 我们手上已经有一个带写权限的句柄，不必再开一次。
     handle
         .sync_all()
         .map_err(|error| pack_error(pack_path, error))?;

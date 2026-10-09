@@ -120,6 +120,11 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "MediaRepository",
         "DownloadTaskRepository",
         "MovieOwnershipGateway",
+        # 同上：演员的字段主权网关，持有 PgPool，不映射任何表。
+        # 与 `MovieOwnershipGateway` 是**两个实体一套形状**，漏登记一个就会
+        # 在这里报 `UNCHECKED_STRUCT` —— 但那不是真的漏了对拍，是这个表的
+        # 豁免清单没跟上。
+        "ActorOwnershipGateway",
         # 插入 DTO：只列出调用方需要显式提供的列，是子集而非全表
         "NewMovie",
         "NewMedia",

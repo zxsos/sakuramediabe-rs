@@ -960,6 +960,134 @@ impl MovieRepository {
         Ok(stmt.execute(&self.pool).await?.rows_affected())
     }
 
+    /// **领取一次订阅检索**：`pending`/`failed_retryable` → `running`。
+    ///
+    /// 对应上游 `MovieSubscriptionSearchStateService.begin_attempt`。返回
+    /// `true` 表示这一行被改动（`false` = 影片不存在）。
+    ///
+    /// # ★ `WHERE` 里**没有** `state` 条件 —— 别顺手加上
+    ///
+    /// 上游是 `Movie.update(...).where(Movie.id == movie_id).execute()`，
+    /// 只按 id 定位。看着像漏了「只有 pending 才能领」，但调用方的候选查询
+    /// 已经筛过状态（见 `candidate_condition`），而那里放行的状态**不止
+    /// `pending`** —— 还有 `failed_retryable`。
+    ///
+    /// 加上 `AND subscription_search_state = 'pending'` 会让
+    /// `failed_retryable` 的影片**永远领不到**：那正是「重试」这个功能本身，
+    /// 而失败的样子是「重试再也跑不动」，不是报错。
+    ///
+    /// `next_retry_at` 在这里被清掉（上游同款）：它只用于
+    /// `failed_retryable` 的退避判定，进了 `running` 就没有意义了。
+    pub async fn begin_subscription_search_attempt(&self, movie_id: i32) -> Result<bool, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query(
+            "UPDATE movie SET subscription_search_state = 'running', \
+             subscription_search_last_attempted_at = $2, \
+             subscription_search_next_retry_at = NULL \
+             WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows > 0)
+    }
+
+    /// 标记订阅检索**成功**（终态）：清掉错误与重试预算。
+    ///
+    /// 对应上游 `mark_succeeded`。`attempt_count` **清零**（不是保留）——
+    /// 下次因别的原因重开时它得从零开始算。
+    pub async fn mark_subscription_search_succeeded(&self, movie_id: i32) -> Result<u64, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query(
+            "UPDATE movie SET subscription_search_state = 'succeeded', \
+             subscription_search_attempt_count = 0, \
+             subscription_search_next_retry_at = NULL, \
+             subscription_search_error_code = NULL, \
+             subscription_search_last_error = NULL, \
+             subscription_search_last_error_at = NULL, \
+             subscription_search_last_succeeded_at = $2 \
+             WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    /// 标记订阅检索**失败**：落 `state` 与**已经算好的** `attempt_count`。
+    ///
+    /// 对应上游 `mark_failed`。状态与计数由调用方算（它才知道
+    /// `consumes_budget` 与影片是否「新鲜」），仓储只负责写 —— 那两条规则
+    /// 在 `sm_service::catalog::movie_subscription_search_state` 里。
+    ///
+    /// `last_error` 收的是错误对象的 `Display`（上游写入的是 `str(error)`，
+    /// 也就是异常消息本身）。
+    pub async fn mark_subscription_search_failed(
+        &self,
+        movie_id: i32,
+        state: &str,
+        attempt_count: i32,
+        error_code: &str,
+        last_error: &str,
+    ) -> Result<u64, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query(
+            "UPDATE movie SET subscription_search_state = $2, \
+             subscription_search_attempt_count = $3, \
+             subscription_search_next_retry_at = NULL, \
+             subscription_search_error_code = $4, \
+             subscription_search_last_error = $5, \
+             subscription_search_last_error_at = $6 \
+             WHERE id = $1",
+        )
+        .bind(movie_id)
+        .bind(state)
+        .bind(attempt_count)
+        .bind(error_code)
+        .bind(last_error)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows)
+    }
+
+    /// ★ 进程启动时的兜底：把卡在 `running` 的检索改回 `failed_retryable`。
+    ///
+    /// 对应上游 `recover_interrupted_running_movies`。**不是改回 `pending`**：
+    /// `pending` 意味着「从没搜过」，而这些影片是「搜到一半被打断」——
+    /// 两者的 `last_attempted_at` 与用户看到的状态不同（那是「失败，待重试」）。
+    ///
+    /// 错误码固定 `task_interrupted`（上游写死）；文案由调用方传（它要跟
+    /// 展示层一致，见 `INTERRUPTED_ERROR_MESSAGE`）。
+    ///
+    /// 不做这一步的后果：那些影片永远停在「正在搜索」，而候选查询把
+    /// `running` 排除在外 —— 于是**再也不会被领取**，且没有任何报错。
+    pub async fn recover_interrupted_subscription_searches(
+        &self,
+        error_message: &str,
+    ) -> Result<u64, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query(
+            "UPDATE movie SET subscription_search_state = 'failed_retryable', \
+             subscription_search_next_retry_at = NULL, \
+             subscription_search_error_code = 'task_interrupted', \
+             subscription_search_last_error = $1, \
+             subscription_search_last_error_at = $2 \
+             WHERE subscription_search_state = 'running'",
+        )
+        .bind(error_message)
+        .bind(now)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows)
+    }
+
     /// 按「大写后的番号」点查。
     ///
     /// 人工输入（URL 路径、批量操作的请求体）不是库内规范形态，所以大小写要
@@ -1411,6 +1539,84 @@ impl MovieRepository {
 
         self.update(id, set, WriteSource::Host).await
     }
+
+    // ------------------------------------------------------------ 热度重算
+
+    /// 热度与公式**不一致**的影片数。
+    ///
+    /// `expression` 是「期望热度」的 SQL 表达式，由
+    /// `sm_service::catalog::movie_heat::heat_expression_sql()` 生成 ——
+    /// **公式留在 service 层**：上游也是这个分层（`movie_heat_service.py:19-28`
+    /// 用 Peewee 表达式拼 SQL，ORM 只负责执行），仓储不该知道权重与参考值。
+    ///
+    /// 让仓储收一个 SQL 片段看着别扭，但替代方案更差：把公式抄成这里的
+    /// 字面量就是**第二份**公式，改一处漏一处，而漏了的后果是两个入口
+    /// （全表 / 单部）算出不同的热度且 `WHERE heat != computed` 永远判定不一致。
+    ///
+    /// 对应上游 `build_candidate_count_query`（`:31-33`）：`COUNT(movie.id)`，
+    /// 连不是 `COUNT(*)` 这个写法都照抄（结果一样，但保持可对拍）。
+    pub async fn count_stale_heat_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        expression: &str,
+    ) -> Result<i64, DbError> {
+        // 动态 SQL 的**审计依据**：`expression` 只可能来自
+        // `movie_heat::heat_expression_sql()` —— 它由本仓的 f64 常量经 `{:?}`
+        // 拼出，没有任何路径能把用户输入或数据库内容喂进去。见 [`safe_sql`]。
+        let sql = format!("SELECT COUNT(movie.id) FROM movie WHERE movie.heat != ({expression})");
+        sqlx::query_scalar::<_, i64>(safe_sql(sql))
+            .fetch_one(ctx.conn().await?.as_conn())
+            .await
+            .map_err(|e| DbError::from(e).with_entity(ENTITY))
+    }
+
+    /// 全表重算：`UPDATE movie SET heat = <公式> WHERE heat != <公式>`。
+    /// 返回**实际更新行数**。
+    ///
+    /// 对应上游 `build_update_query`（`:35-41`）。那个 `!=` 不是优化而是语义：
+    /// 少了它就是 30 万行的全表写。
+    ///
+    /// ⚠️ **不碰 `updated_at`** —— 上游用的是类级 `Model.update(...)`，它绕过
+    /// 推进 `updated_at` 的实例方法覆写（`model/mixins.py:21-22`），所以热度
+    /// 重算不改变影片的「最后修改时刻」。别顺手补 `updated_at = now()`。
+    pub async fn recompute_heat_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        expression: &str,
+    ) -> Result<u64, DbError> {
+        // 审计依据同 `count_stale_heat_in`：`expression` 来自常量，无外部输入。
+        let sql =
+            format!("UPDATE movie SET heat = ({expression}) WHERE movie.heat != ({expression})");
+        let outcome = sqlx::query(safe_sql(sql))
+            .execute(ctx.conn().await?.as_conn())
+            .await
+            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        Ok(outcome.rows_affected())
+    }
+
+    /// 单部影片的热度重算，对应上游 `build_single_movie_update_query`（`:43-49`）：
+    /// 在同一个 `!=` 条件之外再加 `id = ?`。
+    ///
+    /// 返回**实际更新行数**，所以 `0` 同时含义「影片不存在」与「热度已经是对的」
+    /// —— 上游不区分（`:52-53` 只回 `execute()` 的结果），调用方也别去补一个
+    /// 404：手动重算的语义是「确保它是对的」，已经对时 0 是正确结果。
+    pub async fn recompute_heat_for(
+        &self,
+        movie_id: i32,
+        expression: &str,
+    ) -> Result<u64, DbError> {
+        let sql = format!(
+            "UPDATE movie SET heat = ({expression}) \
+             WHERE movie.id = $1 AND movie.heat != ({expression})"
+        );
+        // 审计依据同上：唯一的变量部分还是那条常量表达式（`movie_id` 走绑定参数）。
+        let outcome = sqlx::query(safe_sql(sql))
+            .bind(movie_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        Ok(outcome.rows_affected())
+    }
 }
 
 /// 订阅状态。
@@ -1490,9 +1696,17 @@ impl_bind_value!(
 /// [`sqlx::SqlSafeStr`]，而 `&String` **不实现**它 —— 想用动态 SQL 就
 /// 必须显式声明「我已确认这段 SQL 安全」。
 ///
-/// 确认依据：列名全部来自 [`UpdateSet`]，而调用方只能通过 `set()` 传入
-/// 字面量列名，没有任何路径能把用户输入拼进 SQL。占位符数量由
-/// `assignments()` 按字段数生成，与 bind 数量严格一致。
+/// 目前有**两处**调用，审计依据各自不同，写在这里免得后来人只看见一处：
+///
+/// 1. [`bind_value_exec`] 那条路径（`task.rs` 的 `update_metadata` 等）：列名
+///    全部来自 [`UpdateSet`]，而调用方只能通过 `set()` 传入**字面量列名**，
+///    没有任何路径能把用户输入拼进 SQL。占位符数量由 `assignments()` 按字段数
+///    生成，与 bind 数量严格一致。
+/// 2. 热度重算（[`MovieRepository::count_stale_heat_in`] 等）：被拼进去的只有
+///    `movie_heat::heat_expression_sql()` —— 它由本仓的 f64 常量经 `{:?}` 生成，
+///    不含任何外部数据；影片 id 走绑定参数。
+///
+/// **加新调用点前先想清楚依据**：这个包装是「我已审计」的声明，不是消音器。
 pub(crate) fn safe_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
     sqlx::AssertSqlSafe(sql.into())
 }

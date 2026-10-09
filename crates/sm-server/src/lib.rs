@@ -34,6 +34,9 @@ pub mod config;
 pub mod error;
 pub mod logging;
 pub mod plugins;
+// provider 数据面的**实现**只能在这里：`sm-service` 不能依赖 `sm-plugins`
+// （依赖方向会成环），而 `sm-server` 同时看得见两边。见模块文档。
+pub mod provider_gateway;
 
 use std::sync::Arc;
 
@@ -132,12 +135,21 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // 依赖 sm-plugins），所以在这里转好再塞进 AppState —— 与 job_catalog
     // 同一个模式。
     let ranking_sources = loaded_plugins.ranking_sources();
+    // provider 数据面的**实现**。`sm-service` 只能声明 trait（`sm-plugins` 那条
+    // 依赖链会成环），所以实现由组合根给 —— 这是 playback 域唯一的插件接线点。
+    //
+    // 注册表是**活的**：插件重启会换控制面端口，所以这里传的是共享句柄，
+    // 不是加载期的快照。
+    let gateway = std::sync::Arc::new(provider_gateway::ProviderGateway::new(
+        loaded_plugins.provider_registry(),
+    ));
 
     // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读
     //    `job_disabled_reason` 需要的配置快照，而它是 move 进 AppState 的。
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
-        .with_ranking_sources(ranking_sources);
+        .with_ranking_sources(ranking_sources)
+        .with_storage_gateway(gateway);
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。

@@ -146,77 +146,12 @@ pub fn deferred_backoff_seconds(base_seconds: i64, deferred_count: u32) -> i64 {
         .min(FAILURE_RETRY_BACKOFF_MAX_SECONDS)
 }
 
-/// 一件缩略图产物（宿主侧类型，**不含 proto 形状**）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThumbnailJobArtifact {
-    /// 在媒体里的偏移（秒）。
-    pub offset_seconds: i32,
-    /// **相对 `workspace`** 的路径。宿主拿它拼绝对路径。
-    pub relative_path: String,
-}
-
-/// 一次生成的入参。宿主侧类型 —— 不把 `LibraryHandle` / `MediaHandle` 这类 proto
-/// 结构漏进 [`ThumbnailGenerator`] 的签名（那会让 `sm-service` 依赖插件 ABI 包）。
-#[derive(Debug, Clone)]
-pub struct ThumbnailJobRequest {
-    pub media_id: i32,
-    pub library_id: i32,
-    /// 该库用的 provider。**宿主按它去找到那个插件。**
-    pub provider_key: String,
-    /// provider 的不透明存储引用（原样回传）。宿主只保存与回传。
-    pub storage_ref: Option<String>,
-    pub file_name: String,
-    pub duration_seconds: i32,
-    /// 宿主提供的临时工作目录。provider 把产物写进来，宿主随后搬走。
-    pub workspace: std::path::PathBuf,
-}
-
-/// 一次生成的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThumbnailJobResult {
-    /// provider 期望生成多少张。
-    pub expected_count: u32,
-    pub artifacts: Vec<ThumbnailJobArtifact>,
-}
-
-/// provider 报的失败。
-///
-/// `code` 用**上游那七个字面量**（见 `TERMINAL_ERROR_CODES` 那段说明）——
-/// 宿主据此分流（终态 / 失败轨 / 延迟轨）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderFailure {
-    pub code: String,
-    /// 对外展示的安全文案。**不含插件的内部路径或凭据。**
-    pub safe_message: String,
-    /// 是否值得稍后再试。宿主的延迟轨靠它 ——
-    /// 上游 `retryable` 是 provider 给的独立字段。
-    pub retryable: bool,
-}
-
-/// provider 的缩略图生成能力。
-///
-/// # ★ 为什么是个 trait 而不是直接调 `sm_plugins`
-///
-/// `sm-service` **不能**依赖 `sm-plugins`：依赖方向会是
-/// `sm-plugins → sm-scheduler → sm-service → sm-plugins`，**成环**。
-/// 所以这里定义能力，由**组合根**（`sm-server`，它同时看得见两边）注入实现 ——
-/// 与 `RankingSourceCatalog` 同一个取向。
-///
-/// 没有注入时 `generate_pending_thumbnails` 会直接返回「0 部、跳过全部」：
-/// 没有 provider 就生成不出产物，**不假造**（假造会让客户端拿到打不开的图，
-/// 而状态机以为成功了）。
-pub trait ThumbnailGenerator: Send + Sync {
-    fn generate(
-        &self,
-        request: ThumbnailJobRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<ThumbnailJobResult, ProviderFailure>>
-                + Send
-                + '_,
-        >,
-    >;
-}
+// 插件接缝与相关类型在 [`super::provider_helpers`] —— **整个 playback 域只有
+// 那一个**（`sm-service` 不能依赖 `sm-plugins`：依赖方向会成环）。这里转出来
+// 是为了让本模块的使用点不必写长路径。
+pub use crate::playback::provider_helpers::{
+    json_or_null, ProviderFailure, StorageGateway, ThumbnailJobArtifact, ThumbnailJobResult,
+};
 
 /// 缩略图任务服务。
 ///
@@ -228,7 +163,7 @@ pub struct MediaThumbnailTaskService {
     db: Db,
     /// 图片根目录 —— 产物落盘时要算绝对路径。
     config: Option<ConfigService>,
-    generator: Option<std::sync::Arc<dyn ThumbnailGenerator>>,
+    gateway: Option<std::sync::Arc<dyn StorageGateway>>,
 }
 
 impl MediaThumbnailTaskService {
@@ -237,7 +172,7 @@ impl MediaThumbnailTaskService {
         Self {
             db: db.clone(),
             config: None,
-            generator: None,
+            gateway: None,
         }
     }
 
@@ -247,9 +182,9 @@ impl MediaThumbnailTaskService {
         self
     }
 
-    /// 注入 provider 的缩略图生成能力。由组合根调用。
-    pub fn with_generator(mut self, generator: std::sync::Arc<dyn ThumbnailGenerator>) -> Self {
-        self.generator = Some(generator);
+    /// 注入 provider 数据面的调用能力。由组合根调用。
+    pub fn with_gateway(mut self, gateway: std::sync::Arc<dyn StorageGateway>) -> Self {
+        self.gateway = Some(gateway);
         self
     }
 
@@ -316,10 +251,10 @@ impl MediaThumbnailTaskService {
     /// # 没有注入 generator 时**直接返回空结果**
     ///
     /// 不假造产物 —— 假造会让客户端拿到打不开的图，而状态机以为成功了。
-    /// 见 [`ThumbnailGenerator`] 的说明（`sm-service` 不能依赖 `sm-plugins`）。
+    /// 见 `StorageGateway` 的说明（`sm-service` 不能依赖 `sm-plugins`）。
     pub async fn generate_pending_thumbnails(&self) -> Result<serde_json::Value, ServiceError> {
         let mut stats = RoundStats::default();
-        let Some(generator) = self.generator.as_deref() else {
+        let Some(generator) = self.gateway.as_deref() else {
             // 没有 provider：整轮跳过，但**不要把状态机写成失败** ——
             // 那会让「插件还没装」变成「每部媒体都失败两次后进终态」。
             stats.skipped_no_provider = true;
@@ -388,7 +323,7 @@ impl MediaThumbnailTaskService {
     /// 处理一条媒体。**锁由调用方持有。**
     async fn generate_one(
         &self,
-        generator: &dyn ThumbnailGenerator,
+        gateway: &dyn StorageGateway,
         media_repo: &MediaRepository,
         media_id: i32,
         library_id: i32,
@@ -406,20 +341,44 @@ impl MediaThumbnailTaskService {
         ));
         std::fs::create_dir_all(&workspace).map_err(|_| RoundFailure::Skipped)?;
 
-        let request = ThumbnailJobRequest {
-            media_id,
-            library_id,
-            provider_key: provider_key.to_owned(),
-            storage_ref: media.storage_ref.clone(),
-            file_name: media.file_name.clone(),
-            duration_seconds: media.duration_seconds,
-            workspace: workspace.clone(),
-        };
+        // 句柄要带**库的** provider_config —— 所以候选行里的 `library_id` 不是
+        // 摆设，还得回查一次库记录（`MediaRecord.provider_config` 的注释原话）。
+        let library = sm_db::repo::MediaLibraryRepository::new(self.db.clone())
+            .find_by_id(library_id)
+            .await?
+            .ok_or(RoundFailure::Skipped)?;
+        if library.provider_key != provider_key {
+            // 候选行的 provider_key 来自 `media_library`，库记录的也是 ——
+            // 不一致说明有人改了库却没重扫，这时候**以库记录为准**（句柄是照它发的）。
+            tracing::warn!(
+                media_id,
+                candidate = %provider_key,
+                library = %library.provider_key,
+                "候选行的 provider_key 与库记录不一致，以库记录为准"
+            );
+        }
+        let handle = crate::playback::provider_helpers::media_handle_for(
+            &crate::playback::provider_helpers::MediaRecord {
+                id: i64::from(media.id),
+                library_id: i64::from(media.library_id),
+                storage_ref: json_or_null(media.storage_ref.as_deref()),
+                provider_config: json_or_null(library.provider_config.as_deref()),
+                provider_key: library.provider_key.clone(),
+                account_key: library.account_key.clone(),
+                // 这两个**不是装饰**：`plugin-ref-local` 用 `duration_seconds`
+                // 决定生成几张、用 `file_name` 决定产物叫什么。
+                // 骨架期把它们落在 `ThumbnailJobRequest` 上，合并进
+                // `MediaHandle` 时漏过一次 —— 表现是「provider 报成功但 0 张」。
+                file_name: media.file_name.clone(),
+                file_size_bytes: media.file_size_bytes,
+                duration_seconds: media.duration_seconds,
+            },
+        );
 
         let attempt_count = u32::try_from(media.thumbnail_attempt_count).unwrap_or(0);
         let deferred_count = u32::try_from(media.thumbnail_deferred_count).unwrap_or(0);
 
-        let (result, failure) = match generator.generate(request).await {
+        let (result, failure) = match gateway.generate_thumbnails(&handle, &workspace).await {
             Ok(result) => (Some(result), None),
             Err(failure) => (None, Some(failure)),
         };
@@ -618,6 +577,9 @@ impl From<sm_db::DbError> for RoundFailure {
         Self::Db(error.to_string())
     }
 }
+
+// 见 `provider_helpers::json_or_null` 的文档：宿主**不解释**这两个字段的内容，
+// 解析不出来就原样传 `Null`，让 provider 自己处置。
 
 /// 校验一组产物，返回「可用的那些」与第一条校验错误码。
 ///

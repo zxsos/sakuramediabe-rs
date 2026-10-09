@@ -135,6 +135,20 @@ fn object_at(section: Option<&Value>, field: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// 取注册表的写锁，**容忍中毒**。
+///
+/// 中毒只说明「上一个持锁者 panic 了」，而这张表只是「谁有哪些 provider」的
+/// 缓存：重建一次就能修好（`rebuild` 就是重建）。release 下 `panic = "abort"`
+/// 更不会走到这里。所以这里是**唯一**允许 `unwrap_or_else(into_inner)` 的地方
+/// ——其余地方照常不用 unwrap。
+fn lock_providers(
+    providers: &std::sync::Mutex<ProviderRegistry>,
+) -> std::sync::MutexGuard<'_, ProviderRegistry> {
+    providers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 一个已加载的插件。
 #[derive(Debug)]
 pub struct LoadedPlugin {
@@ -151,7 +165,18 @@ pub struct LoadedPlugin {
 pub struct Plugins {
     config: PluginConfig,
     loaded: Vec<LoadedPlugin>,
-    providers: ProviderRegistry,
+    /// provider 注册表。**为什么要共享（`Arc<Mutex<..>>`）而不是独占**
+    ///
+    /// 因为**插件重启会换端口**：`supervisor::launch` 每次拉起都向内核要一个新
+    /// 地址（`reserve_addr`），而 `ProviderRegistration.plugin_endpoint` 记的
+    /// 就是它。数据面的调用方（`StorageGateway`）若拿一份快照，重启后就带着旧
+    /// 端点 —— 表现为「删媒体/生成缩略图忽然全部 unavailable」，而注册表看起来
+    /// 一切正常。
+    ///
+    /// 所以调用方必须读**活的**这一份。锁用 `std::sync`（不是 tokio 的）：
+    /// `StorageGateway::has_provider` 是**同步**方法，不能在里面 await。
+    /// 临界区只有一次 `HashMap` 查表，很快就出来。
+    providers: Arc<std::sync::Mutex<ProviderRegistry>>,
     jobs: JobRegistry,
     extensions: ExtensionRegistry,
 }
@@ -167,7 +192,7 @@ impl Plugins {
         let mut plugins = Self {
             config,
             loaded: Vec::new(),
-            providers: ProviderRegistry::new(),
+            providers: Arc::new(std::sync::Mutex::new(ProviderRegistry::new())),
             jobs: JobRegistry::with_builtin(builtin_task_keys),
             extensions: ExtensionRegistry::new(),
         };
@@ -201,7 +226,7 @@ impl Plugins {
         // 一个插件可以有多个 provider，多个插件各有一张表 —— 合进宿主那一张，
         // 顺序由 `insert` 按 `enabled` 顺序续在后面。
         for entry in collect_providers(&registration, &endpoint).entries() {
-            self.providers.insert(entry.clone());
+            lock_providers(&self.providers).insert(entry.clone());
         }
         self.collect(&registration);
         self.loaded.push(LoadedPlugin {
@@ -345,8 +370,8 @@ impl Plugins {
     /// `sm_service::discovery::ranking::RankingSourceCatalog` 的文档里。
     pub fn ranking_sources(&self) -> sm_service::discovery::ranking::RankingSourceCatalog {
         use sm_plugins::registration::capability::EXTENSION_RANKING_SOURCE;
-        let entries = self
-            .providers
+        let providers = lock_providers(&self.providers);
+        let entries = providers
             .providers_with(EXTENSION_RANKING_SOURCE)
             .into_iter()
             .map(
@@ -360,6 +385,14 @@ impl Plugins {
         sm_service::discovery::ranking::RankingSourceCatalog::new(entries)
     }
 
+    /// 数据面调用方要用的那一份注册表句柄。
+    ///
+    /// 组合根把它交给 `StorageGateway`（见 [`crate::provider_gateway`]）。**必须是
+    /// 活的**：插件重启会换端点，快照会过期。
+    pub fn provider_registry(&self) -> Arc<std::sync::Mutex<ProviderRegistry>> {
+        Arc::clone(&self.providers)
+    }
+
     /// 从**全部**已加载插件的注册声明重建三张注册表。
     ///
     /// 重启后整体重建而不是增量合并：插件重启后声明可能变（少一个 provider、
@@ -369,7 +402,10 @@ impl Plugins {
             .into_iter()
             .map(|spec| spec.task_key)
             .collect();
-        self.providers = ProviderRegistry::new();
+        // **清空而不是换一个新对象**：句柄是共享的（`Arc`），数据面那边的
+        // `StorageGateway` 正指着这一个对象。换掉它就等于让调用方抱着一份
+        // 「永远空」的旧注册表 —— 插件重启之后所有 provider 都查不到。
+        *lock_providers(&self.providers) = ProviderRegistry::new();
         self.jobs = JobRegistry::with_builtin(builtin_task_keys);
         self.extensions = ExtensionRegistry::new();
         // 先拷出声明再收：`collect` 要可变借用 `self`，而遍历也在借 `self`。

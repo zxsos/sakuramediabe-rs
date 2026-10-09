@@ -55,8 +55,6 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use sm_service::playback::media::MediaService;
-
 use crate::auth::CurrentUser;
 use crate::dto::{MediaPointResource, MediaProgressResource, MediaThumbnailResource};
 use crate::error::ErrorResponse;
@@ -214,12 +212,6 @@ async fn list_multi_version_movies(
     todo!("骨架：接多版本影片查询")
 }
 
-/// 建服务。`MediaService` 要 `Db` 与 `ConfigService`（删时刻要图片根目录，
-/// 而图片根从配置读 —— 见 `media_paths::media_image_root_path`）。
-fn service(state: &AppState) -> MediaService {
-    MediaService::new(state.db(), state.config())
-}
-
 /// 每请求解析出的签名密钥（时刻点的图片要签 URL）。
 fn secret(state: &AppState) -> Result<String, ErrorResponse> {
     let config = crate::config::snapshot_or_500(state)?;
@@ -278,7 +270,8 @@ async fn list_media_points_for_media(
     Path(media_id): Path<i64>,
 ) -> Result<Json<Vec<MediaPointResource>>, ErrorResponse> {
     let secret = secret(&state)?;
-    let values = service(&state)
+    let values = state
+        .media_service()
         .list_points(narrow_media_id(media_id)?)
         .await?;
     let now = now_seconds();
@@ -302,7 +295,8 @@ async fn create_media_point(
     EnvelopeJson(payload): EnvelopeJson<MediaPointCreateRequest>,
 ) -> Result<(StatusCode, Json<MediaPointResource>), ErrorResponse> {
     let secret = secret(&state)?;
-    let (value, created) = service(&state)
+    let (value, created) = state
+        .media_service()
         .create_point(narrow_media_id(media_id)?, payload.thumbnail_id)
         .await?;
     let status = if created {
@@ -329,7 +323,8 @@ async fn delete_media_point(
     _user: CurrentUser,
     Path((media_id, point_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, ErrorResponse> {
-    service(&state)
+    state
+        .media_service()
         .delete_point(narrow_media_id(media_id)?, narrow_point_id(point_id)?)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -342,7 +337,8 @@ async fn update_media_progress(
     Path(media_id): Path<i64>,
     EnvelopeJson(payload): EnvelopeJson<MediaProgressUpdateRequest>,
 ) -> Result<Json<MediaProgressResource>, ErrorResponse> {
-    let value = service(&state)
+    let value = state
+        .media_service()
         .update_progress(narrow_media_id(media_id)?, payload.position_seconds)
         .await?;
     Ok(Json(MediaProgressResource::from_value(&value)))
@@ -355,7 +351,8 @@ async fn list_media_thumbnails(
     Path(media_id): Path<i64>,
 ) -> Result<Json<Vec<MediaThumbnailResource>>, ErrorResponse> {
     let secret = secret(&state)?;
-    let values = service(&state)
+    let values = state
+        .media_service()
         .list_thumbnails(narrow_media_id(media_id)?)
         .await?;
     let now = now_seconds();
@@ -368,10 +365,15 @@ async fn list_media_thumbnails(
 }
 
 /// `DELETE /media/{media_id}` —— **204 且无 body**。
+///
+/// `sync_video_member` 上游是**关键字参数、默认 `True`**，而这个端点**不传它**
+/// —— 所以走的是「非 JAV 媒体连它的视频条目一起删」那一支。把它做成查询参数
+/// 会改变契约（默认行为不同）。
 async fn delete_media(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_media_id): Path<i64>,
+    Path(media_id): Path<i64>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接媒体删除（成功返回 204，不带 body）")
+    state.media_service().delete_media(media_id, true).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

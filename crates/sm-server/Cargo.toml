@@ -39,6 +39,9 @@ sm-plugins = { workspace = true }
 # 插件注册响应的类型（`RegisterResponse`）来自契约层；组合根要把它留在内存里，
 # 以便插件重启后重建三张注册表。
 sm-plugin-api = { workspace = true }
+# 宿主侧是 `serde_json::Value`，proto 侧是 `google.protobuf.Struct` ——
+# 组合根负责这两者的互换（`src/provider_gateway.rs`）。
+prost-types = { workspace = true }
 
 [dev-dependencies]
 sm-db = { workspace = true }

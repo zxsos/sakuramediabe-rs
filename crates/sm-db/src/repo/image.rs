@@ -278,6 +278,19 @@ impl ImageRepository {
                 .fetch_optional(&mut *tx)
                 .await?;
         if existing.is_none() {
+            // 显式回滚 —— **别指望 `Transaction` 的 `Drop`**。
+            //
+            // `sqlx-core/src/transaction.rs` 的 Drop 注释原文：它只是
+            // "queue a rollback operation that will happen on the next
+            // asynchronous invocation of the underlying connection"。而这个连接
+            // 还回池之后**没有下一次调用**，ROLLBACK 就永远不发 —— 上面那条
+            // `SELECT ... FOR UPDATE` 的 `RowShareLock` 一直挂着（实测会话停在
+            // `idle in transaction`，语句就是这条 SELECT）。
+            //
+            // 后果不止「事务开得久」：之后任何要拿 `AccessExclusiveLock` 的 DDL
+            // （`DROP SCHEMA ... CASCADE` / `ALTER TABLE`）都会去等它 —— 直接
+            // 死锁。测试基建就是这样被卡死的：`TestDb` 收尾要 drop schema。
+            tx.rollback().await?;
             return Ok(None);
         }
 
@@ -287,6 +300,8 @@ impl ImageRepository {
             .fetch_one(&mut *tx)
             .await?;
         if referenced {
+            // 同上面的「不存在」分支：**显式**回滚，不要让 Drop 去排队。
+            tx.rollback().await?;
             return Ok(None);
         }
 

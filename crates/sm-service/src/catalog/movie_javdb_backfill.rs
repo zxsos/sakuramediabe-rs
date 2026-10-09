@@ -50,7 +50,8 @@ pub trait JavdbProvider {
 
 /// 把 JavDB 详情写回影片。
 pub trait PluginMovieBackfill {
-    /// 回填。**只写插件拥有的字段**（见 [`super::movie_ownership_gateway`]）。
+    /// 回填。**只写插件拥有的字段**（见
+    /// [`MovieOwnershipGateway`](sm_db::repo::MovieOwnershipGateway)）。
     fn backfill(&self, movie_id: i64, detail: &serde_json::Value) -> Result<bool, ServiceError>;
 }
 

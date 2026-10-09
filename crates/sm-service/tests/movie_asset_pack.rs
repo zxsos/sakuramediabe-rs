@@ -238,9 +238,21 @@ async fn cleanup_rebuilds_the_pack_so_the_deleted_entry_disappears() {
     );
 }
 
-/// 条目名推导是纯函数，顺手钉一下（包内条目名 = 去掉前导斜杠的相对路径）。
+/// 条目名推导是纯函数，顺手钉一下（包内条目名 = **文件名**）。
+///
+/// 这条原先断言的是「去掉前导斜杠的整条相对路径」—— 与实现一起错，
+/// 而读侧只按文件名找，于是包里的图全读不出来（见下面
+/// `a_rebuild_packs_the_live_set_and_clears_the_loose_files` 的断言）。
 #[test]
-fn entry_names_are_relative_paths() {
-    assert_eq!(pack_entry_name(MOVIE_DIR), MOVIE_DIR);
-    assert_eq!(pack_entry_name("/a/b.jpg"), "a/b.jpg");
+fn entry_names_are_bare_file_names() {
+    assert_eq!(
+        pack_entry_name(MOVIE_DIR),
+        "ABC-001",
+        "目录本身没有文件名之外的语义"
+    );
+    assert_eq!(pack_entry_name("/a/b.jpg"), "b.jpg");
+    assert_eq!(
+        pack_entry_name(&format!("{MOVIE_DIR}/cover.jpg")),
+        "cover.jpg"
+    );
 }

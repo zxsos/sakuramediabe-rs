@@ -794,6 +794,25 @@ impl<'a> View<'a> {
         self.raw(section, field)?.as_i64()
     }
 
+    /// 取整数字段，缺失或类型不对时回落到模式里的默认值。
+    ///
+    /// 与 [`Self::str_or_default`] 同一个用途，理由也一样：**默认值只应该
+    /// 有一份**，在 [`SECTIONS`] 里。调用方写 `view.int_or_default("downloads",
+    /// "subscription_search_fresh_days")` 时不必知道它是 90 —— 那个数字出现
+    /// 第二次就意味着它会漂移（改了 schema 没改调用方，或者反过来）。
+    ///
+    /// # 与 `int` + `unwrap_or` 的区别
+    ///
+    /// `unwrap_or(N)` 会在**配置里真的没这个键**时给出一个调用方编的值，
+    /// 而 `int_or_default` 给的是**模式声明**的那个值。前者让「配置没生效」
+    /// 与「配置写错了」长得一模一样。
+    ///
+    /// 键名不在模式里时返回 `None`（与 `int` 一致）：键名写错应当看得见。
+    pub fn int_or_default(&self, section: &str, field: &str) -> Option<i64> {
+        self.int(section, field)
+            .or_else(|| field_of(section, field).and_then(|f| default_of(f).as_i64()))
+    }
+
     fn raw(&self, section: &str, field: &str) -> Option<&'a Value> {
         self.values.get(section)?.as_object()?.get(field)
     }
@@ -833,6 +852,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ★ `View::{str,int}_or_default` 的默认值来自**模式表**，不是调用方编的。
+    ///
+    /// 这就是它们存在的理由：调用方不该再抄一遍 90 / 3 这类数字（抄了就会
+    /// 漂移）。同时钉住「键名不在模式里 → `None`」——写错的键名要看得见，
+    /// 而不是拿到一个看着合理的默认值。
+    #[test]
+    fn view_falls_back_to_the_schema_default() {
+        let empty = serde_json::Map::new();
+        let view = View::new(&empty);
+
+        // 空快照（没有 overlay）也要能取到默认值。
+        assert_eq!(
+            view.int_or_default("downloads", "subscription_search_fresh_days"),
+            Some(90)
+        );
+        assert_eq!(
+            view.int_or_default("downloads", "subscription_search_stale_attempt_limit"),
+            Some(3)
+        );
+        // 键名不在模式里 → None（不是编一个值）。
+        assert_eq!(view.int_or_default("downloads", "no_such_field"), None);
+        assert_eq!(view.int_or_default("no_such_section", "x"), None);
     }
 
     #[test]

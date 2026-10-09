@@ -742,7 +742,8 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 3. **不要发明协议**。上游没实现的（数据面）、proto 没定义的，先查证再动手。
 4. **SQL 用 `QueryBuilder`**，不要拼字符串（占位符编号会静默错位）。
 5. **置空只能用 SQL 字面量 `NULL`**：`UpdateSet` 的 `ValueInner::Null` 在绑定层是 text 类型，对 timestamp 列直接报错。
-6. **受保护字段**（`is_collection` / `is_blacklisted`）必须经 `MovieOwnershipGateway`，否则自动规则会覆盖人工标记。
+6. **受保护字段**（`sm_db::catalog::PROTECTED_MOVIE_FIELDS`，**6 个**：`title` / `summary` / `maker_name` / `director_name` / `is_collection` / `is_blacklisted`）必须经 `sm_db::repo::MovieOwnershipGateway`，否则自动规则会覆盖人工标记。演员侧同构（`PROTECTED_ACTOR_FIELDS` 9 个，`ActorOwnershipGateway`）。
+   > ⚠️ 这里原先写的是「`is_collection` / `is_blacklisted` 两个」—— 那是 `sm-service` 里一份**杜撰的**白名单常量，与上游不符（少 4 个字段，于是插件补录会把 `title` 静默拒掉）。那份骨架连同演员的同款已删除，**网关只此一份**。
 7. **重复常量是缺陷**：`ABI_MAJOR` 之类的只留一份（现在复用 `sm_plugin_api::ABI_MAJOR`）。
 8. ★ **`todo!` / `panic!` 的消息里不能出现 `{...}`**。第一参数是格式串，
    `todo!("解出 {source, external_id}")` 会报「invalid format string」——

@@ -29,10 +29,14 @@
 //! `videos/<id>/cover/0.webp`。它是 `svc-image`（有损 WebP 目前走进程外
 //! `cwebp`，见 ADR §3.4）与 `svc-probe` 的职责，不属于 service 层。
 //!
-//! **③ 封面/图片的磁盘清理。** 换封面与删条目都要调
-//! `ImageCleanupService` 删不再被引用的图片行与磁盘文件。那是
-//! `catalog` 域的 service，本批不在范围内，因此换封面只改
-//! `video_item.cover_image_id` —— 旧图片行会暂时留下，由后续切片回收。
+//! **③ 换封面时旧图片的回收。** `update` 换掉 `video_item.cover_image_id`
+//! 之后，那张旧图可能已经没人引用，该调 `ImageCleanupService` 删掉它的行与
+//! 磁盘文件 —— 这一步**还没做**（本批只改 id，旧图行会留下）。
+//!
+//! ⚠️ 别把这一条读成「删条目也不回收封面」：删条目那条链路**已经**会回收
+//! （[`VideoItemService::delete`](item::VideoItemService::delete) 删完条目行
+//! 之后调 `MediaService::reap_images`）。两者的区别是「引用还在不在」——
+//! 换封面时那张图可能还被**别的**媒体或影片用着，而删条目之后它一定没人用了。
 //!
 //! # 三条容易搞反的规则
 //!

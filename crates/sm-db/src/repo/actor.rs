@@ -2,10 +2,10 @@
 //!
 //! # 这一批解锁了什么
 //!
-//! `actor` 是与 `Movie` **完全对称**的主数据：同样有 9 个受保护字段、
-//! 同样有 `field_owners` / `mutation_revision`、同样有字段主权网关。
-//! 上游有 `actor_ownership_gateway.py` 与 `actor_merge_service.py`，
-//! 而我们此前只实现了 Movie 那一半。
+//! `actor` 是与 `Movie` **完全对称**的主数据：同样有受保护字段白名单、
+//! 同样有 `field_owners` / `mutation_revision`、同样有字段主权网关
+//! （[`super::ActorOwnershipGateway`]）。上游那两个文件
+//! （`actor_ownership_gateway.py` / `actor_merge_service.py`）现在都有对应物。
 //!
 //! # 墓碑指针与「不可删」
 //!

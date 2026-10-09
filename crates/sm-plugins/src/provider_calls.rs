@@ -270,7 +270,13 @@ pub async fn delete_media(
 ///
 /// 抽成别名既是为了 `clippy::type_complexity`，也是为了让调用点一眼看清三个参数
 /// 的含义（裸写 `&mut dyn FnMut(&str, i32, i32)` 看不出谁是总数）。
-pub type ThumbnailProgress = dyn FnMut(&str, i32, i32);
+///
+/// # ★ `+ Send` 是**被逼出来的**，不是风格
+///
+/// 少了它，任何 `async fn` 只要带这个参数就**不是 `Send`** —— 于是它的 future
+/// 进不了 `tokio::spawn`，也塞不进 `Pin<Box<dyn Future + Send>>`。
+/// 组合根的 `StorageGateway` 正是后者，第一个真实调用点就把这个洞踩出来了。
+pub type ThumbnailProgress = dyn FnMut(&str, i32, i32) + Send;
 
 /// `generate_thumbnails` 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]

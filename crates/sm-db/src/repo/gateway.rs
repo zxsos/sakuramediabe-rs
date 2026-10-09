@@ -1,6 +1,24 @@
-//! `Movie` 字段主权网关（v2-lite）——受保护字段的**唯一**写入口。
+//! 字段主权网关（v2-lite）——受保护字段的**唯一**写入口。
 //!
-//! 对应 `src/service/catalog/movie_ownership_gateway.py`。
+//! 两个实体，两套规则，**共用值类型**（[`FieldPatch`] / [`FieldValue`] /
+//! [`FieldCodec`]）：
+//!
+//! | | [`MovieOwnershipGateway`] | [`ActorOwnershipGateway`] |
+//! |---|---|---|
+//! | 上游 | `service/catalog/movie_ownership_gateway.py` | `service/catalog/actor_ownership_gateway.py` |
+//! | 白名单 | `PROTECTED_MOVIE_FIELDS`（6） | `PROTECTED_ACTOR_FIELDS`（9） |
+//! | owner | `plugin:{id}` / `host:manual` | 再加 `host:javdb` |
+//! | 插件 patch 收 `None` | 否 | 是（除 `gender`）—— 显式清空并保留归属 |
+//! | 额外取值校验 | 无 | 正整数、文本 1..255、`gender ∈ {1,2}` |
+//! | 释放归属推进 revision | 否 | **是** |
+//!
+//! 两者都在**仓储层**而不是 service 层：四条入口全是「单条条件 UPDATE +
+//! jsonb + 乐观锁」，属仓储的活；service 侧的调用方收一个网关字段即可
+//! （见 [`crate::repo::movie::MovieRepository`] 的用法）。
+//!
+//! ⚠️ `sm-service` 里曾各有一份**同名骨架**（`catalog/movie_ownership_gateway.rs`
+//! 与 `catalog/actor_ownership_gateway.rs`），带各自杜撰的白名单 —— 影片那份
+//! 只有 2 个字段，与上游的 6 个不符。两份都已删除，**唯一实现在这里**。
 //!
 //! # 为什么不能用通用 update
 //!
@@ -57,18 +75,26 @@ const ENTITY: &str = "Movie";
 /// 并收敛对应宿主写点后才加入」白名单。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldCodec {
-    /// `str` 列。
+    /// `text` / `varchar` 列。
     Text,
     /// `bool` 列。
     Bool,
+    /// `integer` 列（演员的身高/三围等）。
+    Int,
+    /// `date` 列（演员生日）。
+    Date,
 }
 
 impl FieldCodec {
     /// 该 codec 是否接受 `None`。
     ///
-    /// 只有**宿主**写路径放行 `None`：`maker_name` / `director_name` /
-    /// `summary` 等列允许 NULL，远端详情缺失时以 NULL 落库是合法数据。
-    /// 插件 patch 路径不允许（`allow_none=False`）。
+    /// 只有**文本**列放行 `None`：`maker_name` / `director_name` / `summary`
+    /// 允许 NULL，远端详情缺失时以 NULL 落库是合法数据 —— 而 `is_blacklisted`
+    /// 这种布尔列没有「未知」态，`mutation_revision` 之类更不该被写成 NULL。
+    ///
+    /// ⚠️ 这只约束**影片**那条路径（它的插件 patch 不收 `None`）。演员路径
+    /// 的规则不同：只有 `gender` 拒绝 `None`（它必须在 `{1,2}` 里），其余字段
+    /// 允许显式清空 —— 见 [`ActorOwnershipGateway::patch_plugin`]。
     pub fn accepts_none(&self) -> bool {
         matches!(self, Self::Text)
     }
@@ -106,6 +132,10 @@ pub enum FieldValue {
     Text(Option<String>),
     /// 布尔（不接受 `None`）。
     Bool(bool),
+    /// 整数（含 `None`：演员的身高可以清空）。
+    Int(Option<i32>),
+    /// 日期（含 `None`）。
+    Date(Option<chrono::NaiveDate>),
 }
 
 impl FieldValue {
@@ -113,16 +143,27 @@ impl FieldValue {
     fn matches(&self, codec: FieldCodec) -> bool {
         matches!(
             (self, codec),
-            (Self::Text(_), FieldCodec::Text) | (Self::Bool(_), FieldCodec::Bool)
+            (Self::Text(_), FieldCodec::Text)
+                | (Self::Bool(_), FieldCodec::Bool)
+                | (Self::Int(_), FieldCodec::Int)
+                | (Self::Date(_), FieldCodec::Date)
         )
     }
 
     /// 绑到查询上的 SQL 类型。
+    ///
+    /// `Option::<T>::None` 绑成 NULL —— 每个变体都要显式走一次 `Option`，
+    /// 否则 sqlx 会按 `T`（非空）推断出 `NOT NULL` 的类型，写 NULL 时直接报
+    /// 类型错误。
     fn bind<'q>(self, query: Query<'q, Postgres, PgArguments>) -> Query<'q, Postgres, PgArguments> {
         match self {
             Self::Text(Some(v)) => query.bind(v),
             Self::Text(None) => query.bind(Option::<String>::None),
             Self::Bool(v) => query.bind(v),
+            Self::Int(Some(v)) => query.bind(v),
+            Self::Int(None) => query.bind(Option::<i32>::None),
+            Self::Date(Some(v)) => query.bind(v),
+            Self::Date(None) => query.bind(Option::<chrono::NaiveDate>::None),
         }
     }
 }
@@ -152,6 +193,22 @@ impl FieldPatch {
     /// 设一个布尔字段。
     pub fn flag(&mut self, field: &'static str, value: bool) -> &mut Self {
         self.push(field, FieldValue::Bool(value));
+        self
+    }
+
+    /// 设一个整数字段（演员的身高/三围等）。
+    pub fn int(&mut self, field: &'static str, value: Option<i32>) -> &mut Self {
+        self.push(field, FieldValue::Int(value));
+        self
+    }
+
+    /// 设一个日期字段（演员生日）。
+    ///
+    /// 接的是**已解析**的日期 —— 从插件 JSON 来的字符串要先过
+    /// [`parse_iso_date_exact`]（它带上游那条「必须严格 `YYYY-MM-DD`」的校验）。
+    /// 直接 `NaiveDate::parse_from_str` 会把 `2020-1-1` 也收下，而上游拒绝它。
+    pub fn date(&mut self, field: &'static str, value: Option<chrono::NaiveDate>) -> &mut Self {
+        self.push(field, FieldValue::Date(value));
         self
     }
 
@@ -610,6 +667,513 @@ fn bind_patch_triples<'q>(
     acc
 }
 
+// ============================================================ 演员
+
+/// 实体名（错误信息里的 `entity` 字段）。actor 与 movie 的错误要能分开。
+const ACTOR_ENTITY: &str = "Actor";
+
+/// JavDB 补录的 owner 标记（上游 `JAVDB_ACTOR_FIELD_OWNER`）。
+///
+/// 存在 `field_owners` 里的**稳定字符串**，跨版本要能识别 —— 改它等于让存量库
+/// 上已接管的字段全部变成「别人的」。
+///
+/// 人工那条用 [`field_owner::HOST_MANUAL`]（上游两个模块各定义一个，值相同）。
+pub const HOST_JAVDB_OWNER: &str = "host:javdb";
+
+/// 演员受保护字段的期望值类型。对应 Python 的 `ACTOR_FIELD_CODECS`。
+///
+/// 覆盖 [`crate::catalog::actor::PROTECTED_ACTOR_FIELDS`] 的**全部 9 个**字段。
+/// 白名单与这张表必须一一对应 —— 进了白名单却没有 codec 的字段会被
+/// `validate_actor_fields` 拒绝（类型校验不能默认放行）。
+pub const ACTOR_FIELD_CODECS: [(&str, FieldCodec); 9] = [
+    ("gender", FieldCodec::Int),
+    ("birthday", FieldCodec::Date),
+    ("height_cm", FieldCodec::Int),
+    ("bust_cm", FieldCodec::Int),
+    ("waist_cm", FieldCodec::Int),
+    ("hips_cm", FieldCodec::Int),
+    ("cup", FieldCodec::Text),
+    ("birthplace", FieldCodec::Text),
+    ("blood_type", FieldCodec::Text),
+];
+
+/// 查演员字段的 codec。
+pub fn actor_codec_of(field: &str) -> Option<FieldCodec> {
+    ACTOR_FIELD_CODECS
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, codec)| *codec)
+}
+
+/// `gender` 的取值域。上游 `ACTOR_FIELD_ALLOWED_VALUES = {"gender": {1, 2}}`。
+///
+/// 只有这一个字段有枚举值，所以没有做成表：多一层 `HashMap` 只是为了一个
+/// 元素，读起来反而更绕。
+pub const ACTOR_GENDER_VALUES: [i32; 2] = [1, 2];
+
+/// 该字段是否只能取 [`ACTOR_GENDER_VALUES`] 里的值。
+fn has_allowed_values(field: &str) -> bool {
+    field == "gender"
+}
+
+/// 解析严格 ISO `YYYY-MM-DD` 日期（上游 `birthday` 的校验）。
+///
+/// # 为什么不能直接用 `NaiveDate::parse_from_str(_, "%Y-%m-%d")`
+///
+/// 那个格式串**不要求补零**：`2020-1-1` 也能解析成功。上游的判据是
+/// 「`date.fromisoformat(value).isoformat() == value`」—— 即解析后再格式化
+/// 必须**逐字符相同**，于是 `2020-1-1` 被拒。这里的等价做法是：解析成功后
+/// 用 `to_string()`（固定 `YYYY-MM-DD`）比一次。
+pub fn parse_iso_date_exact(raw: &str) -> Result<chrono::NaiveDate, DbError> {
+    let parsed = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map_err(|_| DbError::business(ACTOR_ENTITY, "birthday 必须是 YYYY-MM-DD 日期"))?;
+    if parsed.to_string() != raw {
+        return Err(DbError::business(
+            ACTOR_ENTITY,
+            "birthday 必须是 YYYY-MM-DD 日期",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// 校验演员 patch：非空、字段在 9 个白名单里、类型匹配 codec + 取值域。
+///
+/// 与影片那条路径的**两处语义差异**（都来自上游）：
+///
+/// | | 影片 | 演员 |
+/// |---|---|---|
+/// | `None` | 插件路径拒绝 | **允许**（除 `gender` 外），"显式清空并保留归属" |
+/// | 额外校验 | 无 | 整数必须为正、文本 1..255、`gender ∈ {1,2}` |
+fn validate_actor_fields(patch: &FieldPatch) -> Result<(), DbError> {
+    if patch.is_empty() {
+        return Err(DbError::business(
+            ACTOR_ENTITY,
+            "fields 必须是非空的演员资料字段集合",
+        ));
+    }
+
+    for (name, value) in patch.iter() {
+        if !crate::catalog::actor::PROTECTED_ACTOR_FIELDS.contains(&name) {
+            // 上游对演员侧是**直接报错**（影片侧是静默跳过）：演员字段少，
+            // 传错更可能是代码写错，快速失败比静默丢字段好。
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                format!("字段 {name} 不是演员资料字段"),
+            ));
+        }
+        let Some(codec) = actor_codec_of(name) else {
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                format!("字段 {name} 未声明 codec，按约定必须先补类型校验"),
+            ));
+        };
+        if !value.matches(codec) {
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                format!("字段 {name} 值类型错误: 期望 {codec:?}"),
+            ));
+        }
+
+        match value {
+            FieldValue::Int(None) | FieldValue::Text(None) | FieldValue::Date(None) => {
+                // `gender` 没有「未知」态：它必须在 {1,2} 里。
+                if has_allowed_values(name) {
+                    return Err(DbError::business(
+                        ACTOR_ENTITY,
+                        format!("字段 {name} 值必须是 {:?}", ACTOR_GENDER_VALUES),
+                    ));
+                }
+            }
+            FieldValue::Int(Some(number)) => {
+                if has_allowed_values(name) {
+                    if !ACTOR_GENDER_VALUES.contains(number) {
+                        return Err(DbError::business(
+                            ACTOR_ENTITY,
+                            format!("字段 {name} 值必须是 {:?}", ACTOR_GENDER_VALUES),
+                        ));
+                    }
+                } else if !(1..=i32::MAX).contains(number) {
+                    // 上界不是装饰：这些列是 `integer`，而「必须是正整数厘米值」
+                    // 是上游写在字段级校验里的规则（0 与负数都非法）。
+                    return Err(DbError::business(
+                        ACTOR_ENTITY,
+                        format!("字段 {name} 必须是正整数厘米值"),
+                    ));
+                }
+            }
+            FieldValue::Text(Some(text)) => {
+                // 空白串拿 `strip` 判：上游要求「1 到 255 字符的非空文本；
+                // 清空请传 None」—— 也就是说 `""` 与 `"   "` 都非法。
+                if text.trim().is_empty() || text.chars().count() > 255 {
+                    return Err(DbError::business(
+                        ACTOR_ENTITY,
+                        format!("字段 {name} 必须是 1 到 255 字符的非空文本；清空请传 None"),
+                    ));
+                }
+            }
+            FieldValue::Bool(_) => {
+                // 演员白名单里没有布尔字段（`is_subscribed` 不可写）。
+                return Err(DbError::business(
+                    ACTOR_ENTITY,
+                    format!("字段 {name} 不该是布尔值"),
+                ));
+            }
+            FieldValue::Date(Some(_)) => {}
+        }
+    }
+    Ok(())
+}
+
+/// `Actor` 字段主权网关。
+///
+/// 与 [`MovieOwnershipGateway`] 同构，但**多一个 owner**：
+///
+/// | owner | 谁写的 | 谁可以覆盖它 |
+/// |---|---|---|
+/// | `host:manual` | 人工（改名/换头像/订阅） | 只有人工 |
+/// | `host:javdb` | JavDB 补录 | `host:*` 系列的自动来源 |
+/// | `plugin:{id}` | 插件 | 宿主来源（`host:javdb`）与人工 |
+/// | （无归属） | 谁都行 | —— |
+///
+/// **身份、头像、订阅不在插件可写白名单内**（上游 docstring 原话）。
+/// 放开任何一项都等于把人工决策交给插件 —— `javdb_id` 能改就等于可以把演员
+/// 挂到别的 JavDB 条目上。
+#[derive(Debug, Clone)]
+pub struct ActorOwnershipGateway {
+    pool: PgPool,
+}
+
+impl ActorOwnershipGateway {
+    /// 构造网关。
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 底层连接池。
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// **插件写字段**：每个字段要求「未接管或 owner 是当前插件」，且 revision 匹配。
+    ///
+    /// 返回 `true` 表示命中；**任一字段条件失败则整次零修改**，插件应重新读取
+    /// snapshot 再决定是否重试。`None` 是**显式清空**，且保留归属。
+    pub async fn patch_plugin(
+        &self,
+        actor_id: i32,
+        plugin_id: &str,
+        patch: &FieldPatch,
+        expected_revision: i64,
+    ) -> Result<bool, DbError> {
+        validate_actor_fields(patch)?;
+        if expected_revision < 0 {
+            // 上游显式拒绝负数版本号（认为它只能是读出来的 snapshot 版本）。
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                "expected_revision 必须是非负整数",
+            ));
+        }
+        let owner = field_owner::plugin(plugin_id);
+        let names = patch.names();
+
+        // 占位符编号：字段值 1..n → owner_payload → actor_id → revision
+        // → 每字段 3 个 owner 条件（key, key, owner）。顺序即绑定顺序。
+        let mut q = 0usize;
+        let assignments = names
+            .iter()
+            .map(|name| {
+                q += 1;
+                format!("{name} = ${q}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let owner_payload_idx = {
+            q += 1;
+            q
+        };
+        let actor_idx = {
+            q += 1;
+            q
+        };
+        let revision_idx = {
+            q += 1;
+            q
+        };
+        let owner_conditions = names
+            .iter()
+            .map(|_| {
+                let key = {
+                    q += 1;
+                    q
+                };
+                let key2 = {
+                    q += 1;
+                    q
+                };
+                let own = {
+                    q += 1;
+                    q
+                };
+                format!("(field_owners->>${key} IS NULL OR field_owners->>${key2} = ${own})")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // n 个字段值 + owner 载荷 + id + revision + 每字段 3 个 owner 条件 = 4n+3。
+        // （写成 3n+4 只在 n=1 时碰巧相等 —— 多字段补丁一跑就 panic。）
+        debug_assert_eq!(q, patch.len() * 4 + 3, "占位符总数应为 4n+3");
+
+        let sql = format!(
+            "UPDATE actor SET {assignments}, \
+                field_owners = field_owners || ${owner_payload_idx}::jsonb, \
+                mutation_revision = mutation_revision + 1, \
+                updated_at = now() \
+             WHERE id = ${actor_idx} \
+               AND mutation_revision = ${revision_idx} \
+               AND {owner_conditions}"
+        );
+
+        let owner_payload = owner_map_json(names.iter().copied().map(|nm| (nm, owner.as_str())));
+        let query = bind_patch_values(sqlx::query(safe_sql(sql)), patch)
+            .bind(&owner_payload)
+            .bind(actor_id)
+            .bind(expected_revision);
+        let query = names.iter().fold(query, |query, name| {
+            query.bind(*name).bind(*name).bind(owner.clone())
+        });
+
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// **宿主权威来源写字段**（JavDB 补录；人工写入走同一个方法，见下）。
+    ///
+    /// 只影响**无归属**或**已被同一 owner 占有**的字段；可以替换插件的 owner，
+    /// 但**不会覆盖人工 owner**（`host:manual`）。
+    ///
+    /// ⚠️ **`host:manual` 传不进来** —— 上游 `:89` 显式拒绝它
+    /// （`owner == MANUAL_ACTOR_FIELD_OWNER` 直接抛）。也就是说**演员侧没有
+    /// 「人工写入」入口**：`host:manual` 只会作为**别人摆在那儿的标记**被读到，
+    /// 本方法只会因为它而**不命中**（见下）。
+    ///
+    /// 骨架期的文档曾写着「传 `MANUAL_ACTOR_FIELD_OWNER` 调它就等价于人工写入」
+    /// —— 那是错的，照着写会在第一次调用时拿到一个 `owner 必须是...` 的业务错误。
+    /// 演员的人工编辑走 `actor_merge_service` 那条链路（它读
+    /// `MANUAL_ACTOR_FIELD_OWNER` 判断能否合并），不经过本方法。
+    ///
+    /// ⚠️ 也别想用它写 `is_subscribed`：订阅是人工决策，而它**不在** 9 个
+    /// 受保护字段里，方法根本收不到它。
+    ///
+    /// 返回 `true` 表示命中；没有实际变化时返回 `false`（**不是错误** ——
+    /// 上游把「值没变」也算不命中）。
+    pub async fn update_host_source(
+        &self,
+        actor_id: i32,
+        patch: &FieldPatch,
+        owner: &str,
+    ) -> Result<bool, DbError> {
+        validate_actor_fields(patch)?;
+        // 上游：owner 必须是非人工的宿主来源 —— 人工那条要显式传 MANUAL。
+        if !owner.starts_with("host:") || owner == field_owner::HOST_MANUAL {
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                "owner 必须是非人工的宿主来源 owner",
+            ));
+        }
+        let names = patch.names();
+
+        // 三段各占一轮字段参数（与影片的 `update_host_unowned` 同款）：
+        //   1) SET 的值                            (value)
+        //   2) 字段级 owner 条件                    (name, name, "host:manual")
+        //   3) 变化检测（值或归属任一变了才算）      (value, name, owner)
+        // 最后是 actor_id。
+        let mut q = 0usize;
+        let assignments = names
+            .iter()
+            .map(|name| {
+                q += 1;
+                format!("{name} = ${q}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let owner_payload_idx = {
+            q += 1;
+            q
+        };
+        let actor_idx = {
+            q += 1;
+            q
+        };
+        let owner_conditions = names
+            .iter()
+            .map(|_| {
+                let key = {
+                    q += 1;
+                    q
+                };
+                let key2 = {
+                    q += 1;
+                    q
+                };
+                let manual = {
+                    q += 1;
+                    q
+                };
+                // `<> %s` 而不是 `IS DISTINCT FROM`：上游就是 `<>`，而 key 缺失时
+                // 左边是 NULL、`<>` 结果为 NULL（不成立）—— 但前一个分支
+                // （`IS NULL`）已经把这种情况接住了，两者合起来正是
+                // 「无归属或不是人工owner」。
+                format!("(field_owners->>${key} IS NULL OR field_owners->>${key2} <> ${manual})")
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let changed_conditions = names
+            .iter()
+            .map(|name| {
+                let value = {
+                    q += 1;
+                    q
+                };
+                let key = {
+                    q += 1;
+                    q
+                };
+                let own = {
+                    q += 1;
+                    q
+                };
+                format!(
+                    "({name} IS DISTINCT FROM ${value} \
+                      OR field_owners->>${key} IS DISTINCT FROM ${own})"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        debug_assert_eq!(q, patch.len() * 7 + 2, "占位符总数应为 7n+2");
+
+        let sql = format!(
+            "UPDATE actor SET {assignments}, \
+                field_owners = field_owners || ${owner_payload_idx}::jsonb, \
+                mutation_revision = mutation_revision + 1, \
+                updated_at = now() \
+             WHERE id = ${actor_idx} \
+               AND {owner_conditions} \
+               AND ({changed_conditions})"
+        );
+
+        let owner_payload = owner_map_json(names.iter().copied().map(|nm| (nm, owner)));
+        let mut query = bind_patch_values(sqlx::query(safe_sql(sql)), patch)
+            .bind(&owner_payload)
+            .bind(actor_id);
+        for name in &names {
+            query = query.bind(*name).bind(*name).bind(field_owner::HOST_MANUAL);
+        }
+        for (name, value) in patch.iter() {
+            query = value.clone().bind(query).bind(name).bind(owner);
+        }
+
+        let result = query.execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// **管理员解除插件对字段的接管**。`fields = None` 时清除该插件**全部**
+    /// owner 记录。
+    ///
+    /// ⚠️ 与影片侧同款方法的一处**行为差异**（上游如此）：演员侧会
+    /// **推进 `mutation_revision` 并刷新 `updated_at`**，影片侧不动它们。
+    /// 理由是演员的 snapshot 带 revision，释放归属等于「你手里的那份快照
+    /// 已经过期了」，所以要让版本往前跳一格。
+    pub async fn release_plugin_owners(
+        &self,
+        plugin_id: &str,
+        fields: Option<&[&'static str]>,
+    ) -> Result<u64, DbError> {
+        let owner = field_owner::plugin(plugin_id);
+
+        // 两个分支共用的一句：按 owner（可选再按字段名）过滤重建映射。
+        if let Some(fields) = fields {
+            validate_release_fields(fields)?;
+            // 参数分两轮，内层过滤与外层 `EXISTS` 各用一轮（上游是
+            // `[*params, *params]`）：
+            //   $1 = owner，$2..$1+n = 字段名（内层）
+            //   $2+n = owner，$3+n..$2+2n = 字段名（EXISTS）
+            // 两轮**不能共享**占位符 —— 共享会让 `EXISTS` 判的是「内层过滤前
+            // 的映射」，而那正是被改掉的那份。
+            let n = fields.len();
+            let inner_keys = (2..=n + 1)
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let exists_owner_idx = n + 2;
+            let exists_keys = (n + 3..=n * 2 + 2)
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sql = format!(
+                "UPDATE actor SET field_owners = ( \
+                    SELECT COALESCE(jsonb_object_agg(key, value), '{{}}'::jsonb) \
+                    FROM jsonb_each_text(field_owners) \
+                    WHERE NOT (value = $1 AND key IN ({inner_keys})) \
+                 ), \
+                 mutation_revision = mutation_revision + 1, \
+                 updated_at = now() \
+                 WHERE EXISTS ( \
+                    SELECT 1 FROM jsonb_each_text(field_owners) \
+                    WHERE value = ${exists_owner_idx} AND key IN ({exists_keys}) \
+                 )"
+            );
+
+            let mut query = sqlx::query(safe_sql(sql)).bind(&owner);
+            for name in fields {
+                query = query.bind(*name);
+            }
+            query = query.bind(&owner);
+            for name in fields {
+                query = query.bind(*name);
+            }
+            let result = query.execute(&self.pool).await?;
+            return Ok(result.rows_affected());
+        }
+
+        let result = sqlx::query(safe_sql(
+            "UPDATE actor SET field_owners = COALESCE( \
+                (SELECT jsonb_object_agg(key, value) FROM jsonb_each_text(field_owners) \
+                 WHERE value <> $1), \
+                '{}'::jsonb \
+             ), \
+             mutation_revision = mutation_revision + 1, \
+             updated_at = now() \
+             WHERE EXISTS ( \
+                SELECT 1 FROM jsonb_each_text(field_owners) WHERE value = $2 \
+             )",
+        ))
+        .bind(&owner)
+        .bind(&owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// 校验「释放哪些字段」这一参数：非空且都属于演员白名单。
+fn validate_release_fields(fields: &[&'static str]) -> Result<(), DbError> {
+    if fields.is_empty() {
+        return Err(DbError::business(
+            ACTOR_ENTITY,
+            "fields 必须是非空的演员资料字段集合",
+        ));
+    }
+    for name in fields {
+        if !crate::catalog::actor::PROTECTED_ACTOR_FIELDS.contains(name) {
+            return Err(DbError::business(
+                ACTOR_ENTITY,
+                format!("字段 {name} 不是演员资料字段"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,5 +1282,138 @@ mod tests {
         // 语义在 validate_fields 之外单独测：这里检查的是 fields 参数校验分支
         let unprotected: Vec<&'static str> = vec!["watched_count"];
         assert!(!crate::catalog::movie::PROTECTED_MOVIE_FIELDS.contains(&unprotected[0]));
+    }
+
+    // ---------------------------------------------------------- 演员
+
+    /// ★ codec 表与白名单**一一对应**。
+    ///
+    /// 少一个的后果不是编译失败：那个字段进不了 `actor_codec_of`，于是
+    /// [`validate_actor_fields`] 会拿它当「未声明 codec」拒掉 —— 插件写一个
+    /// 本来合法的字段却拿到错误。多一个则更糟：白名单里没有的字段能被拼进 SQL。
+    #[test]
+    fn actor_codecs_cover_the_whitelist_exactly() {
+        let mut whitelist = crate::catalog::actor::PROTECTED_ACTOR_FIELDS.to_vec();
+        whitelist.sort_unstable();
+        let mut codecs: Vec<&str> = ACTOR_FIELD_CODECS.iter().map(|(name, _)| *name).collect();
+        codecs.sort_unstable();
+        assert_eq!(codecs, whitelist);
+    }
+
+    /// ★ 严格 ISO 日期：`2020-1-1` 必须被拒。
+    ///
+    /// 这条是**手写解析最容易放过的一格**：`NaiveDate::parse_from_str(_, "%Y-%m-%d")`
+    /// 收得下它（格式串不要求补零），而上游靠
+    /// 「解析后再 `isoformat()` 必须逐字符相同」把这种写法挡掉。
+    #[test]
+    fn iso_dates_must_be_zero_padded() {
+        assert!(parse_iso_date_exact("2020-01-01").is_ok());
+        for bad in ["2020-1-1", "2020-01-1", "1-1-1", "2020/01/01", "生"] {
+            assert!(parse_iso_date_exact(bad).is_err(), "{bad} 应被拒");
+        }
+    }
+
+    fn actor_patch() -> FieldPatch {
+        let mut patch = FieldPatch::new();
+        patch.int("height_cm", Some(160));
+        patch
+    }
+
+    /// 白名单外的字段**直接报错**（影片侧是静默跳过 —— 演员字段少，传错更
+    /// 可能是代码写错）。身份/头像/订阅三者都不可写。
+    #[test]
+    fn actor_validation_rejects_fields_outside_the_whitelist() {
+        for field in ["javdb_id", "profile_image_id", "is_subscribed", "name"] {
+            let mut patch = FieldPatch::new();
+            match field {
+                "profile_image_id" => patch.int(field, Some(1)),
+                "is_subscribed" => patch.flag(field, true),
+                _ => patch.text(field, Some("x")),
+            };
+            assert!(
+                validate_actor_fields(&patch).is_err(),
+                "{field} 不该允许（白名单外）"
+            );
+        }
+    }
+
+    /// `gender` 只认 `{1, 2}`，且**不接受 `None`** —— 它没有「未知」态。
+    #[test]
+    fn actor_gender_is_a_two_value_enum() {
+        for good in [1, 2] {
+            let mut patch = FieldPatch::new();
+            patch.int("gender", Some(good));
+            assert!(validate_actor_fields(&patch).is_ok(), "{good} 合法");
+        }
+        for bad in [0, 3, -1] {
+            let mut patch = FieldPatch::new();
+            patch.int("gender", Some(bad));
+            assert!(validate_actor_fields(&patch).is_err(), "{bad} 非法");
+        }
+        let mut patch = FieldPatch::new();
+        patch.int("gender", None);
+        assert!(validate_actor_fields(&patch).is_err(), "gender 不能清空");
+    }
+
+    /// 三围这类整数必须是**正整数**（`0` / 负数都不行），而 `None` 可以。
+    #[test]
+    fn actor_measurements_are_positive_and_clearable() {
+        for bad in [0, -1] {
+            let mut patch = FieldPatch::new();
+            patch.int("height_cm", Some(bad));
+            assert!(validate_actor_fields(&patch).is_err(), "{bad} 非法");
+        }
+        let mut patch = FieldPatch::new();
+        patch.int("height_cm", None);
+        assert!(
+            validate_actor_fields(&patch).is_ok(),
+            "清空身高是合法的（上游：None 显式清空并保留归属）"
+        );
+    }
+
+    /// 文本必须 1..255 且非空白；**要清空请传 `None`**。
+    #[test]
+    fn actor_text_fields_reject_blanks_and_overlong_values() {
+        let mut blank = FieldPatch::new();
+        blank.text("cup", Some("   "));
+        assert!(validate_actor_fields(&blank).is_err(), "空白串不是「有值」");
+
+        let mut too_long = FieldPatch::new();
+        too_long.text("birthplace", Some(&"x".repeat(256)));
+        assert!(validate_actor_fields(&too_long).is_err(), "超过 255 字符");
+
+        let mut boundary = FieldPatch::new();
+        boundary.text("birthplace", Some(&"x".repeat(255)));
+        assert!(validate_actor_fields(&boundary).is_ok(), "255 是合法的上界");
+
+        let mut cleared = FieldPatch::new();
+        cleared.text("cup", None);
+        assert!(validate_actor_fields(&cleared).is_ok());
+    }
+
+    /// 空 patch 一律拒 —— 它只会白扫一趟库。
+    #[test]
+    fn actor_validation_rejects_an_empty_patch() {
+        assert!(validate_actor_fields(&FieldPatch::new()).is_err());
+        assert!(validate_actor_fields(&actor_patch()).is_ok());
+    }
+
+    /// 两个 owner 标记是**稳定字符串**（存在 jsonb 里，跨版本要能识别）。
+    #[test]
+    fn actor_owner_tags_are_pinned() {
+        assert_eq!(HOST_JAVDB_OWNER, "host:javdb");
+        assert_eq!(field_owner::HOST_MANUAL, "host:manual");
+        assert_eq!(field_owner::plugin("local"), "plugin:local");
+    }
+
+    /// 释放归属：字段列表非空且必须在白名单里。
+    #[test]
+    fn actor_release_checks_its_field_list() {
+        assert!(validate_release_fields(&[]).is_err(), "空列表该拒");
+        assert!(validate_release_fields(&["height_cm"]).is_ok());
+        assert!(
+            validate_release_fields(&["javdb_id"]).is_err(),
+            "白名单外的字段不该进释放列表"
+        );
     }
 }

@@ -36,6 +36,7 @@ use sm_db::Db;
 
 use crate::catalog::image_cleanup::ImageCleanupService;
 use crate::error::{details_of, ServiceError};
+use crate::playback::provider_helpers::{self, json_or_null, ProviderFailure, StorageGateway};
 use crate::system::config::ConfigService;
 
 /// `media_point_not_found`（**带归属**）。
@@ -225,15 +226,10 @@ pub struct MediaProgressValue {
 
 /// 媒体服务。
 ///
-/// # 为什么它需要 `Db`（骨架期是无状态单元结构体）
+/// # 五个仓储**按方法用到的面**收
 ///
-/// 骨架期这里是 `pub struct MediaService;`，所有方法都是**关联函数**，
-/// 拿不到任何仓储 —— 于是 12 个方法全是 `todo!()`，一个都落不了地。
-/// 全仓**没有任何调用点**（实测 `grep MediaService::` 只命中模块文档），
-/// 所以改形状是零风险的。
-///
-/// 五个仓储按方法用到的面收：时刻点要 media / points / thumbnails / images，
-/// 进度要 media / progress / pool（后者给 `PlaylistService`）。
+/// 时刻点要 media / points / thumbnails / images，进度要 media / progress /
+/// pool（后者给 `PlaylistService`），删媒体还要 thumbnails + images + config。
 pub struct MediaService {
     media: MediaRepository,
     points: MediaPointRepository,
@@ -243,6 +239,12 @@ pub struct MediaService {
     pool: Db,
     /// 删时刻要连带清掉那张只服务于它的图，而清理服务要图片根目录。
     config: ConfigService,
+    /// provider 数据面（删远端文件）。** [`None`] = 没装任何插件。 **
+    ///
+    /// 由组合根注入（`sm-server`），理由见
+    /// [`StorageGateway`](crate::playback::provider_helpers::StorageGateway) 的
+    /// 文档：`sm-service` 不能依赖 `sm-plugins`（依赖方向会成环）。
+    gateway: Option<std::sync::Arc<dyn StorageGateway>>,
 }
 
 impl MediaService {
@@ -256,7 +258,18 @@ impl MediaService {
             images: ImageRepository::new(db.clone()),
             pool: db.clone(),
             config: config.clone(),
+            gateway: None,
         }
+    }
+
+    /// 注入 provider 数据面。由组合根调用。
+    ///
+    /// **没调用过 = 没有 provider**：`delete_media` 的第一步就会报 503
+    /// `provider_not_installed`，而不是「跳过删远端」—— 后者会留下远端文件，
+    /// 而调用方以为删干净了。
+    pub fn with_gateway(mut self, gateway: std::sync::Arc<dyn StorageGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
     }
 
     /// 取媒体，不存在则 404 `media_not_found`。
@@ -594,17 +607,284 @@ impl MediaService {
 
     /// ★ 删媒体。**三步各自独立**，见模块文档。
     ///
-    /// 错误码：媒体不存在 → `404 media_not_found`；provider 报错 →
-    /// `provider_{code}`（`provider_not_installed` 是 503）。
+    /// ```text
+    ///   1. provider 删物理文件
+    ///   2. 清 Qdrant 缩略图向量（仅 JAV + 图搜启用）
+    ///   3. 删 DB 记录 + 回收缩略图图片（记录 + 磁盘文件）
+    /// ```
     ///
-    /// `sync_video_member` 控制是否连带删 `video_item` 成员关系。
+    /// 错误码：媒体不存在 → `404 media_not_found`；锁不到 → `409
+    /// media_operation_busy`；provider 报错 → `provider_{code}`
+    /// （`provider_not_installed` 是 503）。
+    ///
+    /// # ⚠️ 运行约束：连接池**至少两条连接**
+    ///
+    /// 这条链路会先取一条**会话级** advisory lock 并**持有它**去做后续的库操作
+    /// （查媒体、问 provider、删行、回收图片）。而那条锁自己占着一条连接 ——
+    /// 池里只剩 0 条时，后续每个查询都会在 `acquire_timeout` 后报
+    /// `pool timed out while waiting for an open connection`，表现为 **500**，
+    /// 而错误信息里看不出是池的问题。
+    ///
+    /// 生产默认 20 条（`sm_server::config`），余量充足；这条是给**测试**与
+    /// 自建小池部署看的 —— 与 `sm_db::common::advisory_lock` 模块文档里那条
+    /// 「需要连接数 = 同时持有的锁数 + 1」是同一件事。
+    /// `TestDb` 的池是 `max_connections(1)`，所以删除类用例要用
+    /// `pool_with_max_connections(2)`；这条约束第一次就是这么暴露的。
+    ///
+    /// # `sync_video_member` 那一支**在取锁之前**就委托出去
+    ///
+    /// 上游是「先锁住 M，看到它属于条目 V，就
+    /// `VideoItemService.delete_video(V)` 然后 `return`」；那条链路会把 V 名下
+    /// 的媒体**逐条**再删一遍（M 也在其中，传 `sync_video_member=False`
+    /// 避免递归回本方法）。
+    ///
+    /// 在 Python 里，同一个 session 重入同一把 advisory lock 是**成功**的
+    /// （会话级锁可重入）。本仓不行：
+    /// [`AdvisoryLock`](sm_db::common::advisory_lock::AdvisoryLock) 每条锁
+    /// **独占一条池连接**，重入就是拿**另一条连接**去取同一个 key ——
+    /// `pg_try_advisory_lock` 必然失败，于是「删一个属于条目的媒体」会莫名
+    /// 报 `409 media_operation_busy`，而拿不到锁的那一方看不出任何原因。
+    ///
+    /// 所以判据提前到取锁之前：要委托就整条交给条目链路，那条链路会给它碰到
+    /// 的每一条媒体**各取一次锁**（包括 M）。
+    ///
+    /// ⚠️ 与上游的差别只有这一处：「读 M」到「条目链路锁住 M」之间没有持有 M
+    /// 的锁。上游在纸面上更严，代价却是一个必然发生的 409（见上）；而条目链路
+    /// 删到 M 时仍会先锁住它，所以那段窗口里没有别的操作能改动它。
+    ///
+    /// # 必须先记下缩略图的 `image_id`
+    ///
+    /// 删 `media` 行会把 `media_thumbnail` 行一起带走（`CASCADE`），而那些行里
+    /// 的 `image_id` 是**回收图片的唯一线索**。所以顺序是「先收集 → 再删」，
+    /// 反了就是孤儿图片 —— 不报错，只是磁盘永远不回收。
+    ///
+    /// # ⚠️ 第 2 步本轮**没做**
+    ///
+    /// 本仓还没有 Qdrant 客户端（`qdrant.url` 只是配置项，还没有实际调用），
+    /// 所以这一支跳过。上游它是 `try/except` + 记 warning 的 best-effort 步骤，
+    /// 跳过与它「删除失败」的最终后果一致（留下孤儿向量），但**没有那条
+    /// warning 日志** —— 补 Qdrant 客户端时要一起补上。
     pub async fn delete_media(
         &self,
         media_id: i64,
         sync_video_member: bool,
     ) -> Result<(), ServiceError> {
-        let _ = (media_id, sync_video_member);
-        todo!("骨架：provider 删文件 -> 清 Qdrant(仅启用时) -> 删 DB 记录与图片；三步独立不互阻")
+        // 超出 i32 的 id 按「不存在」处理：上游 Python 的 `int` 没有上界，
+        // 那种 id 会一路查不到然后报 404，而不是 400。
+        let media_id = i32::try_from(media_id).map_err(|_| {
+            ServiceError::not_found_with(
+                "media_not_found",
+                "Media not found",
+                details_of("media_id", media_id),
+            )
+        })?;
+
+        // 要委托给条目删除链路的话，**在取锁之前**就转出去（理由见本方法的
+        // 文档）：那条链路会给条目下的每条媒体各取一次锁，包括这一条。
+        if sync_video_member {
+            let media = self.require_media(media_id).await?;
+            if let Some(video_item_id) = media.video_item_id {
+                return self.delete_video_item(video_item_id).await;
+            }
+        }
+
+        self.delete_media_with_lock(media_id).await
+    }
+
+    /// 取锁 + 删一条媒体。**不判断要不要委托条目** —— 条目删除链路用它。
+    ///
+    /// # 为什么不复用 `delete_media`
+    ///
+    /// 两个理由，第二个是硬约束：
+    ///
+    /// 1. 语义上，条目链路**已经知道**自己在删一个条目的媒体，不需要再问一次；
+    /// 2. `delete_media` →（委托）→ `VideoItemService::delete` →（逐条）→
+    ///    `delete_media` 是一个**静态的互相递归**，而 `async fn` 的递归必须
+    ///    装箱：不在这里断开，编译期就会撞上
+    ///    `E0733: recursion in an async fn requires boxing`。装箱（`Box::pin`）
+    ///    能让它编过，但那是给编译器交保护费，不如把「这里不会委托」这件事
+    ///    写进类型。
+    pub(crate) async fn delete_media_with_lock(&self, media_id: i32) -> Result<(), ServiceError> {
+        // 媒体级锁。**锁不到是 409，不是等待** —— 上游
+        // `media_operation_lock` 就是 `pg_try_advisory_lock` + 409
+        // `media_operation_busy`（另一处正在动它，比如生成缩略图）。
+        //
+        // 锁在**读之前**拿：下面的 `require_media` 读到的那一行，到删它为止
+        // 都不该被别人改动。
+        let lock = sm_db::common::advisory_lock::AdvisoryLock::try_acquire(
+            &self.pool,
+            sm_db::common::advisory_lock::namespace::MEDIA,
+            media_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict("media_operation_busy", "媒体正在处理，请稍后重试", None)
+        })?;
+
+        let outcome = self.delete_one_media(media_id).await;
+
+        // 显式解锁：正常路径把连接**干净地还回池**；不释放的话 `Drop` 会把连接
+        // 从池里摘掉（那是异常路径的兜底，见 `AdvisoryLock` 的模块文档）。
+        lock.release().await;
+        outcome
+    }
+
+    /// 删条目及其全部媒体（上游 `VideoItemService.delete_video`）。
+    ///
+    /// 编排在 [`crate::videos::item::VideoItemService::delete`] —— 那是上游放
+    /// 这条链路的地方（`video_item_service.py`）。这里只是把它接起来，因为
+    /// 那条链路要本服务的 db / config / provider 网关。
+    ///
+    /// ⚠️ **不取条目级的锁** —— 与上游一致：条目下每条媒体由那条链路自己逐个
+    /// 取锁。所以本方法也不该在已持有某条媒体锁的情况下被调用（那正是
+    /// `delete_media` 把委托提前到取锁之前的原因）。
+    pub async fn delete_video_item(&self, video_item_id: i32) -> Result<(), ServiceError> {
+        crate::videos::item::VideoItemService::new(&self.pool)
+            .delete(video_item_id, self)
+            .await
+    }
+
+    /// 单条媒体的实际清理。**调用方必须已持有它的锁**（`delete_media` 拿锁，
+    /// 条目链路里的那一条由 `VideoItemService::delete` 通过 `delete_media` 拿）。
+    ///
+    /// 拆出来是因为 `delete_media` 的那段「先判断要不要委托」必须在取锁**之前**
+    /// 跑：如果整个函数体只有一份、锁又在外层拿，就没有地方安放那段判断。
+    async fn delete_one_media(&self, media_id: i32) -> Result<(), ServiceError> {
+        let media = self.require_media(media_id).await?;
+
+        // ── 1. provider 删远端文件 ──────────────────────────────────
+        //
+        // 没有 provider 就 503，**不跳过**：跳过会留下远端文件，而调用方以为
+        // 删干净了，下一次扫描又把它扫回来（表现为「删了又出现」）。
+        let Some(gateway) = self.gateway.as_deref() else {
+            return Err(ServiceError::unavailable(
+                "provider_not_installed",
+                "媒体提供方未安装",
+            ));
+        };
+        let library = sm_db::repo::MediaLibraryRepository::new(self.pool.clone())
+            .find_by_id(media.library_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(
+                    "media_library_not_found",
+                    "Media library not found",
+                    "library_id",
+                    media.library_id,
+                )
+            })?;
+        let handle = provider_helpers::media_handle_for(&provider_helpers::MediaRecord {
+            id: i64::from(media.id),
+            library_id: i64::from(media.library_id),
+            storage_ref: json_or_null(media.storage_ref.as_deref()),
+            provider_config: json_or_null(library.provider_config.as_deref()),
+            provider_key: library.provider_key.clone(),
+            account_key: library.account_key.clone(),
+            file_name: media.file_name.clone(),
+            file_size_bytes: media.file_size_bytes,
+            duration_seconds: media.duration_seconds,
+        });
+        // `source_not_found` = provider 确认远端早已不在 → **继续**清本地。
+        // 其余按上游那张表映射成状态码。
+        if let Err(failure) = gateway.delete_media(&handle).await {
+            match failure.code.as_str() {
+                "source_not_found" => {}
+                "authentication_failed" | "unavailable" | "invalid_config" | "unsupported" => {
+                    return Err(Self::map_provider_failure(&failure));
+                }
+                // 表里没有的码（含 `provider_not_installed`）。认不出的必须报成
+                // **5xx**，**不许**伪装成上面某个已知码 —— 那会把「插件崩了」
+                // 说成「你的配置不对」，排查方向会被带偏。
+                _ => {
+                    return Err(ServiceError::bad_gateway(
+                        format!("provider_{}", failure.code),
+                        failure.safe_message,
+                        details_of("provider_key", handle.provider_key.as_str()),
+                    ))
+                }
+            }
+        }
+
+        // ── 2. Qdrant 向量 ─────────────────────────────────────────
+        // 仅 JAV 媒体的缩略图会进向量库（非 JAV 落 SKIPPED 从不入库），所以
+        // `movie_number` 是「跳过空删省一次远端往返」的判据。
+        // ⚠️ 见文档：本仓还没有 Qdrant 客户端，这一支尚未实现。
+
+        // ── 3. 删记录 + 回收图片 ────────────────────────────────────
+        //
+        // 缩略图的 `image_id` **先收集再删行**：删 `media` 会把
+        // `media_thumbnail` 一起 CASCADE 掉，而那些行的 `image_id` 是回收
+        // 图片的唯一线索。
+        let image_ids: Vec<i32> = self
+            .thumbnails
+            .list_all_by_media(media_id)
+            .await?
+            .into_iter()
+            .map(|thumbnail| thumbnail.image_id)
+            .collect();
+        self.media.delete(media_id).await?;
+
+        // 条目的封面图**不在这里收**：它属于条目，由
+        // `VideoItemService::delete` 在删掉条目行之后回收（那时它才「不再被
+        // 引用」）。这里顺手删会把它从还活着的条目上摘掉。
+        self.reap_images(image_ids).await
+    }
+
+    /// 回收这批图片：**不再被引用**的删掉记录，删掉记录的那些再删磁盘文件。
+    ///
+    /// ⚠️ **必须在引用它们的行删掉之后调** ——
+    /// [`ImageRepository::delete_if_unreferenced`](sm_db::repo::ImageRepository)
+    /// 是按引用判据的，引用还在时它什么都不做（不报错）。
+    ///
+    /// 媒体缩略图与条目封面共用这一段：两者的「回收」是同一件事，各写一份就会
+    /// 在「哪些情况算不再被引用」上分叉。
+    pub(crate) async fn reap_images(&self, image_ids: Vec<i32>) -> Result<(), ServiceError> {
+        let cleaner = ImageCleanupService::new(&self.pool, &self.config);
+        let mut obsolete: Vec<String> = Vec::new();
+        for image_id in image_ids {
+            // 仍在被引用的图不会被删（胶片是否能回收由 `ImageCleanupService`
+            // 的那张引用方清单决定），所以这里**不去重**：同一个 id 被多个
+            // 缩略图指着，第二轮自然返回空。
+            obsolete.extend(
+                cleaner
+                    .delete_image_record_if_unused(Some(image_id))
+                    .await?,
+            );
+        }
+        obsolete.sort();
+        obsolete.dedup();
+        // 磁盘文件最后删，且**失败不回滚**（记录已经删了）—— 上游同样不回滚：
+        // 这里的失败是「磁盘冗余」，而回滚会试图复活一条已删的记录。
+        if let Err(error) = cleaner.delete_obsolete_image_files(&obsolete).await {
+            tracing::warn!(
+                orphan_files = obsolete.len(),
+                code = error.code(),
+                "回收图片文件失败，已留下孤儿文件"
+            );
+        }
+        Ok(())
+    }
+
+    /// provider 失败码 → HTTP 状态码。**与上游 `delete_media` 那张表逐条对应**：
+    ///
+    /// | provider 码 | 状态 | 上游 `media_service.py:655` |
+    /// |---|---|---|
+    /// | `authentication_failed` | 401 | 凭据过期了，重试没用 |
+    /// | `unavailable` | 503 | 网盘挂了，值得稍后再试 |
+    /// | `invalid_config` / `unsupported` | 422 | 配错了 / 这个 provider 不支持删 |
+    ///
+    /// 对外错误码一律 **`provider_{code}`**（上游 `media_service.py:663`），
+    /// 与 `provider_not_installed` 同一个前缀 —— 前端靠这个前缀分流。
+    ///
+    /// 表里没有的码**不走这里**：认不出的失败要报成 5xx，硬塞进这张表会把
+    /// 「插件崩了」说成「你的配置不对」。
+    fn map_provider_failure(failure: &ProviderFailure) -> ServiceError {
+        let code = format!("provider_{}", failure.code);
+        match failure.code.as_str() {
+            "authentication_failed" => ServiceError::from_status(401, code, &failure.safe_message),
+            "unavailable" => ServiceError::from_status(503, code, &failure.safe_message),
+            _ => ServiceError::from_status(422, code, &failure.safe_message),
+        }
     }
 
     /// 某媒体的缩略图。**按 `(offset, id)` 升序**。
@@ -636,6 +916,63 @@ impl MediaService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failure(code: &str) -> ProviderFailure {
+        ProviderFailure {
+            code: code.to_owned(),
+            safe_message: "provider said no".to_owned(),
+            retryable: false,
+        }
+    }
+
+    /// ★ 状态码与上游 `media_service.py:655` 那张表**逐条**对应。
+    ///
+    /// 401 与 503 的区分是**给客户端的行动指令**：401 重试没用（凭据过期），
+    /// 503 值得稍后再试（网盘挂了）。一律 503 会让前端把所有 provider 故障
+    /// 都显示成「稍后再试」。
+    #[test]
+    fn provider_failures_keep_the_upstream_status_table() {
+        assert_eq!(
+            MediaService::map_provider_failure(&failure("authentication_failed")).status,
+            401
+        );
+        assert_eq!(
+            MediaService::map_provider_failure(&failure("unavailable")).status,
+            503
+        );
+        for code in ["invalid_config", "unsupported"] {
+            assert_eq!(
+                MediaService::map_provider_failure(&failure(code)).status,
+                422,
+                "{code} 是 422"
+            );
+        }
+    }
+
+    /// ★ 对外错误码必须是 `provider_{code}`（上游 `media_service.py:663`）。
+    ///
+    /// 前端靠这个前缀把「provider 出错」和其它 4xx/5xx 分开；少了前缀，客户端
+    /// 会把「网盘挂了」当成服务器内部错误。
+    #[test]
+    fn provider_failure_codes_are_prefixed() {
+        let mapped = MediaService::map_provider_failure(&failure("unavailable"));
+        assert_eq!(mapped.code(), "provider_unavailable");
+    }
+
+    /// ★ 认不出的码**不许**被这张表静默吸收成 422。
+    ///
+    /// 硬塞进去会把「插件崩了」说成「你的配置不对」，排查方向直接偏掉。所以
+    /// `delete_media` 只对那四个已知码调它，其余走 5xx 分支 —— 这条用例盯的是
+    /// 「前缀照加、表名照给」，别把外部可见的码形改掉。
+    #[test]
+    fn a_failure_code_is_never_rewritten() {
+        let mapped = MediaService::map_provider_failure(&failure("invalid_config"));
+        assert_eq!(mapped.code(), "provider_invalid_config");
+        assert_eq!(
+            mapped.code().strip_prefix("provider_"),
+            Some("invalid_config")
+        );
+    }
 
     /// ★ 排序字段是**白名单**，自由字符串 → 422（不夹到默认值）。
     #[test]

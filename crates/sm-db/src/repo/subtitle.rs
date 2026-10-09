@@ -121,13 +121,63 @@ impl SubtitleRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 插入一条字幕并**取回整行**（调用方要 `id`）。
+    ///
+    /// 上游是 `Subtitle.create(movie=movie, file_path=...)`，返回带 `id` 的模型
+    /// （`subtitle_asset_service.py:109` 与 `:139`）。`RETURNING *` 一次往返拿全，
+    /// 比 `INSERT` + `SELECT` 少一次查询、也少一个「插进去又查不到」的窗口。
+    ///
+    /// # 与 [`Self::upsert`] 的关键差别：**不吞冲突**
+    ///
+    /// `upsert` 是 `ON CONFLICT DO NOTHING`（刮削重跑时重复登记不算失败）；
+    /// 这里不做冲突处理 —— 写侧调用方刚分配的是一个**全新**的 `<番号>-<N>` 路径，
+    /// 撞上 `(movie_id, file_path)` 唯一索引说明磁盘状态与库不一致，那该报错，
+    /// 而不是静默变成「什么都没做」然后回一个查不到的 id。
+    pub async fn create(&self, new: &NewSubtitle) -> Result<Subtitle, DbError> {
+        new.validate()?;
+        let now = crate::common::time::now_utc();
+        sqlx::query_as::<_, Subtitle>(
+            "INSERT INTO subtitle (movie_id, file_path, created_at, updated_at) \
+             VALUES ($1, $2, $3, $3) RETURNING *",
+        )
+        .bind(new.movie_id)
+        .bind(new.file_path.trim())
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(SUBTITLE_ENTITY))
+    }
+
+    /// 取该影片下的一条字幕。上游 `Subtitle.get_or_none((id == ..) & (movie == ..))`。
+    ///
+    /// 条件里带 `movie_id` 而不是只按主键查：字幕 id 来自 URL，光按 id 查会让
+    /// `/movies/A/subtitles/<B 的字幕 id>` 命中 —— 返回别的影片的字幕，
+    /// 而调用方以为拿到的是 A 的。
+    pub async fn find_in_movie(
+        &self,
+        movie_id: i32,
+        subtitle_id: i32,
+    ) -> Result<Option<Subtitle>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Subtitle>("SELECT * FROM subtitle WHERE movie_id = $1 AND id = $2")
+                .bind(movie_id)
+                .bind(subtitle_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// 列出某部影片的全部字幕。**刻意不分页。**
     ///
     /// 「这部影片有哪些字幕轨」是播放页一次读全的查询，分页只会让调用方
     /// 自己写取完所有页的循环。一部影片的字幕通常是零到几条。
+    ///
+    /// 排序照上游 `_subtitle_query`（`movie_subtitle_service.py:142-147`）：
+    /// `created_at DESC, id DESC` —— **最新登记的排最前**。用 `file_path` 排序
+    /// 看着更稳定，但播放页要的是「先看新导入的那条」。
     pub async fn list_by_movie(&self, movie_id: i32) -> Result<Vec<Subtitle>, DbError> {
         Ok(sqlx::query_as::<_, Subtitle>(
-            "SELECT * FROM subtitle WHERE movie_id = $1 ORDER BY file_path, id",
+            "SELECT * FROM subtitle WHERE movie_id = $1 ORDER BY created_at DESC, id DESC",
         )
         .bind(movie_id)
         .fetch_all(&self.pool)

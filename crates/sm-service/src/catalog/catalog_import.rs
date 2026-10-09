@@ -6,7 +6,7 @@
 //! 由它 upsert 成 `movie` / `actor` / `image` 记录。分成三条路会各自漂移
 //! —— 同一个番号从不同路进来会得到不同的字段集。
 //!
-//! # ★ 所有写入必须经 [`super::movie_ownership_gateway`]
+//! # ★ 所有写入必须经 [`MovieOwnershipGateway`](sm_db::repo::MovieOwnershipGateway)
 //!
 //! 本文件是**插件写入的主要发起方**，所以它最需要守那条规则：插件能写的
 //! 只有它声明的字段，身份（`javdb_id`）、头像、订阅不在其中。
@@ -189,7 +189,8 @@ impl CatalogImportService {
     /// 上游 `upsert_actor_from_javdb_resource(actor_resource, profile_image_task=None, *, update_gender=False)`。
     ///
     /// ⚠️ `update_gender` 默认 **false**：不要用外部数据覆盖用户改过的性别。
-    /// 头像走 `actor_ownership_gateway` —— 它禁止插件写，但 JavDB 是
+    /// 头像走 [`ActorOwnershipGateway`](sm_db::repo::ActorOwnershipGateway)
+    /// —— 它禁止插件写，但 JavDB 是
     /// `host:javdb` owner，可以写。
     pub async fn upsert_actor_from_javdb_resource(
         &self,
@@ -197,6 +198,6 @@ impl CatalogImportService {
         update_gender: bool,
     ) -> Result<i64, ServiceError> {
         let _ = (actor_resource, update_gender);
-        todo!("骨架：查 JavDB id -> 建或更新 -> 头像经 actor_ownership_gateway(javdb owner)；性别默认不改")
+        todo!("骨架：查 JavDB id -> 建或更新 -> 头像经 ActorOwnershipGateway(host:javdb owner)；性别默认不改")
     }
 }

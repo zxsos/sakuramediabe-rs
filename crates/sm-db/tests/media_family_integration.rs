@@ -557,12 +557,17 @@ async fn point_insert_and_list_by_media() {
     let img1 = seed_image(db.pool(), "p1").await;
     let img2 = seed_image(db.pool(), "p2").await;
 
+    // 第一个参数是 `media_id`，必须真的指向那条媒体 —— `list_by_media`
+    // 就是按 `media_id = $1` 过滤的。原先这里传的是 `None`（而 `movie_number`
+    // 给了值），于是「按媒体列时刻点」一条都列不出来：`media_id` 可空是
+    // 「来源媒体被删后时刻点仍保留」的设计（`on_delete = SET NULL`），
+    // 不是「可以随便不填」。
     points
-        .insert(None, None, img2, Some("ABC-001"), None, 200)
+        .insert(Some(media_id), None, img2, Some("ABC-001"), None, 200)
         .await
         .unwrap();
     points
-        .insert(None, None, img1, Some("ABC-001"), None, 100)
+        .insert(Some(media_id), None, img1, Some("ABC-001"), None, 100)
         .await
         .unwrap();
 

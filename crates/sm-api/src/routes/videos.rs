@@ -221,10 +221,24 @@ async fn update_video(
 }
 
 /// `DELETE /{id}` —— **204，无 body**。
+///
+/// # 这条路径上「删了什么」比 204 本身重要
+///
+/// 逐条媒体各走一遍 `MediaService::delete_media`（远端文件 + 缩略图 +
+/// 向量）→ 删条目行 → 回收封面图。所以**没有插件时它是 503
+/// `provider_not_installed`**，而不是「删了行、文件留着」—— 后者会让下次巡检
+/// 把文件又扫回来，用户看到的是「删了又出现」。
+///
+/// `media` 这个参数不是可选的：`MediaService` 才拿得到 provider 网关（见
+/// `AppState::media_service`）。
 async fn delete_video(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_video_id): Path<i32>,
+    State(state): State<AppState>,
+    Path(video_id): Path<i32>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接删除 —— 上游还要走 MediaService.delete_media 清磁盘文件，同样卡在插件")
+    let media = state.media_service();
+    VideoItemService::new(state.db())
+        .delete(video_id, &media)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

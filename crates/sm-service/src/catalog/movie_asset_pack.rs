@@ -44,11 +44,27 @@ use crate::system::config::ConfigService;
 /// 重建自检的最大尝试次数。
 pub const MAX_REBUILD_ATTEMPTS: u32 = 3;
 
-/// 包内条目名。**必须与导入器约定的一致**。
+/// 包内条目名 = **文件名**（不含目录），上游 `movie_asset_pack_service.py:125`：
+/// `entry_name = PurePosixPath(origin).name`。
+///
+/// # ⚠️ 这里曾经返回**整条相对路径**（把上游读反了）
+///
+/// 原来的实现是 `relative_path.trim_start_matches('/')`，注释还写着「上游保留
+/// 相对路径」—— 但上游那一行是 `.name`，而且**读侧也只按文件名找**
+/// （`image_store.py:31`，本仓 `image_store::read_image_bytes` 同款）。
+///
+/// 后果不是报错，而是**包里的图片从此读不出来**：`read_pack_entry(pack,
+/// "cover.jpg")` 永远命中不了 `movies/ab/ABC-001/cover.jpg` 这个条目，于是
+/// 每一位读者都回退到 loose 文件 —— 而 loose 文件在打包时已经被清掉了。
+/// 表现为「重建包之后图片全变 404」，而包本身看起来完好（`unzip` 打得开）。
+///
+/// 同一部影片的图片都在同一个目录下，所以取文件名不会撞名 —— 这也是上游敢
+/// 用 `.name` 的前提。
 pub fn pack_entry_name(relative_path: &str) -> String {
-    // 上游用 `_like_prefix_pattern(prefix)` 做前缀匹配后保留相对路径，
-    // 即包内条目名 = 相对图片路径。
-    relative_path.trim_start_matches('/').to_owned()
+    // 归一化分隔符：`origin` 里存的是 POSIX 路径，但配置或调用方可能给
+    // Windows 风格的反斜杠（与 `image_store::read_image_bytes` 同一处理）。
+    let normalized = relative_path.trim().replace('\\', "/");
+    normalized.rsplit('/').next().unwrap_or_default().to_owned()
 }
 
 /// 影片图片包服务。
@@ -307,11 +323,21 @@ fn remove_loose_files(scope_dir: &Path, pack_path: &Path) {
 mod tests {
     use super::*;
 
-    /// 条目名去掉**前导斜杠** —— 包内路径必须是相对的。
+    /// ★ 条目名是**文件名**（上游 `:125` 的 `.name`），不是相对路径。
+    ///
+    /// 这条曾按错误的实现写（断言「保留相对路径」）—— 而那正好掩盖了一个
+    /// 把包读废的缺陷：读侧只按文件名找（`image_store.py:31`）。
     #[test]
-    fn entry_names_are_relative() {
-        assert_eq!(pack_entry_name("/a/b.jpg"), "a/b.jpg");
-        assert_eq!(pack_entry_name("a/b.jpg"), "a/b.jpg");
+    fn entry_names_are_bare_file_names() {
+        assert_eq!(pack_entry_name("/a/b.jpg"), "b.jpg");
+        assert_eq!(pack_entry_name("a/b.jpg"), "b.jpg");
+        assert_eq!(pack_entry_name("movies/ab/ABC-001/cover.jpg"), "cover.jpg");
+        // Windows 风格分隔符也要认（与读侧同一处理）。
+        assert_eq!(
+            pack_entry_name("movies\\ab\\ABC-001\\cover.jpg"),
+            "cover.jpg"
+        );
+        assert_eq!(pack_entry_name("  cover.jpg  "), "cover.jpg");
     }
 
     /// 重试上限是 3。

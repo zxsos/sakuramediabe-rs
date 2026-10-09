@@ -33,14 +33,16 @@
 //!
 //! 用 [`Field`] 三态编码，见 [`crate::videos::Field`]。
 //!
-//! # 删除带走什么
+//! # 删除带走什么（[`VideoItemService::delete`]）
 //!
-//! `video_item` 的媒体外键是 `CASCADE`，所以删条目会连带删掉它的
-//! `media` 行。上游还额外做了两件本批不做的事：走
-//! `MediaService.delete_media(..., sync_video_member=False)` 清理磁盘文件与
-//! 缩略图产物、删封面图片文件。**本切片只删库里的行**，所以
-//! 「下架但保留文件」这种用法在 Rust 侧还不成立 —— 要保留得先把媒体改挂到
-//! 别的条目上。
+//! 上游的顺序：**逐条媒体**走 `MediaService.delete_media(...,
+//! sync_video_member=False)`（远端文件 + 缩略图 + 向量）→ 删条目行（合集成员
+//! 随外键 `CASCADE`）→ 回收封面图。
+//!
+//! ⚠️ 这里**没有**「只删行、留下文件」的模式：媒体行与文件要么一起走，要么
+//! 都不动。「下架但保留文件」要先把媒体改挂到别的条目上 —— 而
+//! `media.video_item_id` 是 `CASCADE`，直接删条目会把行带走而文件留下，那是
+//! 最坏的一种：库里干净、磁盘上全是孤儿。
 
 use chrono::NaiveDateTime;
 use sm_db::repo::{
@@ -50,6 +52,7 @@ use sm_db::videos::VideoItem;
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
+use crate::playback::media::MediaService;
 use crate::videos::{Field, SortDirection, DEFAULT_ITEM_SORT, ITEM_SORT_KEYS};
 
 /// 条目归属合集的精简引用（上游 `VideoCollectionRef`）。
@@ -331,10 +334,49 @@ impl VideoItemService {
         Ok(updated)
     }
 
-    /// 删除条目。**连带删除它的媒体行**（外键 CASCADE）。
-    pub async fn delete(&self, video_id: i32) -> Result<(), ServiceError> {
-        self.require_video(video_id).await?;
+    /// ★ 删除条目及其全部媒体（上游 `VideoItemService.delete_video`）。
+    ///
+    /// # 顺序（照上游，不能换）
+    ///
+    /// 1. **逐条媒体**走 [`MediaService::delete_media`]（传
+    ///    `sync_video_member=false`，避免它委托回本方法形成环）：远端文件、
+    ///    缩略图与向量一起清；
+    /// 2. 删条目行 —— 剩下的合集成员随外键级联
+    ///    （`video_collection_item.video_item_id` 是 `CASCADE`）；
+    /// 3. 回收封面图：条目行没了，那张图才「不再被引用」。
+    ///
+    /// ⚠️ **不能把条目行先删掉**：`media.video_item_id` 是 `ON DELETE CASCADE`
+    /// （`docker/schema.sql:511`），先删条目会把媒体行与缩略图行一起带走 ——
+    /// 那些 `image_id` 是回收图片的唯一线索，丢了就永远留在磁盘上。而只删行
+    /// 不删文件，正是本方法要修掉的那个「删了等于没删」。
+    ///
+    /// ⚠️ 与上游的差异：上游把「删条目行 + 删封面图记录」放在**同一个事务**里
+    /// （`get_database().atomic()`）。本仓的两件事各有各的事务
+    /// （`ImageCleanupService::delete_image_record_if_unused` 内部还要按引用判据
+    /// 查一次，见它的文档），所以这里是两条语句。中间崩溃会留下一条**没人引用
+    /// 的图片记录**（记录与文件都还在）—— 那是可回收的垃圾；反过来的顺序
+    /// （先删图片记录再删条目）会让「条目还在、封面没了」，所以只能是现在这样。
+    ///
+    /// # 为什么 `media` 是**参数**而不是字段
+    ///
+    /// 这条链路要 db + config + provider 网关三样，而这三样都归
+    /// [`MediaService`]（图片根目录与插件网关只有它需要）。让本服务自己也持有
+    /// 它们意味着 `new()` 要吃 `ConfigService`，而本服务在
+    /// [`VideoCollectionService`](crate::videos::collection::VideoCollectionService)
+    /// 的**读**路径上也会被构造（那里的 `assemble` 不需要 config）。为一条删除
+    /// 链路把构造签名扩到二十来个调用点不值得，所以需要的那个方法显式收它。
+    pub async fn delete(&self, video_id: i32, media: &MediaService) -> Result<(), ServiceError> {
+        let video = self.require_video(video_id).await?;
+        for row in self.items.list_media(video_id).await? {
+            // `delete_media_with_lock`（不是带 `sync_video_member` 的那个入口）：
+            // 这里已经知道自己在删条目的媒体，不需要再判断一次，而且那个入口
+            // 会委托回本方法 —— 两个 `async fn` 互相递归是编译不过的。
+            media.delete_media_with_lock(row.id).await?;
+        }
         self.items.delete(video_id).await?;
+        if let Some(cover_image_id) = video.cover_image_id {
+            media.reap_images(vec![cover_image_id]).await?;
+        }
         Ok(())
     }
 

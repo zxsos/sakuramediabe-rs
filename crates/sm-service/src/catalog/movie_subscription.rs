@@ -13,7 +13,7 @@
 //! （`pending`），所以「各状态之和恒等于订阅总数」这一性质自动成立 —— 测试
 //! 钉了它，一旦有人往 `CASE` 里加了一个不可达分支，这条断言会红。
 
-use chrono::{Duration, NaiveDateTime};
+use chrono::NaiveDateTime;
 use sm_db::catalog::asset::Image;
 use sm_db::catalog::movie::Movie;
 use sm_db::common::time::now_utc;
@@ -21,6 +21,7 @@ use sm_db::repo::{ImageRepository, MovieRepository};
 use sm_db::Db;
 use std::collections::HashMap;
 
+use crate::catalog::movie_subscription_search_state::MovieSubscriptionSearchStateService;
 use crate::error::ServiceError;
 
 /// 订阅列表的排序键（上游 `MovieSubscriptionSort` 的七个取值）。
@@ -191,7 +192,6 @@ impl MovieSubscriptionService {
             .await?;
 
         let now = now_utc();
-        let fresh_since = now - Duration::days(params.fresh_days);
         let items = ordered
             .into_iter()
             .map(|movie| SubscriptionListItem {
@@ -199,10 +199,16 @@ impl MovieSubscriptionService {
                 thin_cover_image: movie
                     .thin_cover_image_id
                     .and_then(|id| images.get(&id).cloned()),
-                is_fresh: movie
-                    .release_date
-                    .map(|date| date > fresh_since)
-                    .unwrap_or(false),
+                // 判据只此一份：`release_date > now - fresh_days`，见
+                // `movie_subscription_search_state::MovieSubscriptionSearchStateService::is_fresh`
+                // —— 那里是状态机判定「失败要不要扣预算」用的同一个函数，
+                // 两处各写一遍的话，「列表里显示新鲜的影片」与「不扣预算的影片」
+                // 会有一天对不上。
+                is_fresh: MovieSubscriptionSearchStateService::is_fresh(
+                    movie.release_date,
+                    params.fresh_days,
+                    now,
+                ),
                 media_count: media_counts.get(&movie.movie_number).copied().unwrap_or(0),
                 dead_download_task_count: dead_counts
                     .get(&movie.movie_number)

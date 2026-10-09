@@ -31,8 +31,8 @@
 //!
 //! | 缺口 | 阻塞了什么 |
 //! |---|---|
-//! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写 |
-//! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
+//! | ~~[`crate::catalog::actor::Actor`] 的**字段主权网关**缺失~~ | ✅ **已补**：见 [`ActorOwnershipGateway`]（与 [`MovieOwnershipGateway`] 同构，多一个 `host:javdb` owner）。两个网关共用 [`FieldPatch`] / [`FieldValue`] / [`FieldCodec`]，校验规则各有一套 |
+//! | ~~`Movie.subscription_search_*` 9 列无方法~~ | ✅ **已补**：`begin_subscription_search_attempt` / `mark_subscription_search_succeeded` / `mark_subscription_search_failed` / `reset_subscription_search` / `recover_interrupted_subscription_searches`。⚠️ 注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //!
 //! # 全表覆盖之后，接下来不是加表
 //!
@@ -129,6 +129,31 @@
 //! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
 //!
+//! # 事务里每一条提前返回都要**显式**回滚
+//!
+//! **不要**指望 `Transaction` 的 `Drop`。`sqlx-core/src/transaction.rs` 的
+//! Drop 注释原文：它只是
+//! "queue a rollback operation that will happen on the next asynchronous
+//! invocation of the underlying connection" —— 也就是往连接里**排队**一条
+//! `ROLLBACK`，等那条连接下次被拿去发命令时才真正发出去。连接还回池之后若
+//! 没有下一次调用，这条 `ROLLBACK` 就永远躺在缓冲区里。
+//!
+//! 后果不是「事务开得久」，是**死锁**：`SELECT ... FOR UPDATE` 拿到的行锁会一
+//! 直挂着，之后任何要 `AccessExclusiveLock` 的 DDL（`ALTER TABLE`、
+//! `DROP SCHEMA`）都会去等它。`image.rs` 的 `delete_if_unreferenced` 踩过：
+//! 两条「不存在 / 已被引用」的提前返回没回滚，`TestDb` 收尾的
+//! `DROP SCHEMA ... CASCADE` 直接卡死 —— 集成测试挂 300 秒以上，实测会话停在
+//! `idle in transaction`，语句就是那条 `SELECT id FROM image WHERE id = $1
+//! FOR UPDATE`。
+//!
+//! 所以本 crate 的写法是显式的：`tx.commit().await?` / `tx.rollback().await?`
+//! 成对出现（见 `page.rs` / `user.rs` / `task.rs` 与 `image.rs`）。
+//!
+//! ⚠️ **已知的次优形态**：错误路径用 `?` 直接从事务块里跳出（`Ctx` 编排的那几处
+//! 就是这样）仍然只是「排队回滚」，靠下一次借用那条连接时补发。真实运行中它通常
+//! 立刻被补发（池里的连接一直在用），但在「拿过显式锁 + 连接随即闲置」的测试形状
+//! 里会暴露成死锁。改到那些调用点时顺手补上显式回滚。
+//!
 //! # 两个尚未确认的问题
 //!
 //! 落地对应仓储前必须先查清，否则第二个批次一定会撞上：
@@ -181,7 +206,9 @@ pub use discovery::{
     NewRankingItem, RankingItemRepository,
 };
 pub use download::{DownloadTaskRepository, NewDownloadTask};
-pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
+pub use gateway::{
+    ActorOwnershipGateway, FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway,
+};
 pub use image::{ImageRepository, NewImage, IMAGE_REFERENCE_SITES};
 pub use library::{MediaLibraryRepository, NewMediaLibrary};
 pub use media::{MediaRepository, NewMedia};

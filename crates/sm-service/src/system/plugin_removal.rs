@@ -15,8 +15,8 @@
 //! 那些字段**永远显示「已被占用」**，而宿主自动规则写不进去 —— 用户会看到
 //! 「元数据再也刷不出来」，且没有任何报错、没有日志线索。
 //!
-//! 对应 [`super::super::catalog::movie_ownership_gateway::MovieOwnershipGateway::release_plugin_owners`]
-//! 与 `actor_ownership_gateway` 的同名方法。
+//! 对应 [`MovieOwnershipGateway::release_plugin_owners`](sm_db::repo::MovieOwnershipGateway::release_plugin_owners)
+//! 与 [`ActorOwnershipGateway::release_plugin_owners`](sm_db::repo::ActorOwnershipGateway::release_plugin_owners)。
 //!
 //! # 为什么放在 `system` 域而不是插件宿主
 //!

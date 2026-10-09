@@ -37,6 +37,10 @@ sqlx = { workspace = true }
 quick-xml = { workspace = true }
 # 番号目录分片名要 SHA-1（与上游一致，见根 Cargo.toml）。
 sha1 = { workspace = true }
+# 字幕指纹：`subtitle_asset` 要按内容算 SHA-256，而文件可能很大 —— 用本仓
+# `crates/hashing` 的**流式** `Sha256`（1 MiB 一块，照上游 `_sha256_file`），
+# 不把整个文件读进内存。同一个 crate 也提供 `hex`，不必再引十六进制编码依赖。
+hashing = { workspace = true }
 # 宿主侧图像原语：缩略图校验要 `is_webp`，读尺寸要 `decode`。
 svc-image = { workspace = true }
 # 图片包（`assets.zip` / `thumbnails.zip`）：只写/读 STORED 条目，见根 Cargo.toml。

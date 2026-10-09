@@ -27,9 +27,9 @@
 //!
 //! | 顺序 | 文件 | 挡在前面的是什么 |
 //! |---|---|---|
-//! | 1 | `movie_ownership_gateway.rs` | **无**（纯 DB + jsonb） |
-//! | 1 | `actor_ownership_gateway.rs` | **无**（纯 DB + jsonb） |
-//! | 1 | `movie_list_media.rs` | 无（14 行，纯 DB） |
+//! | 1 | `movie_ownership_gateway.rs` | ✅ **已在 `sm-db` 落地**（[`sm_db::repo::gateway`]）—— 见下 |
+//! | 1 | `actor_ownership_gateway.rs` | ✅ **已在 `sm-db` 落地**（[`sm_db::repo::ActorOwnershipGateway`]）—— 同上 |
+//! | 1 | ~~`movie_list_media.rs`~~ | ✅ **不需要**：真实现在 `playback::media_summary`（见下） |
 //! | 2 | `movie_heat.rs` ✅ | 无（已铺） |
 //! | 2 | `movie_task.rs` | 无（48 行） |
 //! | 2 | `movie_subscription_search_state.rs` | 无（纯 DB） |
@@ -39,10 +39,36 @@
 //! | 4 | `metadata_source.rs` | 插件 ABI |
 //! | 4 | `movie_image.rs` | 出网 + Pillow/cv2 |
 //! | 5 | 其余 11 个 | 见各文件 |
+//!
+//! # 两个字段主权网关**都不在本目录**
+//!
+//! 它们整个落在 [`sm_db::repo::gateway`]
+//! （[`sm_db::repo::MovieOwnershipGateway`] / [`sm_db::repo::ActorOwnershipGateway`]）：
+//! 每条入口都是「单条条件 UPDATE + jsonb + 乐观锁」，属仓储的活；而 service
+//! 侧的调用方（[`movie`] / [`catalog_import`] / [`movie_javdb_backfill`]）
+//! 直接收一个网关字段。
+//!
+//! 这里**原来各有一份同名骨架**，各自带一套杜撰的白名单：
+//!
+//! - 影片那份只有 **2** 个字段（`is_collection` / `is_blacklisted`），而上游
+//!   `PROTECTED_MOVIE_FIELDS` 是 **6** 个（再加 `title` / `summary` /
+//!   `maker_name` / `director_name`）—— 谁引用了它，谁的插件补录就会把
+//!   `title` 静默拒掉；
+//! - 演员那份用的是**黑名单**（「除 `javdb_id` / 头像 / 订阅之外都能写」），
+//!   而上游是**9 字段白名单** —— 黑名单会放过 `name` / `alias_name` 这些
+//!   网关根本不认的字段。
+//!
+//! 两份都已删除。`sm-db` 里那份白名单与上游逐字段对齐，并有对拍测试。
+//!
+//! 同一条路还清掉了一个：`movie_list_media.rs`（上游 14 行，只做「把媒体摘要挂
+//! 到影片卡片上」）。它的骨架签名是**同步**的 `fn attach_movie_list_media(
+//! movies: &mut [MovieCard])` —— 而这个函数必须查库（一趟 `IN` 查询），同步
+//! 签名根本落不了地。真实现在 `playback::media_summary::attach_movie_list_media`
+//! （`async`、收连接池与番号列表），`movie` 与 `collections::playlist` 两处都在
+//! 用它。留下的那个骨架只会让人照着错的形状去实现。
 
 pub mod actor;
 pub mod actor_merge;
-pub mod actor_ownership_gateway;
 pub mod catalog_import;
 pub mod image_cleanup;
 // 路径原语与图片包字节原语。上游在 `common/media_paths.py` 与
@@ -59,10 +85,8 @@ pub mod movie_heat;
 pub mod movie_image;
 pub mod movie_interaction_sync;
 pub mod movie_javdb_backfill;
-pub mod movie_list_media;
 pub mod movie_metadata_refresh;
 pub mod movie_metadata_search;
-pub mod movie_ownership_gateway;
 pub mod movie_subscription;
 pub mod movie_subscription_search_state;
 pub mod movie_subtitle;

@@ -73,6 +73,8 @@ async fn the_thumbnail_directory_follows_the_movie_namespace() {
 async fn a_media_without_any_owner_is_refused() {
     let db = TestDb::require().await;
     let image_root = ImageRoot::new();
+    // `None` = 两个归属都没有的媒体（夹具会连那条路径一起造出来，见
+    // `support::seed_media` 的文档）。
     let media_id = seed_media(&db, None).await;
     let media = media_row(&db, media_id).await;
 

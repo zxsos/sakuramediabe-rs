@@ -71,6 +71,14 @@ async fn seed_point_holding(db: &TestDb, image_id: i32) -> i32 {
 async fn every_foreign_key_to_image_is_listed_in_the_reference_sites() {
     let db = TestDb::require().await;
 
+    // ⚠️ schema 用 `current_schema()`，**不能写死 `'public'`**。
+    //
+    // `TestDb` 把 DDL 应用到一个独立的 `smdb_test_<hash>` schema，并 `SET
+    // search_path` 指过去（`sm-db/src/testing/db.rs:120-136`）—— 表不在 `public`
+    // 里。写死 `'public'` 时这个查询返回**空集**，于是 `extra` 断言把 8 个已登记
+    // 的引用方全报成「DDL 里不存在」，看起来像常量写错了，实际是查询找错了地方。
+    // `current_schema()` = `search_path` 里第一个**存在**的 schema，生产和测试
+    // 两种布局都对。
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT tc.table_name::text, kcu.column_name::text \
          FROM information_schema.table_constraints AS tc \
@@ -81,7 +89,7 @@ async fn every_foreign_key_to_image_is_listed_in_the_reference_sites() {
            ON tc.constraint_name = ccu.constraint_name \
           AND tc.table_schema = ccu.table_schema \
          WHERE tc.constraint_type = 'FOREIGN KEY' \
-           AND tc.table_schema = 'public' \
+           AND tc.table_schema = current_schema() \
            AND ccu.table_name = 'image' \
            AND ccu.column_name = 'id'",
     )

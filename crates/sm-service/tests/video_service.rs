@@ -29,6 +29,10 @@ use sm_service::videos::{
     VideoItemUpdate,
 };
 
+mod support;
+
+use support::{media_service_with_gateway, ImageRoot};
+
 fn n() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0);
@@ -137,11 +141,16 @@ async fn seed_collection(db: &TestDb) -> i32 {
 #[tokio::test]
 async fn a_missing_video_is_404_carrying_the_upstream_details_key() {
     let db = TestDb::require().await;
+    let root = ImageRoot::new();
     let svc = VideoItemService::new(db.pool());
+    // 删除链路要一个媒体服务（它才拿得到 provider 网关与图片根）。这条用例
+    // 走不到那一步 —— 条目不存在时 `require_video` 先报 404，**不会取锁**，
+    // 所以这里用只有一条连接的 `db.pool()` 是安全的。
+    let media = media_service_with_gateway(db.pool(), &root.config);
 
     for err in [
         svc.get(999_999).await.unwrap_err(),
-        svc.delete(999_999).await.unwrap_err(),
+        svc.delete(999_999, &media).await.unwrap_err(),
         svc.update(999_999, VideoItemUpdate::default())
             .await
             .unwrap_err(),
@@ -435,14 +444,23 @@ async fn a_rejected_cover_leaves_the_title_untouched() {
 
 #[tokio::test]
 async fn deleting_a_video_takes_its_media_rows_with_it() {
-    // `media.video_item_id` 是 CASCADE。上游还要清磁盘文件与缩略图产物，
-    // 那是另一切片的事 —— 这里是「库里的行确实一起没了」。
+    // 删除链路现在**真的**逐条走 `MediaService::delete_media`（远端文件 +
+    // 缩略图 + 向量），不再是「只靠外键 CASCADE 删行、文件留在磁盘上」。
+    // 用例里的媒体没有缩略图，磁盘上也没有对应文件，所以这里仍然只验
+    // 「库里的行一起没了」—— 而它现在走的是一条**会去问 provider** 的链路，
+    // 所以必须注入桩网关（否则第一步就是 503 `provider_not_installed`）。
     let db = TestDb::require().await;
-    let svc = VideoItemService::new(db.pool());
+    let root = ImageRoot::new();
+    // **两条连接**：删除链路会取一条会话级 advisory lock 并持有它做后续的库
+    // 操作，那条锁占着一条连接。用 `db.pool()`（1 条）会得到
+    // `pool timed out` —— 见 `support::media_service_with_gateway` 的文档。
+    let pool = db.pool_with_max_connections(2).await;
+    let svc = VideoItemService::new(&pool);
+    let media = media_service_with_gateway(&pool, &root.config);
     let id = seed_video(&db).await;
     let _media_id = seed_media(&db, id).await;
 
-    svc.delete(id).await.expect("delete");
+    svc.delete(id, &media).await.expect("delete");
     assert_eq!(svc.get(id).await.unwrap_err().status, 404);
     assert_eq!(
         svc.list_media(id).await.unwrap_err().status,

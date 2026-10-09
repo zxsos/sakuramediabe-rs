@@ -15,7 +15,7 @@
 | `videos` | 4 | 927 | **完成** |
 | `system` | 19 | 2,935 | 进行中（`auth` / `account` / `activity_cleanup` / `config` / `task_queue` / `optional_services` / `status` / `indexer_settings` 完成，剩 11 个） |
 | `playback` | 19 | 3,738 | 进行中（见下节，**能做的已做完**） |
-| `catalog` | 27 | 7,556 | 进行中（`movie_resolution_service` 的档位部分 + `actor_service` / `actor_merge_service` / `movie_service` 的订阅状态流转均已落；两个 ownership gateway 未落） |
+| `catalog` | 27 | 7,556 | 进行中（`movie_resolution_service` 的档位部分 + `actor_service` / `actor_merge_service` / `movie_service` 的订阅状态流转均已落；**两个 ownership gateway 已落** —— 在 `sm-db::repo::gateway`，不在 service 层） |
 | `transfers` | 23 | 4,235 | 进行中（`torznab` 客户端与 `download_service` 的候选搜索已落：解锁 `system/indexer-settings/test` 与 `GET /download-candidates`） |
 | `discovery` | 16 | ~48,000 | **框架 12/16 铺完**（2026-10-05），方法体待实现 |
 | **合计** | **113** | **25,169** | 2/7 域完成 + 3 域部分 |

@@ -232,6 +232,35 @@ impl MediaRepository {
             .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
+    /// 删一条媒体。**连带清理由外键完成，不是这里逐表删。**
+    ///
+    /// DDL 已经把「删掉一部媒体之后该带走什么」表达清楚了：
+    ///
+    /// | 表 | 外键动作 | 上游注释 |
+    /// |---|---|---|
+    /// | `media_progress` | `CASCADE` | 进度随媒体走 |
+    /// | `media_thumbnail` | `CASCADE` | 缩略图随媒体走 |
+    /// | `moment_recommendation` | `CASCADE` | 推荐随媒体走 |
+    /// | `media_point`（时刻）| `SET NULL` | **只置空来源**，时刻点本身保留 |
+    /// | `media_clip`（切片）| `SET NULL` | 同上 |
+    ///
+    /// 所以这里**只发一条 `DELETE`**。手写一遍「先删缩略图、再删进度、再删
+    /// 媒体」不仅多余，还会与 DDL 分叉：DDL 改了这里不改，就成了漏删。
+    ///
+    /// ⚠️ 缩略图**行**被级联带走，但它们指向的 `image` **行与磁盘文件**不在此
+    /// 列 —— 那是调用方的事（`MediaService::delete_media` 在删之前先把
+    /// `image_id` 收集出来，删完交给 `ImageCleanupService`）。忘了这一步就是
+    /// 孤儿图片，而这里不会有任何报错。
+    ///
+    /// 返回是否真的删到了（并发下另一路可能已经删过）。
+    pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
+        let outcome = sqlx::query("DELETE FROM media WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(outcome.rows_affected() > 0)
+    }
+
     /// 插入。**写入前校验 XOR 归属与文件名。**
     pub async fn insert(&self, new: &NewMedia) -> Result<Media, DbError> {
         new.validate()?;
