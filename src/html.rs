@@ -182,10 +182,7 @@ fn split_tag_name_attrs(inner: &str) -> (&str, Vec<(&str, &str)>) {
                 }
             } else {
                 let vstart = i;
-                while i < bytes.len()
-                    && !bytes[i].is_ascii_whitespace()
-                    && bytes[i] != b'>'
-                {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
                     i += 1;
                 }
                 value = &inner[vstart..i];
@@ -218,7 +215,10 @@ fn decode_charrefs(text: &str) -> Cow<'_, str> {
             continue;
         }
         let entity = &after[..semi];
-        let decoded = if let Some(num) = entity.strip_prefix("&#x").or_else(|| entity.strip_prefix("&#X")) {
+        let decoded = if let Some(num) = entity
+            .strip_prefix("&#x")
+            .or_else(|| entity.strip_prefix("&#X"))
+        {
             u32::from_str_radix(num, 16).ok().and_then(char::from_u32)
         } else if let Some(num) = entity.strip_prefix("&#") {
             num.parse::<u32>().ok().and_then(char::from_u32)

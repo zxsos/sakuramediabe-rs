@@ -33,10 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
     let plugin_id = std::env::var(ID_ENV).map_err(|_| format!("缺少环境变量 {ID_ENV}"))?;
     if plugin_id != RANK_MOVIES_PLUGIN_ID {
-        return Err(format!(
-            "plugin_id 不匹配：注入 {plugin_id}，本进程 {RANK_MOVIES_PLUGIN_ID}"
-        )
-        .into());
+        return Err(
+            format!("plugin_id 不匹配：注入 {plugin_id}，本进程 {RANK_MOVIES_PLUGIN_ID}").into(),
+        );
     }
     let control = RankMoviesControl::new(plugin_id);
     let ranking = RankingService::new(control.settings().clone());

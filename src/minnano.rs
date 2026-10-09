@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::html::{Event, events};
+use crate::html::{events, Event};
 
 pub const MINNANO_AV: &str = "https://www.minnano-av.com";
 pub const MINNANO_HOST: &str = "www.minnano-av.com";
@@ -83,7 +83,8 @@ pub fn parse_ranking_entries(content: &str) -> Result<Vec<RankingEntry>, Minnano
     let mut title_depth: usize = 0;
     let mut anchor: Option<(String, String, bool)> = None; // href, text, is_title
 
-    let finish_anchor = |row: &mut Option<Vec<Link>>, anchor: &mut Option<(String, String, bool)>| {
+    let finish_anchor = |row: &mut Option<Vec<Link>>,
+                         anchor: &mut Option<(String, String, bool)>| {
         if let (Some(r), Some((href, text, is_title))) = (row.as_mut(), anchor.take()) {
             let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
             r.push(Link {
@@ -100,10 +101,7 @@ pub fn parse_ranking_entries(content: &str) -> Result<Vec<RankingEntry>, Minnano
                 if tag.is("table") {
                     let classes: HashSet<&str> =
                         tag.attr("class").unwrap_or("").split_whitespace().collect();
-                    if table_depth == 0
-                        && classes.contains("tbllist")
-                        && classes.contains("av")
-                    {
+                    if table_depth == 0 && classes.contains("tbllist") && classes.contains("av") {
                         table_found = true;
                         table_depth = 1;
                     } else if table_depth > 0 {
@@ -188,7 +186,9 @@ pub fn parse_ranking_entries(content: &str) -> Result<Vec<RankingEntry>, Minnano
     let mut seen = HashSet::new();
     for links in &rows {
         let title_link = links.iter().find(|l| l.is_title);
-        let Some(title_link) = title_link else { continue };
+        let Some(title_link) = title_link else {
+            continue;
+        };
         let video_link = links.iter().find(|l| l.text.contains("動画を見る"));
         let dmm_cid = video_link
             .map(|l| extract_dmm_cid(&l.href))
@@ -414,8 +414,7 @@ impl MinnanoAvClient {
 
     /// 读取某周期榜单的正式番号（上游 `get_rank_numbers`）。
     pub async fn get_rank_numbers(&mut self, period: &str) -> Result<Vec<String>, MinnanoError> {
-        let url = ranking_url(period)
-            .ok_or_else(|| MinnanoError::BadPeriod(period.to_owned()))?;
+        let url = ranking_url(period).ok_or_else(|| MinnanoError::BadPeriod(period.to_owned()))?;
         let html = self.request_page(url, "榜单").await?;
         let entries = parse_ranking_entries(&html)?;
         let mut numbers = Vec::new();
@@ -460,7 +459,12 @@ fn join_url(base: &str, href: &str) -> String {
         // 取 base 的 scheme+host
         if let Ok(url) = url::Url::parse(base) {
             if let Some(host) = url.host_str() {
-                return format!("{}://{}/{}", url.scheme(), host, path.trim_start_matches('/'));
+                return format!(
+                    "{}://{}/{}",
+                    url.scheme(),
+                    host,
+                    path.trim_start_matches('/')
+                );
             }
         }
         return format!("{base}/{path}");
@@ -475,10 +479,7 @@ fn urlencoding_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (
-                hex_val(bytes[i + 1]),
-                hex_val(bytes[i + 2]),
-            ) {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
                 out.push((h << 4 | l) as char);
                 i += 3;
                 continue;

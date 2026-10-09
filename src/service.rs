@@ -22,6 +22,7 @@ use std::collections::HashSet;
 
 use futures::stream::BoxStream;
 use sm_plugin_api::v1::extension::Data;
+use sm_plugin_api::v1::job_event::Event as JobEventKind;
 use sm_plugin_api::v1::plugin_control_server::PluginControl;
 use sm_plugin_api::v1::plugin_host_client::PluginHostClient;
 use sm_plugin_api::v1::ranking_source_extension_service_server::RankingSourceExtensionService;
@@ -31,7 +32,6 @@ use sm_plugin_api::v1::{
     RankingSourceExtension, RegisterRequest, RegisterResponse, RunJobRequest,
     SyncRankingSourcesRequest,
 };
-use sm_plugin_api::v1::job_event::Event as JobEventKind;
 use tonic::{Request, Response, Status};
 
 use crate::javdb::{self, LatestItem, LatestPageError, SAFETY_MAX_PAGES};
@@ -161,10 +161,7 @@ impl PluginControl for MoreMoviesControl {
     ) -> Result<Response<Self::RunJobStream>, Status> {
         let req = request.into_inner();
         if req.task_key != MORE_MOVIES_SYNC_TASK {
-            return Err(Status::not_found(format!(
-                "未知任务: {}",
-                req.task_key
-            )));
+            return Err(Status::not_found(format!("未知任务: {}", req.task_key)));
         }
         let settings = self.settings.clone();
         let http = self.http.clone();
@@ -274,7 +271,9 @@ async fn run_more_movies_sync(
                 Ok(items) => items,
                 Err(e) => {
                     stats.page_failed += 1;
-                    emit!(format!("列表翻页中断 type={movie_type} page={page} err={e}"));
+                    emit!(format!(
+                        "列表翻页中断 type={movie_type} page={page} err={e}"
+                    ));
                     break;
                 }
             };
@@ -418,13 +417,13 @@ async fn fetch_latest_page(
     page: u32,
 ) -> Result<Vec<LatestItem>, LatestPageError> {
     let url = javdb::latest_page_url(&settings.javdb_api_host, movie_type, page);
-    let payload = javdb_get(http, &url).await.map_err(|e| {
-        LatestPageError::Request {
+    let payload = javdb_get(http, &url)
+        .await
+        .map_err(|e| LatestPageError::Request {
             movie_type,
             page,
             detail: e,
-        }
-    })?;
+        })?;
     javdb::parse_latest_page(&payload, movie_type, page)
 }
 
@@ -539,7 +538,10 @@ async fn run_rank_sync_all() -> Vec<Result<JobEvent, Status>> {
             return out;
         }
     };
-    match host.sync_ranking_sources(SyncRankingSourcesRequest {}).await {
+    match host
+        .sync_ranking_sources(SyncRankingSourcesRequest {})
+        .await
+    {
         Ok(resp) => {
             let r = resp.into_inner();
             let value = serde_json::json!({
@@ -581,11 +583,9 @@ impl RankingSourceExtensionService for RankingService {
         let req = request.into_inner();
         let numbers = match req.board_key.as_str() {
             MINNANO_BOARD_KEY => {
-                let mut client = MinnanoAvClient::new(
-                    self.settings.timeout,
-                    self.settings.request_interval,
-                )
-                .map_err(|e| Status::internal(format!("{e}")))?;
+                let mut client =
+                    MinnanoAvClient::new(self.settings.timeout, self.settings.request_interval)
+                        .map_err(|e| Status::internal(format!("{e}")))?;
                 client
                     .get_rank_numbers(&req.period)
                     .await

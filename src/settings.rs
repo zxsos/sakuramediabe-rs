@@ -82,7 +82,10 @@ impl MoreMoviesSettings {
             s.min_heat = heat;
         }
         if let Some(host) = v.get("javdb_api_host").and_then(Value::as_str) {
-            let host = host.trim().trim_start_matches("https://").trim_start_matches("http://");
+            let host = host
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
             if !host.is_empty() {
                 s.javdb_api_host = host.to_owned();
             }
@@ -169,7 +172,10 @@ impl RankMoviesSettings {
         if let Some(secs) = value.get("timeout_seconds").and_then(Value::as_u64) {
             s.timeout = Duration::from_secs(secs.clamp(1, 120));
         }
-        if let Some(secs) = value.get("request_interval_seconds").and_then(Value::as_u64) {
+        if let Some(secs) = value
+            .get("request_interval_seconds")
+            .and_then(Value::as_u64)
+        {
             s.request_interval = Duration::from_secs(secs);
         }
         s

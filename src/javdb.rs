@@ -70,10 +70,7 @@ impl std::fmt::Display for LatestPageError {
                 movie_type,
                 page,
                 detail,
-            } => write!(
-                f,
-                "列表请求失败 type={movie_type} page={page}: {detail}"
-            ),
+            } => write!(f, "列表请求失败 type={movie_type} page={page}: {detail}"),
             Self::BadResponse {
                 movie_type,
                 page,

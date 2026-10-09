@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::html::{Event, events};
+use crate::html::{events, Event};
 
 pub const JAVLIBRARY_BASE: &str = "https://www.f101w.com";
 pub const JAVLIBRARY_HOST: &str = "www.f101w.com";
@@ -70,9 +70,7 @@ pub fn parse_ranking(content: &str) -> Vec<String> {
     let mut id_depth: usize = 0;
     let mut buffer = String::new();
 
-    let finish_id = |items: &mut Vec<String>,
-                         buffer: &mut String,
-                         id_depth: &mut usize| {
+    let finish_id = |items: &mut Vec<String>, buffer: &mut String, id_depth: &mut usize| {
         let code: String = buffer.split_whitespace().collect::<Vec<_>>().join(" ");
         if !code.is_empty() && code_re.is_match(&code) {
             items.push(code);
@@ -164,7 +162,11 @@ impl JavLibraryClient {
         })
     }
 
-    async fn request_page(&mut self, url: &str, page_name: &str) -> Result<String, JavLibraryError> {
+    async fn request_page(
+        &mut self,
+        url: &str,
+        page_name: &str,
+    ) -> Result<String, JavLibraryError> {
         if let Some(last) = self.last_request_at {
             let elapsed = last.elapsed();
             if elapsed < self.request_interval {
@@ -195,9 +197,13 @@ impl JavLibraryClient {
             .map_err(|e| JavLibraryError::Http(format!("{page_name}读取正文失败: {e}")))
     }
 
-    async fn rank_numbers(&mut self, path: &str, period: &str) -> Result<Vec<String>, JavLibraryError> {
-        let mode = mode_for_period(period)
-            .ok_or_else(|| JavLibraryError::BadPeriod(period.to_owned()))?;
+    async fn rank_numbers(
+        &mut self,
+        path: &str,
+        period: &str,
+    ) -> Result<Vec<String>, JavLibraryError> {
+        let mode =
+            mode_for_period(period).ok_or_else(|| JavLibraryError::BadPeriod(period.to_owned()))?;
         let mut numbers = Vec::new();
         let mut seen = HashSet::new();
         for page in 1..=self.max_pages {
