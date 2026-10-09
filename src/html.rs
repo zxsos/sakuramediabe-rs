@@ -254,9 +254,9 @@ mod tests {
 
     #[test]
     fn tag_name_case_insensitive() {
-        let mut it = events("<DIV CLASS=\"video\"><div class=\"id\">ABC-123</DIV></div>");
+        let it = events("<DIV CLASS=\"video\"><div class=\"id\">ABC-123</DIV></div>");
         let mut texts = Vec::new();
-        while let Some(e) = it.next() {
+        for e in it {
             match e {
                 Event::Start(t) => assert!(t.is("div")),
                 Event::Text(t) => texts.push(t.into_owned()),
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn comments_and_doctype_ignored() {
-        let mut it = events("<!DOCTYPE html><!-- hi --><p>x</p>");
+        let it = events("<!DOCTYPE html><!-- hi --><p>x</p>");
         let names: Vec<String> = it
             .filter_map(|e| match e {
                 Event::Start(t) => Some(format!("+{}", t.attr("x").unwrap_or(""))),
