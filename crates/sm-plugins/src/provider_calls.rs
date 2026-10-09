@@ -451,7 +451,7 @@ pub async fn preflight_merged_playback(
 ///
 /// ⚠️ 给了但**根不是对象**（比如客户端把字符串当引用传上来）→ 422
 /// `invalid_config`，**不会**被当成「没给」而列根目录
-/// （理由见 [`require_opaque_object`]）。
+/// （理由见 `require_opaque_object`）。
 pub async fn browse(
     client: &mut StorageProviderClient<Channel>,
     provider_key: &str,

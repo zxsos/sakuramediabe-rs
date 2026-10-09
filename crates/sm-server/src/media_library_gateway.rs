@@ -1,6 +1,6 @@
 //! 组合根里的**媒体库能力适配器**：把 `sm-service` 声明的
-//! [`MediaLibraryRegistry`](sm_service::playback::media_library::MediaLibraryRegistry) /
-//! [`MediaLibraryCapability`](sm_service::playback::media_library::MediaLibraryCapability)
+//! [`sm_service::playback::media_library::MediaLibraryRegistry`] /
+//! [`sm_service::playback::media_library::MediaLibraryCapability`]
 //! 接到真实插件的 gRPC 上。
 //!
 //! # 为什么这个文件必须存在
@@ -18,7 +18,7 @@
 //!
 //! `library_config_fields` / `playback_deliveries` / `download_config_fields` 是
 //! 注册期就随 `MediaProviderBundle` 收进
-//! [`ProviderRegistration`](sm_plugins::registry::ProviderRegistration) 的（见
+//! [`sm_plugins::registry::ProviderRegistration`] 的（见
 //! `sm-plugins::loader::collect_providers`）。目录端点与白名单校验都只读这份
 //! **本地**快照 —— 不为了渲染一个下拉框去连插件。
 //!
