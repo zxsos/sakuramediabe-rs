@@ -10,41 +10,35 @@ env:
 
 jobs:
   build:
-    name: build + package
+    name: build release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --bin sakuramedia_actor_metadata
 
-      - name: Package plugin ZIP
+      - name: Create manifest
         run: |
-          PLUGIN_ID=$(basename $GITHUB_REPOSITORY | sed 's/sakuramedia-//;s/-/_/g')
-          VERSION=${GITHUB_REF#refs/tags/v}
-          STAGING=$(mktemp -d)
-          mkdir -p $STAGING/$PLUGIN_ID
-          # 可执行文件
-          find target/release -maxdepth 1 -type f -executable ! -name "*.so" ! -name "*.d" -exec cp {} $STAGING/$PLUGIN_ID/ \;
-          # manifest.json
-          cat > $STAGING/$PLUGIN_ID/manifest.json << JSON
+          cat > manifest.json << 'MANIFEST'
           {
-            "plugin_id": "$PLUGIN_ID",
-            "display_name": "$PLUGIN_ID",
-            "version": "$VERSION",
-            "author": "zxsos"
+            "id": "sakuramedia_actor_metadata",
+            "version": "${{ github.ref_name }}",
+            "entry": "sakuramedia_actor_metadata",
+            "display_name": "Actor Metadata"
           }
-          JSON
-          cd $STAGING
-          zip -r $GITHUB_WORKSPACE/$PLUGIN_ID-$VERSION.zip $PLUGIN_ID
-          echo "ZIP=$PLUGIN_ID-$VERSION.zip" >> $GITHUB_ENV
+          MANIFEST
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/sakuramedia_actor_metadata dist/
+          cp manifest.json dist/
+          cd dist && zip -r ../sakuramedia_actor_metadata-${{ github.ref_name }}.zip manifest.json sakuramedia_actor_metadata
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
         with:
-          files: ${{ env.ZIP }}
-          generate_release_notes: true
+          files: sakuramedia_actor_metadata-${{ github.ref_name }}.zip
