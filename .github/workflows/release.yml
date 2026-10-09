@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build + package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package plugin ZIP
+        run: |
+          PLUGIN_ID=$(basename $GITHUB_REPOSITORY | sed 's/sakuramedia-//;s/-/_/g')
+          VERSION=${GITHUB_REF#refs/tags/v}
+          STAGING=$(mktemp -d)
+          mkdir -p $STAGING/$PLUGIN_ID
+          # 可执行文件
+          find target/release -maxdepth 1 -type f -executable ! -name "*.so" ! -name "*.d" -exec cp {} $STAGING/$PLUGIN_ID/ \;
+          # manifest.json
+          cat > $STAGING/$PLUGIN_ID/manifest.json << JSON
+          {
+            "plugin_id": "$PLUGIN_ID",
+            "display_name": "$PLUGIN_ID",
+            "version": "$VERSION",
+            "author": "zxsos"
+          }
+          JSON
+          cd $STAGING
+          zip -r $GITHUB_WORKSPACE/$PLUGIN_ID-$VERSION.zip $PLUGIN_ID
+          echo "ZIP=$PLUGIN_ID-$VERSION.zip" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          generate_release_notes: true
