@@ -1,6 +1,13 @@
-//! 后台任务调度：cron 解析 + 到点幂等入队。
+//! 后台任务调度：cron 解析 + 到点幂等入队 + 队列 worker。
 //!
-//! 替代上游 APScheduler + `TaskWorker` 的**调度那一半**（`src/start/aps.py`）。
+//! 替代上游 APScheduler + `TaskWorker`（`src/start/aps.py` +
+//! `src/scheduler/worker.py`）。上游 `aps()` 起了两样东西，本 crate 对应两个
+//! 模块：
+//!
+//! | 模块 | 角色 | 上游 |
+//! |---|---|---|
+//! | [`tick`] | **生产者**：cron 到点入队，一个进程一份 | `BlockingScheduler` |
+//! | [`worker`] | **消费者**：领取 → 执行 → 收口 | `TaskWorker` |
 //!
 //! # 为什么是 `cron` + 自研 tick，而不是 `tokio-cron-scheduler`
 //!
@@ -11,16 +18,27 @@
 //!
 //! 所以这里只解析表达式，触发判定是自己那个 200 行的 tick。
 //!
-//! # 本批**只做入队**，不做执行
+//! # 执行侧依赖 `sm-service`
 //!
-//! 上游 `aps()` 起了两样东西：`BlockingScheduler`（cron → 入队）与
-//! `TaskWorker`（领取 → 执行）。本仓库的 worker 还没有，而执行逻辑分布在
-//! `catalog` / `playback` / `transfers` / `discovery` / `system` 五个域
-//! （共 114 个 service 文件），目前只落地 `system` 与 `collections`。
-//! [`tick::Scheduler::tick_once`] 因此只写队列，`claim` 留给下一切片。
+//! [`worker`] 要为每条任务构造执行体，而执行体落在五个业务域里
+//! （`catalog` / `playback` / `transfers` / `discovery` / `system`）。
+//! 依赖方向是 `sm-scheduler → sm-service`，**不能反** —— 反了会成环，
+//! 因为 `sm-service` 侧的 `task_queue` 要用互斥键前缀，而那属于
+//! `sm_db::system::activity`（`sm-db` 是两者共同的依赖）。
 //!
-//! 顺带把 `reclaim_stale` 放在了 tick 里（上游在 worker 循环里做）：
-//! 没有 worker 的这段时间里，僵尸行只能靠 tick 回收。
+//! # 已落地与未落地
+//!
+//! [`worker::builtin_handlers`] 目前只注册了 `activity_record_cleanup` ——
+//! 21 个任务里其余 20 个的 service 还没写（`docs/service-progress.md` 有
+//! 逐条阻塞原因）。未注册的任务被领到时会**明确 `failed`** 并写清原因，
+//! 而不是静默跳过；理由见 [`worker`] 模块文档。
+//!
+//! # 启动引导任务（`trigger_type = "startup"`）不在本批
+//!
+//! 上游对 `gfriends_filetree_refresh` 与 `movie_similarity_recompute` 各加一个
+//! 一次性 date job，条件是「缓存缺失或 TTL 过期」/「相似度索引未就绪」——
+//! 两个判断都要读别的域的状态。硬写一个固定的引导任务会让它在不需要时也跑，
+//! 所以 [`tick::TRIGGER_STARTUP`] 这个常量先留着，等对应域落地。
 //!
 //! # 启动引导任务（`trigger_type = "startup"`）不在本批
 //!
@@ -37,9 +55,14 @@
 
 pub mod cron_spec;
 pub mod tick;
+pub mod worker;
 
 pub use cron_spec::{builtin_jobs, JobSpec, RuntimeTimezone, ScheduleError, ScheduledJob};
 pub use tick::{TickReport, QUEUE_MUTEX_PREFIX};
+pub use worker::{
+    builtin_handlers, HandlerRegistry, TaskWorker, TaskWorkerHandle, WorkerConfig, WorkerError,
+    LANE_CONCURRENCY, LANE_DEFAULT, LANE_IMPORT, LANE_TRANSFER, NON_DEFAULT_LANE_TASK_KEYS,
+};
 
 use std::sync::Arc;
 

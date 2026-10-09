@@ -539,6 +539,59 @@ impl SystemNotificationRepository {
         .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))
     }
 
+    paged_list! {
+        /// 通知的分页查询，带分类与已读状态两个可选筛选。
+        ///
+        /// 对应上游 `NotificationService.list_notifications`
+        /// （`activity/notifications.py:205`）。排序 `id DESC` —— 通知列表要
+        /// 「最新的在前」，升序会把最老的顶在第一页，那是通知里最没用的位置。
+        ///
+        /// 两个筛选都可选，所以用 `($n IS NULL OR …)` 让语句恒定；理由见
+        /// `BackgroundTaskRunRepository::list_runs` 的同款说明（索引在
+        /// 「不筛选」时用不上，对一个通知列表可接受）。
+        pub async fn list_all(
+            &self,
+            category: Option<String>,
+            is_read: Option<bool>,
+        ) -> Result<Page<SystemNotification>, DbError> {
+            count = "SELECT COUNT(*) FROM system_notification \
+                     WHERE ($1::text IS NULL OR category = $1) \
+                       AND ($2::bool IS NULL OR is_read = $2)",
+            items = "SELECT * FROM system_notification \
+                     WHERE ($1::text IS NULL OR category = $1) \
+                       AND ($2::bool IS NULL OR is_read = $2) \
+                     ORDER BY id DESC LIMIT $3 OFFSET $4",
+        }
+    }
+
+    /// 批量标记已读，返回**真正改动了几行**。
+    ///
+    /// 对应上游 `mark_notifications_read`（`notifications.py:246`）。
+    /// `WHERE id = ANY($1) AND is_read = false` 有两个作用：
+    ///
+    /// - 重复标记返回 0 而不是再写一次 `read_at` —— `read_at` 是「第一次被
+    ///   读到的时刻」，不该被后续点击改写（同 [`Self::mark_read`] 的理由）。
+    /// - **不存在的 id 被静默忽略**。上游也是这个行为：客户端传回来一串 id，
+    ///   其中一个已经被清理掉，不该让整批失败。
+    ///
+    /// 空列表直接返回 0，不发 SQL —— 那是「匹配不到任何行」的空查询，
+    /// 白跑一趟往返。
+    pub async fn mark_notifications_read(&self, ids: &[i32]) -> Result<u64, DbError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE system_notification SET is_read = true, read_at = $2, updated_at = $2 \
+             WHERE id = ANY($1) AND is_read = false",
+        )
+        .bind(ids)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
     /// 标记已读，写 `is_read` 与 `read_at` **两个字段**。
     ///
     /// 只写 `is_read` 会留下一个不一致的状态 —— 模型的

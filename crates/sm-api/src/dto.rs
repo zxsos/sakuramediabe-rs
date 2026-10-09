@@ -873,3 +873,137 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------- 任务目录
+
+/// 任务运行记录，字段与上游 `TaskRunResource`
+/// （`src/schema/system/activity.py`）逐个对应。
+///
+/// # 时间字段的三个形状不能混
+///
+/// | 字段 | 上游 | 本结构 |
+/// |---|---|---|
+/// | `created_at` / `updated_at` | `datetime`（非可空） | `String`，缺失输出空串 |
+/// | `started_at` / `finished_at` | `datetime \| None` | `Option<String>`，缺失输出 `null` |
+///
+/// 客户端对前者判空串、对后者判 `null`，混了会让「正在运行」的任务显示成
+/// 1970 年的时间戳。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRunResource {
+    pub id: i32,
+    pub task_key: String,
+    pub task_name: String,
+    pub trigger_type: String,
+    pub state: String,
+    pub progress_current: Option<i32>,
+    pub progress_total: Option<i32>,
+    pub progress_text: Option<String>,
+    pub result_text: Option<String>,
+    /// 结构化摘要。DB 里是 `JsonTextField`（TEXT 里的 JSON 文本），这里已解析。
+    pub result_summary: Option<Value>,
+    pub error_message: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<&sm_db::system::activity::BackgroundTaskRun> for TaskRunResource {
+    fn from(run: &sm_db::system::activity::BackgroundTaskRun) -> Self {
+        let summary = sm_db::system::activity::result_summary::from_column_text(
+            run.result_summary.as_deref(),
+        );
+        Self {
+            id: run.id,
+            task_key: run.task_key.clone(),
+            task_name: run.task_name.clone(),
+            trigger_type: run.trigger_type.clone(),
+            state: run.state.clone(),
+            progress_current: run.progress_current,
+            progress_total: run.progress_total,
+            progress_text: run.progress_text.clone(),
+            result_text: run.result_text.clone(),
+            // 空对象当 `None` —— 上游那列的 DEFAULT 是 `'{}'`，而
+            // 「没有摘要」与「摘要是个空对象」对客户端是同一件事。
+            result_summary: (!summary.as_object().is_none_or(|map| map.is_empty()))
+                .then_some(summary),
+            error_message: run.error_message.clone(),
+            started_at: format_optional_timestamp(run.started_at),
+            finished_at: format_optional_timestamp(run.finished_at),
+            created_at: format_timestamp(run.created_at),
+            updated_at: format_timestamp(run.updated_at),
+        }
+    }
+}
+
+/// 任务目录项，字段与上游 `JobMetadataResource`
+/// （`src/schema/system/jobs.py:5-18`）一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobMetadataResource {
+    pub task_key: String,
+    pub plugin_id: Option<String>,
+    pub log_name: String,
+    pub cli_name: String,
+    pub cli_help: String,
+    /// 配置里覆盖 cron 用的键。`manual_only` 任务为 `None`。
+    pub cron_setting: Option<String>,
+    /// 当前生效的 cron 表达式。`manual_only` 任务为 `None`。
+    pub cron_expr: Option<String>,
+    /// 能力未开时的原因。前端据此把入口置灰。
+    pub disabled_reason: Option<String>,
+    /// **不是目录里的原始声明**，而是「声明允许 **且** 当前未被停用」。
+    ///
+    /// 上游 `_build_job_metadata`（`jobs.py:46`）：
+    /// `manual_trigger_allowed = job_def.manual_trigger_allowed and not disabled_reason`。
+    /// 直接透传声明值会让前端在能力关闭时仍显示可点按钮，点下去吃 409。
+    pub manual_trigger_allowed: bool,
+    /// 参数的 JSON Schema。**当前恒为 `None`** —— 插件任务的 schema 正文要从
+    /// proto 的 `google.protobuf.Struct` 转成 `serde_json::Value`，那一层还没写。
+    /// 目录里只带 `has_params_schema`（有没有），见
+    /// [`sm_service::system::jobs`] 的模块文档。
+    pub params_schema: Option<Value>,
+    pub last_task_run: Option<TaskRunResource>,
+}
+
+// ---------------------------------------------------------------- 账号资料
+
+/// 账号资料，字段与上游 `AccountResource`
+/// （`src/schema/system/account.py:6-9`）一致。
+///
+/// # `password_hash` 永不返回
+///
+/// 上游的 resource 由 Pydantic 从实体构造，`password_hash` 不在字段表里所以
+/// 自动排除。这里是手写结构体 —— **加字段时不要把它带上**，那等于把 argon2
+/// 哈希塞进一个「任何登录用户都能调」的响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountResource {
+    pub username: String,
+    pub created_at: String,
+    pub last_login_at: Option<String>,
+}
+
+impl From<&sm_db::system::user::User> for AccountResource {
+    fn from(user: &sm_db::system::user::User) -> Self {
+        Self {
+            username: user.username.clone(),
+            created_at: format_timestamp(user.created_at),
+            last_login_at: format_optional_timestamp(user.last_login_at),
+        }
+    }
+}
+
+/// `PATCH /account` 请求体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountUpdateRequest {
+    pub username: String,
+}
+
+/// `POST /account/password` 请求体。
+///
+/// **没有** `username` 字段 —— 改的是**当前登录者**的密码，由 JWT 里的 id
+/// 定位。多一个字段就意味着「改别人的密码」这条路。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountPasswordChangeRequest {
+    pub current_password: String,
+    pub new_password: String,
+}

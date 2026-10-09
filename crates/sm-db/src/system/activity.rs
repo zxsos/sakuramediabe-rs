@@ -237,6 +237,52 @@ pub mod notification_category {
 pub mod result_summary {
     use serde_json::Value;
 
+    /// 合并两个摘要。`patch` 为空时原样返回 base 的克隆。
+    ///
+    /// 对应上游 `merge_summary`（`activity/task_runs.py:43-49`）：
+    ///
+    /// ```python
+    /// merged = dict(base_summary); merged.update(summary_patch)
+    /// ```
+    ///
+    /// 键序即插入序（依赖工作区给 `serde_json` 开了 `preserve_order`）——
+    /// `format_text` 的输出要能与上游逐字比对。
+    ///
+    /// base 非法或不是对象时按空对象处理：该列是
+    /// `JsonTextField NOT NULL DEFAULT '{}'`，出现别的形状只能是有人绕过
+    /// 仓储直接写过，此时整条失败比静默丢键位更糟。
+    pub fn merge(base: Option<&Value>, patch: Option<&Value>) -> Value {
+        let mut merged = match base {
+            Some(Value::Object(map)) => Value::Object(map.clone()),
+            _ => Value::Object(serde_json::Map::new()),
+        };
+        if let (Some(target), Some(Value::Object(source))) = (merged.as_object_mut(), patch) {
+            for (key, value) in source {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        merged
+    }
+
+    /// 把 `Value` 序列化成该列的 TEXT 形态。非对象按 `{}` 落库。
+    pub fn to_column_text(value: &Value) -> String {
+        if value.is_object() {
+            value.to_string()
+        } else {
+            "{}".to_owned()
+        }
+    }
+
+    /// 解析该列的 TEXT。非对象或非法一律按空对象。
+    pub fn from_column_text(raw: Option<&str>) -> Value {
+        match raw {
+            Some(text) if !text.trim().is_empty() => {
+                serde_json::from_str::<Value>(text).unwrap_or(Value::Object(serde_json::Map::new()))
+            }
+            _ => Value::Object(serde_json::Map::new()),
+        }
+    }
+
     /// 标量转字符串。**两处方言差异**。
     ///
     /// | 类型 | 本实现 | 上游 `str(value)` |

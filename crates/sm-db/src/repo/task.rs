@@ -642,43 +642,17 @@ impl BackgroundTaskRunRepository {
     // 抛错 —— 上游 `task_execution.py` 正是据此决定「本地成功也不能覆盖
     // 已持久化的失败终态」。
 
-    /// 合并 `result_summary`。
+    /// 合并 `result_summary` 并序列化成该列的 TEXT 形态。
     ///
-    /// 对应上游 `activity/task_runs.py:43`：
-    ///
-    /// ```python
-    /// merged = dict(base_summary); merged.update(summary_patch)
-    /// ```
-    ///
-    /// `patch` 为空时原样返回 base。base 非法或缺失时按空对象处理 ——
-    /// 该列是 `JsonTextField NOT NULL DEFAULT '{}'`，真出现非法值只能是
-    /// 有人绕过本仓储直接写过，此时按空对象继续比整条失败更可用。
-    fn merge_summary_json(
+    /// 合并规则见 [`crate::system::activity::result_summary::merge`]，
+    /// 公开成仓储方法只为少写一次 `to_column_text`。
+    fn merge_summary_column(
         base: Option<&str>,
         patch: Option<&serde_json::Value>,
-    ) -> Result<String, DbError> {
-        let mut merged = match base {
-            Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<serde_json::Value>(raw)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-            _ => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        if !merged.is_object() {
-            // 列里存的是数组或标量时没有可合并的键位，退回空对象。
-            merged = serde_json::Value::Object(serde_json::Map::new());
-        }
-        if let Some(patch) = patch {
-            if patch.is_object() {
-                if let (Some(target), Some(source)) = (
-                    merged.as_object_mut(),
-                    patch.as_object(),
-                ) {
-                    for (key, value) in source {
-                        target.insert(key.clone(), value.clone());
-                    }
-                }
-            }
-        }
-        Ok(merged.to_string())
+    ) -> String {
+        let base_value = crate::system::activity::result_summary::from_column_text(base);
+        let merged = crate::system::activity::result_summary::merge(Some(&base_value), patch);
+        crate::system::activity::result_summary::to_column_text(&merged)
     }
 
     /// 仅执行 `pending -> running`；其它状态**原样返回该行**且不产生任何写入。
@@ -730,14 +704,23 @@ impl BackgroundTaskRunRepository {
     /// 格式化兜底（上游 `format_result_text`）。**同时释放 `mutex_key` 与
     /// 租约** —— 理由同 [`Self::finish`]。
     ///
-    /// 返回 `None` 表示行不存在；`Some(row)` 的 `row.state` 是 `completed`
-    /// 表示本调用赢得了转移，否则是锁内读到的既有终态（调用方须服从它）。
+    /// 返回值三态：
+    ///
+    /// | 返回 | 含义 |
+    /// |---|---|
+    /// | `None` | 行不存在 |
+    /// | `Some((row, true))` | **本调用赢得了转移** |
+    /// | `Some((row, false))` | 行已是终态，`row` 是锁内读到的既有状态 |
+    ///
+    /// 那个 bool 不能从 `row` 的字段推断出来 —— 一个「本来就 completed」的
+    /// 行和一个「刚被我收成 completed」的行，字段完全一样。必须由 CAS 的
+    /// 落败/成功直接给出。
     pub async fn complete_active(
         &self,
         id: i32,
         summary: Option<&serde_json::Value>,
         text: Option<&str>,
-    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+    ) -> Result<Option<(BackgroundTaskRun, bool)>, DbError> {
         let mut tx = self.pool.begin().await?;
         let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
             "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
@@ -752,10 +735,10 @@ impl BackgroundTaskRunRepository {
 
         if !task_state::is_active(&current.state) {
             tx.rollback().await?;
-            return Ok(Some(current));
+            return Ok(Some((current, false)));
         }
 
-        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary)?;
+        let merged = Self::merge_summary_column(current.result_summary.as_deref(), summary);
         // 上游是 `result_text or format_result_text(result_summary)`：两者都
         // 没有值时写 NULL 而不是空串。`text` 列存不透明文本，空串与 NULL 在
         // 客户端渲染上不等价（前者会渲染出一个空的文本节点）。
@@ -781,7 +764,7 @@ impl BackgroundTaskRunRepository {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(Some(row))
+        Ok(Some((row, true)))
     }
 
     /// 收口为 `failed`。CAS 范围与摘要合并规则同 [`Self::complete_active`]。
@@ -790,7 +773,7 @@ impl BackgroundTaskRunRepository {
         id: i32,
         error: &str,
         summary: Option<&serde_json::Value>,
-    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+    ) -> Result<Option<(BackgroundTaskRun, bool)>, DbError> {
         let mut tx = self.pool.begin().await?;
         let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
             "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
@@ -805,10 +788,10 @@ impl BackgroundTaskRunRepository {
 
         if !task_state::is_active(&current.state) {
             tx.rollback().await?;
-            return Ok(Some(current));
+            return Ok(Some((current, false)));
         }
 
-        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary)?;
+        let merged = Self::merge_summary_column(current.result_summary.as_deref(), summary);
         let now = crate::common::time::now_utc();
         let row = sqlx::query_as::<_, BackgroundTaskRun>(
             "UPDATE background_task_run \
@@ -824,7 +807,7 @@ impl BackgroundTaskRunRepository {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(Some(row))
+        Ok(Some((row, true)))
     }
 
     /// 更新进行中任务的**显式**进度字段。终态行原样返回且零写入。
@@ -858,7 +841,7 @@ impl BackgroundTaskRunRepository {
             return Ok(Some(current));
         }
 
-        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary_patch)?;
+        let merged = Self::merge_summary_column(current.result_summary.as_deref(), summary_patch);
         let now = crate::common::time::now_utc();
         let row = sqlx::query_as::<_, BackgroundTaskRun>(
             "UPDATE background_task_run \
@@ -879,6 +862,115 @@ impl BackgroundTaskRunRepository {
         .await?;
         tx.commit().await?;
         Ok(Some(row))
+    }
+
+    /// 每个 `task_key` 各自**最新一条**运行记录，返回 `task_key -> 行`。
+    ///
+    /// 对应上游 `_latest_task_run_by_key`（`api/routers/system/jobs.py:21-32`）。
+    ///
+    /// # 为什么用子查询而不是「全部拉回来在内存里去重」
+    ///
+    /// `background_task_run` 是**只增表** —— 一个每小时跑一次的任务跑一年就是
+    /// 8000 行。全表拉回进程只为取 21 个最大值，代价随时间线性增长。子查询让
+    /// 数据库只返回「任务个数」那么多行。
+    ///
+    /// # 「最新」取 `MAX(id)` 而不是 `MAX(started_at)`
+    ///
+    /// `id` 自增，最大即最新。用 `started_at` 有两个坑：`pending` 行的
+    /// `started_at` 是 NULL（排序时被丢到一边），而两行同一微秒写入时无法区分。
+    /// 上游也是按 `MAX(id)` 分组。
+    pub async fn latest_by_task_keys(
+        &self,
+        task_keys: &[String],
+    ) -> Result<std::collections::HashMap<String, BackgroundTaskRun>, DbError> {
+        if task_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id IN ( \
+                 SELECT MAX(id) FROM background_task_run \
+                 WHERE task_key = ANY($1) GROUP BY task_key \
+             )",
+        )
+        .bind(task_keys)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.task_key.clone(), row))
+            .collect())
+    }
+
+    paged_list! {
+        /// 任务台账的分页查询，带三个可选筛选与排序。对应上游
+        /// `TaskRunService.list_task_runs`（`activity/task_runs.py:347-367`）。
+        ///
+        /// # 筛选用 `($n IS NULL OR …)` 而不是拼 SQL
+        ///
+        /// 三个筛选都可选，拼 SQL 就得为 8 种组合各写一条语句，其中一条会长到
+        /// 没法读。`IS NULL OR` 让**语句恒定**、完全参数化，代价是索引在
+        /// 「不筛选」时用不上 —— 对一个任务中心页面（每次几十行）可接受。
+        ///
+        /// # 排序用 `CASE` 而不是拼 `ORDER BY`
+        ///
+        /// 同理：`ORDER BY` 不能绑参数，六种排序拼六条语句的话 `count` 与
+        /// `items` 都要复制一遍。`CASE` 后面是**值比较**
+        /// （`$4 = 'started_at:desc'`），绑进来的字符串不会进 SQL 文本，
+        /// 所以没有注入面。
+        ///
+        /// 六个 `CASE` 恒有一个命中，其余产出 NULL。未命中的分支不影响结果
+        /// （排序键为 NULL 的行彼此等价），末位的 `id` 次级键让同一时刻的
+        /// 多次写入顺序稳定 —— 否则翻页时同一条记录可能出现在两页。
+        ///
+        /// `sort` 的合法值由 service 层校验（`activity::filters` 的白名单），
+        /// 这里不校验：传了非法值会退化成「只按 id DESC 排」，那是一个
+        /// **稳定但无意义**的顺序，比报错更容易被误认为「排序没生效」。
+        pub async fn list_runs(
+            &self,
+            state: Option<String>,
+            trigger_type: Option<String>,
+            task_key: Option<String>,
+            sort: String,
+        ) -> Result<Page<BackgroundTaskRun>, DbError> {
+            count = "SELECT COUNT(*) FROM background_task_run \
+                     WHERE ($1::text IS NULL OR state = $1) \
+                       AND ($2::text IS NULL OR trigger_type = $2) \
+                       AND ($3::text IS NULL OR task_key = $3)",
+            items = "SELECT * FROM background_task_run \
+                     WHERE ($1::text IS NULL OR state = $1) \
+                       AND ($2::text IS NULL OR trigger_type = $2) \
+                       AND ($3::text IS NULL OR task_key = $3) \
+                     ORDER BY \
+                       CASE WHEN $4 = 'started_at:desc' THEN started_at END DESC, \
+                       CASE WHEN $4 = 'started_at:asc'  THEN started_at END ASC,  \
+                       CASE WHEN $4 = 'created_at:desc' THEN created_at END DESC, \
+                       CASE WHEN $4 = 'created_at:asc'  THEN created_at END ASC,  \
+                       CASE WHEN $4 = 'updated_at:desc' THEN updated_at END DESC, \
+                       CASE WHEN $4 = 'updated_at:asc'  THEN updated_at END ASC,  \
+                       id DESC \
+                     LIMIT $5 OFFSET $6",
+        }
+    }
+
+    /// 列出**进行中**（`pending` + `running`）的运行记录，新的在前。
+    ///
+    /// 对应上游 `list_active_task_runs`（`task_runs.py:370-376`）。**刻意不
+    /// 分页** —— 上游返回一个完整列表，语义是「现在有什么在跑」而不是
+    /// 「翻页看历史上跑过什么」；分页会把进行中的任务挤到第二页，而那正是
+    /// 最需要被看到的那批。
+    ///
+    /// 排序 `started_at DESC, id DESC` 与上游一致。`pending` 行的
+    /// `started_at` 是 NULL 会排到最后 —— 它们还没开始，「最新的在前」这个
+    /// 语义对它们不成立，上游同样如此。
+    pub async fn list_active_runs(&self) -> Result<Vec<BackgroundTaskRun>, DbError> {
+        sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run \
+             WHERE state = ANY($1) ORDER BY started_at DESC, id DESC",
+        )
+        .bind(task_state::ACTIVE)
+        .fetch_all(&self.pool)
+        .await
+            .map_err(Into::into)
     }
 
     /// 列出**全部**租约过期的 `running` 行。**刻意不分页。**

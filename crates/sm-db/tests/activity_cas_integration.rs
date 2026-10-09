@@ -101,11 +101,12 @@ async fn complete_active_accepts_pending_which_the_queue_path_refuses() {
     let queued = repo.finish(id, &Default::default()).await;
     assert!(queued.is_err(), "finish 应当拒绝 pending 行（对照组）");
 
-    let run = repo
+    let (run, won) = repo
         .complete_active(id, None, Some("skipped"))
         .await
         .expect("complete_active 应当接受 pending")
         .expect("行存在");
+    assert!(won, "从 pending 收口算赢得转移");
     assert_eq!(run.state, task_state::COMPLETED);
     assert_eq!(run.result_text.as_deref(), Some("skipped"));
 }
@@ -124,11 +125,12 @@ async fn complete_active_merges_summary_and_derives_text_from_it() {
         .expect("行存在");
 
     // 收口时只带一个键 —— 之前的 `processed` 必须还在。
-    let run = repo
+    let (run, won) = repo
         .complete_active(id, Some(&json!({"imported": 2})), None)
         .await
         .expect("收口")
         .expect("行存在");
+    assert!(won);
     let summary: serde_json::Value =
         serde_json::from_str(run.result_summary.as_deref().expect("摘要非空")).expect("摘要合法");
     assert_eq!(summary["processed"], 3, "旧键不得被覆盖");
@@ -149,17 +151,20 @@ async fn losing_the_race_yields_the_persisted_terminal_state() {
     let id = seed(&repo, "race").await;
     repo.mark_running(id).await.expect("标记运行").expect("行存在");
 
-    repo.fail_active(id, "先到的失败", None)
+    let (_, first_won) = repo
+        .fail_active(id, "先到的失败", None)
         .await
         .expect("先收口")
         .expect("行存在");
+    assert!(first_won, "先到的一方赢得转移");
 
     // 后到的「成功」必须服从已持久化的终态，而不是覆盖它。
-    let late = repo
+    let (late, late_won) = repo
         .complete_active(id, Some(&json!({"late": true})), Some("迟到"))
         .await
         .expect("后收口")
         .expect("行存在");
+    assert!(!late_won, "迟到的一方必须知道自己输了");
     assert_eq!(
         late.state,
         task_state::FAILED,
@@ -185,11 +190,12 @@ async fn fail_active_also_releases_the_mutex_key() {
     let run = repo.enqueue(&draft).await.expect("入队");
     repo.mark_running(run.id).await.expect("标记运行").expect("行存在");
 
-    let failed = repo
+    let (failed, won) = repo
         .fail_active(run.id, "boom", None)
         .await
         .expect("收口失败")
         .expect("行存在");
+    assert!(won);
     assert!(
         !failed.is_mutex_guarded(),
         "失败也必须释放互斥键，否则重试永远撞唯一约束"

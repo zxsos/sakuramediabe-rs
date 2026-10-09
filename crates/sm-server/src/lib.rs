@@ -38,15 +38,18 @@ pub mod plugins;
 use std::sync::Arc;
 
 use sm_api::middleware::slow_log::SlowLogConfig;
-use sm_scheduler::{Scheduler, SchedulerHandle};
+use sm_scheduler::{Scheduler, SchedulerHandle, TaskWorker, TaskWorkerHandle, WorkerConfig};
 use sm_service::system::auth::AuthConfig;
 
 pub use config::{ListenConfig, PoolConfig, ServerConfig};
 pub use error::ConfigError;
 
-/// 调度器与看门狗这一组后台任务。
+/// 调度器、worker 与看门狗这一组后台任务。
 struct Background {
     scheduler: SchedulerHandle,
+    /// 队列消费者。`None` 表示 worker 没起来 —— 那时日志里有一条 error，
+    /// 队列会持续积压而无人领取。
+    worker: Option<TaskWorkerHandle>,
     watchdog: tokio::task::JoinHandle<()>,
     /// 看门狗的停止标志。abort 之外还要它：看门狗可能正睡在退避里，
     /// abort 直接打断即可，但标志让「为什么停」在日志里是可解释的。
@@ -92,8 +95,10 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let plugin_specs = loaded_plugins.scheduler_specs();
     let job_catalog = loaded_plugins.catalog();
 
-    // 5. 路由。
-    let state = sm_api::AppState::new(pool.clone(), auth, config_service).with_jobs(job_catalog);
+    // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读
+    //    `job_disabled_reason` 需要的配置快照，而它是 move 进 AppState 的。
+    let state =
+        sm_api::AppState::new(pool.clone(), auth, config_service.clone()).with_jobs(job_catalog);
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
@@ -121,8 +126,35 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             jobs = summary.join(" "),
             "调度器就绪"
         );
+
+        // 6b. 队列 worker（消费者）。**在调度器之后**启动：worker 的启动第一步
+        //     是恢复上个进程遗留的 running 行并收口其领域状态，那要读队列；
+        //     调度器先起来最坏只是多入队几行 pending（有 mutex_key 幂等），
+        //     反过来则可能让一条刚被恢复的行立刻又被领走。
+        let worker = match TaskWorker::spawn(
+            pool.clone(),
+            Arc::new(sm_scheduler::builtin_handlers()),
+            WorkerConfig::default(),
+            config_service.clone(),
+        )
+        .await
+        {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                // 不 panic：worker 起不来时 HTTP 仍然可用（能看任务中心、能手动
+                // 触发），而 panic 会让整个进程不启动 —— 那是把「后台任务不跑」
+                // 升级成「服务全挂」，代价大得多。
+                tracing::error!(
+                    code = error.code(),
+                    "队列 worker 启动失败：任务会入队但无人执行"
+                );
+                None
+            }
+        };
+
         Some(Background {
             scheduler: handle,
+            worker,
             watchdog,
             watchdog_stop,
         })
@@ -146,8 +178,14 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("HTTP 服务异常退出：{err}"))?;
     tracing::info!("HTTP 服务已停止接受新请求");
 
-    // 9. 收尾：先停看门狗（否则它可能在关停过程中把刚杀掉的插件又拉起来），
-    //    再停调度器（等当前 tick 结束）。
+    // 9. 收尾，顺序有讲究：
+    //
+    //    ① 看门狗 —— 否则它可能在关停过程中把刚杀掉的插件又拉起来。
+    //    ② 调度器（生产者）—— 等当前 tick 结束，不再入队。
+    //    ③ worker（消费者）—— 它在 shutdown 里**等在飞行的任务跑完**，所以
+    //       放最后：一个长任务可能让关停等上它的全量时长。这是「优雅」的真实
+    //       代价，不要为了快而 abort —— abort 会留下一行 running 且租约未续，
+    //       只能等租约到期（最多 `DEFAULT_LEASE_SECONDS`）被回收。
     if let Some(background) = scheduler {
         background
             .watchdog_stop
@@ -155,6 +193,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         background.watchdog.abort();
         background.scheduler.shutdown().await?;
         tracing::info!("调度器已停止");
+        if let Some(worker) = background.worker {
+            // `ServiceError` 不实现 `std::error::Error`，`?` 进不了 anyhow ——
+            // 显式映射，并且只带上机器可读的 code。
+            worker
+                .shutdown()
+                .await
+                .map_err(|error| anyhow::anyhow!("队列 worker 停止失败（{}）", error.code()))?;
+            tracing::info!("队列 worker 已停止");
+        }
     }
     pool.close().await;
     tracing::info!("退出完成");

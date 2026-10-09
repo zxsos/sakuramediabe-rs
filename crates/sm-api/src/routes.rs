@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 
 use crate::error::ErrorResponse;
 
+pub mod account;
 pub mod actors;
 pub mod auth;
 pub mod clip_collections;

@@ -706,4 +706,73 @@ mod tests {
         assert_eq!(RuntimeTimezone::parse_fixed_offset("+08:99"), None);
         assert_eq!(RuntimeTimezone::parse_fixed_offset("garbage"), None);
     }
+
+    /// 内建任务键必须在 service 侧的显示名注册表里。
+    ///
+    /// **这条断言只能放在这个 crate** —— 依赖方向是
+    /// `sm-scheduler → sm-service`，写在 `sm-service` 侧会成环。
+    ///
+    /// # 两条已知的例外是**上游缺陷**，刻意照抄
+    ///
+    /// `movie_asset_pack_backfill` 与 `media_thumbnail_pack_backfill` 在上游
+    /// `BUILTIN_JOB_REGISTRY`（`registry.py:176-185`）里有，
+    /// `TASK_NAME_REGISTRY`（`task_catalog.py`）里**没有**。于是上游
+    /// `resolve_task_name` 对这两个回落到 `task_key`，任务中心里显示英文。
+    ///
+    /// 照抄理由与 `docs/handoff.md` 第五节那两条一致：修它会改变客户端
+    /// 已渲染的文字，属于契约变更，该单独开一个 fix 并同步上游。
+    /// **新增**内建任务若缺显示名，那不是照抄而是真缺陷 —— 断言会拦。
+    const UPSTREAM_REGISTRY_GAPS: [&str; 2] = [
+        "movie_asset_pack_backfill",
+        "media_thumbnail_pack_backfill",
+    ];
+
+    #[test]
+    fn every_builtin_task_key_has_a_display_name_in_the_service_registry() {
+        let jobs = builtin_jobs();
+        let missing: Vec<&str> = jobs
+            .iter()
+            .map(|spec| spec.task_key.as_str())
+            .filter(|key| sm_service::system::activity::lookup_task_name(key).is_none())
+            .filter(|key| !UPSTREAM_REGISTRY_GAPS.contains(key))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "这些内建任务键在 TASK_NAME_REGISTRY 里没有显示名：{missing:?}"
+        );
+    }
+
+    /// 记录在上游那两个缺口**之外**没有新增缺口。
+    ///
+    /// 与上一条分开是为了让「上游缺了」和「我们多漏了」在报告里可区分：
+    /// 两条都失败时，先看这一条更省事。
+    #[test]
+    fn the_upstream_registry_gaps_have_not_grown() {
+        for key in UPSTREAM_REGISTRY_GAPS {
+            assert!(
+                sm_service::system::activity::lookup_task_name(key).is_none(),
+                "{key} 已有了显示名 —— 把它从 UPSTREAM_REGISTRY_GAPS 里去掉，\
+                 并考虑这条记录是否还成立"
+            );
+        }
+    }
+
+    /// 没有 cron 的任务**必须**允许手动触发。
+    ///
+    /// 上游 `JobDefinition._validate_cron_source`
+    /// （`scheduler/contracts.py:47-49`）强制这条：`manual_only` 任务若不允许
+    /// 手动触发就等于永远不会跑。这里没有 import 阶段的校验器，所以靠断言
+    /// 兜住 —— 症状是任务既不自动跑、也不出现在手动列表里，**不报错**。
+    #[test]
+    fn a_task_without_a_cron_must_still_be_manually_triggerable() {
+        for spec in &builtin_jobs() {
+            if spec.cron.is_none() {
+                assert!(
+                    spec.manual_trigger_allowed,
+                    "{} 没有 cron 就必须允许手动触发，否则它永远不会跑",
+                    spec.task_key
+                );
+            }
+        }
+    }
 }

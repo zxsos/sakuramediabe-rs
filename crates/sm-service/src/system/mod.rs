@@ -18,6 +18,7 @@
 //! 排在能落地业务的那几个之后。
 
 pub mod account;
+pub mod activity;
 pub mod activity_cleanup;
 pub mod auth;
 pub mod config;
@@ -28,6 +29,12 @@ pub mod status;
 pub mod task_queue;
 
 pub use account::AccountService;
+pub use activity::{
+    run_task, normalize_allowed_filter, normalize_string_filter, notification_category,
+    notify_task_result, resolve_task_name, task_result_dedupe_key, task_state, TaskHandler,
+    TaskHandlerResult, TaskRunError, TaskRunReporter, TaskRunService, TaskRunTransition,
+    TASK_NAME_REGISTRY, TASK_RESULT_EVENT,
+};
 pub use activity_cleanup::{ActivityCleanupService, ActivityCleanupStats, RetentionPolicy};
 pub use config::ConfigService;
 pub use jobs::{JobCatalog, JobCatalogEntry};

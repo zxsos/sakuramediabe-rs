@@ -1,15 +1,30 @@
-//! `POST /system/jobs/{task_key}/run` —— 手动触发一个任务。
+//! `GET /system/jobs` 与 `POST /system/jobs/{task_key}/run` —— 任务目录与手动触发。
 //!
 //! # 上游对应
 //!
-//! `src/api/routers/system/jobs.py` 的 `trigger_job`，以及它调的
+//! `src/api/routers/system/jobs.py` 的 `list_jobs` 与 `trigger_job`，后者调
 //! `aps.py:submit_manual_job`（`conflict="raise"`）。
 //!
-//! # 只落了「触发」这一条，`GET /system/jobs` 还没落
+//! # 目录是**快照**，不是活注册表
 //!
-//! 列表端点要吐 `last_task_run`（每 key 最新一条运行记录）与 `params_schema`
-//! 正文，两样都还缺（见 [`sm_service::system::jobs`] 的模块文档）。先把「能跑
-//! 起来」落地 —— `manual_only` 的插件任务**只有**这条路能触发，没有 cron。
+//! 插件的注册表在 `sm-plugins` 里、由组合根持有，而 `sm-api` 不能依赖
+//! `sm-server`（反向依赖会成环）。所以 `AppState` 拿的是一份纯数据
+//! 目录，组合根每次加载或重建插件表之后换一份新的。代价是插件崩溃重启后
+//! **新增**的任务不会出现在目录里，要等进程重启 —— 与 `sm-plugins` 模块文档
+//! 里记的那个调度表局限是同一个成因。
+//!
+//! # `manual_trigger_allowed` 在响应里被改写
+//!
+//! 目录里存的是任务**声明**；响应里给的是「声明允许 **且** 当前未被停用」
+//! （上游 `jobs.py:46`）。前端据此决定按钮是否置灰 —— 直接透传声明值会让
+//! 能力关闭时按钮仍可点，点下去吃 409。
+//!
+//! # `params_schema` 当前恒为 `null`
+//!
+//! 上游给的是 Pydantic 模型的 `model_json_schema()`。插件任务的 schema 正文
+//! 在 proto 里是 `google.protobuf.Struct`，转成 `serde_json::Value` 的那一层
+//! 还没写；目录里只有 `has_params_schema`（有没有）这个布尔。**不要**拿它
+//! 拼一个假 schema —— 前端会照着渲染表单，然后提交一份服务端不认的参数。
 //!
 //! # 三条错误分别是三种意思
 //!
@@ -23,16 +38,17 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_db::repo::BackgroundTaskRunRepository;
 use sm_service::system::{
     job_disabled_reason, require_job_enabled, ConflictPolicy, EnqueueOutcome, JobCatalogEntry,
-    TaskQueueService, FEATURE_DISABLED,
+    TaskQueueService, TaskRunService, FEATURE_DISABLED,
 };
 
 use crate::auth::CurrentUser;
+use crate::dto::{JobMetadataResource, TaskRunResource};
 use crate::error::ErrorResponse;
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
@@ -46,10 +62,56 @@ pub struct ManualJobTriggerResponse {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/system/jobs/{task_key}/run",
-        post(trigger).fallback(method_not_allowed),
-    )
+    Router::new()
+        .route("/system/jobs", get(list_jobs).fallback(method_not_allowed))
+        .route(
+            "/system/jobs/{task_key}/run",
+            post(trigger).fallback(method_not_allowed),
+        )
+}
+
+/// 任务目录。对应上游 `list_jobs`（`jobs.py:56-59`）。
+///
+/// 每项的 `last_task_run` 来自**一次**子查询（`MAX(id) GROUP BY task_key`），
+/// 不是 N+1 —— 21 个任务就是 21 次往返，逐项查会变成 42 次。
+async fn list_jobs(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<JobMetadataResource>>, ErrorResponse> {
+    let config = state.config().snapshot().unwrap_or_default();
+    let entries = state.jobs().entries().to_vec();
+    let task_keys: Vec<String> = entries.iter().map(|entry| entry.task_key.clone()).collect();
+
+    // 走服务层而不是直接调仓储：`sm-api::error` 没有 `From<DbError>`，
+    // 而且 `api → service → db` 才是分层该有的方向。
+    let task_runs = TaskRunService::new(state.db());
+    let latest = task_runs.latest_runs_by_task_key(&task_keys).await?;
+
+    let items = entries
+        .iter()
+        .map(|entry| {
+            // 上游 `jobs.py:36` 在**构建每项时**各算一次，不要提到循环外 ——
+            // 一次快照算一次就够，同一轮里配置不会变。
+            let disabled_reason = job_disabled_reason(&entry.task_key, &config);
+            JobMetadataResource {
+                task_key: entry.task_key.clone(),
+                plugin_id: entry.plugin_id.clone(),
+                log_name: entry.log_name.clone(),
+                cli_name: entry.cli_name.clone(),
+                cli_help: entry.cli_help.clone(),
+                cron_setting: entry.cron_setting.clone(),
+                cron_expr: entry.cron_expr.clone(),
+                disabled_reason: disabled_reason.clone(),
+                // 「声明允许」且「当前没被停用」—— 见模块文档。
+                manual_trigger_allowed: entry.manual_trigger_allowed
+                    && disabled_reason.is_none(),
+                params_schema: None,
+                last_task_run: latest.get(&entry.task_key).map(TaskRunResource::from),
+            }
+        })
+        .collect();
+
+    Ok(Json(items))
 }
 
 async fn trigger(

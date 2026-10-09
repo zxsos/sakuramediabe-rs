@@ -66,6 +66,7 @@ use tower_http::cors::CorsLayer;
 /// 顺序决定了 fallback 是否也享受 CORS —— 上游 CORS 是全站生效的。
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(routes::account::routes())
         .merge(routes::actors::routes())
         .merge(routes::auth::routes())
         .merge(routes::clip_collections::routes())

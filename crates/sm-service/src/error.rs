@@ -154,6 +154,14 @@ impl ServiceError {
     pub fn code(&self) -> &str {
         &self.api.code
     }
+
+    /// 取 `details`，便于测试断言。
+    ///
+    /// 与 [`Self::code`] 同用途：`ServiceError` 不实现 `Display`（错误正文要走
+    /// HTTP 层的错误信封），所以要断言「details 里带了这个键」只能经这里。
+    pub fn details(&self) -> Option<&Map<String, Value>> {
+        self.api.details.as_ref()
+    }
 }
 
 /// 编程错误 —— 上游在这一类上抛 `ValueError` 而不是 `ApiError`。
