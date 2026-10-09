@@ -27,9 +27,9 @@ jobs:
         run: |
           cat > manifest.json << 'MANIFEST'
           {
-            "id": "plugin-ref-local",
+            "id": "plugin_ref_local",
             "version": "${{ github.ref_name }}",
-            "entry": "plugin-ref-local",
+            "entry": "plugin_ref_local",
             "display_name": "Reference Local"
           }
           MANIFEST
@@ -37,9 +37,9 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/plugin-ref-local dist/
+          cp target/release/plugin-ref-local dist/plugin_ref_local
           cp manifest.json dist/
-          cd dist && zip -r ../plugin-ref-local-${{ github.ref_name }}.zip manifest.json plugin-ref-local
+          cd dist && zip -r ../plugin-ref-local-${{ github.ref_name }}.zip manifest.json plugin_ref_local
 
       - name: Release
         uses: softprops/action-gh-release@v1
