@@ -15,7 +15,7 @@
 //! ⚠️ `retryable` 是 **provider 给的独立字段**，不是从 `code` 推出来的
 //! （`provider_protocol.py:661-665` 里 `unsupported` 显式给 `retryable=False`）。
 //! 所以宿主**优先信它**，只有在拿不到结构化错误时才退回
-//! [`default_retryable`](crate::error::default_retryable) 那份猜测。
+//! [`default_retryable`] 那份猜测。
 //!
 //! # 为什么需要这个模块
 //!
@@ -36,7 +36,7 @@
 //!
 //! # 给插件作者
 //!
-//! 失败时调 [`to_status`](crate::error::to_status) 而不是手写
+//! 失败时调 [`to_status`] 而不是手写
 //! `Status::unimplemented(...)` —— 前者让宿主能分清「你不支持这个操作」与
 //! 「你崩了」，后者在宿主侧一律归成 `unspecified`（认不出的失败）。
 //! `safe_message` 会展示给用户，**不要**放 Cookie、密码或内部路径（proto 注释
@@ -44,7 +44,7 @@
 //!
 //! # 给宿主
 //!
-//! [`from_status`](crate::error::from_status) 解不出时返回 `None`，调用方
+//! [`from_status`] 解不出时返回 `None`，调用方
 //! **必须**还有一条按 `Status::code` 猜的回落路径 —— 老插件与手写 `Status` 的
 //! 插件不会带这个结构。
 

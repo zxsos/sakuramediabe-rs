@@ -18,20 +18,43 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  rust:
-    name: rust / test
+  rust-build:
+    name: rust / build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --all-targets
 
-      - name: Test
+  rust-test:
+    name: rust / test (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - sm-core
+          - sm-db
+          - sm-api
+          - sm-service
+          - sm-plugins
+          - sm-scheduler
+          - sm-server
+          - sm-plugin-api
+          - hashing
+          - media-file-hash
+          - svc-hash
+          - svc-image
+          - svc-probe
+          - parity-cli
+          - plugin-ref-local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test ${{ matrix.crate }}
         # `--lib` 是刻意的：集成测试需要真实的 PostgreSQL，而本 job 没有
         # 那个 service。带 integration suite 的话，`TestDb::require()` 会
         # 因为连不上库而 panic —— 那是**正确**的行为（静默跳过会让「跳过」
@@ -39,14 +62,39 @@ jobs:
         #
         # 集成测试全部由下面的 `integration` job 跑，那里**跑全部 8 个
         # suite**，不再只挑两个。
-        run: cargo test --workspace --lib
+        run: cargo test -p ${{ matrix.crate }} --lib
 
+  rust-fmt:
+    name: rust / fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all --check
 
+  rust-clippy:
+    name: rust / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  rust-doc:
+    name: rust / doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       # 文档里的类型链接是**活的引用**，写错不会让编译失败、也不会让
       # clippy 失败，只在 cargo doc 时报 warning。而坏链接意味着读者
       # 点不开他去查的那个类型 —— 在这个项目里那正是最常需要的动作。

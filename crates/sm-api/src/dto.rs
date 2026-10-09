@@ -1376,73 +1376,6 @@ impl PlaylistMovieListItemResource {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sm_db::collections::{Playlist, PLAYLIST_KIND_CUSTOM, PLAYLIST_KIND_RECENTLY_PLAYED};
-
-    fn playlist(kind: &str) -> Playlist {
-        Playlist {
-            id: 3,
-            name: "我的列表".to_owned(),
-            description: "d".to_owned(),
-            owner_plugin_id: None,
-            plugin_key: None,
-            kind: kind.to_owned(),
-            created_at: NaiveDateTime::parse_from_str("2026-10-04 01:02:03", "%Y-%m-%d %H:%M:%S")
-                .ok(),
-            updated_at: None,
-        }
-    }
-
-    #[test]
-    fn derived_flags_follow_upstream() {
-        let custom = PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM));
-        assert!(!custom.is_system);
-        assert!(custom.is_mutable);
-        assert!(custom.is_deletable);
-
-        let system = PlaylistResource::from(playlist(PLAYLIST_KIND_RECENTLY_PLAYED));
-        assert!(system.is_system);
-        assert!(!system.is_mutable);
-        assert!(!system.is_deletable);
-    }
-
-    #[test]
-    fn timestamp_uses_the_pydantic_shape() {
-        let resource = PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM));
-        assert_eq!(resource.created_at, "2026-10-04T01:02:03");
-        // 缺失时输出空串，而不是让序列化失败
-        assert_eq!(resource.updated_at, "");
-    }
-
-    #[test]
-    fn field_set_matches_the_upstream_dto() {
-        // 字段数量变化会直接改变响应体字节数 —— 用序列化结果钉住。
-        let json = serde_json::to_value(PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM)))
-            .expect("DTO 必须可序列化");
-        let object = json.as_object().expect("DTO 是 JSON 对象");
-        for key in [
-            "id",
-            "name",
-            "kind",
-            "description",
-            "is_system",
-            "is_mutable",
-            "is_deletable",
-            "movie_count",
-            "created_at",
-            "updated_at",
-        ] {
-            assert!(object.contains_key(key), "缺少字段 {key}");
-        }
-        assert_eq!(
-            object.len(),
-            10,
-            "字段数必须是 10，多一个少一个都是契约变更"
-        );
-    }
-}
 
 // ---------------------------------------------------------------- 任务目录
 
@@ -1667,4 +1600,72 @@ pub struct ActivityBootstrapResource {
     pub unread_count: i64,
     pub active_task_runs: Vec<TaskRunResource>,
     pub task_runs: sm_core::pagination::Paginated<TaskRunResource>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sm_db::collections::{Playlist, PLAYLIST_KIND_CUSTOM, PLAYLIST_KIND_RECENTLY_PLAYED};
+
+    fn playlist(kind: &str) -> Playlist {
+        Playlist {
+            id: 3,
+            name: "我的列表".to_owned(),
+            description: "d".to_owned(),
+            owner_plugin_id: None,
+            plugin_key: None,
+            kind: kind.to_owned(),
+            created_at: NaiveDateTime::parse_from_str("2026-10-04 01:02:03", "%Y-%m-%d %H:%M:%S")
+                .ok(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn derived_flags_follow_upstream() {
+        let custom = PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM));
+        assert!(!custom.is_system);
+        assert!(custom.is_mutable);
+        assert!(custom.is_deletable);
+
+        let system = PlaylistResource::from(playlist(PLAYLIST_KIND_RECENTLY_PLAYED));
+        assert!(system.is_system);
+        assert!(!system.is_mutable);
+        assert!(!system.is_deletable);
+    }
+
+    #[test]
+    fn timestamp_uses_the_pydantic_shape() {
+        let resource = PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM));
+        assert_eq!(resource.created_at, "2026-10-04T01:02:03");
+        // 缺失时输出空串，而不是让序列化失败
+        assert_eq!(resource.updated_at, "");
+    }
+
+    #[test]
+    fn field_set_matches_the_upstream_dto() {
+        // 字段数量变化会直接改变响应体字节数 —— 用序列化结果钉住。
+        let json = serde_json::to_value(PlaylistResource::from(playlist(PLAYLIST_KIND_CUSTOM)))
+            .expect("DTO 必须可序列化");
+        let object = json.as_object().expect("DTO 是 JSON 对象");
+        for key in [
+            "id",
+            "name",
+            "kind",
+            "description",
+            "is_system",
+            "is_mutable",
+            "is_deletable",
+            "movie_count",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(object.contains_key(key), "缺少字段 {key}");
+        }
+        assert_eq!(
+            object.len(),
+            10,
+            "字段数必须是 10，多一个少一个都是契约变更"
+        );
+    }
 }
