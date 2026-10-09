@@ -169,10 +169,21 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     //    要由插件 ABI 那批补上（见 docs/handoff.md）。在那之前的表现是契约化的：
     //    `/media-libraries` 的写方法一律 503 `provider_not_installed`、providers 目录
     //    空表；`/download-clients` 三个写方法同样 503。
+    // 插件管理**必须**接上：它的 trait 已经有实现（`sm_plugins::admin`），
+    // 而 `AppState::plugin_admin()` 在没接时会报 500 `plugin_admin_unavailable`
+    // —— 那是「组合根漏了接线」的信号，不是「没装插件」。
+    //
+    // 它只持有 `ConfigService`：`plugins.root_dir` 与 `plugins.enabled` 每次
+    // 操作都从当前磁盘快照读，所以运维手工拷贝进来的插件目录也看得见。
+    let plugin_admin: std::sync::Arc<dyn sm_service::system::plugins::PluginAdmin> =
+        std::sync::Arc::new(sm_plugins::admin::PluginAdminService::new(
+            config_service.clone(),
+        ));
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
-        .with_storage_gateway(gateway);
+        .with_storage_gateway(gateway)
+        .with_plugin_admin(plugin_admin);
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。

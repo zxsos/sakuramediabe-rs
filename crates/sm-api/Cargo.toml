@@ -45,3 +45,11 @@ sqlx = { workspace = true }
 # 行 —— 只有真起一个回环 HTTP 服务才能覆盖到「候选怎么从 XML 长成资源」。
 # 同一个理由让 sm-service 用了它。
 wiremock = "0.6"
+# `/system/plugins` 的契约测试要挂**真实**的插件管理实现（它在 `sm-plugins`），
+# 而不是一个假实现：这样「配置里写了 `enabled`，列表就跟着变」这类跨层行为
+# 才在测试范围内。**只在 dev-dependencies** —— 生产依赖方向仍是
+# `sm-plugins → sm-service`，反向那条被刻意禁止（见 sm-plugins 的 Cargo.toml）。
+sm-plugins = { workspace = true }
+# `/system/plugins` 的上传测试要造**真的** zip：安装链路的入口就是它，
+# 用假字节走不到「解包 → 发布」那一段。zip 已在依赖树里（sm-plugins 在用）。
+zip = { workspace = true }

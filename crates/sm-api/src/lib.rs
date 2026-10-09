@@ -30,9 +30,10 @@
 //!   三个错误码已就位（见 [`error::ErrorResponse`] 的 `From<SignatureError>`），
 //!   但这条**旁路签名**要读 provider 的 `playback_deliveries`，属插件 ABI 那批，
 //!   仍未接。⚠️ `/files/*` 那条**已经接了**（见下），别一起列成缺失。
-//! - **multipart**：提取器已就绪（[`extract::Multipart`]），但还没有**运行时**
-//!   调用它的路由（`routes::plugins` 的 install/upgrade 签名用了它，handler
-//!   却仍是 `todo!()`）—— 上传插件 zip / 图片要等插件与 provider 资源。
+//! - **multipart**：✅ 已有**运行时**调用它的路由 —— `routes::plugins` 的
+//!   install / upgrade 两个上传端点。它们走的是 [`extract::receive_to_file`]
+//!   （流式落盘，100 MiB 插件包不能全缓冲），而不是 [`extract::Multipart`]
+//!   的 8 MiB 全缓冲路径；后者仍只服务图片那类小文件（图搜端点待接）。
 //!
 //! # 已闭合的坑（别再写成缺口）
 //!

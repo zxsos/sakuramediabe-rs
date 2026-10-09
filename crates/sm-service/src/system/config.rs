@@ -65,6 +65,9 @@ pub const UNKNOWN_CONFIG_FIELD: &str = "unknown_config_field";
 /// 值非法（含类型、范围、跨节不变式）的错误码。
 pub const INVALID_CONFIG_VALUE: &str = "invalid_config_value";
 
+/// 插件配置所在的节名。与 `sm_core::config_schema` 里那张表的节名必须一致。
+pub const PLUGINS_SECTION: &str = "plugins";
+
 /// `ConfigUpdateResource.restart_required` 的恒定值。
 ///
 /// 只有「api」与「aps」两个进程会读配置（上游是两个独立部署），所以恒为这两个。
@@ -238,6 +241,80 @@ impl ConfigService {
 
         self.persist(&merged)?;
         Ok(schema::public_json(&merged))
+    }
+
+    /// 读 `plugins` 整节。**含只读内容**（插件私有配置），与 [`Self::get`] 不同 ——
+    /// 后者会把 `plugins` 整节剔掉。
+    ///
+    /// 只有插件专用的那几个端点该调它。
+    pub fn plugins_section(&self) -> Result<Map<String, Value>, ServiceError> {
+        let snapshot = self.snapshot()?;
+        Ok(snapshot
+            .get(PLUGINS_SECTION)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// 改 `plugins` 节并落盘。**插件专用写入通道。**
+    ///
+    /// # 为什么它绕过 `reject_unknown_fields` 的只读拦截
+    ///
+    /// `plugins` 在通用配置 API 上是**只读键** —— `READONLY_KEYS` 的文档给了
+    /// 理由（含插件私有配置、可能带凭据、import 阶段读取）。那条规则挡的是
+    /// 「通用 PATCH 顺手改到它」，不是「它永远不能变」。
+    ///
+    /// 上游就是这个结构：`/system/plugins/*` 的端点直接调
+    /// `PluginManager.set_enabled` / `set_plugin_settings`，走专用通道，
+    /// 而通用 `/config` 照样拒绝 `plugins`。本函数是那条专用通道。
+    ///
+    /// # 校验只做 `plugins` 节内的
+    ///
+    /// 复用 `validate_strict`（它含上游 `Plugins` 的三个校验器：`enabled` 无重复、
+    /// 每项是合法插件 ID、`job_crons`/`settings` 的键是合法插件 ID），
+    /// 但**只取 `loc` 以 `plugins.` 开头的那几条**。
+    ///
+    /// 不这样做的话，一个**与插件无关**的历史配置问题（比如某个 cron 字段被
+    /// 手工改坏了）会让「停用一个插件」也跟着失败 —— 而那正是运维最想做的
+    /// 应急动作。
+    pub fn update_plugins_section(
+        &self,
+        mutate: impl FnOnce(&mut Map<String, Value>) -> Result<(), ServiceError>,
+    ) -> Result<Map<String, Value>, ServiceError> {
+        // 每次从磁盘快照起算：连续两次局部改动不能互相覆盖（与 `update` 同理）。
+        let mut merged = self.snapshot()?;
+
+        let mut plugins = merged
+            .get(PLUGINS_SECTION)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        mutate(&mut plugins)?;
+
+        {
+            let object = merged.as_object_mut().ok_or_else(|| {
+                ServiceError::from(ProgrammerError::new("配置快照不是对象 —— 配置文件被写坏了"))
+            })?;
+            object.insert(PLUGINS_SECTION.to_owned(), Value::Object(plugins.clone()));
+        }
+
+        let object = merged.as_object().ok_or_else(|| {
+            ServiceError::from(ProgrammerError::new("配置快照不是对象 —— 配置文件被写坏了"))
+        })?;
+        let errors: Vec<schema::FieldError> = schema::validate_strict(object)
+            .into_iter()
+            .filter(|error| error.loc.starts_with("plugins."))
+            .collect();
+        if !errors.is_empty() {
+            return Err(ServiceError::validation_with(
+                INVALID_CONFIG_VALUE,
+                "插件配置校验失败",
+                details_of_errors(&errors),
+            ));
+        }
+
+        self.persist(&merged)?;
+        Ok(plugins)
     }
 
     /// 原子写盘。

@@ -96,8 +96,19 @@ impl PluginConfig {
     }
 
     /// 插件可执行文件：`<root_dir>/<plugin_id>/<plugin_id>`。
+    ///
+    /// ⚠️ **Windows 上的编译产物带 `.exe`** —— 插件作者把它打进包，落点就是
+    /// `<plugin_id>/<plugin_id>.exe`。所以这里**探测实际存在的那个**，而不是
+    /// 硬拼无扩展名的路径：硬拼在 Linux 上没问题，在 Windows 上会让装好的
+    /// 插件一个都起不来，而报出来的错是「找不到可执行文件」—— 看起来像包的
+    /// 问题，其实是路径拼法的问题。
+    ///
+    /// 两个都不存在时回落约定路径，让 `launch` 报「找不到」而不是在这里
+    /// 假装找到了。
     pub fn program_for(&self, plugin_id: &str) -> PathBuf {
-        self.root_dir.join(plugin_id).join(plugin_id)
+        let dir = self.root_dir.join(plugin_id);
+        sm_plugins::installer::entry_point_of(&dir, plugin_id)
+            .unwrap_or_else(|| dir.join(plugin_id))
     }
 
     /// 插件数据目录：`<root_dir>/<plugin_id>/data`。宿主保证存在且重装时保留。
@@ -641,6 +652,38 @@ mod tests {
             config.data_dir_for("local"),
             Path::new("/srv/plugins/local/data")
         );
+    }
+
+    /// ★ Windows 上可执行文件带 `.exe`，`program_for` 必须认出来。
+    ///
+    /// 这条只有在**真的有一个 `<id>.exe` 文件**时才有意义 —— 纯路径断言测不出
+    /// 探测逻辑。而它抓的错很隐蔽：硬拼 `<root>/<id>/<id>` 在 Linux 上完全
+    /// 正确，在 Windows 上会让每个装好的插件都起不来，报「找不到可执行文件」。
+    #[test]
+    fn the_executable_may_carry_an_exe_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "sm-server-program-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let dir = root.join("local");
+        std::fs::create_dir_all(&dir).expect("建插件目录");
+        let exe = dir.join("local.exe");
+        std::fs::write(&exe, b"MZ").expect("写可执行文件");
+
+        let config = PluginConfig {
+            root_dir: root.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.program_for("local"),
+            exe,
+            "有 `<id>.exe` 时就该用它，而不是回落无扩展名的约定路径"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

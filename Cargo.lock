@@ -2670,6 +2670,7 @@ dependencies = [
  "serde_json",
  "sm-core",
  "sm-db",
+ "sm-plugins",
  "sm-service",
  "sqlx",
  "tokio",
@@ -2679,6 +2680,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
+ "zip",
 ]
 
 [[package]]
@@ -2736,14 +2738,18 @@ dependencies = [
 name = "sm-plugins"
 version = "0.1.0"
 dependencies = [
+ "hashing",
  "serde_json",
  "sm-core",
  "sm-db",
  "sm-plugin-api",
+ "sm-service",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -4171,6 +4177,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "typed-path",

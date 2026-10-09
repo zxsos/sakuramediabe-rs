@@ -28,6 +28,11 @@ pub mod indexer_settings;
 pub mod jobs;
 pub mod optional_services;
 pub mod plugin_removal;
+/// 插件管理的**契约层**（DTO + 宿主实现 trait）。
+///
+/// 实现在 `sm-plugins`、由组合根注入 —— 理由见模块文档（分层，以及
+/// `sm-service → sm-plugins` 会闭掉一条将来的环）。
+pub mod plugins;
 pub mod status;
 pub mod task_queue;
 pub mod telemetry;
@@ -46,6 +51,11 @@ pub use optional_services::{
     capabilities, capabilities_of, image_search_enabled, job_disabled_reason,
     movie_similarity_enabled, require_image_search, require_job_enabled, Capabilities,
     FeatureDisabled, FEATURE_DISABLED,
+};
+pub use plugins::{
+    plugin_admin_unavailable, PluginAdmin, PluginDetail, PluginInstallOutcome, PluginSummary,
+    PLUGIN_ADMIN_UNAVAILABLE, PLUGIN_INSTALL_FAILED, PLUGIN_NOT_FOUND, PLUGIN_TOO_LARGE,
+    PLUGIN_UPGRADE_FAILED, RESTART_API_AND_APS, RESTART_CONTAINER,
 };
 pub use task_queue::{
     ConflictPolicy, EnqueueOutcome, TaskQueueService, BOOTSTRAP_QUEUE_TASK_KEYS,

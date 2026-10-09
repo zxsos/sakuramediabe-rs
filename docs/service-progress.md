@@ -16,15 +16,15 @@
 |---|---|---|---|---|
 | `collections` | 5 | 1,292 | 0 | **完成** |
 | `videos` | 4 | 927 | 0 | **完成** |
-| `system` | 19 | 2,935 | 4 | 12 个 service 已落；剩 `telemetry`(2)、`plugin_removal`(2) |
-| `playback` | 19 | 3,741 | 16 | **能做的已做完**，剩 5 个文件卡 provider / PyAV / zip |
-| `catalog` | 27 | 7,556 | 33 | 演员子域 + 影片订阅 / 列表 / 黑名单 / 合集态 + 两个 ownership gateway（在 `sm-db`）已落；剩 9 个文件 |
-| `transfers` | 23 | 4,248 | 27 | 契约层 + 台账 + 入队 + 失败项读取 + 导入提醒已落；剩 10 个文件**几乎全卡插件 ABI** |
-| `discovery` | 16 | 4,485 | 3 | ⚠️ 下面「框架 12/16 铺完、方法体待实现」的说法**已过时** —— 后续多轮落了方法体，现在只剩 3 处 |
-| **合计** | **113** | **25,184** | **83** | 另：`sm-api` 路由层 63 处 `todo!()` |
+| `system` | 19 | 2,935 | 2 | 17 个 service 已落；剩 `plugin_removal`(2)（`telemetry` 已照上游重写为匿名心跳） |
+| `playback` | 19 | 3,741 | 5 | **能做的已做完**，剩 5 个文件卡 provider / PyAV(→`svc-probe`) / zip / image store |
+| `catalog` | 27 | 7,556 | 6 | 演员子域 + 影片订阅 / 列表 / 黑名单 / 合集态 + 两个 ownership gateway（在 `sm-db`）+ `catalog_import` + 元数据入库第一段已落；剩 3 个文件（`movie_metadata_refresh` 3 处、`movie_metadata_search` 2 处、`catalog_import` 1 处） |
+| `transfers` | 23 | 4,248 | 16 | 契约层 + 台账 + 入队 + 失败项读取 + 导入提醒已落；剩 8 个文件**几乎全卡插件 ABI** |
+| `discovery` | 16 | 4,485 | 3 | `moment_recommendation`(2) + `image_search_space`(1) |
+| **合计** | **113** | **25,184** | **32** | 另：`sm-api` 路由层 **42** 处 `todo!()` |
 
 **端点：两个数一起报才不误导** —— 方法级 175/177 已**注册**（路径级 136/136），
-但其中 **63 条的 handler 仍是 `todo!()`**。所以「99% 完成」是假的：
+但其中 **42 条的 handler 仍是 `todo!()`**。所以「99% 完成」是假的：
 注册只说明路由表里有这一条。
 
 行数口径与 `crates/sm-service/src/lib.rs` 的表格一致。推进次序沿用那里的
@@ -293,6 +293,26 @@ provider registry 不存在。
 只落数据库那一半会得到一个**没有调用方的**服务 —— `remove()` 的第一步就是
 `_provider_keys`。所以整体记为阻塞，等阶段 8。
 
+**2026-10-07 更新（前提变了，结论没变）**：上面「`sm-plugins` 仍是一行注释」
+**已经过时** —— 宿主现在是完整的（拉起 / 注册校验 / 看门狗 / 扩展点）。
+本轮又落了**插件管理**（上游 `src/plugins/manager.py`，不属于 `src/service/`
+所以不在本文件的汇总口径里）的下面这几块：
+
+| 上游 | Rust | 状态 |
+|---|---|---|
+| `PluginInstaller.unpack`（安全解压 + sha256） | `sm_plugins::installer::unpack` | ✅ `0c0ef57` |
+| `PluginManager._publish_staging_locked` | `sm_plugins::installer::publish` | ✅ 本轮（4 测试） |
+| `PluginManager.list_plugins` 的目录扫描那一半 | `sm_plugins::inventory` | ✅ 本轮（8 测试） |
+| `list_plugins` / `get_plugin` / `set_enabled` 的编排 | `sm_plugins::admin::PluginAdminService` | ✅ 本轮（11 测试） |
+| 三个端点的 HTTP 层 | `sm-api/routes/plugins.rs` | ✅ 本轮（8 个 HTTP 契约测试） |
+| `install_zip` / `upgrade_zip` / `settings` | —— | ⏳ 目录层已就位，只差接线 |
+
+**但 `plugin_removal` 依然阻塞**，卡点换了一个位置：`_provider_keys` 现在不缺
+「加载插件」的能力（宿主有了），缺的是**扩展点 → provider key 的映射**（
+`MEDIA_PROVIDER_EXTENSION_KEY`）—— 那要 provider 注册表那批。另外
+`PluginRemovalService::remove()` 的第一步「停插件进程」也需要一条
+「supervisor → 服务层」的通道（与 `load_status` 的缺口是同一件事）。
+
 `PluginInUseError` 的 details 形状值得先记下来，将来照抄：
 `{plugin_id, provider_keys, library_ids, media_count, download_client_count}`，
 message 是「插件仍被 N 个媒体库引用（M 个媒体、K 个下载客户端），无法删除；
@@ -349,6 +369,10 @@ serde 对「键不存在」用 `default` 给 `None`，对「键存在但为 null
 存在性，不存在的 id 先撞 404。要测「重复」必须用**真实存在**的 id。
 
 ## `telemetry` —— 待做，且有一个需要拍板的问题
+
+> ⚠️ **本节下方「本批没有实现它」已过时**：`2aaed44` 已照上游把它重写成**匿名心跳**。
+> 剩下的拍板点是「默认开还是关」（上游是 opt-out，即默认就往外发），
+> 见 `handoff.md` §7.5 第 1 条。
 
 | 项 | 状态 |
 |---|---|
@@ -509,7 +533,7 @@ Peewee 的 `where(*conditions)` 默认处理），Rust 侧用 `and_all` 显式�
 「词之间 AND」是这条规则里**最容易被漏掉的一半**，漏了它多词搜索会变成
 「任一词命中」，结果集大得多且看不出原因。
 
-### 剩下 16 个文件
+### 剩下 16 个文件（⚠️ 下表是**清单**，不是剩余量：实际只剩 **5 处** `todo!()`）
 
 | 文件 | 行数 | 备注 |
 |---|---|---|

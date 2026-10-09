@@ -5,20 +5,20 @@
 ## 一、当前状态
 
 > **数字以 `docs/progress-baseline.md` 为准** —— 跑 `pwsh -File scripts/progress.ps1 -Diff`
-> 核对，漂移即失败。下表同步到 **2026-10-07**（HEAD `6020a8e`）。
+> 核对，漂移即失败。下表同步到 **2026-10-07 晚**（HEAD `7933f56`）。
 
 | 项 | 值 |
 |---|---|
 | 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
 | 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
-| 端点方法体 | **实测 `todo!()` 共 75 个**：`sm-service` **33** + `sm-api` **42**。`sm-db` / `sm-scheduler` / `sm-core` **各 0 个** |
-| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **42 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
+| 端点方法体 | **实测 `todo!()` 共 71 个**：`sm-service` **32** + `sm-api` **39**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
+| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **39 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
 | 完成的域 | `collections`、`videos`（2/7） |
 | 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 6/21** |
 | 门禁 | `verify.ps1 -Tier full` **全绿**（fmt / doc / clippy / 单测 / 真库集成 / 对拍 / **契约两仓同步** / 进度基线，共 12 项） |
 | 提交 | 推送状态以 `git status -sb` 为准（`cnb` 从未推过） |
 
-**下一步看 §七「交接快照（2026-10-07）」与 §八「接下来做什么」** —— 前者是剩余 75 条的
+**下一步看 §七「交接快照（2026-10-07）」与 §八「接下来做什么」** —— 前者是剩余 71 条的
 **卡点表**与待拍板项，后者是可立即开工的**执行清单**。§一之二以下的数字是**历史计划**，
 别照它开工。**部署形态与瘦身目标见 [`deployment.md`](deployment.md)。**
 
@@ -1683,24 +1683,24 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
   真调用要 DB 与图片目录。该函数落地后**必须换成真实调用**，
   否则这条用例会一直「绿着但什么都没验」。同类占位用例在做 parity 时一并排查。
 
-## 七、交接快照（2026-10-07，HEAD `6020a8e`）
+## 七、交接快照（2026-10-07，HEAD `7933f56`）
 
 **开工前先做两件事**：`pwsh -File scripts/progress.ps1 -Diff`（应回 `OK`）与
 `cargo clippy --workspace --all-targets -- -D warnings`（应 exit 0）。
-工作区干净、门禁绿、`todo!()` **75** 个（口径见 `docs/progress-baseline.md`）。
+工作区干净、门禁绿、`todo!()` **71** 个（口径见 `docs/progress-baseline.md`）。
 
 ### 7.1 这一批刚落地的（最近 8 个提交）
 
 | 提交 | 内容 |
 |---|---|
+| `7933f56` | **feat(plugins)：`/system/plugins` 的列表 / 详情 / 启停三条落地**（74 → 71），并新增 `PluginAdmin` 契约层 + `installer::publish` + `inventory` |
+| `0c0ef57` | feat(plugins)：插件包安装的核心机制（`manifest` 解析 + 安全解压） |
+| `6a3d7d5` | docs(readme)：测试数与进度表对齐实测 |
+| `aeff054` | **feat(catalog)：`import_by_number` 落地** —— 入库路径第一段通了（窄接口补两支 + `DeliverySource` 枚举） |
 | `6020a8e` | **feat(abi)：`ABI_MAJOR` → 2 + 契约两仓同步门禁**（`parity/check_contract_sync.py` 接进 verify） |
 | `a15a09b` | docs(tasks)：proto P1 缺口提案（纠正「三个待决策」的认知，指出契约分叉是 P0） |
 | `7f08e3f` | docs(deployment)：部署形态与瘦身路线 + handoff §八 执行清单 |
 | `8e0c11c` | docs(handoff)：交接快照更新到 2026-10-07 晚（75 个 `todo!()`） |
-| `2655f4d` | **feat：每日推荐生成侧**（`generate_latest_snapshot` + 四个 IO 装载器 + handler 注册） |
-| `c801441` | feat：接 `/daily-recommendations` **读侧**（完整卡片 + 8 个推荐字段，76 → 75） |
-| `b587480` | test：修掉测试此前从未执行而残留的 6 处断言/夹具错误 |
-| `4746a7b` | parity(compare_schema)：登记 `DownloadTaskFilter` 豁免 |
 
 ⚠️ 推送状态以 `git status -sb` 为准（`cnb` 从头到尾没推过；`origin` 推不推由你定）。
 
@@ -1716,20 +1716,43 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
    只有 DB-only 路径（列表 / PATCH / DELETE）可用。**别**把它当 bug「修」成 200 ——
    要真能用，得照上游实现注册表（属插件 ABI 那批）。
 
-### 7.3 剩余 75 条的**卡点表**（按卡点而非按文件归类）
+### 7.2b 插件管理这批的四个决定（照做，别回退）
+
+1. **`PluginAdmin` 走 trait 注入，不把 `sm-plugins` 加进 `sm-service` 的依赖。**
+   契约（DTO + trait）在 `sm_service::system::plugins`，实现在
+   `sm_plugins::admin::PluginAdminService`，组合根 `sm-server` 注入
+   `AppState::with_plugin_admin` —— 与 `storage` / `downloads` / `media_libraries`
+   同一套。理由写在 `crates/sm-service/Cargo.toml` 那条「刻意不依赖」的注释上：
+   反向依赖会闭掉一条**将来**的环（插件任务接 cron 触发时要
+   `sm-plugins → sm-scheduler → sm-service`）。**方向只能是 `sm-plugins → sm-service`。**
+2. **没注入时 500 `plugin_admin_unavailable`，绝不返回空列表。** 「组合根漏了接线」
+   与「一台插件都没装」都会让插件页面空着，但前者是故障。这条有测试钉住
+   （`tests/plugins_http.rs::without_injection_...`）。
+3. **`installer::publish` 的三步顺序不能换**：丢包里的 `data/` → **先把旧
+   `data/` 搬进暂存** → 再删旧目录、rename 就位。第 2、3 步换过来的话，
+   `remove_dir_all(target)` 已经把用户数据删了，表现为「升级一次插件就失忆」，
+   **不报错**。
+4. **`load_status` 目前只有「清单坏掉」这一种来源**（上游还有「import 阶段加载
+   失败」与「依赖装不上」两种，来自 `PLUGIN_LOAD_ERRORS`）。缺口记在
+   `sm_plugins::admin` 的模块文档里 —— 补它需要一条「supervisor 运行时状态 →
+   管理接口」的通道。**别把它当已完成**：插件页现在不会显示「进程没起来」。
+
+### 7.3 剩余 71 条的**卡点表**（按卡点而非按文件归类）
 
 > 总数与分域计数以 `docs/progress-baseline.md` 为准（那份由脚本生成）；下表按
 > **卡点**归类，只用来判断「下一步该动哪一块」。
 
-**路由 40 条：**
+**路由 39 条：**
 
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
-| **插件 ABI / provider 无实现** | `plugins.rs` 8、`media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、插件 zip 上传、下载器注册表 |
+| **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、下载器注册表 |
 | **`MovieService` 方法不存在** | `movies.rs` 9 | `get_movie_detail` / `get_movie_reviews` / `set_subscription` / `unsubscribe_movie` / `get_merged_playback` 在服务层**根本没有** |
 | **Qdrant / 嵌入探测客户端缺失** | `image_search.rs` 7、`status.rs` 2 | 上游会 probe 嵌入服务与 Qdrant（`status_service.py:410-443`） |
+| **插件管理的剩余 5 条** | `plugins.rs` 5 | 安装 / 升级 / 卸载 / 两个 settings。**目录层已就位**（`installer::publish` / `inventory` / `manifest`），settings 要先定「Rust 插件怎么声明设置项」 |
 | 待核 | `actors.rs` 1 | 还没查卡点 |
 | ~~service IO 编排缺失~~ | ~~`recommendations.rs` 3~~ | ✅ **已解决**：读侧 `c801441` + 生成侧 `2655f4d` |
+| ~~插件 zip 上传~~ | ~~`plugins.rs` 3~~ | ✅ **列表 / 详情 / 启停已落地**（本轮） |
 
 **服务层 35 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 / `import_task` 3 /
 其余各 1：`auto_download` / `download_common` / `download_request` / `download_task` /
@@ -1817,7 +1840,7 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 |---|---|---|---|
 | ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ⚠️ **本仓侧已做完**（`6020a8e`）：9 个文件同步进契约仓（**本地提交**）+ 两仓 `ABI_MAJOR` = 2 + tag `v0.2.0`（**本地未推**）+ 门禁 `parity/check_contract_sync.py`（已接进 verify，人为漂移验证过会红）。**剩下三步：推契约仓 → 两个插件改 tag → `plugin-ref-local` 补 `done` 帧** |
 | ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有两个 | 二进制 `<plugin_id>` 能被宿主拉起；扩展点被 `collect_extensions` 收下；`run_job` 有实现（不返回 `unimplemented`） |
-| ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | `FetchMovie` 的产物能真落库（图片进 `image`、影片字段走 ownership gateway），有一条端到端真库测试 |
+| ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | ⚠️ **第一段已通**（`aeff054`）：`import_by_number` + 窄接口补 `find_movie_id` / `import_plugin_movie` + 4 单测 + 3 个真库测试。**剩 `impl MovieMetadataImporter`** —— 卡在接口冲突（那个 trait 的方法签名**没有 config**，而 `fetch` / `fetch_plugin` 要看 `plugins.enabled` 的顺序），两条走法待拍板 |
 | ④ | **P1-2 决策**：`PlaybackPlan` 加 `local_path` delivery | 同域反证：`OpenCoverSourceResponse` 早有 `oneof { local_path, url }`，唯独播放计划没有。**必须在阶段 ⑤ 之前定**，否则 `local_provider` 要先按 `file://` 写一遍再改 | `PlaybackPlan.oneof delivery` 有 `LocalPathPlan local_path = 3`；`docs/plugin-abi.md` 写明三种 delivery 的适用场景 |
 | ⑤ | **`svc-probe`（ffprobe）** | 解锁 4 个文件（`media_metadata_probe` 338 / `media_video_info_backfill` 232 / `thumbnails/artifacts` 204 / `video_cover`）。上游对 PyAV 缺失是**降级**，所以它不阻塞「能用」但阻塞「完整」 | 上述文件的 `todo!()` 清零；媒体时长/分辨率被真写入 |
 | ⑥ | **`local_provider` 的 Rust 版**（172KB，**分水岭**） | 做完同时发生三件事：本地库+播放闭环、**`libtorrent` 整条可扔**（`deployment.md` §3.1：三处用法全是「种子 → info hash」，`svc-hash` 已覆盖）、宿主第一次承载真干活的 provider | `Browse` / `PlanPlayback` / `GenerateThumbnails` / `ScanImportSource` 四大能力可用；`playback` 域能接上 |

@@ -16,6 +16,8 @@
 //! 直接变成响应（400 + 纯文本），而上游的 `RequestValidationError` 是
 //! 422 信封。
 
+use std::path::Path;
+
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::{
     Form as AxumForm, FromRequest, Json as AxumJson, Multipart as AxumMultipart,
@@ -25,6 +27,8 @@ use axum::http::StatusCode;
 // 重复 query 参数的解析器（`serde_html_form`）—— 只 [`HtmlFormQuery`] 用。
 use axum_extra::extract::Query as AxumExtraQuery;
 use serde::de::DeserializeOwned;
+// 流式落盘（`receive_to_file`）：100 MiB 的插件包不能全缓冲进内存。
+use tokio::io::AsyncWriteExt;
 
 use crate::error::ErrorResponse;
 
@@ -263,6 +267,168 @@ fn details_of_pair(
     map.insert(key_a.to_owned(), serde_json::Value::from(value_a));
     map.insert(key_b.to_owned(), serde_json::Value::from(value_b));
     map
+}
+
+/// 单个**非文件**字段的长度上限（64 KiB）。
+///
+/// 上游没有这一条（FastAPI 把文本字段读进内存，不设限）。这里加上是因为
+/// 本模块的流式路径整体要靠 [`receive_to_file`] 的 `max_bytes` 兜底，
+/// 而「一个 500 MB 的普通表单字段」在流式路径里没有别的闸门。64 KiB 足够
+/// 装下任何真实字段（`sha256` / `enable` 都只有几个字节）。
+pub const MAX_TEXT_FIELD_BYTES: usize = 64 * 1024;
+
+/// [`receive_to_file`] 收到的多部分表单。
+#[derive(Debug, Clone, Default)]
+pub struct ReceivedForm {
+    /// **第一个**文件字段。`None` = 请求里一个文件字段都没有。
+    ///
+    /// 出现第二个及以后的文件字段时它们被**丢弃**（仍计入总量上限）——
+    /// 上游 `File(...)` 是单值，多传不是它支持的用法；这里选「第一个生效」
+    /// 而不是报错，是为了不与「客户端把 zip 又塞了一遍」这种无害的失误较劲。
+    pub file: Option<ReceivedFile>,
+    /// 普通文本字段（字段名 → 值）。同名字段后者覆盖前者。
+    pub fields: std::collections::BTreeMap<String, String>,
+}
+
+/// [`ReceivedForm`] 里的那个文件字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedFile {
+    pub field: String,
+    pub file_name: Option<String>,
+    pub content_type: Option<String>,
+    /// 实际写进文件的字节数。
+    pub bytes_written: u64,
+}
+
+/// 把 multipart 请求体**流式**写进 `dest`，返回文本字段。
+///
+/// # 为什么不能复用 [`Multipart::next_file`]
+///
+/// `next_file` 把字段累积到 `Vec<u8>`。对 8 MiB 的封面图那是合适的（内存里
+/// 有它反而更好用），而插件包的上限是 **100 MiB** —— 全缓冲意味着一次上传
+/// 就占掉一台 16 GB 机器内存的 1/160，几台并发乘上去。上游是把 body
+/// `copyfileobj` 到临时文件再交给安装器，这里照做。
+///
+/// # 总量上限是**整个请求**的，不只是文件
+///
+/// 文件字节 + 文本字段字节一起计入 `max_bytes`。只有文件计入的话，
+/// 「一个巨大的普通表单字段」就成了绕过闸门的路 —— 而流式路径里它会被
+/// `field.text()` 整个读进内存。
+///
+/// # `too_large_code` 是参数而不是常量
+///
+/// 通用提取器超限用 `http_error`；插件端点要回上游自己的 `plugin_too_large`。
+/// 两者状态码相同（413）而 `code` 不同，客户端按 `code` 分支 —— 所以由调用方
+/// 决定，不在这里二选一。
+///
+/// # 写盘失败 → 500
+///
+/// 磁盘满 / 权限不足是**服务端**问题，不是上传者的错（上游同样落到 500）。
+pub async fn receive_to_file(
+    multipart: &mut Multipart,
+    dest: &Path,
+    max_bytes: u64,
+    too_large_code: &str,
+) -> Result<ReceivedForm, ErrorResponse> {
+    let mut form = ReceivedForm::default();
+    let mut sink: Option<tokio::fs::File> = None;
+    // 已经读进来的**总**字节数（文件 + 文本）。
+    let mut total: u64 = 0;
+
+    while let Some(mut field) = multipart
+        .inner
+        .next_field()
+        .await
+        .map_err(ErrorResponse::from)?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        let is_file = field.file_name().is_some();
+        let keep = is_file && form.file.is_none();
+
+        if keep {
+            sink = Some(tokio::fs::File::create(dest).await.map_err(write_failure)?);
+            form.file = Some(ReceivedFile {
+                field: name.clone(),
+                file_name: field.file_name().map(str::to_owned),
+                content_type: field.content_type().map(str::to_owned),
+                bytes_written: 0,
+            });
+        }
+
+        let mut text: Vec<u8> = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(ErrorResponse::from)? {
+            total += chunk.len() as u64;
+            if total > max_bytes {
+                return Err(too_large(too_large_code, max_bytes, total));
+            }
+            if keep {
+                if let Some(file) = sink.as_mut() {
+                    file.write_all(&chunk).await.map_err(write_failure)?;
+                }
+            } else if !is_file {
+                text.extend_from_slice(&chunk);
+                if text.len() > MAX_TEXT_FIELD_BYTES {
+                    return Err(ErrorResponse::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "validation_error",
+                        "Request validation failed",
+                    )
+                    .with_details(details_of_pair(
+                        "field",
+                        &name,
+                        "max_bytes",
+                        MAX_TEXT_FIELD_BYTES as i64,
+                    )));
+                }
+            }
+        }
+
+        if !is_file {
+            // 字段值未必是 UTF-8（客户端可以发二进制），坏字节按替换字符处理
+            // 而不是 422：这个字段的内容由调用方去解析，报错的位置不该在这里。
+            form.fields
+                .insert(name, String::from_utf8_lossy(&text).into_owned());
+        }
+    }
+
+    if let Some(file) = sink.as_mut() {
+        file.flush().await.map_err(write_failure)?;
+    }
+    if let Some(found) = form.file.as_mut() {
+        found.bytes_written = total;
+    }
+    Ok(form)
+}
+
+/// 413：超出上传上限。
+fn too_large(code: &str, max_bytes: u64, received: u64) -> ErrorResponse {
+    let mut details = serde_json::Map::new();
+    details.insert("max_bytes".to_owned(), serde_json::Value::from(max_bytes));
+    details.insert(
+        "received_bytes".to_owned(),
+        serde_json::Value::from(received),
+    );
+    ErrorResponse::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        code,
+        format!("上传体超过大小上限 {max_bytes} 字节"),
+    )
+    .with_details(details)
+}
+
+/// 写临时文件失败 → 500（服务端问题）。
+fn write_failure(error: std::io::Error) -> ErrorResponse {
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "detail".to_owned(),
+        serde_json::Value::from(error.to_string()),
+    );
+    ErrorResponse::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        "写入临时文件失败",
+    )
+    .with_details(details)
 }
 
 impl<S> FromRequest<S> for Multipart

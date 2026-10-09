@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use sm_db::Db;
 use sm_service::discovery::ranking::RankingSourceCatalog;
+use sm_service::error::ServiceError;
 use sm_service::playback::media_library::{MediaLibraryRegistry, MediaLibraryService};
 use sm_service::playback::provider_helpers::StorageGateway;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
+use sm_service::system::plugins::PluginAdmin;
 use sm_service::system::JobCatalog;
 use sm_service::transfers::download_client::DownloadClientService;
 
@@ -72,6 +74,18 @@ pub struct AppState {
     /// 与 `downloads` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 写方法报
     /// 503 `provider_not_installed`、provider 目录返回空表（不是「假装配置合法」）。
     media_libraries: Option<Arc<dyn MediaLibraryRegistry>>,
+    /// 插件**管理**（列表 / 详情 / 启停 / 安装 / 卸载）。
+    ///
+    /// 与 `storage` / `downloads` / `media_libraries` 同一套理由：实现要碰
+    /// 插件目录与配置，只有组合根看得见 `sm-plugins`。
+    ///
+    /// # 与上面三个的一处差别：`None` 不是「功能不可用」
+    ///
+    /// 那三个是**能力**（没装 provider 插件 = 真的没有这个能力），而这个是
+    /// **管理通道**：它永远应该可用，`None` 只意味着组合根漏了接线。
+    /// 所以读它的地方用 [`AppState::plugin_admin`]，它会把 `None` 报成 500
+    /// 而不是让插件页面空着。
+    plugins: Option<Arc<dyn PluginAdmin>>,
 }
 
 impl AppState {
@@ -87,7 +101,27 @@ impl AppState {
             storage: None,
             downloads: None,
             media_libraries: None,
+            plugins: None,
         }
+    }
+
+    /// 挂上插件管理。**只有组合根会调** —— 只有它看得见 `sm-plugins`。
+    pub fn with_plugin_admin(mut self, admin: Arc<dyn PluginAdmin>) -> Self {
+        self.plugins = Some(admin);
+        self
+    }
+
+    /// 插件管理。
+    ///
+    /// # 没注入时**报错**，不返回空列表
+    ///
+    /// 返回空列表会让「组合根忘了接线」与「真的一台插件都没装」长得一模一样，
+    /// 而后者是正常的、前者是故障。区分它们只需要一个明确的错误码
+    /// （`plugin_admin_unavailable`）。
+    pub fn plugin_admin(&self) -> Result<&dyn PluginAdmin, ServiceError> {
+        self.plugins
+            .as_deref()
+            .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
     }
 
     /// 挂上任务目录。只有组合根会调 —— 它才知道有哪些插件任务。

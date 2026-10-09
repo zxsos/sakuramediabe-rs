@@ -148,15 +148,28 @@ sha1 = "0.10"
 # XML（Torznab 搜索响应）。替代上游的 xmltodict。
 quick-xml = "0.42"
 
-# ZIP 容器（影片图片包 `assets.zip` / 缩略图包 `thumbnails.zip`）。
+# ZIP 容器。**两类用法，对压缩特性的要求相反**：
 #
-# `default-features = false` 是**硬要求**：默认特性会把 bzip2 / deflate /
-# aes-crypto / zstd 一整套压缩与加密实现拖进来，而本仓只用 **STORED**（只打包
-# 不压缩）—— 图片（webp/jpg）本身已是压缩格式，deflate 几乎不省空间却要花
-# CPU，而这里的场景是局域网内传输，CPU 比空间贵。
+# 1. **写**影片图片包 `assets.zip` / 缩略图包 `thumbnails.zip` —— 只用 **STORED**
+#    （只打包不压缩）：图片（webp/jpg）本身已是压缩格式，deflate 几乎不省空间
+#    却要花 CPU，而这里的场景是局域网内传输，CPU 比空间贵。
+# 2. **读**插件包（`sm-plugins::installer`）—— 那是**第三方打的 zip**，
+#    绝大多数用 deflate。没有这个特性时读它会报「不支持的压缩方式」，
+#    而插件作者不会为此改用 STORED。
 #
-# 读包同样不需要任何压缩特性：STORED 的条目就是原始字节。
-zip = { version = "8", default-features = false }
+# 所以 `default-features = false` 仍然是**硬要求**（默认特性会把 bzip2 /
+# aes-crypto / deflate64 / lzma / zstd 一整套拖进来，其中 bzip2 是 C 绑定），
+# 但**必须显式开一个 deflate 实现**，否则读压缩包会报「不支持的压缩方式」。
+#
+# 选 `deflate-flate2-zlib-rs` 而不是 `deflate`：后者 = `deflate-zopfli` +
+# `deflate-flate2-zlib-rs`，而 **zopfli 是压缩器**（写包时换更小的体积），
+# 本仓只读别人的包，白拖一个依赖。
+#
+# 也**不能**只用 `deflate-flate2`：它只 `dep:flate2` 而不给 flate2 任何后端
+# （zip 的 `flate2` 依赖带 `default-features = false`），于是 flate2 缺
+# `crc32fast` 直接编译失败。`-zlib-rs` 这一支把后端补上，且 `zlib-rs` 是
+# 纯 Rust 实现（不是 C 的 zlib）。
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # 系统信息（替代 psutil）：遥测心跳的 CPU 型号与内存总量。
 #

@@ -7,6 +7,14 @@ description = "插件宿主：进程管理、gRPC 客户端、能力注册表"
 [dependencies]
 sm-core = { workspace = true }
 sm-plugin-api = { workspace = true }
+# 上传暂存槽位的文件名（上游 `_upload_temp_path` 用 `uuid.uuid4().hex`）。
+# 并发上传必须互不撞名，而「进程 id + 纳秒」在容器里重启后可能重复。
+uuid = { workspace = true }
+# 插件管理（`admin`）要实现 `sm_service::system::plugins::PluginAdmin` 并读写配置，
+# 所以需要服务层。**方向是 `sm-plugins → sm-service`** —— 反过来的那一条
+# （`sm-service → sm-plugins`）被刻意禁止，理由是它会闭掉一条将来的环
+# （见 `crates/sm-service/Cargo.toml` 里那条注释）。
+sm-service = { workspace = true }
 sm-db = { workspace = true }
 # ⚠️ 这里曾经依赖 `sm-scheduler`（只为把插件任务转成 `JobSpec`）。那条边会把
 # `sm-service` 卷进依赖环（`sm-plugins → sm-scheduler → sm-service → sm-plugins`），
@@ -17,6 +25,13 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# 插件包是**第三方打的 zip**（绝大多数用 deflate）。见根 Cargo.toml 那条
+# `zip` 的说明：本仓自己只写 STORED，但读别人打的包必须能解 deflate。
+zip = { workspace = true }
+# `installer` 要算 sha256 校验下载来的包（上游 `compute_sha256`）。
+# **用本仓自实现的 `hashing`，不引 `sha2`** —— 那个 crate 存在的意义就是
+# 「SHA-1 / SHA-256 / Base32 全部自实现、零第三方依赖」。
+hashing = { workspace = true }
 
 
 [dev-dependencies]
