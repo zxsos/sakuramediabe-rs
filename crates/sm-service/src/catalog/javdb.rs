@@ -608,7 +608,7 @@ impl JavdbProvider {
     ///    会重复出现，重复项进 SSE 就是两次下载、两次入库。
     ///
     /// `q` 在最前、其余按 `ACTOR_SEARCH_PARAMS` 声明序 —— 与上游字典序一致
-    /// （理由见 [`Self::api_url`]）。
+    /// （理由见 `api_url` 方法）。
     pub async fn search_actor_resources(
         &self,
         actor_name: &str,

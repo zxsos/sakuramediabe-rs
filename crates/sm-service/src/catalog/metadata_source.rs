@@ -266,7 +266,7 @@ impl MetadataSourceService {
     /// `fetch` 是「JavDB → **首个**命中的插件」的单结果语义（服务于
     /// `import_by_number`）；搜索要**遍历**所有启用的插件收集候选与错误
     /// （`movie_metadata_search_service.py:80-111`）。所以 JavDB 这一支给搜索
-    /// 一个直通，插件侧由调用方逐个走 [`Self::fetch_plugin`]（按 plugin_id
+    /// 一个直通，插件侧由调用方逐个走 `fetch_plugin`（按 plugin_id
     /// 定位，本来就是逐个的）。
     pub async fn search_javdb_by_number(
         &self,

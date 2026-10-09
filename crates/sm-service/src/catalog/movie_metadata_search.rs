@@ -136,7 +136,7 @@ impl MovieMetadataSearchService {
     /// [`MetadataSourceService::fetch`](crate::catalog::metadata_source::MetadataSourceService::fetch)：
     /// 那是「JavDB → 首个命中的插件」的**单结果**语义（服务于
     /// `import_by_number`），搜索要**遍历所有**启用的插件 —— 所以这里是
-    /// `search_javdb_by_number` 直通 + 逐个 [`Self::fetch_plugin`]。
+    /// `search_javdb_by_number` 直通 + 逐个 `fetch_plugin`。
     pub async fn search_by_number(
         &self,
         movie_number: &str,
@@ -302,7 +302,7 @@ impl MovieMetadataSearchService {
     /// 就会出现「重试放行、取详情拒绝」这种半截状态 —— 所以只有这一个实现，
     /// 调用方不必自己拼 `enabled_plugin_sources` 的闭包。
     ///
-    /// [`Self::resolve_candidate_reference`]: 纯解码那一段仍可按需单独调用
+    /// [resolve_candidate_reference]: 纯解码那一段仍可按需单独调用
     /// （它不碰配置与注册表，可脱离插件栈测）。
     pub fn resolve_candidate(
         &self,

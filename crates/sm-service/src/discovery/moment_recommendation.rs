@@ -140,9 +140,9 @@ pub struct MomentSeed {
     /// 种子缩略图的图片相对路径（未签名），`_read_seed_image_bytes` 用。
     ///
     /// 上游 `_MomentSeed.thumbnail.image.origin` —— 一条 JOIN 当时就带出来了。
-    /// Rust 侧种子投影里没有这一列，[`MomentRecommendationService::load_seeds`]
+    /// Rust 侧种子投影里没有这一列，`load_seeds`
     /// 用一次 `by_ids` 批量补上。`None` = 补查时缩略图已不在库里（并发删除
-    /// 窗口），这种种子在 [`MomentRecommendationService::infer_seed_vector`]
+    /// 窗口），这种种子在 `infer_seed_vector`
     /// 里直接跳过。
     pub image_origin: Option<String>,
 }
