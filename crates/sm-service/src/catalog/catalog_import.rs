@@ -659,11 +659,21 @@ impl CatalogImport for CatalogImportService {
         movie_number: &str,
         detail: &serde_json::Value,
     ) -> Result<(i32, bool), ServiceError> {
-        // 番号**从 `detail` 取**（具体服务那支就是这么做的，上游也一样）——
-        // 这个参数存在只是为了让窄接口对「元数据是一份原文」这件事不敏感。
-        let _ = movie_number;
+        // 插件可能不返回 movie_number（如 JavDB 搜索），此时用传入的番号补上
+        let mut detail = detail.clone();
+        if text_of(&detail, "movie_number")
+            .map(|t| t.trim().is_empty())
+            .unwrap_or(true)
+        {
+            if let Some(obj) = detail.as_object_mut() {
+                obj.insert(
+                    "movie_number".to_owned(),
+                    serde_json::Value::String(movie_number.to_owned()),
+                );
+            }
+        }
         // `Self::` 前缀解析到**固有方法**，不是要递归调 trait 方法。
-        let result = Self::import_movie_if_missing(self, detail, false).await?;
+        let result = Self::import_movie_if_missing(self, &detail, false).await?;
         Ok((result.movie_id, result.created))
     }
 
