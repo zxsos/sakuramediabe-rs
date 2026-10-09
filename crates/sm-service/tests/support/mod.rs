@@ -165,6 +165,11 @@ impl StorageGateway for NoopGateway {
     ) -> Pin<Box<dyn Future<Output = Result<String, ProviderFailure>> + Send + '_>> {
         unimplemented!("NoopGateway 不对账")
     }
+
+    fn merged_playback_format(&self, _provider_key: &str) -> Option<String> {
+        // 默认当「没声明」—— 需要非 None 的套件自己包一层。
+        None
+    }
 }
 
 /// 带桩网关的媒体服务。删除类用例用它构造。

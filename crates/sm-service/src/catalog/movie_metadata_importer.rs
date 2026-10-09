@@ -117,16 +117,11 @@ impl MovieMetadataImporter for CatalogMovieMetadataImporter {
         force_subscribed: bool,
     ) -> Pin<Box<dyn Future<Output = Result<bool, ServiceError>> + Send + 'a>> {
         Box::pin(async move {
-            let config = self.config.snapshot()?;
             // ★ 分支在**取详情之前**定，且用与 `fetch_candidate` **同一个**判据
-            // （`plugins.enabled` 的当前值）—— 两处不一致会出现「重试放行、
-            // 取详情拒绝」这种半截状态。**不**从闭包第二个参数是不是 `Null`
-            // 反推来源（见 `fetch_candidate` 的文档）。
-            let enabled = self.source.enabled_plugin_sources(&config);
-            let reference = MovieMetadataSearchService::resolve_candidate_reference(
-                candidate_id,
-                |plugin_id| enabled.iter().any(|source| source.plugin_id == plugin_id),
-            )?;
+            // —— 那个判据只在一个地方（`MovieMetadataSearchService::resolve_candidate`），
+            // 这里与失败项重试/人工搜索三处共用。**不**从闭包第二个参数是不是
+            // `Null` 反推来源（见 `fetch_candidate` 的文档）。
+            let reference = self.search.resolve_candidate(candidate_id)?;
             // 闭包返回 `Result` 而不是直接返回值：两个导入方法都会失败，而
             // `fetch_candidate` 的闭包是**不可失败**的形状 —— 失败沿它外层那个
             // `Result` 出去，与「取详情失败」同一条路。

@@ -691,6 +691,24 @@ impl MediaRepository {
         }
     }
 
+    /// 一部影片的**全量**媒体，按 id 升序（不分页）。
+    ///
+    /// 合并播放的分组（`_merge_playback_groups`）要看到**整库的分段集合**：
+    /// 「这个库有 3 段、都有效」是分组判据，而分页查询会在页边界把同一组
+    /// 分段切开 —— 3 段的库在第 2 页只剩 1 段，就被误判成「不够合并」。
+    /// 所以此处刻意绕过分页宏。
+    pub async fn list_all_by_movie_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Vec<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE movie_number = $1 ORDER BY id")
+                .bind(movie_number)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     /// 这批番号里**有本地媒体**的那些（一次查询，去重）。
     ///
     /// 批量退订用它判定「有媒体就不许退订」——一次聚合查询换掉逐条的

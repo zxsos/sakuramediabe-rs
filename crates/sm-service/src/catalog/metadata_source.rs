@@ -594,6 +594,25 @@ impl MetadataSourceService {
         .await?
     }
 
+    /// 搜演员（**JavDB 那一支**，插件来源不提供演员搜索）。
+    ///
+    /// # 与 `match_actors` 的关系
+    ///
+    /// 上游把「搜演员」写进了 provider（`build_javdb_provider().search_actors`），
+    /// 而服务层两处要用它：`match_actors`（搜完就入库，返回条数）与演员 SSE
+    /// 流（要逐条发进度帧）。把 provider 取出这一步收在这里，两条路径才共用
+    /// 同一份「没配 provider → NotFound」的语义。
+    pub async fn search_actors(
+        &self,
+        keyword: &str,
+    ) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
+        self.provider
+            .as_ref()
+            .ok_or(MetadataSourceError::NotFound)?
+            .search_actors(keyword)
+            .await
+    }
+
     /// 搜演员并逐个入库。返回入库的演员数。
     ///
     /// 上游 `match_actors` 只搜 JavDB（插件来源不提供演员搜索）。
@@ -604,12 +623,8 @@ impl MetadataSourceService {
         // 所以必须是 `Send + Sync` 才不把调用方的 future 拖成不 Send）。
         import_service: &(dyn crate::catalog::catalog_import::CatalogImport + Send + Sync),
     ) -> Result<usize, MetadataSourceError> {
-        let provider = self
-            .provider
-            .as_ref()
-            .ok_or(MetadataSourceError::NotFound)?;
         let mut imported = 0_usize;
-        for resource in provider.search_actors(keyword).await? {
+        for resource in self.search_actors(keyword).await? {
             import_service
                 .upsert_actor(&resource)
                 .await

@@ -134,7 +134,7 @@ upsert / search / alias 切换，接口面小且稳定，用 `reqwest` 足够。
 | `parity/compare_schema.py` 的 `RUST_ROOT` 硬编码 Windows 路径 → 工作区相对路径回退 | `parity/compare_schema.py:43-57` |
 | `tokio-cron-scheduler` → **`cron` + 自研 tick**（ADR §2/§3.1 的决策此前只写在文档里） | `Cargo.toml`、`crates/sm-scheduler/` |
 | axum 开 `multipart` feature；新增 `extract::Multipart`（强制 8 MiB 上限） | `crates/sm-api/src/extract.rs` |
-| SSE 传输骨架 + **10 个**事件名常量（此前文档写「13 事件」，实为 `completed` 的 yield 次数） | `crates/sm-api/src/sse.rs` |
+| SSE 传输骨架 + **13 个**事件名常量（2026-10-09 更正：此前写「10 个」，那是演员流未移植时的漏数） | `crates/sm-api/src/sse.rs` |
 | 慢请求日志中间件（`SAKURAMEDIA_SLOW_LOG` 白名单 + `SAKURAMEDIA_SLOW_REQUEST_MS`） | `crates/sm-api/src/middleware/slow_log.rs` |
 | 405 走错误信封 + 逐路由回归测试（此前每条 `MethodRouter` 已挂 fallback，缺的是测试） | `crates/sm-api/src/routes.rs`、`tests/method_not_allowed_http.rs` |
 | 组合根 `sm-server`：配置 / 池 / 日志 / 路由 / 调度器 / SIGTERM 优雅关闭 | `crates/sm-server/` |

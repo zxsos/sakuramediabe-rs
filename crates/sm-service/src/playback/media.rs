@@ -176,6 +176,20 @@ pub struct MediaListItemResource {
     pub created_at: Option<String>,
 }
 
+/// 一个「可合并播放」的库分组（上游 `_merge_playback_groups` 的元素）。
+///
+/// `media_ids` 按 id 升序 —— 顺序就是合并流的**时间轴**，签名与播放端都
+/// 按这个顺序算，中途不得重排。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergedPlaybackGroup {
+    pub library_id: i32,
+    pub library_name: String,
+    pub provider_key: String,
+    pub media_ids: Vec<i32>,
+    /// provider 声明的合并产物格式（`mp4` / `hls`）。
+    pub playback_format: String,
+}
+
 /// 多版本影片（同一番号有多个媒体）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MultiVersionMovieResource {
@@ -516,6 +530,93 @@ impl MediaService {
             )
             .await
             .map_err(|failure| Self::map_merged_failure(&failure))
+    }
+
+    /// 合并播放分组。上游 `_merge_playback_groups`（`movie_service.py`）。
+    ///
+    /// 影片的媒体**按库分组**（组按 `library_id` 升序），只留「可合并」的组：
+    ///
+    /// | 过滤条件 | 落选的后果 |
+    /// |---|---|
+    /// | 分段数 **≥ 2** | 一段不构成合并（播放端同样有这条下限）|
+    /// | 全部 `valid` | 上游注释明写「任一段失效时不能悄悄跳过它」—— 缺段的总长是错的，比不能播更糟 |
+    /// | provider 声明了 `merged_playback_format ∈ {mp4, hls}` | 没声明的 provider 不支持合并 |
+    ///
+    /// # 与上游的一处结构差异
+    ///
+    /// 上游在这里**内联**做声明检查（`MEDIA_PROVIDER_REGISTRY.require(...)`）；
+    /// 本仓的声明在 `sm-plugins` 注册表里，`sm-service` 依赖不到 —— 走
+    /// [`StorageGateway::merged_playback_format`] 这条缝（同步读活注册表）。
+    ///
+    /// # 全量取行，不分页
+    ///
+    /// 分页会在页边界把同一组分段切开（3 段的库在第 2 页只剩 1 段就被
+    /// 误判「不够合并」），所以走 [`MediaRepository::list_all_by_movie_number`]。
+    pub async fn merged_playback_groups(
+        &self,
+        movie_number: &str,
+    ) -> Result<Vec<MergedPlaybackGroup>, ServiceError> {
+        // 影片在不在与「有没有可合并的库」是**两个** 404/422：
+        // 前者 404 `movie_not_found`（上游 `_require_movie`），后者 422
+        // `merged_playback_unavailable`（路由层在分组为空时给）。
+        MovieRepository::new(self.pool.clone())
+            .find_by_number(movie_number)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found_with(
+                    "movie_not_found",
+                    "影片不存在",
+                    details_of("movie_number", movie_number),
+                )
+            })?;
+
+        let medias = self.media.list_all_by_movie_number(movie_number).await?;
+        let mut groups: Vec<MergedPlaybackGroup> = Vec::new();
+        // 行按 id 升序回来，按库首次出现的顺序聚合；组键排序在最后做
+        // （BTreeMap 天然按 library_id 升序，与上游 `sorted(groups)` 一致）。
+        let mut by_library: std::collections::BTreeMap<i32, Vec<&sm_db::Media>> =
+            std::collections::BTreeMap::new();
+        for media in &medias {
+            by_library.entry(media.library_id).or_default().push(media);
+        }
+
+        for (library_id, segments) in by_library {
+            if segments.len() < 2 {
+                continue;
+            }
+            if segments.iter().any(|media| !media.valid) {
+                continue;
+            }
+            let library = sm_db::repo::MediaLibraryRepository::new(self.pool.clone())
+                .find_by_id(library_id)
+                .await?
+                // 分组键来自 media.library_id 外键，理论上必然在；真缺了
+                // （手工改库）这组跳过 —— 一个坏库不该让整个端点 500。
+                .ok_or_else(|| {
+                    ServiceError::not_found(
+                        "media_library_not_found",
+                        "Media library not found",
+                        "library_id",
+                        library_id,
+                    )
+                })?;
+            let Some(format) = self
+                .gateway
+                .as_deref()
+                .and_then(|gateway| gateway.merged_playback_format(&library.provider_key))
+                .filter(|format| format == "mp4" || format == "hls")
+            else {
+                continue;
+            };
+            groups.push(MergedPlaybackGroup {
+                library_id,
+                library_name: library.name,
+                provider_key: library.provider_key,
+                media_ids: segments.iter().map(|media| media.id).collect(),
+                playback_format: format,
+            });
+        }
+        Ok(groups)
     }
 
     /// 播放投递失败的映射。

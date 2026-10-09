@@ -60,6 +60,29 @@ pub fn plugin_admin_unavailable() -> ServiceError {
     )
 }
 
+/// 媒体提供方未安装的错误码。上游 `ApiError(503, "provider_not_installed", …)`
+/// （`playback/media_library_service.py:63`、`catalog/movie_service.py:639` 等十几处）。
+///
+/// 与 [`PLUGIN_ADMIN_UNAVAILABLE`] **不共用**：那个说的是「组合根漏接线」（500，
+/// 重试无用），这个说的是「这个能力现在没有」（503，稍后可能就有）。
+pub const PROVIDER_NOT_INSTALLED: &str = "provider_not_installed";
+
+/// 依赖插件平台的能力**当前不可用**（503）。
+///
+/// # 哪些槽位该用它
+///
+/// `AppState` 里那些「平台起来了才有」的能力槽位 —— `metadata_search` /
+/// `metadata_refresh` / `actor_javdb_stream` / provider 注册表。它们为 `None`
+/// 的正常原因就是**插件平台没启动**（组合根只在平台起来后才装配它们），
+/// 而这不是接线漏了：同一个二进制在装了插件的机器上就是好的。
+///
+/// ★ 2026-10-09 之前这几处复用 [`plugin_admin_unavailable`]（**500**），
+/// 而它们的文档全都写着 503 —— 文档描述的是意图，代码是顺手复用的。
+/// 客户端对 500 的反应是「报障」，对 503 是「稍后重试」，所以这个差别是真的。
+pub fn provider_not_installed() -> ServiceError {
+    ServiceError::from_status(503, PROVIDER_NOT_INSTALLED, "媒体提供方未安装")
+}
+
 /// 插件的**概要**。上游 `PluginSummaryResource`（`schema/system/plugins.py`）。
 ///
 /// # 字段名就是响应体的键

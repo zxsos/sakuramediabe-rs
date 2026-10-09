@@ -44,6 +44,10 @@
 //! `search` 给失败项找候选元数据（供人工挑选），`retry` 带上挑选结果重新入队。
 //! `search` 返回的是 [`ImportMetadataSearchResponse`]，`retry` 收的是
 //! [`ImportFailedItemRetryRequest`] —— **两者不是同一个结构**，别复用。
+//!
+//! `retry` 已接线（202）；`search` 未接（它要插件 ABI 的调用面，见
+//! `ImportTaskService::search_failed_item`）。⚠️ 于是 `retry` 的**输入端**
+//! 目前没有对应的搜索端点：客户端只能回填它自己缓存的 `candidate_id`。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -151,11 +155,20 @@ async fn search_import_failed_item(
 }
 
 /// `POST /imports/{task_run_id}/failed-items/{item_id}/retry` —— **202**。
+///
+/// 服务层要一个**元数据搜索服务**（校验候选格式 + 那个插件现在还启用吗）。
+/// 用 [`AppState::metadata_search`] 取 —— 与上面 `.../search` 同一个来源，
+/// 所以「搜索放行的候选」与「重试放行的候选」判据一致。平台没起时它是
+/// `None` → 503：这条端点确实依赖插件栈（**JavDB 那支也要它** —— 它带着
+/// 已注册插件来源的名单，不是「插件没起就一定能用」）。
 async fn retry_import_failed_item(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path((_task_run_id, _item_id)): Path<(i32, String)>,
-    EnvelopeJson(_payload): EnvelopeJson<ImportFailedItemRetryRequest>,
+    State(state): State<AppState>,
+    Path((task_run_id, item_id)): Path<(i32, String)>,
+    EnvelopeJson(payload): EnvelopeJson<ImportFailedItemRetryRequest>,
 ) -> Result<(StatusCode, Json<ImportAcceptedResponse>), ErrorResponse> {
-    todo!("骨架：接失败项重试（202；mode=retry_failed_file）")
+    let accepted = ImportTaskService::new(state.db())
+        .enqueue_failed_item_retry(state.metadata_search()?, task_run_id, &item_id, &payload)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }

@@ -105,6 +105,12 @@ pub type MomentSeedRow = (i32, i32, i32, i32, i32, i32);
 /// 8. `movie_is_collection`
 pub type MediaThumbnailRow = (i32, i32, i32, i32, String, i32, i32, bool);
 
+/// 缩略图 → 图片的两列投影：**`(thumbnail_id, image_id, image_origin)`**。
+///
+/// 只为 [`MediaThumbnailRepository::images_by_ids`] 而存在（理由见那里）。
+/// 第 3 位是相对路径、**未签名** —— 签名要密钥，在 API 层做。
+pub type ThumbnailImageRow = (i32, i32, String);
+
 /// 热门候选投影（源 C）。对应上游 `:362-367`。
 ///
 /// 位置是 **`(movie_id, heat)`**，取自 `movie` 的两列 —— 不是整表镜像，
@@ -268,6 +274,49 @@ impl MediaThumbnailRepository {
             .await
             .map_err(|error| {
                 DbError::business(THUMBNAIL_ENTITY, format!("取缩略图失败：{error}"))
+            })?;
+        Ok(rows)
+    }
+
+    /// 缩略图 → **它引用的图片**（`GET /moment-recommendations` 用）。
+    ///
+    /// 位置依次是 **`(thumbnail_id, image_id, image_origin)`**。
+    ///
+    /// # 为什么不能复用 [`Self::by_ids`]
+    ///
+    /// `by_ids` 的投影里有 `image_origin` 却**没有 `image_id`** —— 选图（源
+    /// A/B/C）只关心图片路径，而时刻推荐端点的线格式里 `image` 是一个
+    /// `ImageResource`（`{id, origin}`），id 从 `image_origin` 里补不出来。
+    ///
+    /// 不改 `MediaThumbnailRow`：那是**八个位置**的元组（前四个同为 `i32`，
+    /// 位置写错是静默的），为一条新端点的额外一列去挪全部消费方（
+    /// `pick_closest` 等）不划算。取舍同 [`MomentSeedRow`]。
+    ///
+    /// `WHERE med.valid = true` 与 `by_ids` 一致（同一份上游 `_thumbnail_query`）：
+    /// 失效媒体上的缩略图不该出现在任何对外结果里。
+    pub async fn images_by_ids(
+        &self,
+        thumbnail_ids: &[i32],
+    ) -> Result<Vec<ThumbnailImageRow>, DbError> {
+        if thumbnail_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = r#"
+            SELECT mt.id     AS thumbnail_id,
+                   i.id      AS image_id,
+                   i.origin  AS image_origin
+            FROM media_thumbnail mt
+            JOIN image i ON i.id = mt.image_id
+            JOIN media med ON med.id = mt.media_id
+            WHERE mt.id = ANY($1)
+              AND med.valid = true
+        "#;
+        let rows = sqlx::query_as::<_, ThumbnailImageRow>(sql)
+            .bind(thumbnail_ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| {
+                DbError::business(THUMBNAIL_ENTITY, format!("取缩略图图片失败：{error}"))
             })?;
         Ok(rows)
     }

@@ -40,9 +40,11 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use sm_db::repo::discovery::{CandidateRow, HistoryActorRow, HotActressReleaseRepository};
+use sm_db::Db;
 
+use crate::catalog::actor::{ActorService, ActorView};
+use crate::catalog::movie::{MovieCard, MovieService};
 use crate::error::ServiceError;
 
 /// 女性性别值。对应上游 `FEMALE_GENDER = 1`。
@@ -82,36 +84,40 @@ pub struct ScoredMovie {
     pub score: f64,
 }
 
-/// 单条结果。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 单条结果的**服务形态**：影片卡片 + 胜出的女优 + 两个打分数。
+///
+/// # 这替换了骨架期那三个带 `serde` 的结构
+///
+/// 骨架期把线格式（`movie_id` / `title` / `hot_actress.profile_image: i64`）
+/// 直接定义在服务层，理由是「卡片 DTO 在 API 层，要签名」。方向对，落点错了：
+/// `MovieCard` / `ActorView` **本来就是服务层类型**（`catalog::movie` /
+/// `catalog::actor`），签名在 API 层做。所以这里持有它们，路由照着
+/// `daily_recommendation` 的同一套转线格式。
+#[derive(Debug, Clone)]
 pub struct HotActressReleaseItem {
-    pub movie_id: i64,
-    pub title: Option<String>,
-    pub release_date: Option<String>,
-    /// 胜出的那位女优。
-    pub hot_actress: HotActressResource,
-}
-
-/// 女优信息。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HotActressResource {
-    pub id: i64,
-    pub name: String,
-    pub display_name: Option<String>,
-    pub profile_image: Option<i64>,
-    /// 历史作品数（**已扣掉影片自己**）。
+    /// 影片卡片（[`MovieService::load_cards`] 的产物）。
+    pub card: MovieCard,
+    /// 胜出的那位女优。生效头像（覆盖优先）在 `image_id` / `image_origin` 上。
+    pub actress: ActorView,
+    /// 该女优的历史作品数，**已扣掉影片自己**（见
+    /// [`HotActressReleaseService::score_movies`]）。
     pub historical_movie_count: i64,
-    /// 上游 `round(score, 4)`。
-    pub hotness_score: f64,
+    /// 原始分。写到线格式时 `round(.., 4)`（上游在服务层就 round 了；本仓
+    /// 把格式化统一留在 DTO 层，与 `daily_recommendation` 一致）。
+    pub score: f64,
 }
 
 /// 分页结果。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// ⚠️ `items.len()` 可以**小于** `page_size`（也小于 `total` 与剩余条数）：
+/// 黑名单影片与缺失女优在装配时被跳过且**不补位**（上游 `:191-195` 的
+/// `continue`）。
+#[derive(Debug, Clone)]
 pub struct HotActressReleasePage {
     pub items: Vec<HotActressReleaseItem>,
     pub page: i64,
     pub page_size: i64,
-    /// **候选影片总数**（不是本页条数）。
+    /// **候选影片总数**（打分后的长度），不是本页条数、也不是数据库行数。
     pub total: i64,
 }
 /// 四个窗口边界。
@@ -146,10 +152,15 @@ impl HotActressReleaseService {
 
     /// 归一化发行日。
     ///
-    /// 仓储层已经把列读成 `NaiveDate`（`CAST` 掉时分秒），所以这里**原样返回**。
+    /// 仓储层已经把列读成 `NaiveDate`（两条查询都 `CAST(m.release_date AS date)`，
+    /// 见 `repo::discovery::HistoryActorRow` 的说明），所以这里**原样返回**。
     /// 上游 `_release_date`（`:119-121`）要处理 `date | datetime` 两种类型，
     /// 那是 Python 的动态类型问题 —— **Rust 侧在读取时就定型了**，所以这个
     /// 函数只剩文档价值。
+    ///
+    /// ⚠️ 那句「在读取时就定型了」曾是**空话**：两条查询当时既没 CAST、列又是
+    /// `timestamp`，于是解码阶段就报 `DATE vs TIMESTAMP`。保持这句成立的是
+    /// SQL 里的 CAST，不是这个函数。
     ///
     /// **不要**在这里做时区转换：库里存的是日期不是时刻，转时区会让「同一天」
     /// 变成「不同天」。
@@ -264,25 +275,98 @@ impl HotActressReleaseService {
 /// `effective_profile_image` 优先取 override。**照抄时要保留「override 优先」
 /// 的语义** —— 只取 `profile_image` 会让用户设的头像不生效。
 ///
-/// 而 `MovieListItemResource` 这个卡片 DTO 在本仓库的形状还没定（`dto.rs`
-/// 里现有的影片资源是否含全部字段未核实），所以**不猜字段**。
-pub trait PageContext {
-    /// 取影片卡片。返回 `None` 表示该影片不存在或被过滤掉 —— 上游会
-    /// **跳过**这种行（`:194-195`），不是返回空对象。
-    fn movie_card(&self, movie_id: i64) -> Option<serde_json::Value>;
-    /// 取女优资料。`None` 同样导致跳过。
-    fn actress(&self, actor_id: i64) -> Option<serde_json::Value>;
-}
-
-/// 取数 + 排序 + 分页。
+/// ★ 骨架期那个 `PageContext` trait 已删除：它让 API 层注入「按 id 取一个
+/// `serde_json::Value`」，形状无处校验（字段名写错不会编译失败）。这里改成
+/// **服务层取真类型**（`MovieCard` / `ActorView`），签名留在 API 层 ——
+/// 与 `moment_recommendation` / `daily_recommendation` 同一取向。
+///
+/// 「黑名单影片」这条要特别说清：上游 `with_movie_card_relations` 会**过滤**
+/// `is_blacklisted`，而本仓的 [`MovieService::load_cards`] 走
+/// `MovieRepository::find_by_ids`（`SELECT * FROM movie WHERE id = ANY($1)`，
+/// **不带黑名单过滤**）。所以黑名单影片的**过滤在本模块做**
+/// （见 [`HotActressReleaseQuery::list_items`]）—— 不能指望卡片那层。
 pub struct HotActressReleaseQuery {
+    db: Db,
     repo: HotActressReleaseRepository,
 }
 
 impl HotActressReleaseQuery {
-    /// 构造。
-    pub fn new(repo: HotActressReleaseRepository) -> Self {
-        Self { repo }
+    /// 构造。取 `&Db`（要顺便建卡片与女优两个服务）。
+    pub fn new(db: &Db) -> Self {
+        Self {
+            db: db.clone(),
+            repo: HotActressReleaseRepository::new(db.clone()),
+        }
+    }
+
+    /// 读快照并装配成一页。上游 `list_items`（`:218-238`）。
+    ///
+    /// # 顺序：**先切片，再取数**
+    ///
+    /// 上游 `:234` 是 `_page_resources(scored_movies[start:start+page_size])` ——
+    /// 取卡片与女优只针对**本页**的 id。反过来（先全量取再切）在候选上千时
+    /// 会白取几百部影片。
+    ///
+    /// # `total` 与 `items.len()` 会不一致
+    ///
+    /// `total = 打分后的候选总数`；而本页里被跳过（黑名单影片 / 女优已删）
+    /// 的条目不补位 —— 所以 `items.len() <= page_size`，且
+    /// `items.len() <= total - offset`。
+    pub async fn list_items(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<HotActressReleasePage, ServiceError> {
+        Self::validate_page(page, page_size)?;
+        let today = Self::today();
+        let scored = self.scored(today).await?;
+        let total = scored.len() as i64;
+
+        let offset = ((page - 1) * page_size).max(0) as usize;
+        let window: Vec<ScoredMovie> = scored
+            .into_iter()
+            .skip(offset)
+            .take(page_size.max(0) as usize)
+            .collect();
+
+        // 两批取数（卡片 / 女优）都只针对本页，且都是 `HashMap` 按 id 对齐 ——
+        // 不按下标，因为仓储的返回顺序不保证。
+        let movie_ids: Vec<i32> = window.iter().map(|item| item.movie_id as i32).collect();
+        let mut cards: HashMap<i32, MovieCard> = MovieService::new(&self.db)
+            .load_cards(&movie_ids)
+            .await?
+            .into_iter()
+            .map(|card| (card.movie.id, card))
+            .collect();
+        let actor_ids: Vec<i32> = window.iter().map(|item| item.actor_id as i32).collect();
+        let mut actresses = ActorService::new(&self.db).views_of(&actor_ids).await?;
+
+        let items = window
+            .into_iter()
+            .filter_map(|item| {
+                let card = cards.remove(&(item.movie_id as i32))?;
+                // 黑名单影片不进结果（上游卡片查询就把它滤掉了）。**在取出
+                // 卡片之后判**：`find_by_ids` 不过滤黑名单，这里漏判就会把
+                // 拉黑的影片摆进「热播女优新作」。
+                if card.movie.is_blacklisted {
+                    return None;
+                }
+                let actress = actresses.remove(&(item.actor_id as i32))?;
+                Some(HotActressReleaseItem {
+                    card,
+                    actress,
+                    historical_movie_count: item.historical_movie_count,
+                    score: item.score,
+                })
+            })
+            .collect();
+
+        Ok(HotActressReleasePage {
+            items,
+            page,
+            page_size,
+            total,
+        })
     }
 
     /// 完整流程：取历史证据 + 候选 → 打分排序 → 切片。

@@ -46,6 +46,9 @@ use crate::catalog::metadata_source::{
 pub const API_PATH_SEARCH: &str = "/api/v2/search";
 /// 影片详情（上游 `API_PATH_MOVIE_DETAIL`）。
 pub const API_PATH_MOVIE_DETAIL: &str = "/api/v4/movies/{javdb_id}";
+/// 影片评论（上游 `API_PATH_MOVIE_REVIEWS`）。**不需要登录** —— 上游
+/// `get_movie_reviews_by_javdb_id` 直接 `request_json`，不碰 `_ensure_logged_in`。
+pub const API_PATH_MOVIE_REVIEWS: &str = "/api/v1/movies/{javdb_id}/reviews";
 /// 有码 / 无码 / FC2 榜单（上游 `API_PATH_RANKINGS`）。
 pub const API_PATH_RANKINGS: &str = "/api/v1/rankings";
 /// 播放榜（上游 `API_PATH_RANKINGS_PLAYBACK`）。
@@ -62,6 +65,15 @@ pub const API_PATH_MOVIES_TAGS: &str = "/api/v1/movies/tags";
 const SERIES_SEARCH_PARAMS: [(&str, &str); 2] = [("from_recent", "false"), ("type", "series")];
 /// 系列影片列表的固定参数（上游 `API_PARAMS_SERIES_MOVIES`）。
 const SERIES_MOVIES_PARAMS: [(&str, &str); 2] = [("sort_by", "release"), ("order_by", "desc")];
+
+/// 演员搜索的固定参数（上游 `API_PARAMS_ACTOR_SEARCH`，**不含 page/limit** ——
+/// 与系列搜索同一处理：上游常量里的 `page: 1` 会被显式值覆盖，不产生重复键）。
+///
+/// ⚠️ `limit: 24` **不是**「随便取 24 个」：它决定「同名演员里能不能一次看全」。
+/// JavDB 侧同名卡片（不同 id）很常见，调小它会让用户少看到几条候选。
+const ACTOR_SEARCH_PARAMS: [(&str, &str); 2] = [("from_recent", "false"), ("type", "actor")];
+/// 演员搜索每页条数（上游 `API_PARAMS_ACTOR_SEARCH["limit"]`）。
+const ACTOR_SEARCH_LIMIT: i64 = 24;
 
 /// 搜索的固定查询参数（上游 `API_PARAMS_MOVIE_SEARCH`）。
 ///
@@ -197,6 +209,304 @@ impl JavdbAccount {
     }
 }
 
+/// 评论里嵌的影片摘要（上游 `JavdbReviewMovie`，字段逐个对齐）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct JavdbReviewMovie {
+    /// 上游 `str(movie.get("id") or "")` —— JavDB 的影片 id 在这里当**字符串**用。
+    pub id: String,
+    pub number: String,
+    pub title: String,
+    pub origin_title: Option<String>,
+    pub score: Option<f64>,
+    pub thumb_url: Option<String>,
+    pub release_date: Option<String>,
+}
+
+/// 一条影片评论（上游 `JavdbMovieReview`）。
+///
+/// # 序列化面与 pydantic 一致
+///
+/// 所有字段**恒出现**（缺省值 `0` / 空串 / `null`）—— pydantic 的
+/// `model_validate` + 默认序列化就是这个形状，客户端按这些键读，少一个键
+/// 都可能让它把「没有点赞数」误判成「响应坏了」。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct JavdbMovieReview {
+    pub id: i64,
+    pub score: i64,
+    pub content: String,
+    /// 上游 `parse_external_datetime` 的产物（pydantic 序列化成 ISO8601 或
+    /// `null`）。解析失败的**原文丢弃** —— 上游同样返回 `None`，静默丢掉
+    /// 一个坏时间戳比让整条评论消失温和得多。
+    pub created_at: Option<String>,
+    pub username: String,
+    pub like_count: i64,
+    pub watch_count: i64,
+    pub movie: Option<JavdbReviewMovie>,
+}
+
+/// JavDB 演员卡片（上游 `JavdbMovieActor`，`metadata/_providers/models.py:48-54`）。
+///
+/// 键名与上游逐字一致 —— 它会被序列化成 `Value` 交给
+/// [`CatalogImportService::upsert_actor_from_javdb_resource`]（那里按同一组
+/// 键读），所以改名要同时看两边。
+///
+/// [`CatalogImportService::upsert_actor_from_javdb_resource`]: super::catalog_import::CatalogImportService::upsert_actor_from_javdb_resource
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct JavdbMovieActor {
+    pub javdb_id: String,
+    pub javdb_type: i64,
+    pub name: String,
+    /// 候选名集合（`name` + `name_zht` + `other_name` 拆分去重，见
+    /// [`collect_actor_candidate_names`]）。上游 `alias_names` 默认空列表。
+    pub alias_names: Vec<String>,
+    pub avatar_url: Option<String>,
+    /// 本地枚举：未知 `0` / 女性 `1` / 男性 `2`（见 [`map_actor_gender`]）。
+    pub gender: i64,
+}
+
+/// JavDB 性别值 → 本地枚举（上游 `_map_actor_gender`，`javdb.py:949-967`）。
+///
+/// # ★ 两套枚举是**反的**，不是同一套
+///
+/// | JavDB 原始 | 本仓 |
+/// |---|---|
+/// | `0` | 女性 `1` |
+/// | `1` | 男性 `2` |
+/// | 其它 / `None` | 未知 `0` |
+///
+/// 上游先认字符串（`female` / `女` → 女性，`male` / `男` → 男性），再认
+/// `"0"` / `"1"` 两个数字串，**其余字符串一律未知**（`"2"` 也是未知 —— 别按
+/// 「数字就是本地枚举」想当然）。照抄这个顺序，否则男性会被写成女性。
+pub fn map_actor_gender(raw: Option<&Value>) -> i64 {
+    let Some(raw) = raw else {
+        return 0;
+    };
+    let numeric = match raw {
+        Value::String(text) => {
+            let normalized = text.trim().to_lowercase();
+            match normalized.as_str() {
+                "female" | "女" => return 1,
+                "male" | "男" => return 2,
+                "0" | "1" => normalized.parse::<i64>().unwrap_or(0),
+                // 认不出的字符串（含 "2"、"unknown"）→ 未知。
+                _ => return 0,
+            }
+        }
+        other => other.as_i64().unwrap_or(0),
+    };
+    match numeric {
+        0 => 1,
+        1 => 2,
+        _ => 0,
+    }
+}
+
+/// 演员的候选名集合（上游 `_collect_actor_candidate_names`，`javdb.py:968-995`）。
+///
+/// 顺序：`name` → `name_zht` → `other_name` 按 `,` 拆。去重按
+/// `casefold`（Rust 的 `to_lowercase` 是它的近似 —— 两者对土耳其语 `İ`、
+/// 德语 `ß` 这类边界的处理不同，而那些字符在演员名里不会出现），**保留首次
+/// 出现的原形**（不是小写形）。
+pub fn collect_actor_candidate_names(actor: &Value) -> Vec<String> {
+    let mut candidate_names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push = |candidate: &str, candidate_names: &mut Vec<String>| {
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            return;
+        }
+        if !seen.insert(candidate.to_lowercase()) {
+            return;
+        }
+        candidate_names.push(candidate.to_owned());
+    };
+
+    for key in ["name", "name_zht"] {
+        push(
+            actor.get(key).and_then(Value::as_str).unwrap_or(""),
+            &mut candidate_names,
+        );
+    }
+    let other_name = actor
+        .get("other_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    for candidate in other_name.split(',') {
+        push(candidate, &mut candidate_names);
+    }
+    candidate_names
+}
+
+/// 一条搜索候选 → 演员卡片。`id` 缺失或为空 → `None`（上游同样跳过）。
+pub fn actor_from_search_entry(actor: &Value) -> Option<JavdbMovieActor> {
+    let javdb_id = actor
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_owned();
+    Some(JavdbMovieActor {
+        javdb_id,
+        javdb_type: actor.get("type").and_then(Value::as_i64).unwrap_or(0),
+        name: actor
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        alias_names: collect_actor_candidate_names(actor),
+        avatar_url: normalize_image_url(actor.get("avatar_url").and_then(Value::as_str)),
+        gender: map_actor_gender(actor.get("gender")),
+    })
+}
+
+/// 搜索载荷 → 演员卡片（纯函数，**去重在这里**）。
+///
+/// 上游同一段（`javdb.py:349-369`）：逐条 `model_validate`、按 `id` 去重、
+/// 缺 `id` 的跳过。抽成纯函数是为了让「重复卡片只出一条」「缺 id 的条目不算
+/// 候选」这两条能在不起 HTTP 的情况下断言。
+pub fn actors_from_search_payload(payload: &Value) -> Vec<JavdbMovieActor> {
+    let entries = payload
+        .get("data")
+        .and_then(|data| data.get("actors"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut resources: Vec<JavdbMovieActor> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &entries {
+        let Some(actor) = actor_from_search_entry(entry) else {
+            continue;
+        };
+        if !seen_ids.insert(actor.javdb_id.clone()) {
+            continue;
+        }
+        resources.push(actor);
+    }
+    resources
+}
+
+/// 外部时间戳 → ISO8601 字符串。上游 `parse_external_datetime` 的对位物：
+/// RFC3339（含尾随 `Z`）之外还认 `YYYY-MM-DD HH:MM:SS` 与纯日期两种
+/// 「JavDB 自己的格式」，后者按 UTC 补时区。认不出返回 `None`。
+fn parse_external_datetime(value: &serde_json::Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // RFC3339（chrono 的解析器原生吃 `Z` 后缀）。
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(parsed.to_rfc3339());
+    }
+    use chrono::TimeZone as _;
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(text, format) {
+            return Some(chrono::Utc.from_utc_datetime(&naive).to_rfc3339());
+        }
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(text, format) {
+            return Some(
+                chrono::Utc
+                    .from_utc_datetime(&date.and_hms_opt(0, 0, 0)?)
+                    .to_rfc3339(),
+            );
+        }
+    }
+    None
+}
+
+/// 数值兜底。上游 `safe_int(value, default)`：非数值一律回落默认。
+fn safe_i64(value: Option<&serde_json::Value>, default: i64) -> i64 {
+    value.and_then(serde_json::Value::as_i64).unwrap_or(default)
+}
+
+/// 评论的嵌套影片。非对象 → `None`（上游 `_build_review_movie` 的第一道判）。
+fn review_movie_from(movie: Option<&serde_json::Value>) -> Option<JavdbReviewMovie> {
+    let movie = movie?;
+    let object = movie.as_object()?;
+    let string_or_empty = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    Some(JavdbReviewMovie {
+        id: {
+            // `str(movie.get("id") or "")` —— 数字 id 也转成字符串。
+            match object.get("id") {
+                Some(serde_json::Value::Number(number)) => number.to_string(),
+                Some(serde_json::Value::String(text)) => text.clone(),
+                _ => String::new(),
+            }
+        },
+        number: string_or_empty("number"),
+        title: string_or_empty("title"),
+        origin_title: object
+            .get("origin_title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        score: object.get("score").and_then(serde_json::Value::as_f64),
+        thumb_url: object
+            .get("thumb_url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        release_date: object
+            .get("release_date")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// 单条评论的映射。上游 `_build_movie_review`：键名换算只有两处
+/// （`likes_count` → `like_count`、`watched_count` → `watch_count`），
+/// 其余逐字。非对象返回 `None`（调用方跳过并 warn —— 上游同样如此）。
+pub fn movie_review_from(review: &serde_json::Value) -> Option<JavdbMovieReview> {
+    let object = review.as_object()?;
+    Some(JavdbMovieReview {
+        id: safe_i64(object.get("id"), 0),
+        score: safe_i64(object.get("score"), 0),
+        content: object
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        created_at: object.get("created_at").and_then(parse_external_datetime),
+        username: object
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        like_count: safe_i64(object.get("likes_count"), 0),
+        watch_count: safe_i64(object.get("watched_count"), 0),
+        movie: review_movie_from(object.get("movie")),
+    })
+}
+
+/// 整份载荷 → 评论列表。上游 `_extract_movie_reviews`（缺 `data.reviews` 是
+/// **错误**不是空列表 —— 那说明响应形状变了，当成「没有评论」会让分页静默
+/// 断流）+ 逐条映射（非对象的条目跳过，与上游一致）。
+pub fn movie_reviews_from(
+    payload: &serde_json::Value,
+) -> Result<Vec<JavdbMovieReview>, MetadataSourceError> {
+    let reviews = payload
+        .get("data")
+        .and_then(|data| data.get("reviews"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            MetadataSourceError::RequestFailed("JavDB 评论载荷缺 data.reviews".to_owned())
+        })?;
+    Ok(reviews
+        .iter()
+        .filter_map(|review| match movie_review_from(review) {
+            Some(mapped) => Some(mapped),
+            // 类型不对的条目跳过 —— 一条脏数据不该让整页 502。
+            None => {
+                tracing::warn!("JavDB 评论条目类型异常，已跳过");
+                None
+            }
+        })
+        .collect())
+}
+
 /// 榜单取数失败。
 ///
 /// # 为什么不复用 [`MetadataSourceError`]
@@ -283,6 +593,43 @@ impl JavdbProvider {
                 MetadataSourceError::RequestFailed(format!("构造 JavDB 客户端失败：{error}"))
             })?;
         Ok(Self { client, base })
+    }
+
+    /// 按名字搜演员（上游 `search_actors`，`javdb.py:326-372`）。
+    ///
+    /// # 三条与「搜影片」不同的规矩
+    ///
+    /// 1. **不查 `success`** —— 上游这条路径同样只看 `data.actors`（搜影片那条
+    ///    也是），业务失败会**表现为空列表**，进而 [`MetadataSourceError::NotFound`]。
+    /// 2. **候选为空即 NotFound**，不是空列表：调用方（演员 SSE）要据此发
+    ///    `actor_not_found` 的 `completed` 帧 —— 返回空 Vec 会变成
+    ///    「导入 0 个」的谎报（「搜不了」与「没搜到」在用户眼里是两回事）。
+    /// 3. **这里就按 id 去重**（上游同一处 `seen_actor_ids`）：JavDB 的同名卡片
+    ///    会重复出现，重复项进 SSE 就是两次下载、两次入库。
+    ///
+    /// `q` 在最前、其余按 `ACTOR_SEARCH_PARAMS` 声明序 —— 与上游字典序一致
+    /// （理由见 [`Self::api_url`]）。
+    pub async fn search_actor_resources(
+        &self,
+        actor_name: &str,
+    ) -> Result<Vec<JavdbMovieActor>, MetadataSourceError> {
+        let mut query: Vec<(&str, String)> = vec![("q", actor_name.to_owned())];
+        for (key, value) in ACTOR_SEARCH_PARAMS {
+            query.push((key, value.to_owned()));
+        }
+        query.push(("page", "1".to_owned()));
+        query.push(("limit", ACTOR_SEARCH_LIMIT.to_string()));
+        let url = self.api_url(API_PATH_SEARCH, &query);
+        let payload = self.request_json(&url).await?;
+
+        let resources = actors_from_search_payload(&payload);
+        if resources.is_empty() {
+            // 上游两处 `raise MetadataNotFoundError("actor", actor_name)`：
+            // 原始候选为空、或全都被过滤掉（缺 id），对调用方是同一件事。
+            tracing::warn!("JavDB 演员搜索无有效候选");
+            return Err(MetadataSourceError::NotFound);
+        }
+        Ok(resources)
     }
 
     /// 拼完整 URL（上游 `_build_api_url`）。
@@ -504,6 +851,45 @@ impl JavdbProvider {
             .await
             .map_err(rank_request_error)?;
         rank_numbers_from(&payload)
+    }
+
+    /// 影片评论（上游 `get_movie_reviews_by_javdb_id`，`:444-481`）。
+    ///
+    /// `sort_by` 缺省或空串**不进查询串**（上游 `if sort_by:`）—— 服务层给的
+    /// `recently` / `hotly` 之外的原样透传，**这里不设白名单**：排序枚举的
+    /// 校验是调用方（路由层）的事，provider 只做传输。
+    ///
+    /// # 不需要登录
+    ///
+    /// 上游这条直接 `request_json`，不碰 `_ensure_logged_in` —— 评论接口在
+    /// 未登录态可用。别顺手加登录：多一次登录请求 = 多一次风控暴露。
+    pub async fn movie_reviews(
+        &self,
+        javdb_id: &str,
+        page: i64,
+        limit: i64,
+        sort_by: Option<&str>,
+    ) -> Result<Vec<JavdbMovieReview>, MetadataSourceError> {
+        let path = API_PATH_MOVIE_REVIEWS.replace("{javdb_id}", javdb_id);
+        let mut query: Vec<(&str, String)> =
+            vec![("page", page.to_string()), ("limit", limit.to_string())];
+        if let Some(sort) = sort_by.map(str::trim).filter(|sort| !sort.is_empty()) {
+            query.push(("sort_by", sort.to_owned()));
+        }
+        let url = self.api_url(&path, &query);
+        let payload = self.request_json(&url).await?;
+        // `success != 1` 是业务失败（HTTP 仍是 200）—— 与详情路径同一处理。
+        if payload.get("success").and_then(serde_json::Value::as_i64) != Some(1) {
+            let detail = payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unexpected success")
+                .to_owned();
+            return Err(MetadataSourceError::RequestFailed(format!(
+                "JavDB 评论返回失败：{detail}"
+            )));
+        }
+        movie_reviews_from(&payload)
     }
 
     /// 有码 / 无码 / FC2 榜番号（上游 `get_rank_numbers`，`:483-501`）。
@@ -782,10 +1168,22 @@ impl MetadataProvider for JavdbProvider {
         Ok(movies)
     }
 
-    async fn search_actors(&self, _keyword: &str) -> Result<Vec<Value>, MetadataSourceError> {
-        Err(MetadataSourceError::RequestFailed(
-            "JavDB 演员搜索尚未移植（见 docs/handoff.md §7.2f）".to_owned(),
-        ))
+    /// 搜演员（上游 `search_actors`，`javdb.py:326-372`）。返回 `Vec<Value>`
+    /// 只是为了满足 [`MetadataProvider`] 的窄缝（`match_actors` 拿它喂
+    /// `upsert_actor(&Value)`）；真正的映射在
+    /// [`JavdbProvider::search_actor_resources`]，这里只做一次搬运。
+    async fn search_actors(&self, keyword: &str) -> Result<Vec<Value>, MetadataSourceError> {
+        let resources = self.search_actor_resources(keyword).await?;
+        resources
+            .iter()
+            .map(|actor| {
+                serde_json::to_value(actor).map_err(|error| {
+                    // 自造的结构序列化不会失败；真失败说明结构写错了 ——
+                    // 报出来，别静默丢一位演员。
+                    MetadataSourceError::RequestFailed(format!("演员资源序列化失败：{error}"))
+                })
+            })
+            .collect()
     }
 }
 
@@ -926,6 +1324,171 @@ fn encode_form_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ JavDB 与本地是**两套反的**性别枚举，逐个取值对拍。
+    ///
+    /// 这张表的价值在于「`0` 不是未知、`1` 不是女性」这两条反直觉的事实 ——
+    /// 按本地枚举的直觉写一次，全部男性演员会变成女性。
+    #[test]
+    fn actor_gender_mapping_is_inverted_on_purpose() {
+        let cases: [(Option<serde_json::Value>, i64); 9] = [
+            (None, 0),
+            (Some(serde_json::json!(0)), 1),
+            (Some(serde_json::json!(1)), 2),
+            (Some(serde_json::json!(2)), 0),
+            (Some(serde_json::json!("female")), 1),
+            (Some(serde_json::json!("女")), 1),
+            (Some(serde_json::json!("MALE")), 2),
+            (Some(serde_json::json!(" 男 ")), 2),
+            // 认不出的字符串（含 "2"）→ 未知，**不是**按数字理解。
+            (Some(serde_json::json!("2")), 0),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(map_actor_gender(raw.as_ref()), expected, "raw = {raw:?}");
+        }
+    }
+
+    /// 候选名：`name` → `name_zht` → `other_name` 按 `,` 拆，**大小写不敏感去重**、
+    /// 保留首次出现的原形。
+    #[test]
+    fn candidate_names_are_collected_and_deduplicated() {
+        let actor = serde_json::json!({
+            "name": "Alice",
+            "name_zht": " 艾丽丝 ",
+            "other_name": "alice, Bob ,, 艾丽丝",
+        });
+        assert_eq!(
+            collect_actor_candidate_names(&actor),
+            vec!["Alice".to_owned(), "艾丽丝".to_owned(), "Bob".to_owned()]
+        );
+        // 三个键都缺 → 空集合，不 panic。
+        assert!(collect_actor_candidate_names(&serde_json::json!({})).is_empty());
+    }
+
+    /// 一条搜索候选的映射：`id` 字符串化、头像走 CDN 归一、`type` 缺省 0。
+    #[test]
+    fn a_search_entry_maps_into_an_actor_card() {
+        let actor = actor_from_search_entry(&serde_json::json!({
+            "id": "Act123",
+            "type": 2,
+            "name": "上原",
+            "name_zht": "上原",
+            "avatar_url": "avatars/a1.jpg",
+            "gender": 1,
+        }))
+        .expect("合法候选");
+        assert_eq!(actor.javdb_id, "Act123");
+        assert_eq!(actor.javdb_type, 2);
+        assert_eq!(actor.name, "上原");
+        assert_eq!(actor.alias_names, vec!["上原".to_owned()], "同名去重");
+        assert_eq!(
+            actor.avatar_url.as_deref(),
+            Some("https://c0.jdbstatic.com/avatars/a1.jpg")
+        );
+        assert_eq!(actor.gender, 2, "JavDB 的 1 = 男性");
+        // 缺 id / 空 id → 不是候选（上游同一处跳过）。
+        assert!(actor_from_search_entry(&serde_json::json!({"name": "x"})).is_none());
+        assert!(actor_from_search_entry(&serde_json::json!({"id": "  "})).is_none());
+    }
+
+    /// 载荷解析：**按 id 去重**（重复卡片只出一条）、缺 id 的条目不算候选。
+    ///
+    /// 去重必须在进 SSE 之前完成：重复项会让同一位演员被下载/入库两次。
+    #[test]
+    fn the_search_payload_deduplicates_by_javdb_id() {
+        let payload = serde_json::json!({
+            "data": { "actors": [
+                {"id": "A1", "name": "甲"},
+                {"id": "A1", "name": "甲的重复卡片"},
+                {"name": "没有 id"},
+                {"id": "A2", "name": "乙"},
+            ]}
+        });
+        let actors = actors_from_search_payload(&payload);
+        assert_eq!(actors.len(), 2);
+        assert_eq!(actors[0].javdb_id, "A1");
+        assert_eq!(actors[0].name, "甲", "保留首次出现的那张卡片");
+        assert_eq!(actors[1].javdb_id, "A2");
+        // 形状不对（缺 data.actors）→ 空，由调用方转成 NotFound。
+        assert!(actors_from_search_payload(&serde_json::json!({"data": {}})).is_empty());
+    }
+
+    /// 单条评论映射的键名换算（上游 `_build_movie_review` 逐字段对拍）：
+    /// `likes_count` → `like_count`、`watched_count` → `watch_count`，
+    /// 缺省值 `0` / 空串，嵌套影片带字符串化 id。
+    #[test]
+    fn a_review_entry_maps_field_names_and_defaults() {
+        let review = movie_review_from(&serde_json::json!({
+            "id": 42,
+            "score": 8,
+            "content": "好片",
+            "created_at": "2024-01-02 03:04:05",
+            "username": "alice",
+            "likes_count": 3,
+            "watched_count": 9,
+            "movie": { "id": 123, "number": "SSNI-888", "title": "标题" },
+        }))
+        .expect("合法条目");
+        assert_eq!(review.id, 42);
+        assert_eq!(review.score, 8);
+        assert_eq!(review.content, "好片");
+        // JavDB 自己的 `YYYY-MM-DD HH:MM:SS` 格式按 UTC 补时区。
+        assert_eq!(
+            review.created_at.as_deref(),
+            Some("2024-01-02T03:04:05+00:00")
+        );
+        assert_eq!(review.username, "alice");
+        assert_eq!(review.like_count, 3, "键名换算：likes_count");
+        assert_eq!(review.watch_count, 9, "键名换算：watched_count");
+        let movie = review.movie.expect("嵌套影片在");
+        assert_eq!(movie.id, "123", "数字 id 字符串化");
+        assert_eq!(movie.number, "SSNI-888");
+        assert_eq!(movie.title, "标题");
+        assert_eq!(movie.origin_title, None);
+        assert_eq!(movie.score, None);
+    }
+
+    /// 类型异常的输入**逐项兜底**而不是报错：坏时间戳丢弃（不是整条丢弃），
+    /// 非对象的嵌套影片变 `None`，数值型缺省 `0`。上游 pydantic 验不过会炸，
+    /// 那是因为它的模型校验在「逐条构建」之后；本仓的映射器同时承担
+    /// 「容错」职责 —— 一条脏数据不该让整页 502。
+    #[test]
+    fn malformed_fields_fall_back_instead_of_failing() {
+        let review = movie_review_from(&serde_json::json!({
+            "id": "not-a-number",
+            "content": null,
+            "created_at": "完全不是时间",
+            "movie": "不是对象",
+        }))
+        .expect("条目本身是对象就映射");
+        assert_eq!(review.id, 0, "非数值 id 回落默认");
+        assert_eq!(review.content, "", "null content 变空串");
+        assert_eq!(review.created_at, None, "认不出的时间戳丢弃");
+        assert_eq!(review.movie, None, "非对象嵌套影片变 None");
+    }
+
+    /// 缺 `data.reviews` 是**错误**不是空列表 —— 那说明响应形状变了，
+    /// 当成「没有评论」会让分页静默断流。
+    #[test]
+    fn a_payload_without_the_reviews_list_is_an_error() {
+        assert!(movie_reviews_from(&serde_json::json!({ "success": 1 })).is_err());
+        assert!(movie_reviews_from(&serde_json::json!({
+            "success": 1, "data": { "reviews": "不是数组" }
+        }))
+        .is_err());
+    }
+
+    /// 非对象的条目**跳过**（上游同样 `continue`），其余照常返回。
+    #[test]
+    fn invalid_entries_are_skipped_not_failing() {
+        let reviews = movie_reviews_from(&serde_json::json!({
+            "success": 1,
+            "data": { "reviews": [ { "id": 1 }, "脏数据", 3 ] }
+        }))
+        .expect("合法载荷");
+        assert_eq!(reviews.len(), 1, "只留下对象条目");
+        assert_eq!(reviews[0].id, 1);
+    }
 
     #[test]
     fn image_urls_are_rewritten_to_the_cdn() {

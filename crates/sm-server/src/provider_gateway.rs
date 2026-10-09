@@ -81,6 +81,14 @@ impl ProviderGateway {
 }
 
 impl StorageGateway for ProviderGateway {
+    fn merged_playback_format(&self, provider_key: &str) -> Option<String> {
+        // **活的注册表**：读的是锁里的当下快照 —— 插件重启重装后声明会变，
+        // 这里没有理由持有旧答案。
+        self.registry()
+            .get(provider_key)
+            .and_then(|entry| entry.merged_playback_format.clone())
+    }
+
     fn has_provider(&self, provider_key: &str) -> bool {
         self.registry().get(provider_key).is_some()
     }

@@ -282,22 +282,87 @@ async fn a_non_json_body_is_reported_as_a_request_failure() {
     );
 }
 
-/// ★ 演员搜索**显式报未实现**，不是返回空列表。
+/// 演员搜索：固定参数全在，逐条映射（含性别反转、头像 CDN 归一）。
 ///
-/// 返回空列表会让调用方（演员 SSE）报「导入 0 个」—— 那是**谎报**：用户看到
-/// 「没搜到」而不是「搜不了」。
+/// 四个固定参数一个都不能少：`type=actor` 决定搜的是演员（不是影片），
+/// `from_recent=false` 决定排序，`page`/`limit` 决定取多少 —— 少任何一个
+/// JavDB 都会按另一套默认值理解，而那个差异只在结果里看得见。
 #[tokio::test]
-async fn actor_search_says_not_implemented_instead_of_returning_empty() {
+async fn actor_search_sends_the_query_and_maps_the_cards() {
     let server = MockServer::start().await;
-    let error = provider_for(&server)
-        .search_actors("演员名")
+    Mock::given(method("GET"))
+        .and(path("/api/v2/search"))
+        .and(query_param("q", "上原"))
+        .and(query_param("type", "actor"))
+        .and(query_param("from_recent", "false"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "24"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": 1,
+            "data": { "actors": [
+                {
+                    "id": "Act9", "type": 1, "name": "上原", "name_zht": "上原亚衣",
+                    "avatar_url": "avatars/a9.jpg", "gender": 1,
+                },
+                // 同一张卡片重复出现 —— 必须只出一条。
+                { "id": "Act9", "type": 1, "name": "上原" },
+            ]}
+        })))
+        .mount(&server)
+        .await;
+
+    let actors = provider_for(&server)
+        .search_actor_resources("上原")
         .await
-        .expect_err("★ 未实现就该报错");
+        .expect("搜演员");
+    assert_eq!(actors.len(), 1, "按 javdb_id 去重");
+    assert_eq!(actors[0].javdb_id, "Act9");
+    assert_eq!(actors[0].javdb_type, 1);
+    assert_eq!(
+        actors[0].alias_names,
+        vec!["上原".to_owned(), "上原亚衣".to_owned()]
+    );
+    assert_eq!(
+        actors[0].avatar_url.as_deref(),
+        Some("https://c0.jdbstatic.com/avatars/a9.jpg")
+    );
+    assert_eq!(actors[0].gender, 2, "JavDB 的 1 = 男性（本地枚举 2）");
+}
+
+/// ★ 候选为空 → **`NotFound`**，不是空列表。
+///
+/// 调用方（演员 SSE）据此发 `completed {success: false, reason:
+/// "actor_not_found"}`；返回空 `Vec` 会变成「导入 0 个」的成功帧 —— 那是
+/// 谎报：用户看到「没搜到」而不是「搜不了」。
+#[tokio::test]
+async fn an_empty_actor_search_is_not_found_not_an_empty_list() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": 1, "data": { "actors": [] } })),
+        )
+        .mount(&server)
+        .await;
+
+    let error = provider_for(&server)
+        .search_actor_resources("查无此人")
+        .await
+        .expect_err("该报 NotFound");
+    assert!(
+        matches!(error, MetadataSourceError::NotFound),
+        "应当是 NotFound，实际 {error:?}"
+    );
+
+    // 顺带钉住 trait 那一支的搬运：值形状要能被 `upsert_actor` 读（键名不能变）。
+    let error = provider_for(&server)
+        .search_actors("查无此人")
+        .await
+        .expect_err("该报 NotFound");
     match error {
-        MetadataSourceError::RequestFailed(message) => {
-            assert!(message.contains("尚未移植"), "{message}");
-        }
-        other => panic!("应当是 RequestFailed，实际 {other:?}"),
+        MetadataSourceError::NotFound => {}
+        other => panic!("应当是 NotFound，实际 {other:?}"),
     }
 }
 
@@ -444,4 +509,109 @@ async fn a_login_without_a_token_is_reported_as_an_auth_failure() {
         JavdbRankError::Auth(detail) => assert!(detail.contains("帳號或密碼錯誤"), "{detail}"),
         other => panic!("应当是 Auth，实际 {other:?}"),
     }
+}
+
+// ---- 影片评论（`get_movie_reviews_by_javdb_id` 的对位物） ----
+
+#[tokio::test]
+async fn movie_reviews_send_the_query_and_map_the_payload() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/J123/reviews"))
+        .and(query_param("page", "2"))
+        .and(query_param("limit", "10"))
+        .and(query_param("sort_by", "hotly"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "success": 1,
+        "data": { "reviews": [
+            {
+                "id": 7, "score": 9, "content": "不错",
+                "username": "bob", "likes_count": 2, "watched_count": 5,
+                "movie": { "id": 99, "number": "SSNI-888" }
+            }
+        ]}})))
+        .mount(&server)
+        .await;
+
+    let reviews = provider_for(&server)
+        .movie_reviews("J123", 2, 10, Some("hotly"))
+        .await
+        .expect("取评论");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].id, 7);
+    // ★ 键名换算在此生效：JavDB 给 `likes_count`，客户端读 `like_count`。
+    assert_eq!(reviews[0].like_count, 2);
+    assert_eq!(
+        reviews[0].movie.as_ref().expect("嵌套影片在").id,
+        "99",
+        "数字 id 字符串化"
+    );
+}
+
+/// `sort_by` 为 `None` 或空串时**不进查询串**（上游 `if sort_by:`）——
+/// 多传一个空参数会让对端按它的默认值理解，两边「同一请求」对不上。
+#[tokio::test]
+async fn movie_reviews_omit_an_empty_sort_from_the_query() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/J123/reviews"))
+        // 缺省 page/limit 仍然要给（上游常量的两个键）。
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "20"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": 1, "data": { "reviews": [] }
+        })))
+        .mount(&server)
+        .await;
+
+    let reviews = provider_for(&server)
+        .movie_reviews("J123", 1, 20, Some("  "))
+        .await
+        .expect("取评论");
+    assert!(reviews.is_empty());
+}
+
+/// `success != 1` 是**请求失败**（502 那条路），**不是**「没有评论」——
+/// 与详情/榜单路径同一判据。混掉它会把「服务端拒绝」包装成「这部片没有
+/// 评论」，用户以为没数据，实际是请求被拒了。
+#[tokio::test]
+async fn movie_reviews_treat_a_failed_payload_as_a_request_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/J123/reviews"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": 0, "message": "denied" })),
+        )
+        .mount(&server)
+        .await;
+
+    match provider_for(&server)
+        .movie_reviews("J123", 1, 20, None)
+        .await
+    {
+        Err(MetadataSourceError::RequestFailed(detail)) => {
+            assert!(detail.contains("denied"), "{detail}");
+        }
+        other => panic!("应当是 RequestFailed，实际 {other:?}"),
+    }
+}
+
+/// 缺 `data.reviews` 是**错误**不是空列表：响应形状变了要让调用方看见，
+/// 而不是「分页静默断流」。
+#[tokio::test]
+async fn movie_reviews_missing_list_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/J123/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": 1, "data": {}
+        })))
+        .mount(&server)
+        .await;
+
+    assert!(provider_for(&server)
+        .movie_reviews("J123", 1, 20, None)
+        .await
+        .is_err());
 }

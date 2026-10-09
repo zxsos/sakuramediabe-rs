@@ -30,12 +30,16 @@
 `item.rs` 已经写好（`VideoCollectionService` / `VideoItemService`），缺的只是
 `sm-api/src/routes/videos.rs` 与注册。这是当前性价比最高的一块。
 
-另有 2 条虽然 service 存在，但**已判定不做**：
+另有 1 条虽然 service 存在，但**已判定不做**：
 
 | 路径 | 不做的理由 |
 |---|---|
 | `/auth/docs-token` | 唯一消费方是 Swagger UI 的 OAuth2 表单，而本仓库无 `/docs` 路由、0 处 `utoipa`。实现它要加 axum 的 `form` feature + 写一个新提取器，换一个没人调用的 handler。见 `routes/auth.rs` 的模块文档。 |
-| `/actors/search/javdb/stream` | SSE 端点，需要真实 provider 插件才能验证，而插件侧本轮不做。 |
+
+★ `/actors/search/javdb/stream` **曾在此表**（当时的理由：SSE 需要真实 provider
+插件）。2026-10-09 已落地 —— 演员搜索走的是 **JavDB**（`build_javdb_provider()
+.search_actors`，不需要插件），缺的是它自己那一段抓取与流式编排
+（`ActorJavdbStreamService`），不是插件侧。
 
 ### B 类：缺 service（66 条）
 

@@ -68,6 +68,7 @@
 //! 用它。留下的那个骨架只会让人照着错的形状去实现。
 
 pub mod actor;
+pub mod actor_javdb_stream;
 pub mod actor_merge;
 pub mod catalog_import;
 pub mod image_cleanup;
@@ -89,6 +90,7 @@ pub mod movie_javdb_backfill;
 pub mod movie_metadata_importer;
 pub mod movie_metadata_refresh;
 pub mod movie_metadata_search;
+pub mod movie_reviews;
 pub mod movie_subscription;
 pub mod movie_subscription_search_state;
 pub mod movie_subtitle;

@@ -331,6 +331,49 @@ pub fn build_signed_media_url(
     ))
 }
 
+/// 构造签名**合并播放** URL。上游 `build_signed_merged_media_url`
+/// （`common/file_signatures.py:212-224`）：
+///
+/// ```text
+/// /media/merged-play/{resource_path}?media_ids=1,2&expires=…&signature=…
+/// ```
+///
+/// # 顺序就是语义
+///
+/// `media_ids` 的顺序进签名载荷（[`merged_signature`]），也决定时间轴怎么拼 ——
+/// 调用方传什么顺序就签什么顺序，**这里不排序不去重**（那是播放端
+/// `parse_merged_media_ids` 的判据，构建端擅自整理会造出一份验证不过的 URL）。
+///
+/// `resource_path` 由调用方按 provider 声明的格式给（mp4 → `stream.mp4`，
+/// hls → `index.m3u8`），这里只做与 [`verify_merged`] 对称的路径归一。
+pub fn build_signed_merged_media_url(
+    secret: &str,
+    media_ids: &[i32],
+    resource_path: &str,
+    now_seconds: i64,
+) -> Result<String, SignatureError> {
+    if media_ids.is_empty() {
+        // 上游 `_normalize_merged_media_ids` 对空序列同样拒绝。
+        return Err(SignatureError::PathInvalid);
+    }
+    let path = normalize_resource_path(resource_path)?;
+    let expires = signature_expires(now_seconds);
+    let signature = merged_signature(secret, media_ids, &path, expires);
+    let tail = if path.is_empty() {
+        String::new()
+    } else {
+        encode_path(&path)
+    };
+    Ok(format!(
+        "{MERGED_MEDIA_PLAY_ROUTE_PREFIX}/{tail}?media_ids={}&expires={expires}&signature={signature}",
+        media_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
 /// 构造签名片段串流 URL。
 ///
 /// 对应上游 `build_signed_clip_url`（`src/common/file_signatures.py:241`）：
@@ -552,6 +595,49 @@ mod tests {
         assert_eq!(SignatureError::Expired.code(), "file_signature_expired");
         assert_eq!(SignatureError::Invalid.code(), "file_signature_invalid");
         assert_eq!(SignatureError::STATUS, 403);
+    }
+
+    /// 构造出来的合并播放 URL 要能被播放端**原样验过**。
+    ///
+    /// 这条钉住三个契约：路径前缀是 `/media/merged-play`（与 axum 路由一致）、
+    /// `media_ids` 以 CSV 进查询串且**顺序原样**、签名载荷含整个 id 序列 ——
+    /// 三者任一错了，客户端拿到的是一条 403 的 URL，而错在构造端还是播放端
+    /// 要对半天。
+    #[test]
+    fn a_built_merged_url_verifies_on_the_play_side() {
+        let now = 1_800_000_000;
+        let url =
+            build_signed_merged_media_url(SECRET, &[3, 7, 9], "stream.mp4", now).expect("构造成功");
+        assert!(url.starts_with("/media/merged-play/stream.mp4?"), "{url}");
+        assert!(url.contains("media_ids=3,7,9"), "{url}");
+
+        // 从 URL 里拆回参数再验签 —— 模拟播放端做的事。
+        let query = url.split('?').nth(1).expect("有查询串");
+        let get = |key: &str| {
+            query
+                .split('&')
+                .find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == key))
+                .map(|(_, v)| v.to_owned())
+                .expect("参数在")
+        };
+        let expires: i64 = get("expires").parse().expect("expires 是整数");
+        let ids: Vec<i32> = get("media_ids")
+            .split(',')
+            .map(|id| id.parse().expect("id 是整数"))
+            .collect();
+        let normalized = verify_merged(SECRET, &ids, "stream.mp4", expires, &get("signature"), now)
+            .expect("验签通过");
+        assert_eq!(normalized, "stream.mp4");
+    }
+
+    /// **空 id 序列拒绝构造**：上游 `_normalize_merged_media_ids` 对空序列同样
+    /// 拒 —— 没有分段的合并流是概念错误，签出来的 URL 也必然没人验得过。
+    #[test]
+    fn an_empty_id_list_is_rejected_at_build_time() {
+        assert_eq!(
+            build_signed_merged_media_url(SECRET, &[], "stream.mp4", 1_800_000_000),
+            Err(SignatureError::PathInvalid)
+        );
     }
 
     // ------------------------------------------------ URL

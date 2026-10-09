@@ -886,6 +886,54 @@ impl BackgroundTaskRunRepository {
         Ok(Some(row))
     }
 
+    /// 只合并 `result_summary`，**不看 state、不碰 progress**。返回是否命中行。
+    ///
+    /// # 为什么不能复用 `report_progress*`
+    ///
+    /// `report_progress_active` 的语义是「任务在跑」：state 不是活动态就**直接
+    /// 返回、不写库**。而这里要写的是**已到终态**的任务 —— 失败项重试
+    /// （`ImportTaskService::enqueue_failed_item_retry`）给刚入队的重试回写
+    /// `state=queued` / `retry_task_run_id` 时，原任务早已 `completed`/`failed`。
+    /// 用它会把回写静默丢掉，而客户端已经拿到了 202。
+    ///
+    /// # 合并是**顶层键覆盖**
+    ///
+    /// 见 [`crate::system::activity::result_summary::merge`]：patch 里的
+    /// `failed_files` 是数组，**整段替换**（不是逐元素合并）—— 正是上游
+    /// `_replace_failure_item` 的语义（它也是整段写回）。
+    ///
+    /// 行不存在返回 `false`（不报错）：调用方要据此**撤销刚入队的任务**并报
+    /// 404，而不是让一个查不到的任务行把 500 抛给用户。
+    pub async fn merge_result_summary(
+        &self,
+        id: i32,
+        patch: Option<&serde_json::Value>,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+
+        let merged = Self::merge_summary_column(current.result_summary.as_deref(), patch);
+        sqlx::query(
+            "UPDATE background_task_run SET result_summary = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(merged)
+        .bind(crate::common::time::now_utc())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// 每个 `task_key` 各自**最新一条**运行记录，返回 `task_key -> 行`。
     ///
     /// 对应上游 `_latest_task_run_by_key`（`api/routers/system/jobs.py:21-32`）。

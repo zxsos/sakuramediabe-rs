@@ -536,9 +536,19 @@ TaskRun **显式判失败**（顺带释放互斥键），再返回上游的 409/
 （202），随后被 worker 领取并以 `WorkerError::NoHandler` **判失败**。
 这是阶段性事实，不是回归 —— 任务在任务中心里能看到那条失败记录。
 
-其余三个 `todo!()`（`search_failed_item` / `enqueue_failed_item_retry` /
-`execute`）各自的缺口写在模块文档的表格里；注意上游第三个 mode 名是
-`retry_failed_file`（骨架期注释写的 `retry_failed_item` 是错的，已改）。
+其余两个 `todo!()`（`search_failed_item` / `execute`）各自的缺口写在模块文档
+的表格里；注意上游第三个 mode 名是 `retry_failed_file`（骨架期注释写的
+`retry_failed_item` 是错的，已改）。
+
+`enqueue_failed_item_retry` **2026-10-09 已落地**（`POST …/failed-items/{id}/retry`
+→ 202）：候选校验（**先于**台账，坏候选 → 422 `invalid_metadata_candidate`）→
+终态 409 `import_task_not_finished` → 失败项 404 → 可重试性（`failed_item_not_pending`
+与 `failed_item_search_unavailable` **两个不同的码**）→ 源与库（409 / 404 /
+422 `invalid_media_library_provider`）→ 按库互斥入队 → 回写
+`state=queued` + `retry_task_run_id`（`BackgroundTaskRunRepository::merge_result_summary`
+是本轮为「在**终态**任务上合并 `result_summary`」新增的：`report_progress*` 会说
+「任务没在跑」而静默不写）。⚠️ 它的**输入端** `search_failed_item` 还没接，
+所以客户端目前只能回填自己缓存的 `candidate_id`。
 
 新增测试：`crates/sm-service/tests/media_import_enqueue.rs`（11 条真库用例，
 含「两个库互不阻塞」「批量整批拒绝且一条都不改」「撤掉的台账必须释放互斥键」）、
@@ -2227,22 +2237,43 @@ proto→宿主转换 / 转发层）在 `5bf2d63`、`d573ecc`、`e8e51d5`、`26ea
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
 | ~~**插件 ABI**~~ | ~~`media_playback.rs` 3~~ | ✅ **本文件已清零**（`4a7f6d7` / `4aa347c` / `df0c39a`，见 §7.2k）|
-| **provider 能力** | `videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `library_handle` / 浏览与暂存 / 转存源目标 / **下载器注册表**。**10 条**，仍最大一块。⚠️ 其中 `playback_deliveries` **已经有了**（§7.2k）——`videos.rs` 那 3 条**不再是**「等 ABI」，见 §八 |
-| **JavBus provider 不存在** | `movies.rs` 2（SSE）、`actors.rs` 1（SSE） | 见 §7.2f |
-| **`MovieService` 缺方法** | `movies.rs` 3 | `get_movie_reviews`（要 JavBus）/ `get_merged_playback`（要 provider）/ `refresh_movie_metadata`。⚠️ 三个的**服务层方法都不存在**（不是「有方法只差接线」），别照骨架注释当成接线做。`refresh_movie_metadata` 尤其容易读错：`catalog_import.rs:468` 那个是**已实现的辅助函数** `refresh_movie_metadata_strict`，端点真正要的 `MovieMetadataRefreshService::refresh_movie_metadata`（`movie_metadata_refresh.rs:49`）**本身就是 `todo!()`** —— 所以「JavDB host 定下来」也解不开它（2026-10-08 核过）|
+| **provider 能力** | `videos.rs` 3、`media_import.rs` 2、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `library_handle` / 浏览与暂存 / 转存源目标 / **下载器注册表**。**9 条**，仍最大一块。⚠️ 其中 `playback_deliveries` **已经有了**（§7.2k）——`videos.rs` 那 3 条**不再是**「等 ABI」，见 §八 |
+| ~~**JavBus provider 不存在**~~（3 SSE） | ~~`movies.rs` 2（SSE）、`actors.rs` 1（SSE）~~ | ✅ **2026-10-09 清零**。三条 SSE 要的是 **JavDB** 与自己的流式编排（`build_javdb_provider().search_*`），**不经过 JavBus** —— 当时的推断错了。§7.2f 的 JavBus 缺口仍然成立，只是不卡这三个端点。`actors.rs` 那条最后补的是演员抓取 + `ActorJavdbStreamService`（见 `## 八` 的更正）|
+| ~~**`MovieService` 缺方法**~~（3） | ~~`movies.rs` 3~~ | ✅ **2026-10-09 清零**。三个服务层方法都已落地：`get_movie_reviews`（**走 JavDB 评论接口**，不是 JavBus）、`get_merged_playback`、`refresh_movie_metadata`。|
 | ~~**`status.rs` 1**~~ | ~~`status.rs`~~ | ✅ **本文件已清零**。`GET /status/image-search` → ✅ **已落**（§7.2j）；`GET /status/metadata-providers/{provider}/test` → ✅ **已落**（§7.5 项 3，依赖 §7.2i 的 `jdsignature` 修复才真能用）|
-| **`recommendations.rs` 2** | `recommendations.rs` 2 | `moment-recommendations`：要 `MomentRecommendationService::list_items`（自身也是 todo）+ API 层的 `PageContext` 实现。`hot-actress-releases`：要 `PageContext` 的两个方法（影片卡片 + 女优资料），§7.3 旧版误标已解决 |
+| ~~**`recommendations.rs` 2**~~ | ~~`recommendations.rs` 2~~ | ✅ **2026-10-09 清零**。`moment-recommendations`：读侧做成 `MomentRecommendationQuery`（`HotActressReleaseQuery` 同款分读侧/生成侧），**两个 `PageContext` trait 都被删**（卡片本来就是服务层类型，注入 `serde_json::Value` 只会让形状无处校验）。`hot-actress-releases`：`HotActressReleaseQuery::list_items` 装配卡片 + 女优，**顺带修掉两条从未被执行过的 SQL**（`ma.movie` → `ma.movie_id`、缺 `CAST(... AS date)`，见下）。|
 | **插件设置 2** | `plugins.rs` 2 | 见 §7.5，要先定「Rust 插件怎么声明自己的设置项」 |
 
-**服务层 27 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 /
-`import_task` 3，其余各 1：`auto_download` / `download_common` / `download_request` /
-`download_task` / `provider_browse`）、`catalog` 6（`movie_metadata_refresh` 3 /
-`movie_metadata_search` 2 / `catalog_import` 1）、`playback` 3（`media_file_hash_backfill` /
-`media_validity_scan` / `media_video_info_backfill`）、`discovery` 2（`moment_recommendation`）。
+**服务层 18 条**（2026-10-09 复核；原记 27 条，`catalog` 的 6 与 `playback` 的 3
+已全部落地）：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 /
+`import_task` 2，其余各 1：`auto_download` / `download_common` / `download_request` /
+`download_task` / `provider_browse`）、`catalog` 1（`catalog_import` 的竖封面，卡
+image store + cv2）、`discovery` 1（`moment_recommendation::generate_recommendations`
+—— 只剩读种子图字节，卡 image store）。
+路由侧同步：**5 条**（原 20），`actors.rs` / `recommendations.rs` / `movies.rs` /
+`status.rs` / `media_playback.rs` 均已清零，`media_import.rs` 2 → 1。
 
-**按卡点合并后的真相**：`transfers` 16 + `playback` 3（服务层：`media_file_hash_backfill` /
-`media_validity_scan` / `media_video_info_backfill`）+ 路由那 10 条 ≈ **29 条压在
-provider 插件上**。剩下 18 条各自有独立卡点。
+**按卡点合并后的真相**（2026-10-09 复核）：`transfers` 16 + 路由那 5 条
+（`download_tasks` 2 / `media_import` 1 / `media_transfer` 2）≈ **21 条压在
+provider 插件上** —— 路由侧**没有一条不是**卡插件的。
+剩下 **2 条**各自有独立卡点（都不是「等 provider」）：`catalog_import` 的竖封面
+（image store + cv2）、`moment_recommendation::generate_recommendations`
+（读种子图字节，同样是 image store）。
+
+⚠️ 而「21 条压在 provider 上」这句话**本身也太粗**：2026-10-09 逐条核过之后，
+它们缺的是**三样不同的东西**（别再一次当成「等 ABI」）：
+
+| 缺的东西 | 在哪 | 影响 |
+|---|---|---|
+| **storage provider**：宿主侧「provider_key → 端点 → 客户端」那一层缝 + 一条**能从测试里驱动**的参考实现 | `sm-service` 不依赖 `sm-plugins`（ADR），playback 有一份 `provider_helpers`，transfers 这边还是空壳（`download_common::library_provider` 就是它） | `provider_browse`、`import_task::execute`、`media_transfer_task`、`media_import` 剩的那条 |
+| **download provider 的调用面**：ABI（`DownloadProviderExt` + proto 全在）**有了**，但 `sm-plugins/src/provider_calls.rs` 里**一个 download 函数都没有**（模块文档却写着「storage / download 都发」），`plugin-ref-local` 也没实现它 | 只有 `sm-plugin-api` 内部的 `MinimalDownload` 测试替身 | `download_sync` 的 2 条、`download_task::delete`、`download_request::create`、`auto_download`、`download_tasks` 那 2 条路由 |
+| **image store**（与服务层解耦的读写图字节） | 尚无 | `catalog_import` 竖封面、`moment_recommendation` 生成侧 |
+
+★ 最关键的一条：**`sm-plugins` 至今没有任何测试真的起过一个 provider**（
+`provider_calls` 只有 `connect_storage` 那一族，而 `plugin-ref-local` 的往返测试
+只在插件自己那个 crate 里跑）。所以 storage 那一路的**接入成本与可测性都还没被验证过** ——
+动 transfers 那批之前，先把这件事做出来（参考实现 + 一条真往返用例），否则每条都会
+各自发明一遍怎么连。
 
 ⚠️ 但「压在 provider 上」**不等于**「等 ABI」—— §7.2k 就是一次反例：原来那 13 条里有 3 条
 （`media_playback.rs`）的卡点被写成「等 ABI」，实际 ABI 早就够用，真正的缺口是**宿主侧
@@ -2309,6 +2340,12 @@ provider 插件上**。剩下 18 条各自有独立卡点。
 
 **权威依据**：[`deployment.md`](deployment.md)（部署形态与瘦身路线）。§一~§七 讲
 「为什么」，这一节只讲**先做哪个、怎么算做完**。
+
+> ★ **2026-10-09 追加**：`media_import` 的失败项重试（`POST …/retry`）已落地，
+> 队列从 24 降到 23（§7.3 的表已更新）。**下一步不变**，仍是下面的 step 0
+> （storage seam）—— `transfers` 那 21 条各自缺什么，见 §7.4 末尾那三行表
+> （storage seam / download 调用面 / image store）。其中 **download 调用面**是
+> 本轮侦察的结论：ABI 有、宿主侧一个函数都没有、参考实现也没有。
 
 ### 8.0 ★ 正在做的一刀（2026-10-08，**代码未动，从这继续**）
 

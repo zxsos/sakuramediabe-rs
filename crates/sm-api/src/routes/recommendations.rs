@@ -15,11 +15,26 @@
 //!
 //! # 两处上游不一致，**照抄不统一**
 //!
-//! **1. `page_size` 的校验边界。** daily 与 hot-actress 是
-//! `Query(default=20, ge=1, le=100)`，**moment 没有任何边界**
-//! （`Query(default=20)`）—— 也就是说 `page_size=100000` 在 moment 上合法。
-//! 加上上界是「看着更安全」的直觉改动，但那会**改变契约**：客户端传大值时
-//! 上游返回 200，本仓库返回 422。照抄。
+//! **1. `page_size` 的校验边界。** daily 与 hot-actress 的**查询参数**是
+//! `Query(default=20, ge=1, le=100)`，moment 的查询参数**没有边界**
+//! （`Query(default=20)`）。
+//!
+//! ⚠️ 一度据此写「`page_size=100000` 在 moment 上合法」—— **那是错的**。
+//! 边界有两道：pydantic 的 Query 边界，与服务层的 `validate_page`
+//! （`1 <= page_size <= 100`）。**三个端点都调 validate_page**，所以
+//! `page_size=100000` 三条都 422；差别只在**错误码**：
+//!
+//! | 端点 | 上游拦在哪 | `page_size=100000` 的码 |
+//! |---|---|---|
+//! | daily / hot-actress | pydantic `le=100` | `validation_error` |
+//! | moment | 服务层 | `invalid_moment_recommendation_filter` |
+//!
+//! 本仓三条路由都**不**在查询参数上设边界（都交给服务层），所以 daily /
+//! hot-actress 这里报的是各自的专用码而不是 `validation_error` ——
+//! 由 `daily_recommendations_http.rs` 的断言钉住。
+//!
+//! 「给 moment 也加上界」因此是个**看着有意义其实没有**的改动：上界本来就
+//! 在，真正会变的只有错误码。照抄。
 //!
 //! **2. 分页响应形态。** daily/hot-actress 用泛型 `PageResponse[T]`（带 `total`），
 //! moment 用专用 `MomentRecommendationPageResource` —— 形状不同，**但不是
@@ -32,13 +47,19 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sm_db::repo::discovery::HotActressReleaseRepository;
 use sm_service::discovery::daily_recommendation::DailyRecommendationService;
-use sm_service::discovery::hot_actress_release::{HotActressReleaseItem, HotActressReleaseQuery};
+use sm_service::discovery::hot_actress_release::HotActressReleaseQuery;
+use sm_service::discovery::moment_recommendation::MomentRecommendationQuery;
 
 use crate::auth::CurrentUser;
-use crate::dto::{DailyRecommendationMovieResource, ImageResource, MovieListItemResource};
+use crate::dto::{
+    sign_image_origin, DailyRecommendationMovieResource, HotActressReleaseMovieResource,
+    ImageResource, MovieListItemResource,
+};
 use crate::error::ErrorResponse;
+// 查询参数一律走信封提取器：坏值（`?page=abc`）要 422 + 错误信封，而不是
+// axum 默认的 400 + 纯文本。见 `crate::extract` 的模块文档。
+use crate::extract::Query as EnvelopeQuery;
 use crate::query::{one, twenty};
 use crate::signing::{now_seconds, signing_secret};
 use crate::state::AppState;
@@ -87,7 +108,7 @@ struct PageResponse<T> {
 async fn list_daily_recommendations(
     State(state): State<AppState>,
     _user: CurrentUser,
-    axum::extract::Query(query): axum::extract::Query<BoundedPageQuery>,
+    EnvelopeQuery(query): EnvelopeQuery<BoundedPageQuery>,
 ) -> Result<Json<PageResponse<DailyRecommendationMovieResource>>, ErrorResponse> {
     let page = DailyRecommendationService::new(state.db())
         .list_items(query.page, query.page_size)
@@ -113,9 +134,10 @@ async fn list_daily_recommendations(
 ///
 /// 上游 `moment_recommendations.py:16-17` 是 `Query(default=1)` 与
 /// `Query(default=20)`，**没有 `ge` / `le`**。所以不能复用上面的
-/// [`BoundedPageQuery`]：加了上界就改变了契约。
-// 两个字段都还没接上（handler 体是 `todo!()`），但它们是契约的一部分。落地后删 allow。
-#[allow(dead_code)]
+/// [`BoundedPageQuery`]：它的名字会让人以为边界在这里。
+///
+/// 边界仍然存在 —— 在服务层（`MomentRecommendationQuery::validate_page`），
+/// 见模块文档第 1 条：越界的错误**码**才是两者真正的差别。
 #[derive(Debug, Deserialize)]
 struct UnboundedPageQuery {
     #[serde(default = "one")]
@@ -173,13 +195,55 @@ struct MomentRecommendationResponse {
 ///
 /// 上游用 `validate_page(..., error_code="invalid_moment_recommendation_filter")`
 /// （`moment_recommendation_service.py:511`）—— **专用错误码**，与
-/// hot-actress 的那个区分开。
+/// hot-actress 的那个区分开。校验在服务层做（这里只把参数递进去）。
+///
+/// # 装配由服务层完成，这里只做两件本层才有的事
+///
+/// 1. **签名**：`image.origin` 与卡片里的封面都要密钥；
+/// 2. **换形状**：`MomentRecommendationCard` → `MomentRecommendationItemResource`
+///    （上游 `:548-575` 的 `MovieListResource.from_attributes_model(...)` 与
+///    `ImageResource.from_attributes_model(thumbnail.image)`）。
+///
+/// 服务层返回的 `items` 可能比 `page_size` 短（取不到图片/卡片的行被跳过且
+/// 不补位）—— **照原样返回，不补齐**，`total` 也不因此调整。
 async fn list_moment_recommendations(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    axum::extract::Query(_query): axum::extract::Query<UnboundedPageQuery>,
+    EnvelopeQuery(query): EnvelopeQuery<UnboundedPageQuery>,
 ) -> Result<Json<MomentRecommendationResponse>, ErrorResponse> {
-    todo!("骨架：接 MomentRecommendationService::list_items + PageContext 补 image/movie")
+    let page = MomentRecommendationQuery::new(state.db())
+        .list_items(query.page, query.page_size)
+        .await?;
+
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let items = page
+        .items
+        .iter()
+        .map(|item| MomentRecommendationItemResource {
+            recommendation_id: item.row.recommendation_id,
+            rank: item.row.rank,
+            score: item.row.score,
+            strategy: item.row.strategy.clone(),
+            reason: item.row.reason.clone(),
+            media_id: item.row.media_id,
+            thumbnail_id: item.row.thumbnail_id,
+            offset_seconds: item.row.offset_seconds,
+            image: ImageResource {
+                id: item.image.id,
+                origin: sign_image_origin(&secret, &item.image.origin, now),
+            },
+            movie: MovieListItemResource::from_movie_card(&item.card, &secret, now),
+        })
+        .collect();
+
+    Ok(Json(MomentRecommendationResponse {
+        items,
+        page: page.page,
+        page_size: page.page_size,
+        total: page.total,
+        generated_at: page.generated_at,
+    }))
 }
 
 /// `GET /hot-actress-releases`
@@ -196,22 +260,28 @@ async fn list_moment_recommendations(
 async fn list_hot_actress_releases(
     State(state): State<AppState>,
     _user: CurrentUser,
-    axum::extract::Query(query): axum::extract::Query<BoundedPageQuery>,
-) -> Result<Json<PageResponse<HotActressReleaseItem>>, ErrorResponse> {
-    let page = query.page;
-    let page_size = query.page_size;
-    // 越界要 422 而不是夹到边界（FastAPI 的行为）。
-    HotActressReleaseQuery::validate_page(page, page_size)?;
+    EnvelopeQuery(query): EnvelopeQuery<BoundedPageQuery>,
+) -> Result<Json<PageResponse<HotActressReleaseMovieResource>>, ErrorResponse> {
+    // 打分、分页、校验、装配（卡片 + 女优）都在服务层。**校验也在那里**
+    // （它要在打分之前跑），所以路由这边不再调一次 `validate_page`。
+    let page = HotActressReleaseQuery::new(state.db())
+        .list_items(query.page, query.page_size)
+        .await?;
 
-    let repo = HotActressReleaseRepository::new(state.db().clone());
-    let query_service = HotActressReleaseQuery::new(repo);
-    let scored = query_service.scored_today().await?;
-    let _total = scored.len() as i64;
-    let start = ((page - 1) * page_size) as usize;
-    let _ = (scored, start);
-    // TODO: 填影片卡片与女优资料（`PageContext` 的两个方法）。
-    // 依赖 `repo/movie.rs` 的 `with_movie_card_relations` 等价物与
-    // `repo/actor.rs` 的双 LEFT JOIN（`profile_image_override` 优先）——
-    // 两者都还没确认形态，不猜字段。
-    todo!("骨架：分页与打分已接；待补卡片与女优资料")
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let items = page
+        .items
+        .iter()
+        .map(|item| HotActressReleaseMovieResource::from_item(item, &secret, now))
+        .collect();
+
+    // **回显请求的 page / page_size**，不是服务归一后的值（与上游
+    // `PageResponse` 一致：客户端据此拼下一页 URL）。
+    Ok(Json(PageResponse {
+        items,
+        page: query.page,
+        page_size: query.page_size,
+        total: page.total,
+    }))
 }

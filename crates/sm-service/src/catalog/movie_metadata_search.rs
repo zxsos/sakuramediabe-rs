@@ -295,6 +295,26 @@ impl MovieMetadataSearchService {
     /// 把 `candidate_id` 解成来源引用。上游 `resolve_candidate_reference(candidate_id) -> dict[str, str]`。
     ///
     /// 错误码：id 格式不对 → `422 invalid_metadata_candidate`。
+    /// 解析候选 id 并校验它的来源现在可用（插件来源要**仍然启用**）。
+    ///
+    /// [「候选格式 + 插件启用」]这个判据在本仓有三个入口要用：按候选取详情
+    /// （`fetch_candidate` 之前）、失败项重试入队、失败项人工搜索。三处各写一遍
+    /// 就会出现「重试放行、取详情拒绝」这种半截状态 —— 所以只有这一个实现，
+    /// 调用方不必自己拼 `enabled_plugin_sources` 的闭包。
+    ///
+    /// [`Self::resolve_candidate_reference`]: 纯解码那一段仍可按需单独调用
+    /// （它不碰配置与注册表，可脱离插件栈测）。
+    pub fn resolve_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<CandidateReference, ServiceError> {
+        let config = self.config.snapshot()?;
+        let enabled = self.source.enabled_plugin_sources(&config);
+        Self::resolve_candidate_reference(candidate_id, |plugin_id| {
+            enabled.iter().any(|source| source.plugin_id == plugin_id)
+        })
+    }
+
     /// # `plugin_id` 是否启用要由调用方给
     ///
     /// 上游在这里查 `MetadataSourceService.is_plugin_enabled(plugin_id)`

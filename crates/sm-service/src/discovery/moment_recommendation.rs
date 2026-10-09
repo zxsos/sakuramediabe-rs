@@ -60,8 +60,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use sm_db::repo::moment::{MediaThumbnailRepository, MomentRecommendationRepository};
+use sm_db::Db;
+
 use super::embedding::EmbeddingClient;
 use super::qdrant::dense::DenseStore;
+use crate::catalog::movie::{MovieCard, MovieService};
 use crate::error::ServiceError;
 
 /// 单次生成最多落多少条（上游 `MOMENT_RECOMMENDATION_LIMIT`）。
@@ -156,7 +160,8 @@ pub struct MomentCandidate {
 /// 一行已落库的时刻推荐（上游 `MomentRecommendation` 表的投影）。
 ///
 /// **不含 `image` / `movie`** —— 那两个是 `MovieListItemResource` 与
-/// `ImageResource`，要签名密钥，属于 API 层。见 [`PageContext`]。
+/// `ImageResource`，要签名密钥，属于 API 层。它们装在
+/// [`MomentRecommendationCard`] 里与这一行同行。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MomentRecommendationRow {
     pub recommendation_id: i64,
@@ -171,19 +176,50 @@ pub struct MomentRecommendationRow {
     pub movie_id: i64,
 }
 
+impl MomentRecommendationRow {
+    /// 仓储元组 → 具名行。
+    ///
+    /// 位置对应 `sm_db::repo::moment` 里那条投影的九列：
+    /// `(recommendation_id, rank, score, strategy, reason, media_id,
+    /// thumbnail_id, offset_seconds, movie_id)` —— 前四个里三个是 `i32`，
+    /// **位置写错不会编译失败**，所以只在仓储那一处做这个换算（`list_items`
+    /// 是唯一消费方）。
+    fn from_tuple(row: sm_db::repo::moment::MomentRecommendationRow) -> Self {
+        Self {
+            recommendation_id: i64::from(row.0),
+            rank: i64::from(row.1),
+            score: row.2,
+            strategy: row.3,
+            reason: row.4,
+            media_id: i64::from(row.5),
+            thumbnail_id: i64::from(row.6),
+            offset_seconds: i64::from(row.7),
+            movie_id: i64::from(row.8),
+        }
+    }
+}
+
 /// 分页（对应上游 `MomentRecommendationPageResource`）。
 ///
 /// **有 `total`，也有 `generated_at`** —— 我早先在路由骨架里断言「专用资源
 /// 所以没有总数字段」，那是**错的**：上游 `schema/discovery/
 /// moment_recommendations.py:21-26` 两个字段都有。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// ⚠️ `items` 的条数**可能小于 `page_size`，也可能小于 `total`**：装配时
+/// 取不到缩略图图片或影片卡片的行会被跳过且**不补位**（见
+/// [`MomentRecommendationQuery::list_items`]）。
+///
+/// **不派生 `Serialize`**：`MovieCard` 是服务层形态（不是线格式），页面的
+/// 线格式由 `sm-api` 的 `MomentRecommendationResponse` 决定 —— 与
+/// `daily_recommendation` 的做法一致。
+#[derive(Debug, Clone)]
 pub struct MomentRecommendationPage {
-    pub items: Vec<MomentRecommendationRow>,
+    pub items: Vec<MomentRecommendationCard>,
     pub page: i64,
     pub page_size: i64,
     /// **仍然有效的推荐数**（媒体有效 + 影片未黑名单），不是表里的总行数。
     pub total: i64,
-    /// 最近一次生成时间。`None` = 还没生成过。
+    /// 最近一次生成时间，形如 `2026-10-09T12:34:56`（本仓统一格式，秒以下
+    /// 截断）。`None` = 还没生成过。
     pub generated_at: Option<String>,
 }
 
@@ -197,18 +233,177 @@ pub struct GenerateStats {
     pub stored_items: usize,
 }
 
-/// 需要跨到别的域取数据的部分：缩略图图片与影片卡片。
+/// 缩略图的图片素材（签名所需的两个字段）。
 ///
-/// 与 `hot_actress_release::PageContext` 同一个理由 —— 卡片 DTO 在 API 层
-/// （要签名），service 层不该知道它的形状。
-pub trait PageContext {
-    /// 取缩略图的图片素材。`None` = 该缩略图已不存在 -> **跳过这条**。
-    fn thumbnail_image(&self, thumbnail_id: i64) -> Option<serde_json::Value>;
-    /// 取影片卡片。`None` 同样导致跳过。
+/// `origin` 是**未签名**的相对路径 —— 签名要密钥，在 API 层做。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThumbnailImage {
+    pub id: i32,
+    pub origin: String,
+}
+
+/// 一条读侧装配结果：快照行 + 缩略图图片 + 影片卡片。
+///
+/// 后两者的**原始素材**（服务层类型）而不是线格式 DTO —— 上游
+/// `list_items` 里 `MovieListResource.from_attributes_model(...)` 与
+/// `ImageResource.from_attributes_model(thumbnail.image)` 都在 API 层做，
+/// 因为要签名密钥。这里给出 `MovieCard` / [`ThumbnailImage`]，路由照着
+/// `movies.rs` 的同一套（`MovieListItemResource::from_movie_card`）转。
+///
+/// # 这替换了骨架期的 `PageContext` trait
+///
+/// 那个 trait 想的是「service 不该知道卡片 DTO 的形状，让 API 层注入取数」。
+/// 但 `MovieCard` 本来就是**服务层类型**（`crate::catalog::movie`），
+/// `movies.rs` 与 `daily_recommendation` 走的都是「服务给卡片、路由签名」——
+/// 再为一处读侧发明一个返回 `serde_json::Value` 的注入缝，只会让形状无人
+/// 校验（`Value` 里字段写错不会编译失败）。用 trait 的唯一好处是「不起
+/// 数据库依赖」，而 `daily_recommendation` 已经证明读侧持有 `Db` 是可接受的。
+#[derive(Debug, Clone)]
+pub struct MomentRecommendationCard {
+    /// 快照行本身。
+    pub row: MomentRecommendationRow,
+    /// 该缩略图的图片。**取不到就整条跳过**（上游 `:556`）。
+    pub image: ThumbnailImage,
+    /// 影片卡片（[`MovieService::load_cards`] 的产物）。取不到同样跳过。
+    pub card: MovieCard,
+}
+
+/// 读取已存的瞬时推荐快照（`GET /moment-recommendations`）。
+///
+/// # 为什么与生成侧分开
+///
+/// 生成侧（[`MomentRecommendationService`]）要 Qdrant 稠密库 + 推理客户端，
+/// 而这条端点**只读库**。合成一个类型、让路由去构造向量库依赖，或者为它把
+/// 服务塞进 `AppState`，都是「为一个只读端点把生成侧的依赖拖成进程级」。
+/// 同一模块里 `hot_actress_release::HotActressReleaseQuery` 是同一取舍。
+#[derive(Debug, Clone)]
+pub struct MomentRecommendationQuery {
+    db: Db,
+}
+
+impl MomentRecommendationQuery {
+    /// 构造。取 `&Db` 并克隆（与 `DailyRecommendationService::new` 同形）。
+    pub fn new(db: &Db) -> Self {
+        Self { db: db.clone() }
+    }
+
+    /// 分页参数非法时的错误码。
     ///
-    /// 上游 `:556-557` 是 `if thumbnail is None or movie is None: continue` ——
-    /// **跳过的行不补位**，所以 `items` 可能比 `page_size` 短。
-    fn movie_card(&self, movie_id: i64) -> Option<serde_json::Value>;
+    /// 上游 `list_items`（`moment_recommendation_service.py:520`）传
+    /// `error_code="invalid_moment_recommendation_filter"`。
+    pub const INVALID_FILTER: &str = "invalid_moment_recommendation_filter";
+
+    /// 校验分页参数。违规 → 422 [`Self::INVALID_FILTER`]。
+    ///
+    /// ★ **三个 discovery 端点的分页口径是统一的**（都走
+    /// `sm_core::pagination::validate_page`，`1 <= page`、`1 <= page_size <= 100`）。
+    /// 路由文档里曾写「moment 没有任何边界，`page_size=100000` 合法」—— 那是
+    /// 把**上游 pydantic 的 Query 边界**当成了唯一一道闸：边界有两道，而
+    /// 服务层这道对三条流一视同仁。
+    ///
+    /// 真正的差别只在**错误码**：daily / hot-actress 在上游被 pydantic 先拦
+    /// （`validation_error`），moment 无 Query 边界，直接落到服务层的专用码。
+    #[allow(clippy::result_large_err)]
+    fn validate_page(page: i64, page_size: i64) -> Result<(), ServiceError> {
+        sm_core::pagination::validate_page(page, page_size).map_err(|error| {
+            let details = match error.details() {
+                serde_json::Value::Object(map) => map,
+                other => {
+                    let mut map = serde_json::Map::new();
+                    map.insert("page".to_owned(), other);
+                    map
+                }
+            };
+            ServiceError::validation_with(Self::INVALID_FILTER, error.message(), details)
+        })
+    }
+
+    /// 读快照并装配成卡片。上游 `list_items`（`:509-580`）。
+    ///
+    /// # 三件事与上游逐条对齐
+    ///
+    /// 1. **`total` 是「仍然有效的推荐数」**（`count_valid`：媒体有效 + 影片
+    ///    未黑名单），**不是**表里行数 —— 失效媒体的行还在表里。
+    /// 2. **取不到缩略图图片或影片卡片的行直接跳过，且不补位**（上游
+    ///    `:556-557` 的 `continue`）→ `items.len()` 可能小于 `page_size`，
+    ///    也可能小于 `total`。这是个**故意的**不齐：补位会让客户端以为还有
+    ///    下一页。
+    ///
+    ///    ⚠️ **这条在正常路径上不可达**：`moment_recommendation` 的
+    ///    `thumbnail_id` / `media_id` / `movie_id` 三列都是
+    ///    `ON DELETE CASCADE`（`docker/schema.sql:522-526`），而 `list_valid`
+    ///    对 `media` / `movie` 都是 INNER JOIN —— 所以「行还在、缩略图/影片
+    ///    没了」这种**状态**造不出来。它接的只是**两次查询之间的并发删除**
+    ///    （毫秒级窗口），与 `daily_recommendation` 那处跳过同类。保留它是因为
+    ///    上游有、且窗口真实存在；但别以为它能被稳定触发（见
+    ///    `moment_recommendations_http.rs` 的 `a_deleted_thumbnail_takes_the_recommendation_row_with_it`）。
+    /// 3. **`generated_at` 每次现取**（`latest_generated_at`），不是快照行上的
+    ///    时间 —— 整表替换（见 `repo::moment` 模块文档）保证全表同一个时间，
+    ///    但空表时它是 `None`（「还没生成过」），行上取不到这个信息。
+    pub async fn list_items(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<MomentRecommendationPage, ServiceError> {
+        Self::validate_page(page, page_size)?;
+        let repo = MomentRecommendationRepository::new(self.db.clone());
+        // ⚠️ `list_valid` 的第二个参数是 **offset 不是页码**（上游 Peewee
+        // `.paginate(page, page_size)` 是 1 基，仓储那层已经换算成 SQL 的
+        // `OFFSET`）。直接把 `page` 递进去，`page=1` 会跳掉第一条 ——
+        // 而这个偏移量错法只在**恰好有跨页数据**时才看得出来。
+        let offset = (page - 1) * page_size;
+        let rows = repo.list_valid(offset, page_size).await?;
+        let total = repo.count_valid().await?;
+        let generated_at = repo.latest_generated_at().await?;
+
+        // 两批取数都只在有行时才发查询（空列表在 SQL 里是语法错，仓储已挡，
+        // 这里再挡一次是为了省一次往返）。
+        let thumbnail_ids: Vec<i32> = rows.iter().map(|row| row.6).collect();
+        let images: HashMap<i32, ThumbnailImage> = MediaThumbnailRepository::new(self.db.clone())
+            .images_by_ids(&thumbnail_ids)
+            .await?
+            .into_iter()
+            .map(|(thumbnail_id, image_id, image_origin)| {
+                (
+                    thumbnail_id,
+                    ThumbnailImage {
+                        id: image_id,
+                        origin: image_origin,
+                    },
+                )
+            })
+            .collect();
+
+        let movie_ids: Vec<i32> = rows.iter().map(|row| row.8).collect();
+        let mut cards: HashMap<i32, MovieCard> = MovieService::new(&self.db)
+            .load_cards(&movie_ids)
+            .await?
+            .into_iter()
+            .map(|card| (card.movie.id, card))
+            .collect();
+
+        let items = rows
+            .into_iter()
+            .filter_map(|row| {
+                // 缩略图/影片在分页与装配之间被删（或媒体被判失效）—— 跳过。
+                let image = images.get(&row.6)?.clone();
+                let card = cards.remove(&row.8)?;
+                Some(MomentRecommendationCard {
+                    row: MomentRecommendationRow::from_tuple(row),
+                    image,
+                    card,
+                })
+            })
+            .collect();
+
+        Ok(MomentRecommendationPage {
+            items,
+            page,
+            page_size,
+            total,
+            generated_at: generated_at.map(|time| time.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        })
+    }
 }
 
 /// 瞬时推荐服务。
@@ -382,18 +577,5 @@ impl MomentRecommendationService {
     ) -> Result<GenerateStats, ServiceError> {
         let _ = limit;
         todo!("骨架：编排已就位，只差 image store 的读图字节（种子/选图/热门/落库/打分的仓储都已在 sm_db::repo::moment）")
-    }
-
-    /// 读已存的瞬时推荐快照（分页）。上游 `list_items`（`:509-580`）。
-    ///
-    /// **仍是 `todo!()`** —— 依赖 `PageContext` 的两个方法（取缩略图图片 +
-    /// 影片卡片）。
-    pub async fn list_items(
-        &self,
-        page: i64,
-        page_size: i64,
-    ) -> Result<MomentRecommendationPage, ServiceError> {
-        let _ = (page, page_size);
-        todo!("骨架：读侧仓储已就位，缺 PageContext 的取数实现（缩略图图片 + 影片卡片都要签名，属 API 层）")
     }
 }

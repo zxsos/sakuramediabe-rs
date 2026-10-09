@@ -738,8 +738,10 @@ pub const FEMALE_GENDER: i32 = 1;
 ///
 /// 1. `movie_id` 2. `actor_id`
 /// 3. `heat` —— 影片热度。**库里可能为 NULL**（上游写 `float(heat or 0)`）
-/// 4. `release_date` —— 发行日。**库里可能带时分秒**（见 service 层
-///    `_release_date` 的归一化）
+/// 4. `release_date` —— 发行日，**已 `CAST(... AS date)` 掉时分秒**（列本身是
+///    `timestamp`，见 `movie.release_date` 的 DDL）。查询里没有这个 CAST 时
+///    `NaiveDate` 会解码失败 —— `mismatched types ... DATE vs TIMESTAMP`
+///    （2026-10-09 真库第一次执行时抓到的）。
 pub type HistoryActorRow = (i32, i32, Option<i32>, chrono::NaiveDate);
 
 /// 候选窗口里带女优的影片。
@@ -792,30 +794,35 @@ impl HotActressReleaseRepository {
         history_start: chrono::NaiveDate,
         history_end: chrono::NaiveDate,
     ) -> Result<Vec<HistoryActorRow>, DbError> {
+        // ⚠️ `movie_actor` 的列是 `movie_id` / `actor_id`（`docker/schema.sql`
+        // 的 DDL，也是仓储其它 20 处写入用的名字）。此处曾写成 `ma.movie` /
+        // `ma.actor` —— 那是上游 Peewee 的**外键字段名**，SQL 列名不是它。这条
+        // 查询在 2026-10-09 之前**从未被真库执行过**（`hot-actress-releases`
+        // 的端点当时还是骨架），所以一直没暴露。
         let sql = r#"
-            WITH single_female_movies AS (
-                SELECT ma.movie AS movie_id
-                FROM movie_actor ma
-                JOIN movie m ON m.id = ma.movie
-                JOIN actor a ON a.id = ma.actor
-                WHERE m.is_collection = false
-                  AND m.is_blacklisted = false
-                  AND m.release_date >= $1
-                  AND m.release_date <  $2
-                GROUP BY ma.movie
-                HAVING SUM(CASE WHEN a.gender = 1 THEN 1 ELSE 0 END) = 1
-            )
-            SELECT ma.movie AS movie_id,
-                   ma.actor AS actor_id,
-                   m.heat AS heat,
-                   m.release_date AS release_date
-            FROM movie_actor ma
-            JOIN movie m ON m.id = ma.movie
-            JOIN actor a ON a.id = ma.actor
-            JOIN single_female_movies sfm ON sfm.movie_id = ma.movie
-            WHERE a.gender = 1
-            ORDER BY ma.movie, ma.actor
-        "#;
+           WITH single_female_movies AS (
+               SELECT ma.movie_id AS movie_id
+               FROM movie_actor ma
+               JOIN movie m ON m.id = ma.movie_id
+               JOIN actor a ON a.id = ma.actor_id
+               WHERE m.is_collection = false
+                 AND m.is_blacklisted = false
+                 AND m.release_date >= $1
+                 AND m.release_date <  $2
+               GROUP BY ma.movie_id
+               HAVING SUM(CASE WHEN a.gender = 1 THEN 1 ELSE 0 END) = 1
+           )
+           SELECT ma.movie_id AS movie_id,
+                  ma.actor_id AS actor_id,
+                  m.heat AS heat,
+                  CAST(m.release_date AS date) AS release_date
+           FROM movie_actor ma
+           JOIN movie m ON m.id = ma.movie_id
+           JOIN actor a ON a.id = ma.actor_id
+           JOIN single_female_movies sfm ON sfm.movie_id = ma.movie_id
+           WHERE a.gender = 1
+           ORDER BY ma.movie_id, ma.actor_id
+       "#;
         let rows = crate::common::page::in_snapshot_tx(&self.pool, |conn| {
             Box::pin(async move {
                 sqlx::query_as::<_, HistoryActorRow>(sql)
@@ -840,20 +847,21 @@ impl HotActressReleaseRepository {
         candidate_start: chrono::NaiveDate,
         candidate_end: chrono::NaiveDate,
     ) -> Result<Vec<CandidateRow>, DbError> {
+        // 列名同 `history_actor_rows` 上面的说明（`ma.movie_id` / `ma.actor_id`）。
         let sql = r#"
-            SELECT ma.movie AS movie_id,
-                   ma.actor AS actor_id,
-                   m.release_date AS release_date
-            FROM movie_actor ma
-            JOIN movie m ON m.id = ma.movie
-            JOIN actor a ON a.id = ma.actor
-            WHERE m.is_collection = false
-              AND m.is_blacklisted = false
-              AND m.release_date >= $1
-              AND m.release_date <  $2
-              AND a.gender = 1
-            ORDER BY m.id, ma.actor
-        "#;
+           SELECT ma.movie_id AS movie_id,
+                  ma.actor_id AS actor_id,
+                  CAST(m.release_date AS date) AS release_date
+           FROM movie_actor ma
+           JOIN movie m ON m.id = ma.movie_id
+           JOIN actor a ON a.id = ma.actor_id
+           WHERE m.is_collection = false
+             AND m.is_blacklisted = false
+             AND m.release_date >= $1
+             AND m.release_date <  $2
+             AND a.gender = 1
+           ORDER BY m.id, ma.actor_id
+       "#;
         let rows = crate::common::page::in_snapshot_tx(&self.pool, |conn| {
             Box::pin(async move {
                 sqlx::query_as::<_, CandidateRow>(sql)

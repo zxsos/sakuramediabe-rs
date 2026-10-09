@@ -111,6 +111,11 @@ impl StorageGateway for ScriptedGateway {
         unimplemented!("ScriptedGateway 不对账")
     }
 
+    fn merged_playback_format(&self, _provider_key: &str) -> Option<String> {
+        // 本套件不做合并播放。
+        None
+    }
+
     fn compute_file_hash(
         &self,
         handle: &MediaHandle,

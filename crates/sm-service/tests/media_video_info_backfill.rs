@@ -87,6 +87,11 @@ impl StorageGateway for ScriptedProbe {
         unimplemented!("本套件不对账")
     }
 
+    fn merged_playback_format(&self, _provider_key: &str) -> Option<String> {
+        // 本套件不做合并播放。
+        None
+    }
+
     fn probe_video_info(
         &self,
         handle: &MediaHandle,

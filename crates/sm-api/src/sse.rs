@@ -17,24 +17,32 @@
 //! - **每条事件以 `\n\n` 结束** —— 两个换行。少一个，客户端会把两条事件
 //!   连成一条（`data` 变成多行），而 Flutter 侧的解析器只在空行处切分。
 //!
-//! # 事件清单：**10 个**，不是 13
+//! # 事件清单：**13 个**
 //!
-//! 本仓库此前的注释（`Cargo.toml` 与 `sm-api/src/lib.rs`）写的是
-//! 「SSE 13 事件」。那是把 `completed` 的 **yield 次数**（恰好 13 处）当成了
-//! 事件种数。穷举三个流的 `yield "<name>"` 后，**去重**得到 10 个：
+//! 穷举三个流的 `yield`（`movie_metadata_refresh_service.py` 与
+//! `actor_service.py`），**去重**得到 13 个：
 //!
 //! | 事件 | 影片搜索 | 系列导入 | 演员搜索 |
 //! |---|---|---|---|
 //! | [`SEARCH_STARTED`] | ✅ | ✅ | ✅ |
+//! | [`ACTOR_FOUND`] | — | — | ✅ |
 //! | [`SERIES_FOUND`] | — | ✅ | — |
 //! | [`JAVDB_SERIES_FOUND`] | — | ✅ | — |
 //! | [`MOVIE_FOUND`] | ✅ | ✅ | — |
 //! | [`UPSERT_STARTED`] | ✅ | ✅ | ✅ |
+//! | [`IMAGE_DOWNLOAD_STARTED`] | — | — | ✅ |
+//! | [`IMAGE_DOWNLOAD_FINISHED`] | — | — | ✅ |
 //! | [`MOVIE_SKIPPED`] | — | ✅ | — |
 //! | [`MOVIE_UPSERT_STARTED`] | — | ✅ | — |
 //! | [`MOVIE_UPSERT_FINISHED`] | — | ✅ | — |
 //! | [`UPSERT_FINISHED`] | ✅ | ✅ | ✅ |
 //! | [`COMPLETED`] | ✅ | ✅ | ✅ |
+//!
+//! ★ **这张表曾经是 10 个**：演员流尚未移植时，枚举只覆盖了影片与系列两条流，
+//! 于是漏掉 [`ACTOR_FOUND`] / [`IMAGE_DOWNLOAD_STARTED`] /
+//! [`IMAGE_DOWNLOAD_FINISHED`]。当时的注释还把「`completed` 的 yield 次数
+//! 恰好 13」当成误记去纠正 —— 那个「13 事件」的说法其实是对的，错的是纠正。
+//! 教训：**枚举必须覆盖全部调用方**，否则「去重后的数字」只是个好看的巧合。
 //!
 //! 三个流（路径与上游一致）：
 //!
@@ -46,9 +54,8 @@
 //!
 //! # 本模块只做传输，**不**注册这三个端点
 //!
-//! 它们的数据源是 `MovieMetadataRefreshService` 与 `ActorService` 的
-//! `stream_*` 生成器，都在 `catalog` 域（27 文件 / 7,556 行，尚未开工）。
-//! 端点注册随那个域一起做 —— 现在注册只能返回空流。
+//! 端点注册在各域自己的 `routes()` 里（三条都已接）。本模块只提供事件名、
+//! [`ServerEvent`] 与两种响应构造（[`one_shot_response`] / [`SseHub`]）。
 //!
 //! # 与上游刻意的一处差异：不发 `Connection: keep-alive`
 //!
@@ -74,6 +81,22 @@ pub const SEARCH_STARTED: &str = "search_started";
 pub const SERIES_FOUND: &str = "series_found";
 /// `javdb_series_found`：JavDB 上找到了这个系列（仅系列导入流）。
 pub const JAVDB_SERIES_FOUND: &str = "javdb_series_found";
+/// `actor_found`：演员搜索的候选（**落库前**），`{actors, total}`。
+///
+/// 载荷里的 `actors` 只有 `javdb_id` / `name` / `avatar_url` 三个键 ——
+/// 那是给用户**挑人**用的（同名卡片常见），不是入库结果。
+pub const ACTOR_FOUND: &str = "actor_found";
+/// `image_download_started`：单条开始下载头像（仅演员流），`{javdb_id, index, total}`。
+///
+/// 单独发事件是因为**图片下载是前端最关心的慢步骤**（上游注释原话），而
+/// 入库本身很快。本仓没有 image store、不真下载，两帧照发（帧名是契约，
+/// 客户端按它画进度）。
+pub const IMAGE_DOWNLOAD_STARTED: &str = "image_download_started";
+/// `image_download_finished`：单条头像处理结束（仅演员流）。
+///
+/// `has_avatar` 取自**资源**上有没有头像 URL（上游 `bool(
+/// actor_resource.avatar_url)`），与是否真的落盘无关。
+pub const IMAGE_DOWNLOAD_FINISHED: &str = "image_download_finished";
 /// `movie_found`：远端命中的影片信息，**落库前**就回给前端。
 pub const MOVIE_FOUND: &str = "movie_found";
 /// `upsert_started`：开始落库，`{"total": n}`。
@@ -89,13 +112,16 @@ pub const UPSERT_FINISHED: &str = "upsert_finished";
 /// `completed`：流结束。`{"success": bool, "reason": ...}`。
 pub const COMPLETED: &str = "completed";
 
-/// 全部事件名（去重后 10 个）。测试断言这个集合与上游一致。
-pub const SSE_EVENT_NAMES: [&str; 10] = [
+/// 全部事件名（去重后 13 个）。测试断言这个集合与上游一致。
+pub const SSE_EVENT_NAMES: [&str; 13] = [
     SEARCH_STARTED,
+    ACTOR_FOUND,
     SERIES_FOUND,
     JAVDB_SERIES_FOUND,
     MOVIE_FOUND,
     UPSERT_STARTED,
+    IMAGE_DOWNLOAD_STARTED,
+    IMAGE_DOWNLOAD_FINISHED,
     MOVIE_SKIPPED,
     MOVIE_UPSERT_STARTED,
     MOVIE_UPSERT_FINISHED,
@@ -259,9 +285,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_event_list_has_ten_distinct_names() {
-        // 「13 事件」是误记（那是 `completed` 的 yield 次数）。这个断言的
-        // 作用是：上游若新增或改名事件，这里会先红，而不是等到客户端发现。
+    fn the_event_list_has_thirteen_distinct_names() {
+        // 「10」曾经是错的：演员流没移植时漏数了它的三条（`actor_found` 与
+        // 两个 `image_download_*`）。这个断言的真正作用是**哨兵**：上游若新增
+        // 或改名事件，这里会先红，而不是等到客户端画不出进度才发现。
         let mut sorted = SSE_EVENT_NAMES;
         sorted.sort_unstable();
         let unique = {
@@ -269,8 +296,12 @@ mod tests {
             deduped.dedup();
             deduped
         };
-        assert_eq!(sorted.len(), 10, "去重前就应有 10 个");
-        assert_eq!(unique.len(), 10, "10 个名字必须互不相同");
+        assert_eq!(sorted.len(), 13, "去重前就应有 13 个");
+        assert_eq!(unique.len(), 13, "13 个名字必须互不相同");
+        // 演员流的三条必须在表里 —— 少了它们，路由层无处可引用。
+        for name in [ACTOR_FOUND, IMAGE_DOWNLOAD_STARTED, IMAGE_DOWNLOAD_FINISHED] {
+            assert!(SSE_EVENT_NAMES.contains(&name), "缺少事件名 {name}");
+        }
     }
 
     #[test]

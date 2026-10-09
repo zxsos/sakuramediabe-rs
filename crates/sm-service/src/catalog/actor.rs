@@ -40,6 +40,8 @@
 //! （合并会压平，见 `sm_db::repo::actor` 模块文档），但一旦有人绕过合并流程
 //! 写指针，「跳一跳」与「走到底」就会给出不同演员，而本层必须与上游相同。
 
+use std::collections::HashMap;
+
 use chrono::NaiveDate;
 use serde_json::{Map, Value};
 use sm_core::text_search::split_search_terms;
@@ -248,6 +250,26 @@ impl ActorService {
             page_size: params.page_size,
             total,
         })
+    }
+
+    /// 批量取视图（含生效头像）。`hot-actress-releases` 的装配用。
+    ///
+    /// 与 [`Self::detail`] 的区别是**批量 + 不报 404**：缺的 id 只是不出现在
+    /// 返回的映射里，由调用方决定跳过还是报错（上游那处 `continue`）。
+    /// `movie_count` / `age` / `manual_fields` 与列表端点同一份 `view_of` ——
+    /// 三处各写一遍迟早会漂。
+    pub async fn views_of(
+        &self,
+        actor_ids: &[i32],
+    ) -> Result<HashMap<i32, ActorView>, ServiceError> {
+        let today = today_utc();
+        Ok(self
+            .repo
+            .find_with_images(actor_ids)
+            .await?
+            .iter()
+            .map(|row| (row.0.id, view_of(row, today)))
+            .collect())
     }
 
     /// `GET /actors/filter-options`。

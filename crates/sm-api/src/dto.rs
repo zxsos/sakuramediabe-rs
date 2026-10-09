@@ -31,6 +31,7 @@ use sm_service::catalog::actor::{
 use sm_service::catalog::movie::MovieCard;
 use sm_service::collections::playlist::PlaylistMovieCard;
 use sm_service::discovery::daily_recommendation::DailyRecommendationCard;
+use sm_service::discovery::hot_actress_release::HotActressReleaseItem;
 use sm_service::playback::media_summary::{MediaSummary, MovieMediaAttachment};
 use sm_service::videos::VideoMediaItem;
 
@@ -1267,6 +1268,84 @@ impl DailyRecommendationMovieResource {
             is_stale: card.is_stale,
         }
     }
+}
+
+/// 热播女优新作里的女优信息（上游 `HotActressResource`，
+/// `schema/discovery/hot_actress_releases.py:6-12`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct HotActressResource {
+    pub id: i32,
+    pub name: String,
+    /// `display_name_override` 优先，否则 `name`（`Actor::display_name`）。
+    pub display_name: String,
+    /// **生效**头像（覆盖优先）。无头像时 `null` —— 注意不是 `profile_image_id`：
+    /// 用户设的本地头像不生效是这一条最容易漏的地方。
+    pub profile_image: Option<ImageResource>,
+    /// 该女优的历史作品数，**已扣掉出现在本结果里的这部**。
+    pub historical_movie_count: i64,
+    /// 上游 `round(score, 4)` —— 与 `recommendation_score` **同一个值**。
+    pub hotness_score: f64,
+}
+
+/// 热播女优新作的一条结果（上游 `HotActressReleaseMovieResource`）。
+///
+/// **继承完整的影片卡片**（[`MovieListItemResource`]，`#[serde.flatten]`），
+/// 再挂两个字段 —— 与上游的继承语义一致。所以响应里没有 `movie_id` /
+/// `title` 这类「拍平后重命名」的键：影片的一切都在卡片自己的键上。
+#[derive(Debug, Clone, Serialize)]
+pub struct HotActressReleaseMovieResource {
+    #[serde(flatten)]
+    pub base: MovieListItemResource,
+    /// 推荐分。与 `hot_actress.hotness_score` **同源同值**
+    /// （上游两处都是 `round(scored_movie.score, 4)`）—— 看着冗余，但客户端
+    /// 各读各的，不能只给一个。
+    pub recommendation_score: f64,
+    pub hot_actress: HotActressResource,
+}
+
+impl HotActressReleaseMovieResource {
+    /// 从读侧装配结果组装（`GET /hot-actress-releases`）。
+    ///
+    /// 头像的「覆盖优先」由服务层解析（`ActorView.image_id`），这里只签名 ——
+    /// 与 [`ActorResource::from_view`] 同一个来源，所以演员列表与这里
+    /// 看到的是同一张头像。
+    pub fn from_item(item: &HotActressReleaseItem, secret: &str, now: i64) -> Self {
+        let actress = &item.actress.actor;
+        let score = round_to_4(item.score);
+        Self {
+            base: MovieListItemResource::from_movie_card(&item.card, secret, now),
+            recommendation_score: score,
+            hot_actress: HotActressResource {
+                id: actress.id,
+                name: actress.name.clone(),
+                display_name: actress.display_name().to_owned(),
+                profile_image: item.actress.image_id.map(|id| ImageResource {
+                    id,
+                    origin: sign_image_origin(
+                        secret,
+                        item.actress.image_origin.as_deref().unwrap_or_default(),
+                        now,
+                    ),
+                }),
+                historical_movie_count: item.historical_movie_count,
+                hotness_score: score,
+            },
+        }
+    }
+}
+
+/// 上游 `round(value, 4)`。
+///
+/// # 为什么不是 `(value * 1e4).round() / 1e4`
+///
+/// 乘 `1e4` 会再引入一次浮点误差：`0.12345 * 1e4 == 1234.4999999999998`，
+/// 于是 `0.12345` 被舍成 `0.1234`，而上游（以及「对二进制真值做十进制
+/// 舍入」的任何正确实现）给 `0.1235`。`{:.4}` 走的是精确十进制转换，
+/// 与 Python `round` 同语义（含半值取偶），所以用**格式化再解析**。
+///
+/// 失败时回退原值：`{:.4}` 对任何非 NaN 的 f64 都产出可解析的十进制串。
+fn round_to_4(value: f64) -> f64 {
+    format!("{value:.4}").parse().unwrap_or(value)
 }
 
 /// 播放列表内的影片卡片（上游 `PlaylistMovieListItemResource`）。

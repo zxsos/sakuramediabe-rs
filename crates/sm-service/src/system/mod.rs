@@ -53,9 +53,10 @@ pub use optional_services::{
     FeatureDisabled, FEATURE_DISABLED,
 };
 pub use plugins::{
-    plugin_admin_unavailable, PluginAdmin, PluginDetail, PluginInstallOutcome, PluginSummary,
-    PLUGIN_ADMIN_UNAVAILABLE, PLUGIN_INSTALL_FAILED, PLUGIN_NOT_FOUND, PLUGIN_TOO_LARGE,
-    PLUGIN_UPGRADE_FAILED, RESTART_API_AND_APS, RESTART_CONTAINER,
+    plugin_admin_unavailable, provider_not_installed, PluginAdmin, PluginDetail,
+    PluginInstallOutcome, PluginSummary, PLUGIN_ADMIN_UNAVAILABLE, PLUGIN_INSTALL_FAILED,
+    PLUGIN_NOT_FOUND, PLUGIN_TOO_LARGE, PLUGIN_UPGRADE_FAILED, PROVIDER_NOT_INSTALLED,
+    RESTART_API_AND_APS, RESTART_CONTAINER,
 };
 pub use task_queue::{
     ConflictPolicy, EnqueueOutcome, TaskQueueService, BOOTSTRAP_QUEUE_TASK_KEYS,

@@ -61,7 +61,9 @@ use crate::extract::Query as EnvelopeQuery;
 use crate::query::deser_bool;
 use crate::routes::method_not_allowed;
 use crate::signing::{now_seconds, signing_secret};
+use crate::sse::{self, ServerEvent};
 use crate::state::AppState;
+use sm_service::catalog::actor_javdb_stream::ActorStreamFrame;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -443,13 +445,144 @@ async fn get_actor_years(
     Ok(Json(years.into_iter().map(YearResource::from).collect()))
 }
 
+/// `POST /actors/search/javdb/stream` 的请求体。
+///
+/// 上游 `ActorJavdbSearchRequest`（`schema/catalog/actors.py`）：
+/// `min_length=1` **加上**「strip 后不能为空」的校验 —— 两个条件是分开的
+/// （`"   "` 长度是 3，过第一关、卡在第二关），所以下面在 handler 里补第二道。
+#[derive(Debug, Deserialize)]
+struct ActorJavdbSearchRequest {
+    actor_name: String,
+}
+
+/// 演员名不合法 → 422 `validation_error`。
+///
+/// 形状照 [`crate::extract`] 里那两处（`details.detail` 是字符串）——
+/// 客户端只读状态码与 `code`，`detail` 是给人看的。
+fn invalid_actor_name(raw: &str) -> ErrorResponse {
+    let mut details = Map::new();
+    details.insert(
+        "detail".to_owned(),
+        Value::from("actor_name cannot be blank"),
+    );
+    details.insert("actor_name".to_owned(), Value::from(raw));
+    ErrorResponse::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+        "Request validation failed",
+    )
+    .with_details(details)
+}
+
 /// `POST /actors/search/javdb/stream` —— **SSE 流**：搜 JavDB 并入库。
 ///
-/// 流式而非一次性返回，因为一个演员可能有几百部作品，逐部入库要几十秒。
+/// 一个演员可能有几百个同名候选，逐条入库要几十秒，所以边做边发。
+///
+/// # 参数字段是 `actor_name`
+///
+/// 不是 `name` / `query` —— 上游请求体就这么写（`ActorJavdbSearchRequest`）。
+///
+/// # 一遍跑完再返回（本仓特有）
+///
+/// 服务层返回的是**帧的 `Vec`**（async 生成器需要额外依赖），所以这里
+/// `collect` 之后一次性发出：帧序与上游一致，只是到达时间被压缩。
+/// 见 [`ActorJavdbStreamService::stream_search_and_upsert_actor_from_javdb`]。
+///
+/// [`ActorJavdbStreamService::stream_search_and_upsert_actor_from_javdb`]: sm_service::catalog::actor_javdb_stream::ActorJavdbStreamService::stream_search_and_upsert_actor_from_javdb
 async fn search_javdb_actor_stream(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    EnvelopeJson(_payload): EnvelopeJson<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：SSE —— 接 ActorService::stream_search_and_upsert_actor_from_javdb")
+    EnvelopeJson(payload): EnvelopeJson<ActorJavdbSearchRequest>,
+) -> Result<axum::response::Response, ErrorResponse> {
+    let actor_name = payload.actor_name.trim().to_owned();
+    if actor_name.is_empty() {
+        return Err(invalid_actor_name(&payload.actor_name));
+    }
+    let frames = state
+        .actor_javdb_stream()?
+        .stream_search_and_upsert_actor_from_javdb(&actor_name)
+        .await;
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let events: Vec<ServerEvent> = frames
+        .into_iter()
+        .map(|frame| {
+            let (name, payload) = actor_sse_frame_parts(frame, &secret, now);
+            ServerEvent::json(name, &payload).expect("帧载荷序列化不会失败")
+        })
+        .collect();
+    Ok(sse::one_shot_response(events))
+}
+
+/// 帧 → SSE 的 `(事件名, 载荷)`。
+///
+/// ★ **可选键只在有内容时出现**：早退帧不带 `failed_items`/`stats`，成功帧
+/// 不带 `reason` —— 缺键与空值在客户端是两种渲染（同 `sse_frame_parts`）。
+fn actor_sse_frame_parts(frame: ActorStreamFrame, secret: &str, now: i64) -> (&'static str, Value) {
+    match frame {
+        ActorStreamFrame::SearchStarted { actor_name } => (
+            sse::SEARCH_STARTED,
+            serde_json::json!({ "actor_name": actor_name }),
+        ),
+        ActorStreamFrame::ActorFound { actors, total } => (
+            sse::ACTOR_FOUND,
+            serde_json::json!({ "actors": actors, "total": total }),
+        ),
+        ActorStreamFrame::UpsertStarted { total } => {
+            (sse::UPSERT_STARTED, serde_json::json!({ "total": total }))
+        }
+        ActorStreamFrame::ImageDownloadStarted {
+            javdb_id,
+            index,
+            total,
+        } => (
+            sse::IMAGE_DOWNLOAD_STARTED,
+            serde_json::json!({ "javdb_id": javdb_id, "index": index, "total": total }),
+        ),
+        ActorStreamFrame::ImageDownloadFinished {
+            javdb_id,
+            index,
+            total,
+            has_avatar,
+        } => (
+            sse::IMAGE_DOWNLOAD_FINISHED,
+            serde_json::json!({
+                "javdb_id": javdb_id,
+                "index": index,
+                "total": total,
+                "has_avatar": has_avatar,
+            }),
+        ),
+        ActorStreamFrame::UpsertFinished { stats } => {
+            (sse::UPSERT_FINISHED, serde_json::json!(stats))
+        }
+        ActorStreamFrame::Completed {
+            success,
+            reason,
+            actors,
+            failed_items,
+            stats,
+        } => {
+            // 头像是**签名**资源：服务形态的 `ActorView` 在这里才变成线格式。
+            let actors: Vec<ActorResource> = actors
+                .iter()
+                .map(|view| ActorResource::from_view(view, secret, now))
+                .collect();
+            let mut payload = Map::new();
+            payload.insert("success".to_owned(), Value::from(success));
+            payload.insert("actors".to_owned(), serde_json::json!(actors));
+            if let Some(reason) = reason {
+                payload.insert("reason".to_owned(), Value::from(reason));
+            }
+            if !failed_items.is_empty() {
+                payload.insert("failed_items".to_owned(), serde_json::json!(failed_items));
+            }
+            // `stats` 走 `Option`（早退帧没有它），但**全失败帧有** ——
+            // 那时 `failed_items` 与 `stats` 一起出现，客户端据此画「3 成 2 败」。
+            if let Some(stats) = stats {
+                payload.insert("stats".to_owned(), serde_json::json!(stats));
+            }
+            (sse::COMPLETED, Value::Object(payload))
+        }
+    }
 }

@@ -133,6 +133,10 @@ pub struct AppState {
     /// = 插件平台没起。见 [`Self::metadata_refresh`]。
     metadata_refresh:
         Option<Arc<sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService>>,
+    /// 演员搜索流式导入（`POST /actors/search/javdb/stream` 用）。**组合根装配**；
+    /// `None` = 插件平台没起。见 [`Self::actor_javdb_stream`]。
+    actor_javdb_stream:
+        Option<Arc<sm_service::catalog::actor_javdb_stream::ActorJavdbStreamService>>,
     /// 剧情图搜的检索服务。理由与 `image_search` 完全一致（同一组 router 依赖）。
     plot_image_search:
         Option<Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>>,
@@ -158,6 +162,7 @@ impl AppState {
             plot_image_search: None,
             metadata_search: None,
             metadata_refresh: None,
+            actor_javdb_stream: None,
         }
     }
 
@@ -223,7 +228,8 @@ impl AppState {
         self
     }
 
-    /// 元数据刷新服务。未装配 → 503（理由同 [`Self::metadata_search`]）。
+    /// 元数据刷新服务。未装配 → **503 `provider_not_installed`**（理由同
+    /// [`Self::metadata_search`]）。
     pub fn metadata_refresh(
         &self,
     ) -> Result<
@@ -232,20 +238,47 @@ impl AppState {
     > {
         self.metadata_refresh
             .as_deref()
-            .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
+            .ok_or_else(sm_service::system::plugins::provider_not_installed)
+    }
+
+    /// 挂上演员搜索流式导入。**只有组合根会调**。
+    pub fn with_actor_javdb_stream(
+        mut self,
+        stream: Arc<sm_service::catalog::actor_javdb_stream::ActorJavdbStreamService>,
+    ) -> Self {
+        self.actor_javdb_stream = Some(stream);
+        self
+    }
+
+    /// 演员搜索流式导入服务。未装配 → **503 `provider_not_installed`**（理由
+    /// 同 [`Self::metadata_refresh`]：它依赖插件平台，平台没起时这个能力不
+    /// 存在 —— 而不是「搜了没有」）。
+    pub fn actor_javdb_stream(
+        &self,
+    ) -> Result<&sm_service::catalog::actor_javdb_stream::ActorJavdbStreamService, ServiceError>
+    {
+        self.actor_javdb_stream
+            .as_deref()
+            .ok_or_else(sm_service::system::plugins::provider_not_installed)
     }
 
     /// 元数据搜索服务。
     ///
-    /// 未装配 → 503（与 [`Self::plugin_admin`] 同一取向：它依赖插件平台，
-    /// 平台没起时这个能力就不存在 —— 而不是「搜了没有」）。
+    /// 未装配 → **503 `provider_not_installed`**：它依赖插件平台，平台没起时
+    /// 这个能力就不存在 —— 而不是「搜了没有」。
+    ///
+    /// ★ 与 [`Self::plugin_admin`] 的 500 `plugin_admin_unavailable` **不是
+    /// 同一件事**：那个是组合根漏了接线（重试无用），这里是能力当前不可用。
+    /// 2026-10-09 之前这三处复用前者，而文档写着 503 —— 测试（
+    /// `media_import_retry_http.rs` 的 `without_the_search_service_the_route_is_503`）
+    /// 把差别暴露出来后改成 503。
     pub fn metadata_search(
         &self,
     ) -> Result<&sm_service::catalog::movie_metadata_search::MovieMetadataSearchService, ServiceError>
     {
         self.metadata_search
             .as_deref()
-            .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
+            .ok_or_else(sm_service::system::plugins::provider_not_installed)
     }
 
     /// 图搜检索服务。`None` = 未启用。

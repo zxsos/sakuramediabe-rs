@@ -76,12 +76,13 @@
 //! # 未落地（各有阻塞）
 //!
 //! ✅ 已落地：`enqueue` / `enqueue_batch`（按库互斥、四分支）、
-//! `list_failed_items`（读 `result_summary.failed_files` 投影成 13 字段）。
+//! `list_failed_items`（读 `result_summary.failed_files` 投影成 13 字段）、
+//! `enqueue_failed_item_retry`（202：候选校验 → 终态 → 失败项 → 源与库 →
+//! 入队 → 回写 `state=queued`）。
 //!
 //! | 方法 | 缺什么 |
 //! |---|---|
 //! | [`ImportTaskService::search_failed_item`] | 元数据搜索 —— 走**插件 ABI**（`metadata_source`）|
-//! | [`ImportTaskService::enqueue_failed_item_retry`] | 同上前提：它第一步就调 `MovieMetadataSearchService.resolve_candidate_reference`（校验候选与插件启用），跳过它等于放行一个**必然失败**的重试任务 |
 //! | [`ImportTaskService::execute`] | `import_service`（扫描/暂存/定稿）+ `catalog_import`；且 `sm-scheduler` 尚未注册 `library_import` 处理器 |
 //!
 //! # 手动搜索的两种失败**要区别对待**
@@ -93,6 +94,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sm_db::system::task_state;
 
 use sm_db::repo::{
     BackgroundTaskRunRepository, DownloadClientRepository, DownloadTaskRepository,
@@ -102,6 +104,7 @@ use sm_db::system::activity::BackgroundTaskRun;
 use sm_db::transfers::downloads::{import_status, DownloadTask};
 use sm_db::{Db, MediaLibrary};
 
+use crate::catalog::movie_metadata_search::MovieMetadataSearchService;
 use crate::error::{details_of, ProgrammerError, ServiceError};
 use crate::system::activity::TaskRunService;
 use crate::system::task_queue::{ConflictPolicy, EnqueueOutcome, TaskQueueService};
@@ -118,6 +121,22 @@ pub const TASK_KEY: &str = "library_import";
 /// 该走重试与告警。
 pub const MANUAL_SEARCH_FAILURE_REASONS: [&str; 2] =
     ["movie_number_not_found", "metadata_fetch_failed"];
+
+/// 失败项重试的触发方式。上游 `enqueue_failed_item_retry` 写死
+/// `trigger_type="manual"` —— 与批量入队的 `"internal"` 不同，任务中心据此
+/// 区分「谁触发的」。
+const RETRY_TRIGGER_TYPE: &str = "manual";
+
+/// 失败项重试的任务名。上游那处字面量（`…service.py:265`）。
+///
+/// 与 [`default_task_name`] 不一回事：那条是「JAV媒体库导入」，这条专指重试。
+const RETRY_TASK_NAME: &str = "JAV失败项重试导入";
+
+/// `params["mode"]` 之一：重试一条失败项。
+///
+/// 与模块文档「三种执行模式」那张表**同一组字面量**，worker 的
+/// [`ImportTaskService::execute`] 按它分发。
+pub const IMPORT_MODE_RETRY_FAILED_FILE: &str = "retry_failed_file";
 
 /// 批量入队的触发方式。上游 `enqueue_batch` 里写死 `trigger_type="internal"`。
 ///
@@ -737,19 +756,141 @@ impl ImportTaskService {
 
     /// `POST /imports/{task_run_id}/failed-items/{item_id}/retry` —— **202**。
     ///
-    /// 错误码：同 `search_failed_item`，另加 `409 failed_item_source_unavailable`
-    /// （暂存文件已被清理 —— 只能让用户重新浏览导入）。
+    /// 上游 `enqueue_failed_item_retry`（`shared/import_task_service.py:199-277`）。
     ///
-    /// ⚠️ **未落地**：要先做终态校验（`409 import_task_not_finished`，
-    /// 见 `_ensure_retryable_task`），再以 `mode=retry_failed_file` 入队。
+    /// | 情况 | 码 |
+    /// |---|---|
+    /// | 候选 id 编码不对 / 其插件来源已停用 | 422 `invalid_metadata_candidate` |
+    /// | 请求本身不合法（`candidate_id` 空白或超长） | 422 `validation_error` |
+    /// | 任务不存在 / 不是导入任务 | 404 `import_task_not_found` |
+    /// | 任务**还没跑完** | 409 `import_task_not_finished` |
+    /// | 失败项不在这条任务里 | 404 `failed_item_not_found` |
+    /// | 该条已在重试 / 已解决 | 409 `failed_item_not_pending` |
+    /// | 该条不是「JAV 视频 + 可人工处理的原因」 | 409 `failed_item_search_unavailable` |
+    /// | 暂存文件信息已不可用 | 409 `failed_item_source_unavailable` |
+    /// | 媒体库不存在 | 404 `media_library_not_found` |
+    /// | 媒体库没有 provider 配置 | 422 `invalid_media_library_provider` |
+    /// | 同一媒体库已有导入在跑 | 409 `import_task_conflict` |
+    ///
+    /// # 顺序是契约的一部分
+    ///
+    /// 候选校验（①）在**台账之前**：上游注释「入队即校验候选格式与插件启用
+    /// 状态，避免用户拿到一个必然失败的任务」。所以「候选坏 + 任务不存在」报
+    /// 的是**候选**的 422，不是 404。
+    ///
+    /// # `search` 为什么要传进来
+    ///
+    /// 候选校验要问「那个插件现在还启用吗」，而那要读配置 + 插件注册表；
+    /// 本 crate 不做插件运行时（见 `Cargo.toml` 的说明），所以由调用方
+    /// （路由，经 `AppState::metadata_search`）递进来。与
+    /// [`MetadataSourceService::match_actors`] 收 `import_service` 同形。
+    ///
+    /// [`MetadataSourceService::match_actors`]: crate::catalog::metadata_source::MetadataSourceService::match_actors
     pub async fn enqueue_failed_item_retry(
         &self,
+        search: &MovieMetadataSearchService,
         task_run_id: i32,
         item_id: &str,
-        candidate_id: &str,
+        payload: &ImportFailedItemRetryRequest,
     ) -> Result<ImportAcceptedResponse, ServiceError> {
-        let _ = (task_run_id, item_id, candidate_id);
-        todo!("骨架：以选定的候选入队一条重试（mode=retry_failed_file）")
+        payload.validate()?;
+        let candidate_id = payload.candidate_id.trim();
+        // ① 候选格式 + 插件启用。
+        let _reference = search.resolve_candidate(candidate_id)?;
+
+        // ② 台账：终态 → 找失败项 → 它可不可重试 → 源与库还在不在。
+        let task_run = self.require_import_task_run(task_run_id).await?;
+        ensure_retryable_task(&task_run)?;
+        let items = failed_files(task_run_id, task_run.result_summary.as_deref())?;
+        let raw = find_failure_item(task_run_id, &items, item_id)?;
+        let stored: StoredFailedItem = serde_json::from_value(raw.clone())
+            .map_err(|error| malformed_summary(task_run_id, format!("失败项形状不对：{error}")))?;
+        ensure_searchable_failure_item(&stored)?;
+        // 源文件信息还在吗？这里只做**存在性**判断 —— 值本身随整条 `raw`
+        // 进 `params`（重试是一条自足的任务，worker 不回头读原任务）。
+        // 判空的理由：暂存区可能已经被清理，那样这条重试必然失败，不如现在就
+        // 告诉用户「重新浏览导入」。
+        if !raw
+            .get("source_ref")
+            .is_some_and(|value| value.as_object().is_some_and(|map| !map.is_empty()))
+        {
+            return Err(ServiceError::conflict(
+                "failed_item_source_unavailable",
+                "失败项的源文件信息已不可用",
+                None,
+            ));
+        }
+        // `library_id` 必须是**整数**（`bool` 不算 —— Python 里 `True` 是 `int`，
+        // 上游专门排掉了它；Rust 的 `as_i64` 对 JSON `true` 返回 `None`，
+        // 天然满足）。缺了就 409：这是**库被写坏**，重试必然失败。
+        let library_id = raw
+            .get("library_id")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| {
+                ServiceError::conflict(
+                    "failed_item_source_unavailable",
+                    "失败项缺少媒体库信息",
+                    None,
+                )
+            })?;
+        let library = require_library(&self.db, library_id).await?;
+
+        // ③ 入队。互斥键按**库**（同库不能两个导入并行），与 `enqueue` 同键。
+        let params = json!({
+            "mode": IMPORT_MODE_RETRY_FAILED_FILE,
+            "original_task_run_id": task_run.id,
+            "failure_item_id": item_id,
+            // 整条存储项进 params（含 `source_ref` / `library_id`）——
+            // worker 不回头读原任务，重试是一条**自足**的任务。
+            "failure_item": raw,
+            "candidate_id": candidate_id,
+        });
+        let outcome = TaskQueueService::new(&self.db)
+            .enqueue_with_mutex_key(
+                TASK_KEY,
+                RETRY_TRIGGER_TYPE,
+                Some(RETRY_TASK_NAME),
+                &library_import_mutex_key(i64::from(library.id)),
+                Some(params),
+                ConflictPolicy::Raise,
+            )
+            .await?;
+        let retry_run = match outcome {
+            EnqueueOutcome::Enqueued(run) => *run,
+            EnqueueOutcome::Skipped {
+                blocking_task_run_id,
+            } => return Err(import_task_conflict(blocking_task_run_id)),
+        };
+
+        // ④ 回写失败项：`state=queued` + 指向新任务 + 清掉上次的错误。
+        //
+        // ★ **整段替换** `failed_files`（不是改其中一个元素的字段）：上层
+        // 合并是顶层键覆盖，而这一列是数组 —— 所以先把新数组整个算出来。
+        let patch = replace_failure_item(
+            &items,
+            item_id,
+            json!({
+                "state": ImportFailedItemState::Queued,
+                "retry_task_run_id": retry_run.id,
+                "last_retry_error": Value::Null,
+            }),
+        )?;
+        let written = BackgroundTaskRunRepository::new(self.db.clone())
+            .merge_result_summary(task_run.id, Some(&json!({ "failed_files": patch })))
+            .await?;
+        if !written {
+            // 原任务行在入队与回写之间被删了。**撤销刚建的任务**再报 404 ——
+            // 否则用户拿到 202，而那条重试指向一个已经不存在的失败项。
+            self.abort_enqueued_run(retry_run.id).await;
+            return Err(failed_item_not_found(item_id));
+        }
+
+        Ok(ImportAcceptedResponse {
+            task_run_id: retry_run.id,
+            task_key: retry_run.task_key.clone(),
+            state: retry_run.state.clone(),
+        })
     }
 
     /// ★ 执行体。worker 调用。
@@ -1021,8 +1162,18 @@ impl StoredFailedItem {
     /// | `media_kind == jav` | 非 JAV 不走番号刮削 |
     /// | `reason ∈ {movie_number_not_found, metadata_fetch_failed}` | 见 [`MANUAL_SEARCH_FAILURE_REASONS`] |
     fn can_manual_search(&self) -> bool {
-        self.state == ImportFailedItemState::Pending
-            && self.is_video
+        self.state == ImportFailedItemState::Pending && self.is_searchable_kind()
+    }
+
+    /// 上一条判据去掉「状态」那一项（后三个条件）。
+    ///
+    /// 单独拆出来是因为重试路径要把这两组**报成不同的码**：
+    /// `failed_item_not_pending`（有人正在处理）与
+    /// `failed_item_search_unavailable`（这条根本不适合人工处理）——
+    /// 合成一个 `can_manual_search` 就分不出来，而客户端对这两个的提示词不同
+    /// （「等它跑完」vs「这条修不了，换个源」）。
+    fn is_searchable_kind(&self) -> bool {
+        self.is_video
             && self.media_kind == super::import_service::media_kind::JAV
             && MANUAL_SEARCH_FAILURE_REASONS.contains(&self.reason.as_str())
     }
@@ -1059,6 +1210,118 @@ fn failure_item_resource(
     serde_json::from_value::<StoredFailedItem>(item)
         .map(StoredFailedItem::into_resource)
         .map_err(|error| malformed_summary(task_run_id, format!("失败项形状不对：{error}")))
+}
+
+/// 任务必须在**终态**才能重试它里面的失败项。上游 `_ensure_retryable_task`
+/// （`import_task_service.py:492-495`）。
+///
+/// 判据用 [`task_state::is_terminal`]（`completed || failed`）而不是
+/// 「非 active」：两者在当前状态机下等价，但**语义不同** —— 将来若加了
+/// `cancelled`，它应当继续被拒（那次导入没跑完就中止了，里面的失败项不该
+/// 由用户逐条重试），而不是因为「不是 active」被放进来。
+fn ensure_retryable_task(task_run: &BackgroundTaskRun) -> Result<(), ServiceError> {
+    if task_state::is_terminal(&task_run.state) {
+        return Ok(());
+    }
+    Err(ServiceError::conflict(
+        "import_task_not_finished",
+        "导入任务尚未完成",
+        None,
+    ))
+}
+
+/// 404 `failed_item_not_found`。
+///
+/// **不带 details**（上游 `ApiError(404, …)` 的 details 是空对象）—— 与
+/// [`Self::require_import_task_run`] 的 `import_task_not_found` 同一取向：
+/// `item_id` 已经在路径里回显过了，再塞进 details 只是多一个客户端不读的键。
+fn failed_item_not_found(_item_id: &str) -> ServiceError {
+    ServiceError::from_status(404, "failed_item_not_found", "导入失败项不存在")
+}
+
+/// 从存储里的失败项数组里按 `id` 取一条。上游 `_find_failure_item`
+/// （`:497-501`）。
+///
+/// # 元素必须是对象
+///
+/// 上游是 `item.get("id")`：元素不是 dict 就 `AttributeError` → **500**。
+/// 这里同样不把非对象元素当「没匹配上」跳过 —— 那一列的形状是宿主自己写的
+/// （[`failed_files`] 的文档），混进一个字符串就是缺陷，静默跳过会让「失败项
+/// 列表少一条」与「本来就没有」长得一样。
+fn find_failure_item(
+    task_run_id: i32,
+    items: &[Value],
+    item_id: &str,
+) -> Result<Value, ServiceError> {
+    for item in items {
+        if !item.is_object() {
+            return Err(malformed_summary(
+                task_run_id,
+                format!("failed_files 里的元素不是对象：{item}"),
+            ));
+        }
+        if item.get("id").and_then(Value::as_str) == Some(item_id) {
+            return Ok(item.clone());
+        }
+    }
+    Err(failed_item_not_found(item_id))
+}
+
+/// 这一条**现在**能不能重试。上游 `_ensure_searchable_failure_item`
+/// （`:503-512`）—— 与人工搜索同一道闸，两个不同的码。
+fn ensure_searchable_failure_item(item: &StoredFailedItem) -> Result<(), ServiceError> {
+    if item.state != ImportFailedItemState::Pending {
+        return Err(ServiceError::conflict(
+            "failed_item_not_pending",
+            "失败项当前不在待处理状态",
+            None,
+        ));
+    }
+    if !item.is_searchable_kind() {
+        return Err(ServiceError::conflict(
+            "failed_item_search_unavailable",
+            "该失败项不支持手动元数据搜索",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// 整段替换 `failed_files` 里的一条（`changes` 覆盖同名键）。上游
+/// `_replace_failure_item`（`:539-556`）。
+///
+/// 返回**新的整个数组**（不是就地改）：`result_summary` 的合并是顶层键覆盖，
+/// 数组要整段给出去。
+///
+/// 找不到那一条 → 404（上游同一处）。理论上 [`find_failure_item`] 刚找到过，
+/// 走到这里说明两次调用之间被并发改掉了 —— 报 404 而不是 500：对用户来说
+/// 「这条不见了」就是 404。
+fn replace_failure_item(
+    items: &[Value],
+    item_id: &str,
+    changes: Value,
+) -> Result<Vec<Value>, ServiceError> {
+    let Value::Object(changes) = changes else {
+        return Err(ProgrammerError::new("失败项改动必须是对象").into());
+    };
+    let mut updated = Vec::with_capacity(items.len());
+    let mut replaced = false;
+    for item in items {
+        if item.get("id").and_then(Value::as_str) != Some(item_id) {
+            updated.push(item.clone());
+            continue;
+        }
+        let mut merged = item.as_object().cloned().unwrap_or_default();
+        for (key, value) in &changes {
+            merged.insert(key.clone(), value.clone());
+        }
+        updated.push(Value::Object(merged));
+        replaced = true;
+    }
+    if !replaced {
+        return Err(failed_item_not_found(item_id));
+    }
+    Ok(updated)
 }
 
 /// 下载任务的完成源引用。上游直接读 `task.completed_source_ref`（已是 dict）。

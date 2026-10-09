@@ -302,23 +302,36 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 error.api.message
             )
         })?;
-        let metadata_import = sm_service::catalog::catalog_import::CatalogImportService::new(
-            &pool,
-            Box::new(sm_service::catalog::movie_image::MovieImageService::new(
+        //
+        // ⚠️ **建两份**：影片刷新一份、演员流一份。`CatalogImportService`
+        // 里有 `Box<dyn …>`，既非 `Clone` 也不便于共享；而它本身**无状态**
+        // —— 连接池、图片根、下载器闭包都不持有会话或缓存，两份实例不会
+        // 各自漂移。想改成共享得先把那两个字段换成 `Arc`，那是另一件事。
+        let build_metadata_import = |image_root: std::path::PathBuf| {
+            sm_service::catalog::catalog_import::CatalogImportService::new(
                 &pool,
-                image_root,
+                Box::new(sm_service::catalog::movie_image::MovieImageService::new(
+                    &pool,
+                    image_root,
+                    sm_service::catalog::movie_image::http_image_downloader(),
+                )),
                 sm_service::catalog::movie_image::http_image_downloader(),
-            )),
-            sm_service::catalog::movie_image::http_image_downloader(),
-        );
-        // 搜索与刷新共用同一条来源服务 —— 两个端点的「JavDB + 插件」顺序与
-        // 错误分类必须一致，分叉就会各漂各的。
+            )
+        };
+        // 搜索、刷新、演员流共用同一条来源服务 —— 三处的「JavDB + 插件」顺序
+        // 与错误分类必须一致，分叉就会各漂各的。
         let metadata_refresh =
             sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService::new(
                 &pool,
                 &config_service,
                 Arc::clone(&metadata_source),
-                metadata_import,
+                build_metadata_import(image_root.clone()),
+            );
+        let actor_javdb_stream =
+            sm_service::catalog::actor_javdb_stream::ActorJavdbStreamService::new(
+                &pool,
+                Arc::clone(&metadata_source),
+                build_metadata_import(image_root),
             );
         (
             sm_service::catalog::movie_metadata_search::MovieMetadataSearchService::new(
@@ -326,17 +339,20 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 metadata_source,
             ),
             metadata_refresh,
+            actor_javdb_stream,
         )
     };
-    let (metadata_search, metadata_refresh) = metadata_search;
+    let (metadata_search, metadata_refresh, actor_javdb_stream) = metadata_search;
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
-        .with_storage_gateway(storage_gateway)
+        // 克隆给 worker（下面 6b 步三个 playback 任务用），本体进 AppState。
+        .with_storage_gateway(std::sync::Arc::clone(&storage_gateway))
         .with_playback_gateway(playback_gateway)
         .with_media_library_registry(media_library_gateway)
         .with_metadata_search(Arc::new(metadata_search))
         .with_metadata_refresh(Arc::new(metadata_refresh))
+        .with_actor_javdb_stream(Arc::new(actor_javdb_stream))
         .with_plugin_admin(plugin_admin);
     // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
     //
@@ -424,6 +440,11 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                             )
                         })?,
                     ),
+                    // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
+                    // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
+                    // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
+                    // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
+                    storage: std::sync::Arc::clone(&storage_gateway),
                 },
             )),
             WorkerConfig::default(),

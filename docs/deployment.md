@@ -205,7 +205,8 @@ def _parse_torrent_hash(payload: bytes) -> str:
 - [x] **`svc-probe`（ffprobe）落地**（2026-10-09，`crates/svc-probe`：真跑 `ffprobe`
       CLI + JSON 解析 + 远端 reader 落盘；`media_metadata_probe` 那处接缝已换上）。
       消费方进度：`media_file_hash_backfill` / `media_video_info_backfill` /
-      `media_validity_scan` 已接（2026-10-09，4 + 5 + 3 项集成测试）；
+      `media_validity_scan` 已接（2026-10-09，4 + 5 + 5 项集成测试），三个任务的
+      cron handler 也已注册进调度器（`HandlerDeps` 注入同一个数据面网关）；
       `video_cover_service` 仍是 `todo!()`
 - [ ] **zip 实现** —— 解锁 `media_thumbnail_pack_backfill_service`(216)（仓库当前无 zip crate）
 - [ ] `catalog` 入库路径（插件元数据 → 库表），见 §6 第 3 条

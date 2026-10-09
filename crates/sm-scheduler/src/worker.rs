@@ -56,6 +56,15 @@ use sm_db::Db;
 use sm_service::catalog::movie_asset_pack_backfill::MovieAssetPackBackfillService;
 use sm_service::catalog::movie_heat::MovieHeatService;
 use sm_service::catalog::movie_task::MovieTaskService;
+use sm_service::playback::media_file_hash_backfill::{
+    MediaFileHashBackfillService, TASK_KEY as HASH_TASK_KEY,
+};
+use sm_service::playback::media_validity_scan::{
+    MediaValidityScanService, TASK_KEY as SCAN_TASK_KEY,
+};
+use sm_service::playback::media_video_info_backfill::{
+    MediaVideoInfoBackfillService, TASK_KEY as INFO_TASK_KEY,
+};
 use sm_service::system::activity::{run_task, TaskHandler, TaskRunError, TaskRunService};
 use sm_service::system::activity_cleanup::RetentionPolicy;
 use sm_service::system::optional_services::job_disabled_reason;
@@ -113,7 +122,6 @@ const HOUSEKEEPING_FLOOR_SECONDS: u64 = 5;
 /// | **工厂闭包捕获 `Arc<HandlerDeps>`** | ✅ 无破坏、可注入、`Fn + Send + Sync` 满足 |
 ///
 /// 选第三种。`ConfigService` 的 `Clone` 只复制一个 `PathBuf`，很便宜。
-#[derive(Debug, Clone)]
 pub struct HandlerDeps {
     /// 配置服务。`image_search_index` 从这里读 `image_search.*`。
     pub config: sm_service::system::config::ConfigService,
@@ -121,6 +129,12 @@ pub struct HandlerDeps {
     /// 建客户端可能失败，而那应该由工厂返回的 `Err` 报出来，
     /// 而不是让 `builtin_handlers()` 整个 panic。
     pub qdrant: QdrantEndpoint,
+    /// 数据面网关（算哈希 / 探测 / 对账三个 playback 任务用）。组合根注入
+    /// 真的 `ProviderGateway`，测试注入桩 —— 与播放投递那条缝同一个 trait。
+    ///
+    /// ⚠️ 进来后**整个 `HandlerDeps` 不再 `Debug`**：trait 对象没有 `Debug`。
+    /// 本来也只在前几轮排查时打印过，删 derive 比给网关手写 `Debug` 诚实。
+    pub storage: Arc<dyn sm_service::playback::provider_helpers::StorageGateway>,
 }
 
 /// Qdrant 连接信息。
@@ -280,7 +294,7 @@ impl HandlerRegistry {
 ///
 /// # 现在有六个
 ///
-/// 19 个内建 cron 任务里 13 个的 service 还没写（zip / provider 各挡一批，
+/// 19 个内建 cron 任务里 10 个的 service 还没写（zip / provider 各挡一批，
 /// 见 `docs/service-progress.md`）。**不注册就没有处理器**，那些任务被领到
 /// 时会明确 `failed` 并写清「未在处理器注册表中」，而不是静默跳过。
 ///
@@ -289,6 +303,9 @@ impl HandlerRegistry {
 /// | `activity_record_cleanup` | `system` | 无 |
 /// | `movie_asset_pack_backfill` | `catalog` | 无（只读库 + 本地图片根）|
 /// | `movie_heat_update` | `catalog` | 无 |
+/// | `media_file_hash_backfill` | `playback` | 数据面网关（插件）|
+/// | `media_video_info_backfill` | `playback` | 数据面网关（插件）|
+/// | `media_file_scan` | `playback` | 数据面网关（插件）|
 /// | `image_search_index` | `discovery` | 推理服务 + Qdrant（都已在 `sm-service` 侧就位）|
 /// | `movie_similarity_recompute` | `discovery` | Qdrant（稀疏向量通路）|
 /// | `daily_recommendation_generate` | `discovery` | Qdrant（**可选**：不可用时只丢相似度那一路）|
@@ -576,6 +593,88 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
                         .update_movie_heat()
                         .await
                         .map_err(|error| format!("影片热度重算失败：{}", error.code()))?;
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
+    // ---- playback 域三个 provider 任务（同一个数据面网关，一批注册） ----
+    //
+    // 上游三个注册项（`scheduler/registry.py`）共同点：都是「拿候选 → 逐条
+    // 走 provider → 回统计」，所以 handler 形状一致：注入的
+    // `Arc<dyn StorageGateway>` 直接 move 进闭包（`Arc` 克隆便宜），服务在
+    // 每次运行时用**当次的** `&Db` 构造。
+    //
+    // # 为什么这三个要 `deps.storage` 而别的 handler 不用
+    //
+    // 它们是**仅有的三个真要连插件数据面**的内建 cron 任务。`qdrant` 那次
+    // 只存连接信息（客户端可能建失败），这里不同：网关在组合根已经构造完
+    // （活注册表句柄），直接共享即可 —— 与播放投递同一条缝、同一个实例。
+
+    // `media_file_hash_backfill` —— 文件哈希回填（去重的地基）。cron 那条。
+    let hash_deps = Arc::clone(&deps);
+    registry.register(
+        HASH_TASK_KEY,
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&hash_deps);
+            let db = Db::clone(db);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    let service = MediaFileHashBackfillService::new(&db, Arc::clone(&deps.storage));
+                    let sink = progress_sink_for(&reporter);
+                    let stats = service
+                        .backfill_missing_file_hashes(Some(sink))
+                        .await
+                        .map_err(|error| format!("媒体文件哈希回填失败：{}", error.code()))?;
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
+    // `media_video_info_backfill` —— 技术信息回填。上游它是**三条无 cron 的
+    // 手动任务之一**（与 `movie_asset_pack_backfill` 同档）：没 handler 的话
+    // 手动触发也是 `NoHandler` 失败，等于功能不存在。
+    let info_deps = Arc::clone(&deps);
+    registry.register(
+        INFO_TASK_KEY,
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&info_deps);
+            let db = Db::clone(db);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    let service =
+                        MediaVideoInfoBackfillService::new(&db, Arc::clone(&deps.storage));
+                    let sink = progress_sink_for(&reporter);
+                    let stats = service
+                        .backfill_missing_video_infos(Some(sink))
+                        .await
+                        .map_err(|error| format!("媒体技术信息回填失败：{}", error.code()))?;
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
+    // `media_file_scan` —— 有效性巡检（对账：provider 说没有 → 才判失效）。
+    let scan_deps = Arc::clone(&deps);
+    registry.register(
+        SCAN_TASK_KEY,
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&scan_deps);
+            let db = Db::clone(db);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    let service = MediaValidityScanService::new(&db, Arc::clone(&deps.storage));
+                    let sink = progress_sink_for(&reporter);
+                    let stats = service
+                        .scan_media_validity(Some(sink))
+                        .await
+                        .map_err(|error| format!("媒体文件巡检失败：{}", error.code()))?;
                     serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
                 })
             });

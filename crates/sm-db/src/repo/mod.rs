@@ -217,6 +217,15 @@ pub use playback::{
     ClipFilter, MediaClipRepository, MediaPointRepository, MediaProgressRepository,
     MediaThumbnailRepository, NewMediaClip,
 };
+// ⚠️ 这两个名字在 `repo` 下**各有两份**：`repo::moment` 也定义了
+// `MomentRecommendationRepository` 与 `NewMomentRecommendation`（同一张
+// `moment_recommendation` 表，形状不同 —— `moment` 那份读侧是元组投影、
+// 写侧把 `generated_at` 当参数；这里这份把 `generated_at` 当字段）。
+//
+// 重导出的是 `recommendation` 这一份，所以 `sm_db::repo::…` 与
+// `sm_db::repo::moment::…` 是两个**不同类型**：混用会以「写进去的行读不出来」
+// 的形式出现，而不是编译错误。用之前先确认对面用的是哪一份
+// （读侧服务 `discovery::moment_recommendation` 用的是 `repo::moment`）。
 pub use recommendation::{
     DailyRecommendationItemRepository, MomentRecommendationRepository, NewDailyRecommendation,
     NewMomentRecommendation,

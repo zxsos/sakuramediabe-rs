@@ -721,6 +721,45 @@ ABI** 的那一侧 —— 这个域的大头全在 `sm-plugins` 宿主后面，�
 未铺的一个是超大文件：`moment_recommendation_service.py`（24KB）—— 它消费
 `recommendation_service` 的产出，单独一轮。
 
+**2026-10-09 更新**：`moment_recommendation_service.py` 的**读侧已落地**
+（`GET /moment-recommendations`）：
+
+- 读侧拆成 `MomentRecommendationQuery`（同模块里 `HotActressReleaseQuery` 的
+  同款取舍）—— 生成侧要 Qdrant + 推理客户端，而这条端点只读库；
+- **骨架期的 `PageContext` trait 被删除**：`MovieCard` 本来就是服务层类型，
+  `movies.rs` / `daily_recommendation` 走的是「服务给卡片、路由签名」；
+  trait 版返回 `serde_json::Value`，形状无处校验；
+- 新增 `MediaThumbnailRepository::images_by_ids`（缩略图 → `image_id` +
+  路径：既有的 `by_ids` 投影里没有 image_id）；
+- 8 个真库 HTTP 用例（`moment_recommendations_http.rs`）钉住：嵌套 shape +
+  签名 URL、两条过滤不占分页槽位、`generated_at` 不带有效过滤、
+  `page_size=101` 的**专用错误码**、坏查询值的错误信封；
+- ★ 顺带纠正两处：`list_valid` 的第二个参数是 **offset 不是页码**（页 1 曾
+  会跳掉第一条）；三条 discovery 路由改用 `crate::extract::Query`（此前用裸
+  `axum::extract::Query`，坏参数是 400 + 纯文本，不是错误信封）；
+- 仍待做：生成侧（唯一卡点是读种子图字节 → image store）。
+
+**2026-10-09 再更新**：`hot_actress_release_service.py` 的**装配也落地**
+（`GET /hot-actress-releases`）：
+
+- `HotActressReleaseQuery::list_items`（`new(&Db)`）—— 打分是纯函数（已有单测），
+  这段补的是「先切片再取数 → 卡片 + 女优 → 平铺成线格式」；
+- **第二个 `PageContext` trait 也删掉**（同 `moment_recommendation` 的理由）；
+- 线格式：`HotActressReleaseMovieResource`（`#[serde(flatten)]` 完整卡片 +
+  `recommendation_score` + `hot_actress`）。DTO 层新增 `round_to_4` ——
+  `(v * 1e4).round() / 1e4` 会因乘 `1e4` 再引入的浮点误差把 `0.12345` 舍成
+  `0.1234`，改用 `{:.4}` 格式化的精确十进制转换（与 Python `round` 同语义）；
+- 头像走 `ActorView.image_id`（覆盖优先），与演员列表同一份
+  `profile_images_of`；
+- ★ 两条 SQL **从未被执行过**（端点一直是骨架），本轮第一次真库执行就抓到两处：
+  `movie_actor` 的列写成了上游 Peewee 的外键字段名（`ma.movie` / `ma.actor`
+  实际是 `movie_id` / `actor_id`）；`NaiveDate` 解码撞上 `timestamp` 列（缺
+  `CAST(m.release_date AS date)`）。两处都已修，并各自留了注释；
+- 8 个真库 HTTP 用例（`hot_actress_releases_http.rs`）：平铺 shape 与两个分同值、
+  `display_name` 覆盖、**覆盖头像优先**（端到端验 `profile_images_of` 的双
+  LEFT JOIN）、`historical_movie_count` 扣掉自己、历史不足 3 部整条跳过、
+  黑名单不入结果、score 降序分页、专用错误码。
+
 ### 外部依赖：**已无阻塞**
 
 | 依赖 | 状态 |

@@ -28,6 +28,7 @@
 //! 解析链要多走一跳；更糟的是若 B 的行被清理，A 就成了**悬空指针**。
 //! 一次合并把链压成一层，深度始终为 1。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -1206,6 +1207,43 @@ impl ActorRepository {
                 (*image_id, origin.clone())
             });
         Ok(Some((actor, movie_count, image_id, image_origin)))
+    }
+
+    /// 批量取演员（含生效头像与影片数）。`hot-actress-releases` 的装配用。
+    ///
+    /// 「生效头像」的那条缝与 [`Self::find_with_image`] 完全同一份实现
+    /// （`profile_images_of` 里 override 优先）—— 两处不能各写一遍：只取
+    /// `profile_image` 会让用户设的本地头像不生效。
+    ///
+    /// **返回顺序不保证**（`find_by_ids` 的 `WHERE id = ANY($1)` 不带 `ORDER BY`），
+    /// 调用方按 `row.0.id` 建映射，别按下标对齐。
+    pub async fn find_with_images(&self, ids: &[i32]) -> Result<Vec<ActorListRow>, DbError> {
+        let actors = self.find_by_ids(ids).await?;
+        if actors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.pool.acquire().await?;
+        let counts: HashMap<i32, i64> = Self::movie_counts_of(&mut conn, ids)
+            .await?
+            .into_iter()
+            .collect();
+        let images: HashMap<i32, (Option<i32>, Option<String>)> =
+            Self::profile_images_of(&mut conn, ids)
+                .await?
+                .into_iter()
+                .map(|(id, image_id, origin)| (id, (image_id, origin)))
+                .collect();
+        Ok(actors
+            .into_iter()
+            .map(|actor| {
+                // 没有影片的左连接侧：`COUNT(*)` 的 `GROUP BY` 里就没有这一行，
+                // 所以缺省是 0 而不是「没查到」（演员本身一定在）。
+                let movie_count = counts.get(&actor.id).copied().unwrap_or(0);
+                let (image_id, image_origin) =
+                    images.get(&actor.id).cloned().unwrap_or((None, None));
+                (actor, movie_count, image_id, image_origin)
+            })
+            .collect())
     }
 
     /// 演员列表的聚合：给筛选项用。

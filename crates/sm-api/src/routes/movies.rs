@@ -43,6 +43,7 @@ use sm_service::catalog::movie::{
     MovieListParams, MovieNumberParseResult, MovieService, SubscriptionBatchResponse,
     SubscriptionSkippedItem, COLLECTION_TYPE_COLLECTION, COLLECTION_TYPE_SINGLE,
 };
+use sm_service::catalog::movie_reviews::MovieReviewService;
 use sm_service::catalog::movie_subtitle::MovieSubtitleService;
 use sm_service::catalog::movie_task::MovieTaskService;
 use sm_service::discovery::recommendation::MovieRecommendationService;
@@ -891,14 +892,29 @@ struct MovieReviewQuery {
 ///
 /// ⚠️ 响应是 **list 而非分页对象**（`list[JavdbMovieReviewResource]`）——
 /// 上游给了分页参数却返回裸列表。**照抄**，别「修正」成 `PageResponse`。
+///
+/// # `sort` 原样透传
+///
+/// 上游的 `sort: MovieReviewSort` 枚举只认 `recently` / `hotly`，而服务层
+/// `sort.value if isinstance(sort, MovieReviewSort) else str(sort)` 对**未知值**
+/// 原样透传（JavDB 自己决定怎么理解）。这里同样不校验：未来 JavDB 加排序键
+/// 时，本服务不需要发版。
 async fn get_movie_reviews(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
     EnvelopeQuery(query): EnvelopeQuery<MovieReviewQuery>,
-) -> Result<Json<Vec<serde_json::Value>>, ErrorResponse> {
-    let _ = (movie_number, query);
-    todo!("骨架：接 MovieService::get_movie_reviews；响应是裸 list 不是分页对象")
+) -> Result<Json<Vec<sm_service::catalog::javdb::JavdbMovieReview>>, ErrorResponse> {
+    let reviews = MovieReviewService::new(state.db())
+        .get_movie_reviews(
+            &movie_number,
+            query.page,
+            query.page_size,
+            query.sort.as_deref(),
+        )
+        .await
+        .map_err(ErrorResponse::from)?;
+    Ok(Json(reviews))
 }
 
 /// `GET /movies/{movie_number}/subtitles`
@@ -1030,23 +1046,70 @@ async fn list_similar_movies(
 ///
 /// 上游 `library_id: int = Query(..., ge=1)` —— **无默认值**，缺参即 **422**。
 /// 所以下面**没有** `#[serde(default)]`：缺了它会把「缺参」变成「library_id=0」。
-// `library_id` 还没接上（handler 体是 `todo!()`），但它是**必填**契约参数。
-// 落地后删 allow。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct MergedPlaybackQuery {
     library_id: i64,
 }
 
 /// `GET /movies/{movie_number}/merged-playback` —— 合并播放。
+///
+/// 上游 `MovieService.get_merged_playback`（`movie_service.py`）：按番号找
+/// 「可合并」的库分组，命中 `library_id` 的那组换一条**签名 URL**。
+///
+/// # 错误码与上游逐条对齐
+///
+/// | 情况 | 码 |
+/// |---|---|
+/// | 影片不存在 | 404 `movie_not_found`（服务层）|
+/// | `library_id` 不在可合并分组里（或根本没有分组）| 422 `merged_playback_unavailable` |
+///
+/// # 没有 preflight
+///
+/// 上游在回 URL 前还会调一次 provider 的 `preflight_merged_playback` 提前
+/// 报 `provider_*` 错。本仓刻意省掉：预检是**数据面调用**，它的失败码在真正
+/// 播放（`/media/merged-play`）时由 `plan_merged_playback` 原样给出 —— 在
+/// 这里多打一次 rpc 只会让「返回 URL」与「URL 真能播」之间多出一个可以
+/// 失败的窗口，而不减少任何用户可见的失败。
 async fn get_merged_playback(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
     EnvelopeQuery(query): EnvelopeQuery<MergedPlaybackQuery>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let _ = (movie_number, query);
-    todo!("骨架：接 MovieService::get_merged_playback；library_id 缺参应在 extractor 层 422")
+    let groups = state
+        .media_service()
+        .merged_playback_groups(&movie_number)
+        .await
+        .map_err(ErrorResponse::from)?;
+    let group = groups
+        .into_iter()
+        .find(|group| i64::from(group.library_id) == query.library_id)
+        .ok_or_else(|| {
+            ErrorResponse::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "merged_playback_unavailable",
+                "该媒体库不支持合并播放",
+            )
+        })?;
+
+    // 资源路径由格式决定：mp4 是整段流，hls 是索引播放列表（上游
+    // `media.py` 同款三元）。
+    let resource_path = if group.playback_format == "mp4" {
+        "stream.mp4"
+    } else {
+        "index.m3u8"
+    };
+    let secret = signing_secret(&state)?;
+    let play_url = sm_core::signing::build_signed_merged_media_url(
+        &secret,
+        &group.media_ids,
+        resource_path,
+        now_seconds(),
+    )
+    .map_err(|error| ErrorResponse::new(StatusCode::FORBIDDEN, error.code(), error.message()))?;
+
+    // 响应体就一个键（上游 `MovieMergedPlaybackResource`：`play_url`）。
+    Ok(Json(serde_json::json!({ "play_url": play_url })))
 }
 
 /// `POST /movies/{movie_number}/metadata-refresh` —— **200**（不是 202）。

@@ -272,6 +272,22 @@ pub trait StorageGateway: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, ProviderFailure>> + Send + '_>,
     >;
+
+    /// provider 声明的**合并播放格式**（`mp4` / `hls`）。上游
+    /// `bundle.merged_playback_format`（`movie_service._merge_playback_groups`）。
+    ///
+    /// # 为什么它是**同步**的
+    ///
+    /// 这是注册期的**声明**（bundle 元数据），不是一次数据面调用 —— 宿主在
+    /// 组装「这部影片在哪些库能合并播放」的清单时要逐库问，为每个声明起一次
+    /// rpc 既慢又没意义。
+    ///
+    /// # 为什么它进这个 trait 而不是让路由层直接读 `sm-plugins`
+    ///
+    /// `sm-service` 不能依赖 `sm-plugins`（成环，见模块顶注）；而声明属于
+    /// provider 的能力面 —— 跟 [`Self::plan_merged_playback`] 是同一条缝。
+    /// `None` = 该 provider 没声明合并播放（上游的 `getattr(...) is None`）。
+    fn merged_playback_format(&self, provider_key: &str) -> Option<String>;
 }
 
 /// 能力缺失（provider 在，但**不支持这个操作**）。
