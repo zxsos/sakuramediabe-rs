@@ -295,7 +295,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s.translation_base_url(), "https://api.example.com/v1");
-        s.base_url = "https://api.example.com/v1/".to_owned();
+        let s = Settings {
+            base_url: "https://api.example.com/v1/".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(s.translation_base_url(), "https://api.example.com/v1");
     }
 
