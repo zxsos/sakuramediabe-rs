@@ -155,7 +155,10 @@ impl TaskQueueService {
         build_mutex_key(task_key)
     }
 
-    /// 入队一次执行。
+    /// 入队一次执行（互斥键 = `aps:{task_key}`）。
+    ///
+    /// 这是 [`Self::enqueue_with_mutex_key`] 的薄封装：默认互斥粒度就是
+    /// 「同一类任务最多一个在跑」。需要按**业务对象**互斥的调用方走那个方法。
     ///
     /// `conflict` 决定撞上唯一约束时的行为：
     ///
@@ -182,20 +185,58 @@ impl TaskQueueService {
         params: Option<serde_json::Value>,
         conflict: ConflictPolicy,
     ) -> Result<EnqueueOutcome, ServiceError> {
-        let task_key = task_key.trim();
-        if task_key.is_empty() {
-            return Err(ServiceError::validation(
-                "validation_error",
-                "task_key cannot be empty",
-            ));
-        }
+        let mutex_key = Self::mutex_key(task_key);
+        self.enqueue_with_mutex_key(
+            task_key,
+            trigger_type,
+            task_name,
+            &mutex_key,
+            params,
+            conflict,
+        )
+        .await
+    }
+
+    /// 入队一次执行，**互斥键由调用方给定**。
+    ///
+    /// # 为什么不能都用 `aps:{task_key}`
+    ///
+    /// 默认的互斥粒度是「同一类任务」，但有的任务天然按**业务对象**互斥：
+    ///
+    /// | 任务 | 正确的键 | 用 `aps:{task_key}` 的后果 |
+    /// |---|---|---|
+    /// | 媒体库导入 | `library_import:{id}`（[`crate::transfers::import_write_mutex`]）| 不同的媒体库被串行化 —— 本可并行，且不报错 |
+    /// | 媒体转存 | 按源库 | 同上 |
+    ///
+    /// 反过来，**别**用这个方法把键写成 `aps:{task_key}` 的等价物 —— 那只是把
+    /// 默认行为抄了一遍，还多一个能写错的地方。
+    ///
+    /// # `mutex_key` 不能是空白
+    ///
+    /// 仓储层的 `NewTaskRun::normalize` 会把空白 `mutex_key` **静默**归一为
+    /// `NULL`（= 不参与互斥）。那对「本来就不要互斥」的调用是对的，对这里是
+    /// **静默失效**：调用方以为锁住了，实际没有，而后果是两批文件互相覆盖。
+    /// 所以入队前显式拒绝。
+    ///
+    /// 其余行为（`conflict` 策略、只有唯一违例才降级、
+    /// `scheduled_at = now`）与 [`Self::enqueue`] 完全一致。
+    pub async fn enqueue_with_mutex_key(
+        &self,
+        task_key: &str,
+        trigger_type: &str,
+        task_name: Option<&str>,
+        mutex_key: &str,
+        params: Option<serde_json::Value>,
+        conflict: ConflictPolicy,
+    ) -> Result<EnqueueOutcome, ServiceError> {
+        let (task_key, mutex_key) = validate_enqueue_keys(task_key, mutex_key)?;
         // `task_name` 缺省时回落到 `task_key`：仓储层要求非空，而
         // 任务中心展示的 `cli_help` 本来就常常等于 key。
         let new = NewTaskRun {
             task_key: task_key.to_owned(),
             task_name: task_name.unwrap_or(task_key).trim().to_owned(),
             trigger_type: trigger_type.trim().to_owned(),
-            mutex_key: Some(Self::mutex_key(task_key)),
+            mutex_key: Some(mutex_key.to_owned()),
             params,
             // **`Some(now)` 而不是 `None`** —— 上游的模块 docstring 写明
             // 「所有 task_run 都是队列托管行；scheduled_at 记录进入队列的
@@ -224,10 +265,7 @@ impl TaskQueueService {
                     ConflictPolicy::Raise => {
                         // 冲突可能刚好消失（持有者已结束并释放了 mutex_key），
                         // 所以这里**允许**查不到 —— 那是合法的「阻塞方 id = None」。
-                        self.runs
-                            .find_by_mutex_key(&build_mutex_key(task_key))
-                            .await?
-                            .map(|r| r.id)
+                        self.runs.find_by_mutex_key(mutex_key).await?.map(|r| r.id)
                     }
                 };
                 Ok(EnqueueOutcome::Skipped {
@@ -382,6 +420,34 @@ fn is_state_conflict(err: &sm_db::DbError) -> bool {
     matches!(err, sm_db::DbError::Business { .. })
 }
 
+/// 校验入队用的两个键，返回 trim 后的借用。
+///
+/// `task_key` 仓储层也拦（空白会在 `NewTaskRun::normalize` 里报 business
+/// 错误），这里提前拦是为了让调用方拿到 422 而不是 500。
+/// `mutex_key` 则是**只有这里拦得住**：仓储层把空白静默归一为 `NULL`，
+/// 而那等于「不参与互斥」—— 见
+/// [`TaskQueueService::enqueue_with_mutex_key`] 的文档。
+fn validate_enqueue_keys<'a>(
+    task_key: &'a str,
+    mutex_key: &'a str,
+) -> Result<(&'a str, &'a str), ServiceError> {
+    let task_key = task_key.trim();
+    if task_key.is_empty() {
+        return Err(ServiceError::validation(
+            "validation_error",
+            "task_key cannot be empty",
+        ));
+    }
+    let mutex_key = mutex_key.trim();
+    if mutex_key.is_empty() {
+        return Err(ServiceError::validation(
+            "validation_error",
+            "mutex_key cannot be empty",
+        ));
+    }
+    Ok((task_key, mutex_key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +489,40 @@ mod tests {
     #[test]
     fn the_default_lease_is_five_minutes() {
         assert_eq!(DEFAULT_LEASE_SECONDS, 300);
+    }
+
+    /// 显式互斥键**逐字使用**，不加也不剥前缀。
+    ///
+    /// 「导入按媒体库互斥」全靠这一点：键一旦被改写成 `aps:{task_key}`，
+    /// 不同媒体库的导入就被串行化了 —— 而那种退化不会报错，只表现为
+    /// 「导入怎么这么慢」。
+    #[test]
+    fn the_explicit_mutex_key_is_used_verbatim() {
+        let (task_key, mutex_key) =
+            validate_enqueue_keys("library_import", "  library_import:7  ").expect("合法");
+        assert_eq!(task_key, "library_import");
+        assert_eq!(mutex_key, "library_import:7");
+        assert!(
+            !mutex_key.starts_with(QUEUE_MUTEX_PREFIX),
+            "按库的键不带 aps: 前缀"
+        );
+    }
+
+    /// 空白互斥键必须当场被拒 —— 它是**唯一**拦得住的地方。
+    ///
+    /// 仓储层的 `normalize` 把空白归一为 `NULL`，即「不参与互斥」：调用方
+    /// 以为锁住了，实际没有，而后果是两批导入互相覆盖暂存文件。
+    #[test]
+    fn a_blank_mutex_key_is_rejected_before_it_silently_becomes_null() {
+        for blank in ["", "   ", "\t"] {
+            let error = validate_enqueue_keys("library_import", blank).expect_err("必须被拒");
+            assert_eq!(error.status, 422);
+            assert_eq!(error.code(), "validation_error");
+        }
+        // 键非空时两个键都会被 trim 后再入库。
+        assert!(
+            validate_enqueue_keys("  ", "x").is_err(),
+            "task_key 同样不能空"
+        );
     }
 }

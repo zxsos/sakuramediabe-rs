@@ -67,13 +67,27 @@ pub fn unfinished_import_download_task_exists(movie_number: &str) -> (String, Ve
     )
 }
 
+/// 视为「已下载完成」的状态。**只有一个元素。**
+///
+/// 上游 `downloads/common.py:36` 的 `DOWNLOAD_COMPLETE_STATES = {"completed"}`。
+///
+/// ⚠️ 骨架期这里是 `{completed, done, seeding, finished}` —— 后三个在**库里
+/// 根本不存在**（`download_state` 只有 queued/submitted/downloading/completed/
+/// failed）。把它们当完成态会让导入拿到半截产物：`seeding` 是「做种中」，
+/// 下载还没结束，「已完成」是白名单，不是「看起来像完成」。
+///
+/// 常量住在 `transfer_shared` 而不是 `download_common`：它与
+/// [`is_download_complete`] 是同一个判据的两半，分开写迟早漂移。
+/// `download_common` 会把这个名字**再导出**，上游同名路径照常可用。
+pub const DOWNLOAD_COMPLETE_STATES: [&str; 1] = ["completed"];
+
 /// 任务状态是否属于「已完成」。
 ///
-/// 上游 `is_download_complete(state)`。**完成态是白名单**，不是「非进行中」
-/// —— 将来 provider 加一个 `failed` 状态时，它既不是完成也不是进行中，
+/// 上游 `is_download_complete(state)`（`downloads/common.py:228`）。
+/// **完成态是白名单**，不是「非进行中」 —— `failed` 既不是完成也不是进行中，
 /// 按「非进行中即完成」判会让失败的任务被当成已入库。
 pub fn is_download_complete(state: &str) -> bool {
-    matches!(state, "completed" | "done" | "seeding" | "finished")
+    DOWNLOAD_COMPLETE_STATES.contains(&state)
 }
 
 #[cfg(test)]
@@ -99,6 +113,13 @@ mod tests {
         assert!(!is_download_complete("failed"));
         assert!(!is_download_complete("error"));
         assert!(!is_download_complete("queued"));
+        // ★ 骨架期这四个里的后三个曾被误当完成态（库中不存在这些值）。
+        // `seeding` 尤其危险：做种中 = 还没下完，判成完成会让导入拿到半截产物。
+        for bogus in ["done", "seeding", "finished"] {
+            assert!(!is_download_complete(bogus), "{bogus} 不是完成态");
+        }
+        // 白名单只有一个元素。
+        assert_eq!(DOWNLOAD_COMPLETE_STATES, ["completed"]);
     }
 
     /// 进行中与已完成**不得重叠**。

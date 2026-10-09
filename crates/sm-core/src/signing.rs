@@ -334,6 +334,17 @@ pub fn build_signed_clip_url(secret: &str, clip_id: i32, now_seconds: i64) -> St
     )
 }
 
+/// 字幕下载 URL。上游 `build_signed_subtitle_url`（`common/file_signatures.py:269-271`）。
+///
+/// 形状与 [`build_signed_clip_url`] 一致，只是**没有额外路径段** ——
+/// `/files/subtitles/{id}?expires=..&signature=..`。签名只覆盖 `subtitle_id`
+/// 与 `expires`，所以一个 URL 只对应一条字幕。
+pub fn build_signed_subtitle_url(secret: &str, subtitle_id: i32, now_seconds: i64) -> String {
+    let expires = signature_expires(now_seconds);
+    let signature = subtitle_signature(secret, subtitle_id, expires);
+    format!("{SUBTITLE_FILE_ROUTE_PREFIX}/{subtitle_id}?expires={expires}&signature={signature}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

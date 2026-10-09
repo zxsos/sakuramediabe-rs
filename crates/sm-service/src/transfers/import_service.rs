@@ -34,14 +34,21 @@
 //!
 //! # `source_disposition` 决定源文件留不留
 //!
+//! ⚠️ **下面这张表是骨架期写的，与上游不符**（同 [`source_disposition`] 模块）。
+//! 权威定义是上游 `schema/transfers/media_import.py:39` 的
+//! `Literal["keep", "delete_after_commit", "in_place"]` —— **没有 `move`**；
+//! 非法取值是 `422 invalid_source_disposition`
+//! （`imports/import_service.py:188`）。
+//!
 //! | 值 | 含义 |
 //! |---|---|
 //! | `keep` | 暂存后**保留**源（默认） |
-//! | `move` | 移动（转存语义） |
+//! | `delete_after_commit` | 宿主写完之后删掉源 |
+//! | `in_place` | 文件不动，只登记 |
 //!
-//! 与 `in_place_import` 冲突：某些 provider **不支持原地导入**
+//! `in_place` 有前提：某些 provider **不支持原地导入**
 //! （`422 in_place_import_unsupported`）—— 那时源与目标在同一存储，
-//! 「移动」等于删掉自己。
+//! 「原地」等于把文件指给了它自己。
 //!
 //! # 「不安全文件名」是一道真实的安全检查
 //!
@@ -53,11 +60,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ServiceError;
 
-/// 源文件处置方式。
+/// 源文件处置方式（⚠️ **待对齐的第二份定义**，见下）。
+///
+/// # 与上游不符：少了两个取值、多了一个自造的
+///
+/// 上游 `schema/transfers/media_import.py:39` 是
+/// `Literal["keep", "delete_after_commit", "in_place"]`，而
+/// `imports/import_service.py:188` 还会按同一集合再校验一次
+/// （`422 invalid_source_disposition`）。**`move` 上游没有**。
+///
+/// 权威定义已经在 [`super::import_task::SourceDisposition`]（带 serde 形状，
+/// 入队请求用的就是它）。这里那份是骨架期留下的，**本轮刻意不动**：本模块的
+/// 编排仍是 `todo!()`，改常量既没有调用面可验、又会让
+/// 「两处取值不一致」这件事从显眼变成隐形。接线时删掉本模块，改用
+/// `import_task` 那个枚举。
 pub mod source_disposition {
     /// 保留源文件（默认）。
     pub const KEEP: &str = "keep";
-    /// 移动源文件（转存语义）。
+    /// 移动源文件（转存语义）。⚠️ **上游没有这个取值**。
     pub const MOVE: &str = "move";
 }
 
@@ -96,21 +116,19 @@ pub struct ImportFailure {
     pub staged: bool,
 }
 
-/// 失败原因码。**这些值会进 `params` 并被 retry 端点读**，所以不能改名。
-pub mod failure_reason {
-    /// 番号识别不出来。
-    pub const MOVIE_NUMBER_NOT_FOUND: &str = "movie_number_not_found";
-    /// 元数据抓取失败。
-    pub const METADATA_FETCH_FAILED: &str = "metadata_fetch_failed";
-    /// 已是合集条目。
-    pub const IS_COLLECTION: &str = "is_collection";
-    /// 文件名不安全。
-    pub const UNSAFE_FILENAME: &str = "unsafe_filename";
-    /// provider 暂存失败。
-    pub const STAGE_FAILED: &str = "stage_failed";
-    /// 定稿失败。
-    pub const FINALIZE_FAILED: &str = "finalize_failed";
-}
+/// 失败原因码。**唯一一份**在
+/// [`sm_db::transfers::downloads::failure_reason`]
+/// （上游 `common/media_import_status.py:42-52` 的十个取值）。
+///
+/// ⚠️ 骨架期这里是**自造**的六项，且六项里有四项上游**没有**：
+/// `is_collection`（那是 `Movie` 的一个**字段**，不是失败原因）、
+/// `unsafe_filename` / `stage_failed` / `finalize_failed`（上游这三类都落
+/// `media_import_failed`）。同时真的那十个里少了八个。
+///
+/// 自造取值的后果不是「多一个常量」，而是**读侧认不出来**：失败项分类表
+/// （[`sm_db::transfers::downloads::failed_file_kind`]）没有这些键，它们会掉进
+/// `file` 这一档 —— 于是「主动跳过」被渲染成「可删除的文件级失败」。
+pub use sm_db::transfers::downloads::failure_reason;
 
 /// 元数据导入结果（并发批处理里每个番号一条）。
 #[derive(Debug, Clone)]
@@ -291,15 +309,52 @@ mod tests {
     /// 「已是合集」是**跳过**而不是**失败**。
     ///
     /// 合集影片本来就不该单独导入，把它算作失败会让失败列表被合集条目淹没，
-    /// 真正的失败项反而看不见。
+    /// 真正的失败项反而看不见。上游的失败原因集合里**没有** `is_collection`
+    /// 一类的取值 —— 骨架期那个自造的常量已删（它会把「跳过」表达成「失败」）。
     #[test]
     fn collection_entries_are_skipped_not_failed() {
         let result = ImportResult::default();
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 0);
         assert!(result.failed.is_empty());
-        // 失败原因码是**独立**于跳过原因的 —— 别把它塞进 failed。
-        assert_ne!(failure_reason::IS_COLLECTION, failure_reason::STAGE_FAILED);
+    }
+
+    /// 失败原因码**只有**仓储层那一份（本模块是 `pub use` 转发，不是第二份）。
+    ///
+    /// 这条断言在类型层面钉住「同一个常量」：一旦有人在这里又写一份字面量，
+    /// 两处就会各自漂移，而漂移的后果是读侧分类表认不出来（掉进 `file`）。
+    #[test]
+    fn the_reason_codes_are_the_storage_layers_single_copy() {
+        use sm_db::transfers::downloads::failure_reason as upstream;
+        assert_eq!(
+            failure_reason::MOVIE_NUMBER_NOT_FOUND,
+            upstream::MOVIE_NUMBER_NOT_FOUND
+        );
+        assert_eq!(
+            failure_reason::METADATA_FETCH_FAILED,
+            upstream::METADATA_FETCH_FAILED
+        );
+        assert_eq!(
+            failure_reason::MEDIA_IMPORT_FAILED,
+            upstream::MEDIA_IMPORT_FAILED
+        );
+    }
+
+    /// 「用户可修」的两个原因必须是失败原因集合里的元素。
+    ///
+    /// 手动搜索只认这两个（见
+    /// `import_task::ImportTaskService::MANUAL_SEARCH_FAILURE_REASONS`）——
+    /// 写出一个集合外的字符串，会让「搜索」在判据处永远为假。
+    #[test]
+    fn the_manual_search_reasons_are_part_of_the_reason_set() {
+        use crate::transfers::import_task::MANUAL_SEARCH_FAILURE_REASONS;
+        for reason in MANUAL_SEARCH_FAILURE_REASONS {
+            assert!(
+                reason == failure_reason::MOVIE_NUMBER_NOT_FOUND
+                    || reason == failure_reason::METADATA_FETCH_FAILED,
+                "{reason} 不在可搜索的原因里"
+            );
+        }
     }
 
     /// 失败项的 `movie_number` 是**空串**而不是 `None`。
@@ -340,16 +395,24 @@ mod tests {
         assert!(!failure.staged, "没暂存成功 -> 必须重新 scan");
     }
 
-    /// 失败原因码是**稳定契约** —— 它们进 TaskRun `params` 并被 retry 读。
+    /// 失败原因码是**稳定契约** —— 它们落进 `result_summary` 的正本，
+    /// 也被读侧的分类表当键查（改了名就从「跳过」掉进「可删除的文件级失败」）。
+    ///
+    /// 逐个列出上游那十个，而不是遍历一个 `ALL` 数组：后者在**漏加**一项时
+    /// 仍然通过。
     #[test]
-    fn the_failure_reason_codes_are_part_of_the_contract() {
+    fn the_failure_reason_codes_are_upstreams_ten() {
         for code in [
             failure_reason::MOVIE_NUMBER_NOT_FOUND,
             failure_reason::METADATA_FETCH_FAILED,
-            failure_reason::IS_COLLECTION,
-            failure_reason::UNSAFE_FILENAME,
-            failure_reason::STAGE_FAILED,
-            failure_reason::FINALIZE_FAILED,
+            failure_reason::IMAGE_DOWNLOAD_FAILED,
+            failure_reason::METADATA_UPSERT_FAILED,
+            failure_reason::MEDIA_IMPORT_FAILED,
+            failure_reason::FILE_TOO_SMALL,
+            failure_reason::UNSUPPORTED_FORMAT,
+            failure_reason::SOURCE_DELETE_FAILED,
+            failure_reason::NO_MEDIA_FILES_FOUND,
+            failure_reason::ALREADY_INDEXED_PATH,
         ] {
             assert!(!code.is_empty());
         }

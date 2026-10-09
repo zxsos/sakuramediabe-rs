@@ -205,7 +205,7 @@ pub use discovery::{
     ImageSearchIndexStateRepository, ImageSearchSessionRepository, NewImageSearchSession,
     NewRankingItem, RankingItemRepository,
 };
-pub use download::{DownloadTaskRepository, NewDownloadTask};
+pub use download::{DownloadTaskFilter, DownloadTaskRepository, DownloadTaskSort, NewDownloadTask};
 pub use gateway::{
     ActorOwnershipGateway, FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway,
 };

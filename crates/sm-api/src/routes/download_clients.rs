@@ -10,13 +10,17 @@
 //!
 //! # 与上游 `src/api/routers/transfers/downloads.py` 的对应
 //!
-//! | 上游端点 | 状态码 | 阻塞 |
+//! | 上游端点 | 状态码 | 状态 |
 //! |---|---|---|
-//! | `GET /download-clients` | 200 | 下载器 provider 插件 |
-//! | `POST /download-clients` | **201** | 同上 |
-//! | `POST /download-clients/test` | 200 | 同上（**探测**用） |
-//! | `PATCH /download-clients/{client_id}` | 200 | 同上 |
-//! | `DELETE /download-clients/{client_id}` | **204** | 同上 |
+//! | `GET /download-clients` | 200 | ✅ 已接（只查库；**裸数组**，无分页信封）|
+//! | `DELETE /download-clients/{client_id}` | **204** | ✅ 已接（两道 409 在服务层）|
+//! | `POST /download-clients` | **201** | ⏳ 等 provider seam（要插件声明的配置 schema + `prepare_client`）|
+//! | `POST /download-clients/test` | 200 | ⏳ 同上（**探测**用）|
+//! | `PATCH /download-clients/{client_id}` | 200 | ⏳ 同上 |
+//!
+//! ⚠️ 骨架期这张表把五个都标成「阻塞：下载器 provider 插件」—— 前两条**过度
+//! 保守**：上游 `list_clients`（`client_config_service.py:257-265`）与
+//! `delete_client`（`:333-351`）都是纯库操作。
 //!
 //! # `POST /download-clients/test` 是**无副作用的诊断端点**
 //!
@@ -39,6 +43,7 @@ use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
+use sm_service::transfers::download_client::DownloadClientService;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -60,17 +65,17 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// 下载器客户端配置。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DownloadClientResource {
-    pub id: i32,
-    pub name: String,
-    /// 下载器种类（qbittorrent / transmission / …）。**具体取值由插件决定**。
-    pub kind: String,
-    pub enabled: bool,
-    /// 插件自定义配置。**不要建模成固定结构** —— 各插件字段不同。
-    pub config: serde_json::Value,
-}
+/// 下载器客户端配置（响应体）。
+///
+/// **直接复用服务层那一份**（`sm_service::transfers::download_client`）—— 形状只留
+/// 一处定义，就不会出现「路由这份与上游差一个 `library_id`」这种事。
+///
+/// ⚠️ 骨架期这里有一份**本地副本**，字段是 `{id, name, kind, enabled, config}`：
+/// 上游 `schema/transfers/downloads.py:14-33` 是
+/// `{id, name, library_id, provider_config, created_at, updated_at}` ——
+/// `kind` / `enabled` 在表里根本没有，「下载器种类」由 provider 自己解释
+/// `provider_config`。
+pub use sm_service::transfers::download_client::DownloadClientResource;
 
 /// 创建请求。
 #[derive(Debug, Clone, Deserialize)]
@@ -109,9 +114,15 @@ pub struct DownloadClientDiagnostic {
 /// `GET /download-clients`
 async fn list_download_clients(
     _user: CurrentUser,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<DownloadClientResource>>, ErrorResponse> {
-    todo!("骨架：接下载器 provider 插件（未移植）")
+    // ⚠️ 骨架期这条写的是「接下载器 provider 插件（未移植）」—— **过度保守**：
+    // 上游 `DownloadClientService.list_clients`（`client_config_service.py:257-265`）
+    // 只查库并投影，与插件无关。排序是 `created_at DESC, id DESC`（最新在前）。
+    let clients = DownloadClientService::new(state.db())
+        .list_clients()
+        .await?;
+    Ok(Json(clients))
 }
 
 /// `POST /download-clients` —— **201 Created**。
@@ -145,8 +156,13 @@ async fn update_download_client(
 /// `DELETE /download-clients/{client_id}` —— **204，无 body**。
 async fn delete_download_client(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_client_id): Path<i32>,
+    State(state): State<AppState>,
+    Path(client_id): Path<i32>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接插件删除（成功 204 不带 body）")
+    // 同样与插件无关：两道 409（先「名下有任务行」、后「被索引器绑定」）
+    // 与删除都在服务层，见那里的文档。
+    DownloadClientService::new(state.db())
+        .delete_client(client_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

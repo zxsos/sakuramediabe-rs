@@ -15,6 +15,9 @@ sm-core = { workspace = true }
 sm-service = { workspace = true }
 sm-db = { workspace = true }
 axum = { workspace = true }
+# 只为 `HtmlFormQuery`（重复 query 参数）—— 见 `crates/sm-api/src/extract.rs`。
+# `query` 特性在这里是**必需**的（默认不带）。
+axum-extra = { workspace = true, features = ["query"] }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 # SSE 的广播流：`BroadcastStream` 把 `broadcast::Receiver` 变成 `Stream`。

@@ -33,10 +33,13 @@
 
 use axum::extract::{Path, State};
 use axum::http::header;
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+
+use sm_service::catalog::movie_subtitle::MovieSubtitleService;
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -107,11 +110,75 @@ async fn get_image_file(
 /// 字幕按**整数主键**取，**不用通配**（见模块文档的路径穿越说明）。
 async fn get_subtitle_file(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_subtitle_id): Path<i64>,
-    EnvelopeQuery(_query): EnvelopeQuery<SignedUrlQuery>,
+    State(state): State<AppState>,
+    Path(subtitle_id): Path<i64>,
+    EnvelopeQuery(query): EnvelopeQuery<SignedUrlQuery>,
 ) -> Result<Response, ErrorResponse> {
-    todo!("骨架：接签名校验（403）+ 字幕读取")
+    // 上游 `require_signed_params`（`routers/_utils.py`）：**缺一即拒**，码是
+    // `file_signature_invalid`（不是「缺少参数」那类 400 —— 对客户端来说
+    // 「URL 不完整」与「签名不对」都是「这个 URL 不认」）。
+    let (Some(expires), Some(signature)) = (query.expires, query.signature.as_deref()) else {
+        return Err(ErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            "file_signature_invalid",
+            "文件签名无效",
+        ));
+    };
+    // 路径参数是 `i64`（axum 的整数解析），签名域是 `i32`（上游同样以 int 签）。
+    // 超出 i32 的 id 必然取不到记录 —— 直接 404，别静默截断成一个**别的** id。
+    let subtitle_id = i32::try_from(subtitle_id).map_err(|_| {
+        ErrorResponse::new(StatusCode::NOT_FOUND, "subtitle_not_found", "字幕不存在")
+    })?;
+
+    let secret = crate::signing::signing_secret(&state)?;
+    // 验签的三种失败（缺参数另算）：过期、签名不匹配、格式不对 —— 都由
+    // `sm_core::signing` 那张表给出**码与文案**，这里不重新映射。
+    sm_core::signing::verify_subtitle(
+        &secret,
+        subtitle_id,
+        expires,
+        signature,
+        crate::signing::now_seconds(),
+    )
+    .map_err(|error| ErrorResponse::new(StatusCode::FORBIDDEN, error.code(), error.message()))?;
+
+    let path = MovieSubtitleService::new(state.db(), state.config())
+        .resolve_file_path(subtitle_id)
+        .await?;
+    // 上游 `require_existing_file`：文件不在是 **404 `file_not_found`**
+    // —— **不是**读接口那个 409 `subtitle_unavailable`（见服务层文档）。
+    if !path.is_file() {
+        return Err(ErrorResponse::new(
+            StatusCode::NOT_FOUND,
+            "file_not_found",
+            "文件不存在",
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        tracing::error!(path = %path.display(), %error, "字幕文件读取失败");
+        ErrorResponse::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "subtitle_read_failed",
+            "字幕文件读取失败",
+        )
+    })?;
+
+    // 上游 `FileResponse(..., media_type="text/plain; charset=utf-8")`
+    // （`routers/files/subtitles.py:21`）—— 字幕是纯文本，且**编码交给客户端**，
+    // 所以不带 BOM、不做转码。
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, bytes.len().to_string())
+        .body(axum::body::Body::from(bytes))
+        .map_err(|error| {
+            tracing::error!(%error, "构造字幕响应失败");
+            ErrorResponse::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_build_failed",
+                "构造响应失败",
+            )
+        })
 }
 
 /// 让 `header` 导入有归属（实现时用于设 Content-Type）。

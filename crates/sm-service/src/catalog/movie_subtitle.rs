@@ -271,6 +271,34 @@ impl MovieSubtitleService {
         })
     }
 
+    /// 下载路由用：由字幕 id 解析出**磁盘上的绝对路径**。
+    ///
+    /// 上游 `resolve_subtitle_file_path`（`common/file_signatures.py:264-271`）：
+    /// 按主键取记录（没有 → `404 subtitle_not_found`），再过
+    /// [`ensure_movie_subtitle_path`]（路径非法 → `403 file_path_invalid`）。
+    ///
+    /// # 与 [`Self::read_subtitle_content`] 的区别（**别合并**）
+    ///
+    /// 那个是「读内容」入口：文件不在报 **409** `subtitle_unavailable`、超过
+    /// 10 MiB 报 **413**。下载路由两者都不是 —— 文件不在是 **404
+    /// `file_not_found`**（上游 `require_existing_file`），而且**不设大小上限**
+    /// （`FileResponse` 是流式的；10 MiB 是读接口的保护）。合并会把两种语义糊成
+    /// 一个，客户端拿到的码就不对了。
+    pub async fn resolve_file_path(&self, subtitle_id: i32) -> Result<PathBuf, ServiceError> {
+        let Some(row) = SubtitleRepository::new(self.db.clone())
+            .find(subtitle_id)
+            .await?
+        else {
+            return Err(ServiceError::not_found_with(
+                "subtitle_not_found",
+                "字幕不存在",
+                details_of("subtitle_id", serde_json::Value::from(subtitle_id)),
+            ));
+        };
+        let movie = self.require_movie(row.movie_id).await?;
+        ensure_movie_subtitle_path(&self.config, &movie.movie_number, Path::new(&row.file_path))
+    }
+
     /// 按番号取该影片的字幕列表（端点入口）。
     ///
     /// 上游 `get_movie_subtitles`（`:90-104`）：`require_record`（找不到 →

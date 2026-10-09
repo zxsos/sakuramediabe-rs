@@ -255,6 +255,29 @@ pub fn sign_image_origin(secret: &str, origin: &str, now_seconds: i64) -> String
         .unwrap_or_else(|_| trimmed.to_owned())
 }
 
+/// `import_status` 的中文说明（上游 `common/media_import_status.py:88-90`
+/// 的 `describe_import_status`）。
+///
+/// 上游是 `IMPORT_STATUS_DESCRIPTIONS.get(value or "", value or "")`：
+/// **未知取值回退原值**（不是 `None`、不是空串），空值回退空串。
+///
+/// `import_status` 本身是 `varchar(32) NOT NULL DEFAULT 'pending'` 且**无 CHECK
+/// 约束**，所以库里理论上可能存着这五个之外的值 —— 那时回退原值比回退 `null`
+/// 好：客户端至少能看到后端到底写了什么。
+///
+/// 全仓只有这一份映射（`GET /download-tasks` 与 `GET /movie-subscriptions`
+/// 两处都用它），改文案只改这里。
+pub fn describe_import_status(value: &str) -> String {
+    match value {
+        "pending" => "待导入：下载已完成，等待自动导入触发".to_owned(),
+        "running" => "导入中：导入作业正在执行".to_owned(),
+        "completed" => "已导入：符合条件的媒体文件已入库".to_owned(),
+        "failed" => "导入失败：存在未成功导入的文件".to_owned(),
+        "skipped" => "已跳过：没有符合条件的媒体文件".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 /// 把「显式 `null`」与「缺键」分开的反序列化器。
 ///
 /// # 为什么需要它

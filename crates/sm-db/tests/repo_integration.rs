@@ -58,7 +58,10 @@ use sm_db::common::guard::WriteSource;
 use sm_db::common::page::PageRequest;
 use sm_db::common::update::UpdateSet;
 use sm_db::error::DbError;
-use sm_db::repo::{DownloadTaskRepository, MediaRepository, MovieRepository};
+use sm_db::repo::{
+    BackgroundTaskRunRepository, DownloadTaskRepository, MediaRepository, MovieRepository,
+    NewTaskRun,
+};
 use sm_db::testing::TestDb;
 
 mod fixtures {
@@ -510,6 +513,72 @@ async fn the_two_state_machines_move_independently() {
         .expect("设置导入状态失败");
     assert_eq!(after.import_status, "running");
     assert_eq!(after.state, "downloading", "远端状态不应被导入状态影响");
+}
+
+// ---------------------------------------------------------------- 批量占用
+
+/// `mark_import_started` 是**全有或全无**：只要有一条不在 `pending`，
+/// **一条都不改**、返回 0 行。
+///
+/// 这是「一批下载任务要么整批被这次导入占住、要么整批不动」的判据。
+/// 换成「逐条 UPDATE + 事后比数量」时，第一条会被改成 `running`，而调用方
+/// 拿到 409 之后**没有 worker 在跑它** —— 那条任务就永久卡在「导入中」。
+#[tokio::test]
+async fn mark_import_started_is_all_or_nothing() {
+    let db = TestDb::require().await;
+    let repo = DownloadTaskRepository::new(db.pool().clone());
+    let first = repo
+        .insert(&fixtures::download_task(db.pool(), "remote-batch-1").await)
+        .await
+        .unwrap();
+    let second = repo
+        .insert(&fixtures::download_task(db.pool(), "remote-batch-2").await)
+        .await
+        .unwrap();
+    // `import_task_run_id` 有外键，所以台账行必须真的存在。
+    let run = BackgroundTaskRunRepository::new(db.pool().clone())
+        .enqueue(&NewTaskRun {
+            task_key: "library_import".to_owned(),
+            task_name: "媒体库导入".to_owned(),
+            trigger_type: "manual".to_owned(),
+            mutex_key: Some(format!("library_import:{}", first.id)),
+            params: None,
+            scheduled_at: Some(sm_db::common::time::now_utc()),
+        })
+        .await
+        .unwrap();
+
+    // ① 空批次：不发查询，也不需要台账。
+    assert_eq!(repo.mark_import_started(&[], 0).await.unwrap(), 0);
+
+    // ② 混合状态：整批拒绝，**连那条 pending 的也不能动**。
+    repo.set_import_status(second.id, "running", None)
+        .await
+        .unwrap();
+    let affected = repo
+        .mark_import_started(&[first.id, second.id], i64::from(run.id))
+        .await
+        .unwrap();
+    assert_eq!(affected, 0, "有一条不在 pending 时整批不改");
+    let untouched = repo.find_by_id(first.id).await.unwrap().unwrap();
+    assert_eq!(untouched.import_status, "pending");
+    assert_eq!(untouched.import_task_run_id, None);
+
+    // ③ 都是 pending：全部占用并挂上台账。
+    repo.set_import_status(second.id, "pending", None)
+        .await
+        .unwrap();
+    let affected = repo
+        .mark_import_started(&[first.id, second.id], i64::from(run.id))
+        .await
+        .unwrap();
+    assert_eq!(affected, 2);
+    for id in [first.id, second.id] {
+        let row = repo.find_by_id(id).await.unwrap().unwrap();
+        assert_eq!(row.import_status, "running");
+        assert_eq!(row.import_task_run_id, Some(run.id));
+        assert_eq!(row.state, "queued", "远端状态不该被批量占用碰到");
+    }
 }
 
 #[tokio::test]

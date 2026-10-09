@@ -17,6 +17,24 @@
 //! 它可能被高频调用（用户在前端一层层点开），但结果**立即过期**。加缓存会
 //! 让用户点了好几层之后看到与磁盘不符的内容，而这里没有任何「快照」语义
 //! 支撑它。
+//!
+//! # ⚠️ 形状还有几处与上游不符（留到本模块接线那一轮）
+//!
+//! 上游（`schema/transfers/media_import.py:11-30`）：
+//!
+//! | 上游 | 本模块 |
+//! |---|---|
+//! | `ImportBrowseRequest { library_id, parent_ref, cursor, limit }` | 同（`library_id` 是 `i64`，线上无差别）|
+//! | `ImportBrowseEntryResource { source_ref, name, entry_type: "file"\|"directory", size_bytes, modified_at, is_video }` | `BrowseEntry { source_ref, name, is_directory, size_bytes }` |
+//!
+//! 差别在**条目**上：上游用 `entry_type` 而不是布尔，且多两个字段 ——
+//! 客户端要靠 `is_video` 决定「这一项能不能导」、靠 `entry_type` 渲染图标。
+//! 这里只登记不改：浏览端点还没接线（[`ProviderBrowseService::browse`] 仍是
+//! `todo!()`），改形状得连着 provider 调用面一起验。
+//!
+//! **没有**第二份定义：`sm-api` 的 `/import-sources/browse` 已经 `use` 本模块
+//! 的类型（骨架期那里另有一套 `{source, depth}` / `{items, ...}` 的内联
+//! DTO，已删）。
 
 use serde::{Deserialize, Serialize};
 

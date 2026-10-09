@@ -1,224 +1,398 @@
 //! 下载器客户端配置（上游 `downloads/client_config_service.py`，351 行）。
 //!
-//! # `provider_config` 是**透传的黑盒**，但仍有白名单校验
+//! # 这里**只**做库侧那两件事，其余三条卡在 provider seam
 //!
-//! 看起来矛盾，其实不是：宿主**不解释**里面的字段（各插件字段不同），
-//! 但要校验两件事 ——
-//!
-//! 1. **它是个对象**（不是数组/字符串/数字）
-//! 2. **不含未知字段**（相对插件声明的配置 schema）
-//!
-//! 第 2 条是**向前兼容的关键**：插件升版新增了配置项时，老宿主若把新字段
-//! 拒掉，那个插件就完全不能用。校验必须以**插件自己声明的 schema** 为准，
-//! 而不是宿主硬编码一份字段清单。
-//!
-//! # 只读字段不可写：`name` / `kind` / `enabled` 的特殊规则
-//!
-//! 上游有两条不同的只读规则（`*_READONLY` 与 `*_IMMUTABLE`），照抄：
-//!
-//! | 字段 | 创建时 | 更新时 |
+//! | 入口 | 上游 | 现在 |
 //! |---|---|---|
-//! | `kind` | 必填 | **不可改**（`409 download_client_library_change_forbidden` 同族） |
-//! | `enabled` | 可选 | 可改 |
-//! | `name` | 必填 | 可改，但**重名 409** |
+//! | [`DownloadClientService::list_clients`] | `:257-265` | ✅ 已落地（纯库）|
+//! | [`DownloadClientService::delete_client`] | `:333-351` | ✅ 已落地（纯库）|
+//! | `create_client` | `:266-278` | ⏳ 阶段二：要 `_prepare`（`:144-172`）|
+//! | `update_client` | `:279-331` | ⏳ 阶段二：同上 |
+//! | `test_client` | `:199-256` | ⏳ 阶段二：要插件探测 |
 //!
-//! `kind` 不可改是因为它决定 provider_config 的 schema —— 改了之后
-//! 旧配置的含义就变了。
+//! # 为什么 `create` / `update` 不能「先落库、以后补校验」
 //!
-//! # `test_client` **不落库**
+//! 上游那两条都要先 `_bundle(library)`（注册表里取 provider bundle）再做两件事：
 //!
-//! 这是个**无副作用的诊断端点**（见 `routes/download_clients.rs`）：
-//! 它测的是「这份配置能不能连上」，所以
+//! 1. `_validate_config`（`:94-128`）拿**插件声明**的 `config_fields` 判「未知字段 /
+//!    只读字段」—— 宿主**没有**那份表；
+//! 2. `_prepare`（`:144-172`）直接调 `bundle.downloads.prepare_client(...)`
+//!    （合并 secret、派生/归一化配置），失败按 `provider_error` 映射。
 //!
-//! - **不要求 `client_id` 存在** —— 测的是待创建的配置
-//! - **连不上返回 200 + `reachable: false`**，不是 5xx
+//! 宿主自己编一份字段表就是**把插件 schema 抄进宿主** —— 插件升版新增配置项时，
+//! 老宿主会把新字段拒掉，那个插件就完全不能用（上游注释里说的「向前兼容」正是
+//! 要防这个）。所以宁可留 `todo!()` + 上游行号，也不做半截实现。
 //!
-//! # 删除的两个前置检查，顺序不能反
+//! # ★ 形状按上游 `schema/transfers/downloads.py` 逐字对齐
 //!
-//! | 检查 | 错误码 |
-//! |---|---|
-//! | 被索引器绑定 | `409 download_client_in_use_by_indexers` |
-//! | 有任务在跑 | `409 download_client_in_use` |
+//! ⚠️ 骨架期这三种类型都是自造的，差异如下（都已按上游改回）：
 //!
-//! 先查绑定再查任务：绑定是**配置层面**的冲突（静态），任务是运行状态
-//! （动态）。反过来会让用户看到「有任务在跑」，去掉任务后又看到「被绑定」，
-//! 两次修复。
+//! | 骨架期 | 上游 | 为什么 |
+//! |---|---|---|
+//! | `Resource { id, name, kind, enabled, config }` | `:14-33` `{ id, name, library_id, provider_config, created_at, updated_at }` | `kind` / `enabled` **库里没有这两列**；`config` 的真名是 `provider_config` |
+//! | `CreateRequest { name, kind, config }` | `:35-38` `{ name, library_id(>0), provider_config(默认 `{}`) }` | 同上；`library_id` 是必填且必须为正 |
+//! | `UpdateRequest { name, enabled, config }`（注释还写着「`kind` 刻意不提供，不可改」）| `:41-44` `{ name?, library_id?, provider_config? }` | 上游**根本没有 `kind` 字段**，也不存在 `download_client_library_change_forbidden` 这个码 —— 那张「kind 不可改」的表是骨架期编的 |
+//! | `TestRequest { kind, config, library_id? }` | `:47-50` `{ library_id(>0), provider_config(默认 `{}`), client_id?(>0) }` | 探测要的是「库 + 配置（+ 可选已有客户端）」，不是「种类」 |
+//!
+//! # ★ 删除的两道 409：**先任务、后绑定**
+//!
+//! | 顺序 | 检查 | 码 |
+//! |---|---|---|
+//! | 1 | 该客户端名下**有没有任务行**（含历史） | `409 download_client_in_use` |
+//! | 2 | 有没有索引器还绑着它 | `409 download_client_in_use_by_indexers` |
+//!
+//! ⚠️ 骨架期的文档把顺序写反了（「先查绑定再查任务」），实际上游是
+//! `:335` 查任务、`:342` 查绑定。两道的**判据也不同**：第一道是「有没有任何任务」
+//! （不是「有没有在跑的」），因为任务行会随下载器 `CASCADE` 删掉 —— 拦的是
+//! 「你的下载历史会一起没」，不是「任务还在跑」。
+//!
+//! # `provider_config` 是**透传的黑盒**，但白名单校验在插件侧
+//!
+//! 宿主不解释里面有哪些字段，但「未知字段 / 只读字段」的判据来自**插件声明的
+//! schema**（`_validate_config`），所以这条校验只能跟 provider seam 一起做。
 
 use serde::{Deserialize, Serialize};
 
-use super::download_common::DownloadClientRow;
-use crate::error::ServiceError;
+use sm_db::repo::{
+    DownloadClientRepository, DownloadTaskRepository, IndexerDownloadClientRepository,
+};
+use sm_db::Db;
 
-/// 客户端配置（响应体，对齐上游 `DownloadClientResource`）。
+use crate::error::{details_of, ServiceError};
+use crate::transfers::download_common::require_client;
+
+/// 客户端配置（响应体）。上游 `DownloadClientResource`
+/// （`schema/transfers/downloads.py:14-33`）。
+///
+/// `created_at` / `updated_at` 在实体里是 `Option`（迁移期可能有 NULL），
+/// 上游模型继承 `TimestampedMixin` 所以是必填 —— 差异只在历史数据。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadClientResource {
     pub id: i32,
     pub name: String,
-    /// 下载器种类。**取值由插件决定**。
-    pub kind: String,
-    pub enabled: bool,
-    /// 插件配置。**原样透传**。
-    pub config: serde_json::Value,
+    /// 归属库。`library_id` **必填且 > 0**（上游 `:38`）。
+    pub library_id: i32,
+    /// 插件配置。**原样透传** —— 字段由插件解释。
+    pub provider_config: serde_json::Value,
+    pub created_at: Option<chrono::NaiveDateTime>,
+    pub updated_at: Option<chrono::NaiveDateTime>,
 }
 
-/// 创建请求。
+impl DownloadClientResource {
+    /// 从库里的行投影。`provider_config` 是不透明 JSON 文本 → 用
+    /// [`provider_config_object`](crate::transfers::download_common) 同款规则
+    /// （NULL / 脏数据当空对象，上游 `client.provider_config or {}`）。
+    fn from_entity(row: &sm_db::DownloadClient) -> Self {
+        Self {
+            id: row.id,
+            name: row.name.clone(),
+            library_id: row.library_id,
+            provider_config: sm_db_provider_config(row.provider_config.as_deref()),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+/// 库里的 `provider_config` 文本 → 对象。规则与 `download_common` 那份一致
+/// （上游 `downloads/common.py:93` 的 `or {}`），所以复用它。
+fn sm_db_provider_config(raw: Option<&str>) -> serde_json::Value {
+    crate::transfers::download_common::provider_config_object(raw)
+}
+
+/// 创建请求。上游 `DownloadClientCreateRequest`（`:35-38`）。
+///
+/// `provider_config` 缺省是空对象；`library_id` 上游带 `gt=0` 校验。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadClientCreateRequest {
     pub name: String,
-    pub kind: String,
-    /// 插件配置。必须是**对象**，且字段不得超出插件声明的 schema。
-    pub config: serde_json::Value,
+    pub library_id: i32,
+    #[serde(default)]
+    pub provider_config: serde_json::Value,
 }
 
-/// 更新请求 —— **部分更新**。
+/// 更新请求 —— **部分更新**。上游 `DownloadClientUpdateRequest`（`:41-44`）。
 ///
 /// ⚠️ 字段全 `Option` 带来 serde 的固有局限：`None` **不区分**「没传这个键」
 /// 与「显式传了 `null`」。上游 FastAPI 用的是同一套 `exclude_unset` 语义，
 /// 所以这不是移植引入的偏差。要真正区分得用 `Option<Option<T>>` + 自定义
 /// 反序列化，上游没做，**照抄**。
+///
+/// 三个字段都可以改（`library_id` 也在内）—— 骨架期那条「`kind` 不可改」的规则
+/// 上游并不存在，因为**上游没有 `kind` 字段**。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DownloadClientUpdateRequest {
     pub name: Option<String>,
-    pub enabled: Option<bool>,
-    pub config: Option<serde_json::Value>,
-    // ★ `kind` **刻意不提供** —— 见模块文档「`kind` 不可改」。
-    // 用普通注释而非 `///`：doc comment 必须紧跟一个项，挂在 `}` 前会报
-    // "documentation comment that doesn't document anything"。
+    pub library_id: Option<i32>,
+    pub provider_config: Option<serde_json::Value>,
 }
 
-/// 探测请求。**不落库。**
+/// 探测请求。**不落库**。上游 `DownloadClientTestRequest`（`:47-50`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadClientTestRequest {
-    pub kind: String,
-    pub config: serde_json::Value,
-    /// 探测用的媒体库。`Some` 时校验它与配置里的库是否一致
-    /// （`422 download_client_test_library_mismatch`）。
-    pub library_id: Option<i64>,
+    /// 用哪个库的 provider 来探测。**必填且 > 0**。
+    pub library_id: i32,
+    #[serde(default)]
+    pub provider_config: serde_json::Value,
+    /// 要测的是**已存在**的客户端（会带上库里存的配置）。
+    pub client_id: Option<i32>,
 }
 
-/// 诊断结果。**失败也返回 200**（见模块文档）。
+/// 诊断中的一项检查。上游 `DownloadClientDiagnosticCheckResource`（`:53-58`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadClientDiagnosticCheck {
+    pub key: String,
+    /// `ok` / `warning` / `failed` / `skipped`。
+    pub status: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+/// 探测诊断结果。上游 `DownloadClientDiagnosticResource`（`:60-64`）。
+///
+/// ⚠️ 骨架期这里是 `{ reachable, latency_ms, version, error }` —— **自造的四项**。
+/// 上游给的是 `{ status, checks[], checked_at, elapsed_ms }`：一次探测会跑多项
+/// 检查，每项各有自己的码与文案，客户端按 `checks[].status` 显示。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadClientDiagnostic {
-    pub reachable: bool,
-    pub latency_ms: Option<i64>,
-    pub version: Option<String>,
-    /// 失败原因。`reachable = true` 时为 `None`。
-    pub error: Option<String>,
+    /// `ok` / `warning` / `failed`。
+    pub status: String,
+    pub checks: Vec<DownloadClientDiagnosticCheck>,
+    pub checked_at: chrono::NaiveDateTime,
+    pub elapsed_ms: i64,
 }
 
-/// 插件能力：下载器配置与探测。
+/// 插件能力：下载器配置与探测。**形状待 provider seam 定型**（阶段二）。
 pub struct DownloadClientProvider {
     _private: (),
 }
 
 impl DownloadClientProvider {
-    /// 取某个客户端的 provider 句柄。**未装插件 → 503**。
-    pub fn require(kind: &str) -> Result<Self, ServiceError> {
-        let _ = kind;
-        todo!("骨架：经 sm-plugins 取 download_client 能力；未装 -> 503 provider_not_installed")
+    /// 取某个库的下载器 provider 句柄。**未装插件 → 503**。
+    ///
+    /// ⚠️ 骨架期这个函数收的是 `kind`（「下载器种类」）—— 而**没有 `kind` 这个东西**：
+    /// provider 由**媒体库的 `provider_key`** 决定（上游 `_bundle(library)`，`:53-72`）。
+    pub fn require(library_provider_key: &str) -> Result<Self, ServiceError> {
+        let _ = library_provider_key;
+        todo!("骨架：经 provider seam 取 download_client 能力；未装 -> 503 provider_not_installed")
     }
 
-    /// 探测。**失败不返回 `Err`** —— 返回 `DownloadClientDiagnostic { reachable: false }`。
+    /// 探测。**失败不返回 `Err`** —— 上游把失败也包成诊断结果（200）。
     pub async fn test(&self, config: &serde_json::Value) -> DownloadClientDiagnostic {
         let _ = config;
-        todo!("骨架：调插件的 downloads.test_client；连不上也要 Ok(reachable=false)")
+        todo!(
+            "骨架：调插件的 downloads.test_client；连不上也要 200（见上游 `_diagnostic_resource`）"
+        )
     }
 
     /// 插件声明的 `provider_config` schema。**用它**做字段白名单。
     pub fn config_schema(&self) -> serde_json::Value {
-        todo!("骨架：取插件声明的配置 schema（字段白名单的依据）")
-    }
-
-    /// 当前库里是否还有该客户端的任务在跑。
-    pub async fn has_running_tasks(
-        &self,
-        client: &DownloadClientRow,
-    ) -> Result<bool, ServiceError> {
-        let _ = client;
-        todo!("骨架：查 download_task 是否有该客户端的进行中任务")
+        todo!("骨架：取插件声明的配置 schema（字段白名单的依据，上游 `_validate_config`）")
     }
 }
 
-/// `GET /download-clients`
-pub async fn list_clients() -> Result<Vec<DownloadClientResource>, ServiceError> {
-    todo!("骨架：查 download_client 表，按 id 升序")
-}
-
-/// `POST /download-clients` —— **201**。
-pub async fn create_client(
-    payload: DownloadClientCreateRequest,
-) -> Result<DownloadClientResource, ServiceError> {
-    let _ = payload;
-    todo!("骨架：校验 name/kind/provider_config -> 落库；重名 -> 409 download_client_name_conflict")
-}
-
-/// `POST /download-clients/test` —— **无副作用**，成功与失败都 200。
-pub async fn test_client(
-    payload: DownloadClientTestRequest,
-) -> Result<DownloadClientDiagnostic, ServiceError> {
-    let _ = payload;
-    todo!("骨架：不落库；连不上返回 200 + reachable=false（不要 502）")
-}
-
-/// `PATCH /download-clients/{client_id}` —— 不存在 → **404**。
-pub async fn update_client(
-    client_id: i32,
-    payload: DownloadClientUpdateRequest,
-) -> Result<DownloadClientResource, ServiceError> {
-    let _ = (client_id, payload);
-    todo!("骨架：部分更新；空更新 -> 422 empty_download_client_update；kind 不可改")
-}
-
-/// `DELETE /download-clients/{client_id}` —— **204**，无 body。
+/// 下载器客户端服务（**库侧**）。
 ///
-/// 顺序：先查索引器绑定（409），再查运行中任务（409），最后才删。见模块文档。
-pub async fn delete_client(client_id: i32) -> Result<(), ServiceError> {
-    let _ = client_id;
-    todo!("骨架：先查索引器绑定 -> 再查运行任务 -> 才删（两次 409 有先后）")
+/// # 为什么要有状态
+///
+/// 骨架期这三个函数是**无状态的自由 `async fn`**（连 `Db` 都没有）—— 落不了地。
+/// `list_clients` / `delete_client` 只查库，所以现在持 `Db` 就够；阶段二注入
+/// provider seam 时再加一个网关字段（与 `playback::media::MediaService` 同款）。
+pub struct DownloadClientService {
+    db: Db,
+}
+
+impl DownloadClientService {
+    /// 构造。
+    pub fn new(db: &Db) -> Self {
+        Self { db: db.clone() }
+    }
+
+    /// `GET /download-clients` —— **裸数组**（上游没有分页信封）。
+    ///
+    /// 上游 `list_clients`（`:257-265`）：`created_at DESC, id DESC`，最新在前。
+    pub async fn list_clients(&self) -> Result<Vec<DownloadClientResource>, ServiceError> {
+        Ok(DownloadClientRepository::new(self.db.clone())
+            .list_ordered()
+            .await?
+            .iter()
+            .map(DownloadClientResource::from_entity)
+            .collect())
+    }
+
+    /// `DELETE /download-clients/{client_id}` —— **204**，无 body。
+    ///
+    /// 上游 `delete_client`（`:333-351`）。两道 409 **有先后**：
+    ///
+    /// 1. 有任务行（**含历史**）→ `download_client_in_use` + details `{client_id}`；
+    /// 2. 有索引器绑定 → `download_client_in_use_by_indexers` + details `{client_id}`。
+    ///
+    /// 顺序照抄会更好用：先报「有任务」时用户删掉任务，再删会看到「被绑定」——
+    /// 两步都能修完。反过来（骨架期文档写的那种顺序）也能修完，但与上游的
+    /// **错误码**就不一致了，客户端按码分流的提示会错位。
+    ///
+    /// ⚠️ 删除会 `CASCADE` 掉该客户端的**全部任务历史**与索引器绑定，
+    /// 所以这两道检查拦的正是「你确定要连历史一起删吗」。
+    pub async fn delete_client(&self, client_id: i32) -> Result<(), ServiceError> {
+        let client = require_client(&self.db, client_id).await?;
+
+        if DownloadTaskRepository::new(self.db.clone())
+            .exists_for_client(client.id)
+            .await?
+        {
+            return Err(ServiceError::conflict(
+                "download_client_in_use",
+                "Download client is still referenced by download tasks",
+                Some(details_of("client_id", serde_json::Value::from(client.id))),
+            ));
+        }
+        if IndexerDownloadClientRepository::new(self.db.clone())
+            .exists_for_client(client.id)
+            .await?
+        {
+            return Err(ServiceError::conflict(
+                "download_client_in_use_by_indexers",
+                "Download client is still referenced by indexers",
+                Some(details_of("client_id", serde_json::Value::from(client.id))),
+            ));
+        }
+
+        DownloadClientRepository::new(self.db.clone())
+            .delete(client.id)
+            .await?;
+        Ok(())
+    }
+
+    /// `POST /download-clients` —— **201**。**阶段二**（要 provider seam）。
+    pub async fn create_client(
+        &self,
+        payload: DownloadClientCreateRequest,
+    ) -> Result<DownloadClientResource, ServiceError> {
+        let _ = payload;
+        todo!("骨架：等 provider seam —— `_bundle` + `_validate_config`(`:94-128`) + `_prepare`(`:144-172`)")
+    }
+
+    /// `PATCH /download-clients/{client_id}` —— 不存在 → **404**。**阶段二**。
+    pub async fn update_client(
+        &self,
+        client_id: i32,
+        payload: DownloadClientUpdateRequest,
+    ) -> Result<DownloadClientResource, ServiceError> {
+        let _ = (client_id, payload);
+        todo!("骨架：等 provider seam —— 上游 `:279-331`（`_ensure_name_available` 之后走 `_prepare`）")
+    }
+
+    /// `POST /download-clients/test` —— **无副作用**，成功与失败都 200。**阶段二**。
+    pub async fn test_client(
+        &self,
+        payload: DownloadClientTestRequest,
+    ) -> Result<DownloadClientDiagnostic, ServiceError> {
+        let _ = payload;
+        todo!("骨架：等 provider seam —— 上游 `:199-256` + `_diagnostic_resource`(`:175-198`)")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `kind` **不在**更新请求里 —— 它不可改。
+    /// ★ 更新请求按上游三个字段反序列化；`{}` → 三个 `None`（「空更新」的判据）。
     ///
-    /// 加上它就意味着「改 kind 后旧配置的字段含义变了」，而那不会报错，
-    /// 只会让下载器在某天突然连不上。
+    /// ⚠️ 骨架期这里断言的是 `enabled` / `config` —— 那两个字段上游没有。
     #[test]
-    fn the_update_request_cannot_change_the_kind() {
-        let request: DownloadClientUpdateRequest =
-            serde_json::from_str(r#"{"kind":"transmission"}"#).expect("可解析");
-        assert_eq!(request.name, None);
-        assert_eq!(request.enabled, None);
-        assert_eq!(request.config, None);
+    fn the_update_request_matches_upstream_fields() {
+        let full: DownloadClientUpdateRequest = serde_json::from_value(serde_json::json!({
+            "name": "qb",
+            "library_id": 7,
+            "provider_config": {"host": "127.0.0.1"}
+        }))
+        .expect("三个字段都合法");
+        assert_eq!(full.name.as_deref(), Some("qb"));
+        assert_eq!(full.library_id, Some(7));
+        assert!(full.provider_config.is_some());
+
+        // 空对象 = 空更新（由 `update_client` 报 422 `empty_download_client_update`）。
+        let empty: DownloadClientUpdateRequest =
+            serde_json::from_value(serde_json::json!({})).expect("空对象合法");
+        assert!(empty.name.is_none() && empty.library_id.is_none());
+        assert!(empty.provider_config.is_none());
+
+        // `kind` 不是上游字段 —— 传了也该被忽略，而不是当成未知字段报错
+        // （serde 默认忽略未知键；这条用例把它钉住）。
+        let with_kind: DownloadClientUpdateRequest =
+            serde_json::from_value(serde_json::json!({"kind": "qbittorrent"}))
+                .expect("未知键被忽略");
+        assert!(with_kind.name.is_none());
     }
 
-    /// 三个 `Option` 全 `None` = **空更新** → 422 `empty_download_client_update`。
-    ///
-    /// 不能当成功：那样一次空 PATCH 也会触发一次无意义的写入与 `updated_at` 刷新。
+    /// ★ 创建请求：`library_id` 必填、`provider_config` 可缺省。
     #[test]
-    fn an_empty_update_is_distinguishable_from_a_real_one() {
-        let empty: DownloadClientUpdateRequest = serde_json::from_str("{}").expect("可解析");
-        let named: DownloadClientUpdateRequest =
-            serde_json::from_str(r#"{"name":"qb2"}"#).expect("可解析");
-        assert!(empty.name.is_none() && empty.enabled.is_none() && empty.config.is_none());
-        assert_eq!(named.name.as_deref(), Some("qb2"));
+    fn the_create_request_matches_upstream() {
+        let minimal: DownloadClientCreateRequest =
+            serde_json::from_value(serde_json::json!({"name": "qb", "library_id": 3}))
+                .expect("缺 provider_config 应合法");
+        assert_eq!(minimal.library_id, 3);
+        assert_eq!(
+            minimal.provider_config,
+            serde_json::json!(null),
+            "serde 的缺省是 Null；上游是 `{{}}`，由服务层归一"
+        );
+
+        assert!(
+            serde_json::from_value::<DownloadClientCreateRequest>(
+                serde_json::json!({"name": "qb"})
+            )
+            .is_err(),
+            "library_id 必填"
+        );
     }
 
-    /// 诊断结果的失败分支：`reachable: false` 且**有** `error` 文案。
-    ///
-    /// 反过来（`reachable: true` 却带 `error`）会让客户端把正常结果显示成失败。
+    /// ★ 响应体的**线上字段名**照上游：`library_id` / `provider_config`，
+    /// 且**没有** `kind` / `enabled` / `config`。
     #[test]
-    fn an_unreachable_client_reports_why() {
-        let diagnostic = DownloadClientDiagnostic {
-            reachable: false,
-            latency_ms: None,
-            version: None,
-            error: Some("连接超时".to_owned()),
+    fn the_resource_wire_shape_has_no_invented_fields() {
+        let resource = DownloadClientResource {
+            id: 1,
+            name: "qb".to_owned(),
+            library_id: 2,
+            provider_config: serde_json::json!({"host": "h"}),
+            created_at: None,
+            updated_at: None,
         };
-        assert!(!diagnostic.reachable);
-        assert!(diagnostic.error.is_some());
-        assert!(diagnostic.latency_ms.is_none(), "不可达时没有延迟");
+        let json = serde_json::to_value(&resource).expect("序列化");
+        assert_eq!(json["library_id"], 2);
+        assert_eq!(json["provider_config"]["host"], "h");
+        for absent in ["kind", "enabled", "config"] {
+            assert!(json.get(absent).is_none(), "{absent} 不该出现在响应里");
+        }
+    }
+
+    /// ★ 诊断结果的形状照上游：一次探测多项 `checks`。
+    #[test]
+    fn the_diagnostic_shape_is_the_upstream_one() {
+        let diagnostic = DownloadClientDiagnostic {
+            status: "warning".to_owned(),
+            checks: vec![DownloadClientDiagnosticCheck {
+                key: "connection".to_owned(),
+                status: "ok".to_owned(),
+                code: "ok".to_owned(),
+                message: "reachable".to_owned(),
+                details: None,
+            }],
+            checked_at: chrono::NaiveDate::from_ymd_opt(2026, 10, 6)
+                .expect("日期")
+                .and_hms_opt(0, 0, 0)
+                .expect("时刻"),
+            elapsed_ms: 12,
+        };
+        let json = serde_json::to_value(&diagnostic).expect("序列化");
+        assert_eq!(json["status"], "warning");
+        assert_eq!(json["checks"][0]["key"], "connection");
+        assert!(json["checks"][0].get("details").is_none(), "None 不序列化");
+        for absent in ["reachable", "latency_ms", "version", "error"] {
+            assert!(json.get(absent).is_none(), "{absent} 是骨架期自造的字段");
+        }
     }
 }

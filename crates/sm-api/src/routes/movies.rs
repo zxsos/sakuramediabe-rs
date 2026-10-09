@@ -39,6 +39,7 @@ use sm_service::catalog::movie::{
     MovieNumberParseResult, MovieService, SubscriptionBatchResponse, SubscriptionSkippedItem,
     COLLECTION_TYPE_COLLECTION, COLLECTION_TYPE_SINGLE,
 };
+use sm_service::catalog::movie_subtitle::MovieSubtitleService;
 use sm_service::error::details_of;
 
 use crate::auth::CurrentUser;
@@ -812,12 +813,40 @@ async fn get_movie_reviews(
 /// 服务层见 [`sm_service::catalog::movie_subtitle`]。两处不变量在那边：
 /// 10 MiB 上限先 stat 再读、路径逃逸校验在 canonicalize 之后。
 async fn get_movie_subtitles(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(movie_number): Path<String>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let _ = movie_number;
-    todo!("骨架：接 MovieSubtitleService::get_movie_subtitles；影片不存在 -> 404 movie_not_found")
+    let list = MovieSubtitleService::new(state.db(), state.config())
+        .get_movie_subtitles(&movie_number)
+        .await?;
+
+    // 每项补**签名 URL**：上游在服务里拼（`MovieSubtitleItemResource.url`，
+    // `movie_subtitle_service.py:160-165`），本仓的签名密钥由路由层持有
+    // （见 `sm_service::catalog::movie_subtitle` 的模块文档）。
+    //
+    // 载荷与上游逐字对齐：`subtitle_id` / `url` / `created_at` / `file_name` ——
+    // **不含** `format` 与 `size_bytes`（那两个只在服务层的 `SubtitleAsset` 上，
+    // 上游的列表资源也不带）。多塞字段不是「顺便给点信息」，是改协议。
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let items: Vec<serde_json::Value> = list
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "subtitle_id": item.subtitle_id,
+                "url": sm_core::signing::build_signed_subtitle_url(&secret, item.subtitle_id, now),
+                "created_at": item.created_at,
+                "file_name": item.file_name,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "movie_number": list.movie_number,
+        "items": items,
+    })))
 }
 
 /// `limit` 的边界是 `0..=100`（**下界 0**，见 handler 文档）。

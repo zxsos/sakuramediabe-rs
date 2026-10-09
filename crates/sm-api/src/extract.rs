@@ -21,6 +21,8 @@ use axum::extract::{
     FromRequest, Json as AxumJson, Multipart as AxumMultipart, Query as AxumQuery, Request,
 };
 use axum::http::StatusCode;
+// 重复 query 参数的解析器（`serde_html_form`）—— 只 [`HtmlFormQuery`] 用。
+use axum_extra::extract::Query as AxumExtraQuery;
 use serde::de::DeserializeOwned;
 
 use crate::error::ErrorResponse;
@@ -70,6 +72,50 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match AxumQuery::<T>::from_request(request, state).await {
             Ok(AxumQuery(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ErrorResponse::from(rejection)),
+        }
+    }
+}
+
+/// 查询参数提取器（**唯一支持重复键的那个**）。
+///
+/// # 为什么不能复用 [`Query`]
+///
+/// axum 自带的 `Query` 走 `serde_urlencoded`，而后者把「字段期待序列」直接
+/// 转发成 `visit_str`（`serde_urlencoded-0.7.1/src/de.rs` 的 `Part`：`seq`
+/// 落在 `forward_to_deserialize_any!` 里）。于是：
+///
+/// ```text
+/// ?state=a&state=b   -> invalid type: string "a", expected a sequence
+/// ?state=a           -> 同样失败
+/// ```
+///
+/// 也就是说「重复键」与「单个值」**都会** 422，而不是「取最后一个」。
+///
+/// 上游 `GET /download-tasks` 的 `state` 是 `list[str] = Query(default=None)`
+/// （重复键），客户端（Flutter dio 的 `ListFormat.multi`）就是这么发的 ——
+/// 那条路由必须走 html-form 解析（`axum_extra::extract::Query`，内部是
+/// `serde_html_form`）。
+///
+/// # 只在那条路由上用
+///
+/// `serde_html_form` 与 `serde_urlencoded` 对**平面标量**的解析基本一致，
+/// 但把全仓的查询解析器换掉是无谓的爆炸半径（每条已接端点的 HTTP 用例都在
+/// 它的影响面里）。所以这里**新增**一个提取器，而不是改 [`Query`]。
+///
+/// 用法与 [`Query`] 相同：`HtmlFormQuery(q): HtmlFormQuery<Q>`。
+pub struct HtmlFormQuery<T>(pub T);
+
+impl<T, S> FromRequest<S> for HtmlFormQuery<T>
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = ErrorResponse;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumExtraQuery::<T>::from_request(request, state).await {
+            Ok(AxumExtraQuery(value)) => Ok(Self(value)),
             Err(rejection) => Err(ErrorResponse::from(rejection)),
         }
     }

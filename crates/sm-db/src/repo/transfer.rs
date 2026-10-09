@@ -235,6 +235,22 @@ impl DownloadClientRepository {
         }
     }
 
+    /// 列出全部下载器客户端，**不分页**，按 `created_at DESC, id DESC`。
+    ///
+    /// 上游 `DownloadClientService.list_clients`（`client_config_service.py:257-265`）
+    /// 就是 `DownloadClient.select().order_by(created_at.desc(), id.desc())` ——
+    /// **不分页，且最新在前**。骨架期那条注释写的是「按 id 升序」，与上游相反。
+    ///
+    /// 与 [`Self::list`] 的区别：那个分页，这个给 `GET /download-clients`
+    /// （上游那个端点返回**裸数组**，没有分页信封）。
+    pub async fn list_ordered(&self) -> Result<Vec<DownloadClient>, DbError> {
+        Ok(sqlx::query_as::<_, DownloadClient>(
+            "SELECT * FROM download_client ORDER BY created_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 删下载器。返回是否真的删掉了一行。
     ///
     /// **连带删除**它名下的全部 `download_task` 与 `indexer_download_client`
@@ -559,6 +575,44 @@ impl IndexerDownloadClientRepository {
         )
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// 该索引器绑定的下载器客户端**完整行**，按关联行 `id` 升序。
+    ///
+    /// 与 [`Self::list_all_with_clients`] 的区别是**取什么**：那个只回
+    /// `(id, name)`（配置页列表用，不把可能含 cookie 的 `provider_config`
+    /// 带出来），这里回完整行 —— 提交下载时要构造插件句柄，而句柄必须带
+    /// `provider_config` 与 `library_id`。
+    ///
+    /// 上游 `list_indexer_clients`（`downloads/common.py:147-156`）取的是
+    /// **`link.download_client`**，也就是完整客户端行，同样按关联行 id 升序。
+    pub async fn list_clients_by_indexer(
+        &self,
+        indexer_id: i32,
+    ) -> Result<Vec<DownloadClient>, DbError> {
+        Ok(sqlx::query_as::<_, DownloadClient>(
+            "SELECT c.* FROM indexer_download_client b \
+             JOIN download_client c ON c.id = b.download_client_id \
+             WHERE b.indexer_id = $1 \
+             ORDER BY b.id",
+        )
+        .bind(indexer_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 该下载器客户端是否还被任何索引器绑定。
+    ///
+    /// 上游 `delete_client` 的第二道 409（`client_config_service.py:342-350`）：
+    /// `IndexerDownloadClient.select().where(download_client == id).exists()`。
+    pub async fn exists_for_client(&self, download_client_id: i32) -> Result<bool, DbError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM indexer_download_client WHERE download_client_id = $1)",
+        )
+        .bind(download_client_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
     }
 
     /// 绑定索引器与下载器。**幂等。**

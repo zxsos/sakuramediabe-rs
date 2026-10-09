@@ -125,29 +125,44 @@ impl From<JsonRejection> for ErrorResponse {
     }
 }
 
+/// 查询串解析失败 → 422 `validation_error`。
+///
+/// 与 [`JsonRejection`] 同一个理由：axum 的 `QueryRejection` 默认响应是
+/// **400 + 纯文本**，不经过错误信封。上游 FastAPI 走
+/// `RequestValidationError`，是 422 + 信封。两者状态码与响应体形状
+/// 都不同，而客户端是按 `code` 分支的。
+///
+/// `details.detail` 带 axum 的原始描述（哪个键、什么值、为什么不行），
+/// 与 `JsonRejection` 的做法一致 —— 那是定位「客户端拼错了哪个参数」
+/// 的唯一线索。
+///
+/// # 为什么有两个 `from` 实现
+///
+/// 本仓有两个查询提取器：[`crate::extract::Query`]（`serde_urlencoded`）与
+/// [`crate::extract::HtmlFormQuery`]（`serde_html_form`，支持重复键）。它们
+/// 失败时的 **rejection 是不同类型**，但语义完全一样。映射只留这一份，
+/// 两个 `From` 都转发过来 —— 免得日后改文案只改一边。
+fn query_rejection(detail: String) -> ErrorResponse {
+    let mut details = serde_json::Map::new();
+    details.insert("detail".to_owned(), serde_json::Value::from(detail));
+    ErrorResponse::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+        "Request validation failed",
+    )
+    .with_details(details)
+}
+
 impl From<QueryRejection> for ErrorResponse {
-    /// 查询串解析失败 → 422 `validation_error`。
-    ///
-    /// 与 [`JsonRejection`] 同一个理由：axum 的 `QueryRejection` 默认响应是
-    /// **400 + 纯文本**，不经过错误信封。上游 FastAPI 走
-    /// `RequestValidationError`，是 422 + 信封。两者状态码与响应体形状
-    /// 都不同，而客户端是按 `code` 分支的。
-    ///
-    /// `details.detail` 带 axum 的原始描述（哪个键、什么值、为什么不行），
-    /// 与 `JsonRejection` 的做法一致 —— 那是定位「客户端拼错了哪个参数」
-    /// 的唯一线索。
     fn from(value: QueryRejection) -> Self {
-        let mut details = serde_json::Map::new();
-        details.insert(
-            "detail".to_owned(),
-            serde_json::Value::from(value.body_text()),
-        );
-        Self::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "validation_error",
-            "Request validation failed",
-        )
-        .with_details(details)
+        query_rejection(value.body_text())
+    }
+}
+
+/// [`crate::extract::HtmlFormQuery`] 的 rejection（见 `query_rejection`）。
+impl From<axum_extra::extract::QueryRejection> for ErrorResponse {
+    fn from(value: axum_extra::extract::QueryRejection) -> Self {
+        query_rejection(value.body_text())
     }
 }
 

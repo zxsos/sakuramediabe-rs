@@ -299,6 +299,30 @@ impl MovieRepository {
         Ok(row)
     }
 
+    /// 按一批番号**批量**查询，返回 `番号 -> Movie`。
+    ///
+    /// 下载任务列表用它一次把当页涉及的影片卡片取回来（上游
+    /// `_load_movies_for_tasks` 的 `Movie.movie_number.in_(numbers)`）；
+    /// 逐行 [`Self::find_by_number`] 就是 N+1。
+    ///
+    /// 空入参直接返回空映射，不发查询。
+    pub async fn find_by_numbers(
+        &self,
+        numbers: &[String],
+    ) -> Result<HashMap<String, Movie>, DbError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Movie>("SELECT * FROM movie WHERE movie_number = ANY($1)")
+            .bind(numbers)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|movie| (movie.movie_number.clone(), movie))
+            .collect())
+    }
+
     /// 按主键**批量**取回，返回 `id → Movie`。**没命中的 id 不在结果里。**
     ///
     /// # 为什么列表页需要它

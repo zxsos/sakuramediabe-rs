@@ -462,6 +462,146 @@ service 侧类型改名 `MediaThumbnailValue` 带未签名路径，API 层 `dto.
 > 而本仓的 registry **只存在于注释里**（`sm-api/src/routes/{videos,
 > video_collections}.rs` 提到它）。没有 provider 就生成不出产物，**不假造**。
 
+### `import_task` 的契约层 + 入队落地（本轮）+ `download_tasks` 收尾（上一轮）
+
+两轮的落点都在 `transfers`：
+
+| 轮 | 落点 | 结果 |
+|---|---|---|
+| 上一轮 | `download_task.rs` 的台账响应改回上游形状、`list_tasks`、重复 query 参数、`trigger_import` 的两道门 | ⚠️ 202 正常路径当时会 panic（`enqueue` 是 `todo!()`）|
+| 本轮 | `import_task.rs` 的 **6 个 DTO 全部重写** + `enqueue` / `enqueue_batch` 落地 + `sm-api` 路由改单一 DTO 来源 | 202 真的建出 TaskRun（但跑不起来，见下）|
+
+#### 契约层：骨架期那 6 个 DTO **六个全错**
+
+对照 `schema/transfers/media_import.py`（行号见文件内表格）逐条修了：
+`ImportRequest`（`media_kind` 是小写 `jav`/`video`；`source_disposition` 是
+`keep`/`delete_after_commit`/`in_place`，**没有 `move`**；**删掉自造的
+`operation_namespace`** —— 上游那是执行参数，不是请求字段）；
+`ImportAcceptedResponse` 补 `task_key` / `state`；`ImportFailedItemResource`
+从自造的 5 字段换成上游 **13 字段**；`ImportMetadataSearchResponse` 去掉
+`item_id`、补 `source_errors`；`MetadataCandidate` 换成上游 10 字段
+（**删掉自造的 `confidence` / `date`**）；`ImportExecuteSummary` 的字段名
+按上游 `ImportResult` 逐字改（`imported_count` …）。另补了
+`ImportMetadataSearchRequest` / `ImportFailedItemRetryRequest`。
+
+**`sm-api/routes/media_import.rs` 里那套内联 DTO 已全删** —— 它自带一份与
+service 层不同、且与上游都不同的第二/第三份形状。现在导入取
+`import_task`、浏览取 `provider_browse`。
+
+#### 按库互斥：新增 `TaskQueueService::enqueue_with_mutex_key`
+
+`enqueue` 原本把 `mutex_key` 写死成 `aps:{task_key}`，而导入的互斥键必须按
+**媒体库**（`library_import:{id}`，`import_write_mutex.rs` 早就有那把键）。
+所以给队列加了一个**显式互斥键**的入口，`enqueue` 退化成它的薄封装。
+`import_task` 与以后的 `media_transfer` 走新入口。
+
+> ⚠️ 空白互斥键当场拒绝：仓储层的 `normalize` 会把空白**静默**归一为 `NULL`
+> （= 不参与互斥）—— 那对「本来就不要互斥」的调用是对的，对按库互斥是
+> **静默失效**（两批文件互相覆盖）。
+
+#### ★ 一处刻意偏离：入队与回写下载任务**不是一个事务**
+
+上游把「建 TaskRun + 回写 `download_task.import_status/import_task_run`」放在
+同一个 `atomic()` 里。本仓这两笔分属两个仓储、都只走连接池（没有 `_in`
+变体），真要原子得加一批 `_in` 方法并让队列破一次「唯一入队路径」。
+
+本轮**用补偿代替回滚**：入队成功但回写失败（或批量占用数量不符）时，把刚建的
+TaskRun **显式判失败**（顺带释放互斥键），再返回上游的 409/502。唯一可见差异：
+上游回滚后没有那行，本仓留下一条**失败**的 run（任务中心可见、不发通知）。
+
+**理由是不可逆的那一侧**：宁可留一条失败的 run，也不能留一条占着
+`library_import:{id}` 的 pending run —— 互斥键不释放会让该媒体库**永久 409**。
+后续项：补 `_in` 变体 + `UnitOfWork`，把这处收回原子性。
+
+批量的「全有或全无」不需要事务：`DownloadTaskRepository::mark_import_started`
+用**单条带计数谓词**的 UPDATE，条件不成立时影响 0 行（fail-closed）。
+
+#### ⚠️ 本轮之后仍跑不起来：handler 未注册
+
+`ImportTaskService::execute` 仍是 `todo!()`（要 `import_service` +
+`catalog_import`），`sm-scheduler` 的处理器注册表里**没有** `library_import`。
+于是 `POST /imports` / `POST /download-tasks/{id}/import` 会真的建出 TaskRun
+（202），随后被 worker 领取并以 `WorkerError::NoHandler` **判失败**。
+这是阶段性事实，不是回归 —— 任务在任务中心里能看到那条失败记录。
+
+其余三个 `todo!()`（`search_failed_item` / `enqueue_failed_item_retry` /
+`execute`）各自的缺口写在模块文档的表格里；注意上游第三个 mode 名是
+`retry_failed_file`（骨架期注释写的 `retry_failed_item` 是错的，已改）。
+
+新增测试：`crates/sm-service/tests/media_import_enqueue.rs`（11 条真库用例，
+含「两个库互不阻塞」「批量整批拒绝且一条都不改」「撤掉的台账必须释放互斥键」）、
+`repo_integration.rs` 的 `mark_import_started_is_all_or_nothing`、
+`task_queue.rs` 里两条显式互斥键的钉子用例。
+
+#### 失败项**读取**路径也落地了（`list_failed_items`）
+
+`GET /imports/{task_run_id}/failed-items` 从 `todo!()` 变成可用。要点四处：
+
+1. **失败项没有表**：它们在 `background_task_run.result_summary` 的
+   `failed_files` 数组里（上游 `import_task_service.py:178`），随任务结果一起
+   保存 —— 它们的生命周期与那次任务完全相同。
+2. **404 有两个条件**：行不存在，**或** `task_key != library_import`。后者不是
+   洁癖：`{id}` 是裸整数，缩略图/图搜/相似度的 id 都能填进来，而那些任务的
+   `result_summary` 是别的形状 —— 放行会让「拿错 id」看起来像「这次没有失败项」。
+   （刻意不复用 `TaskRunService::get_task_run`：它报的是另一个码
+   `task_run_not_found`，而且不看 `task_key`。）
+3. **形状读不出来是 500，不当空列表**：`result_summary` 不是 JSON / 不是对象 /
+   `failed_files` 不是数组 → 500。静默当空会让「这一趟全失败了」与「一切正常」
+   长得一模一样，而用户再也没有入口重试那些文件。
+4. **`can_manual_search` 是算出来的**（上游 `:530-535`）：`pending` + 是视频 +
+   JAV + 原因 ∈ {`movie_number_not_found`, `metadata_fetch_failed`} 四条全满足
+   才为真 —— 前三条挡「点了没意义」，第四条挡「点了也修不好」。
+
+投影用 `StoredFailedItem`（serde）而不是手挖键：缺键/类型不对由 serde 报出
+字段名，落 500，与上游 `item["x"]` 的 `KeyError` 同码；`source_ref` /
+`library_id` / `media_kind` / `name` 这些宿主内部字段**不声明进这个结构**，
+免得有人顺手外发（`source_ref` 里可能有真实路径）。
+
+#### ★ 顺带修掉一处**自造契约**：失败原因码
+
+`sm-service/import_service.rs` 里那份 `failure_reason` 是骨架期编的六项：
+`is_collection`（那是 `Movie` 的**字段**，不是失败原因）、`unsafe_filename` /
+`stage_failed` / `finalize_failed`（上游这三类都落 `media_import_failed`）
+**上游都没有**，而真的十项里少了八个。
+
+后果不是「多几个常量」，而是**读侧认不出来**：分类表
+（`failed_file_kind`）没有这些键，它们会掉进 `file` 这一档 —— 于是「主动跳过」
+被渲染成「可删除的文件级失败」。
+
+现在：`sm-db::transfers::downloads` 新增 `failed_file_kind`（四档 + `classify`，
+含上游显式锁死分类的**两条历史 reason**）与 `failure_reason`（十项），
+`import_service` 改成 `pub use` 转发（一份定义），`import_task` 的两个可修原因
+也引它。`kind` 在**读侧是原样读存储值、不重算** —— 重算会让改一次分类表就与
+存量数据不一致。
+
+#### `import_notifications` 落地（+ 改回上游形状）
+
+`create_new_media_reminder` 从 `todo!()` 变成可用，同时**删掉一个自造形状**：
+
+| 骨架期 | 上游 |
+|---|---|
+| `NewMediaReminder { title: "本次导入新增 N 部影片", items: [...] }` —— 自造资源 + 逐部条目 | 通知的 `title` 是**固定文案**「有新的影片可以播放了」，正文「新增了 N 个影片」，**没有逐部条目** |
+| 不去重，且截断到 **20 部**（注释自称「这是刻意的差异」）| **按 `movie_number` 去重**、不截断（`:14-23`）|
+| `related_task_run_id: Option<i64>` | `Option<i32>` |
+
+那个 20 部上限的理由（「逐部展开 200 行会让通知中心变成列表页」）在形状改回上游
+之后**不复存在** —— 正文只有一个计数。`handoff.md` §五 只登记了两处刻意照抄的
+缺陷，这一处不在其中（骨架期凭空加的）。
+
+两条落库路径都要保留：带 task run 走 `create_once`（幂等键
+`download_import_new_media:task_run:{id}`，同一 TaskRun 重放只留一条），不带
+task run 走 `notify`（**不去重**，通用入口的旧行为）。
+
+★ **一处照抄的缺陷**：上游读的是 `movie_items[].movie_id`，而写入侧
+（`new_playable_movies`，`import_service.py:466-468` 与 `:718-723`）给的键是
+`id` —— 所以 `related_resource_id` 线上**一直是 `None`**。照抄，别「顺手修」成
+读 `id`（那会改变通知挂的关联资源）。
+
+接线时的三条约束（`import_task_service.py:287-299`，本轮未落地）已写进模块文档：
+只有**下载任务发起**的导入才发提醒（判据是 `params` 里有 `download_tasks` 或
+`download_task_id`）；传的是 `reporter.task_run_id`；**提醒失败不能让导入失败**
+（上游把整个调用包在 `try/except` 里只记 warning）。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |
@@ -470,6 +610,7 @@ service 侧类型改名 `MediaThumbnailValue` 带未签名路径，API 层 `dto.
 | `catalog/movie_metadata_search.rs`(4) | 纯 DB |
 | `transfers/download_client.rs`(9) + `download_common.rs`(8) | ⚠️ **被下载器插件 ABI 挡**（与上面同一个 registry）|
 | `catalog/catalog_import.rs`(7) | 依赖 `metadata_source`（插件 ABI）+ `image_cleanup`（已就绪）|
+| `transfers/import_task.rs` 剩下 3 个 | 见上（`execute` 要 `import_service` + `catalog_import`；`search` / `retry` 要插件 ABI —— `retry` 第一步就是 `resolve_candidate_reference`）|
 
 ### ★ 插件 ABI 评估：协议面其实**已经齐了**，缺的是宿主侧调用面
 
@@ -621,7 +762,7 @@ service 侧类型改名 `MediaThumbnailValue` 带未签名路径，API 层 `dto.
 | 候选 | 备注 |
 |---|---|
 | `MediaService` 剩下 8 个 | `list_media`（七参数过滤 + 白名单排序 + `heat` 的 `NULLS LAST`）、`list_duplicate_media_groups`（哈希分组，缺哈希走**退化键**并标 `Degraded`）、`list_multi_version_movies`、`list_media_points`（全局列表，默认 `created_at` 降序）、`list_thumbnails`（等 `artifacts` 改形状）、`list_invalid_media`、`delete_media`（⚠️ **被插件 provider 挡**：第一步要 `storage.delete_media(media_handle)`，不做第一步就是留远端文件；`sync_video_member` 那一支可走 `VideoItemService::delete`） |
-| `download_tasks`(4) | `transfers/download_task.rs` 还剩 3 个 `todo` |
+| ~~`download_tasks`~~ | ✅ 已收尾（`list_tasks` 落地）；`import_task` 的入队也已落地，两者各剩 `delete_task` / `execute` 一族被插件 ABI 与 `import_service` 挡 |
 | `system/telemetry`(2) | 依赖最少 |
 | worker handler 3/19 → 19/19 | 每个 handler 的 service 都已就绪 |
 | `videos` 详情/创建/更新/删除 | ⚠️ **被插件 ABI 卡住** —— `media_items[].play_url` 要 `MEDIA_PROVIDER_REGISTRY` 拿 `playback_deliveries[0]`。**不要用空串冒充**：客户端会把空地址当成「不可播放」 |
@@ -714,11 +855,20 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 
 ### 卡死的（不用试）
 
-- ~~`GET /movies/{n}/subtitles`~~ —— **已解阻塞**（2026-10-05）。原判断「要读媒体
-  文件系统（provider 族）」是**错的**：读字幕只读宿主自己的字幕目录，provider 参与
-  的是「把字幕搬过来」那一步（写侧 `subtitle_asset.rs`）。读侧
-  `movie_subtitle.rs` 已铺，其中两处不变量：10 MiB 上限**先 stat 再读**、
-  路径逃逸校验要在 `canonicalize` 之后做（只查字符串前缀会被软链绕过）。
+- ~~`GET /movies/{n}/subtitles`~~ —— **两个端点都已落地**（读侧 `7698b78`、
+  写侧 `0e10757`）。原判断「要读媒体文件系统（provider 族）」是**错的**：读字幕
+  只读宿主自己的字幕目录，provider 参与的是「把字幕搬过来」那一步（写侧
+  `subtitle_asset.rs`）。
+  - 不变量一（**骨架期写错、已纠正**）：10 MiB 上限是
+    `os.fstat` 判一次 + 限读 `MAX + 1` **再判一次**
+    （上游 `movie_subtitle_service.py:69-83`）。不是「先 stat 再读」那么一次 ——
+    文件可能在 stat 与 read 之间被写大。
+  - 不变量二：路径逃逸校验要在**解析之后**做（只查字符串前缀会被软链绕过），
+    且「文件不存在」**不是**路径非法 —— 那是 409 `subtitle_unavailable`
+    （读内容）或 404 `file_not_found`（下载）。
+  - 题外的坑：`os.stat` 那条注释是错的（上游用 `os.fstat`），骨架期的
+    `ensure_subtitle_path` 也因此把 403 与 409 混成一个 —— 两处都已在
+    `media_paths` / `movie_subtitle` 里纠正。
 - `GET /movies/{n}` 详情 —— 要 playback 的进度/打点 + rankings
 
 （`discovery` 已不再是卡死项：Qdrant 稠密/稀疏两侧都已落地，`sm-service` 16 个上游服务

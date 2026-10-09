@@ -59,6 +59,11 @@ async-trait = "0.1"
 # multipart：上传（插件 zip / 图片）。提取器在 sm-api::extract，
 # 对齐上游 FastAPI 的 `UploadFile = File(...)`。
 axum = { version = "0.8", features = ["multipart"] }
+# 重复 query 参数（`?state=a&state=b`）只靠 axum 自带的 `Query` 解析不了：
+# 它走 `serde_urlencoded`，而后者把「字段期待序列」直接转发成 `visit_str`。
+# 上游 `GET /download-tasks` 的 `state` 就是 `list[str]`，所以那条路由需要
+# `query` 特性提供的 `axum_extra::extract::Query`（内部是 `serde_html_form`）。
+axum-extra = { version = "0.10", features = ["query"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 # 读取响应体（集成测试断言用）
@@ -162,6 +167,17 @@ zip = { version = "8", default-features = false }
 # 封面书脊检测的 Sobel 是自写的（crates/svc-image），不引 imageproc ——
 # 后者会拖进 nalgebra / rayon / rustdct，为 40 行卷积不值得。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# dev（`cargo test` / `cargo check` / `cargo clippy`）默认 `debug = true`，而 MSVC 下
+# 每个二进制/库各写一份**独立的 .pdb** —— 这个仓有 60+ 个集成测试目标，实测
+# `target/debug/deps` 里 `.pdb` 占 **40GB**（`.rlib` 才 16GB），并且把 C: 顶到
+# 只剩 0.01GB、`link.exe` 直接开始报错。
+#
+# `line-tables-only` 保留**行号**（回溯里能看到「哪一行」），丢掉变量值/表达式信息。
+# 需要完整符号时临时 `CARGO_PROFILE_DEV_DEBUG=2 cargo test`（会另建一套指纹，
+# 于是又要一份全量产物 —— 别常态化）。
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

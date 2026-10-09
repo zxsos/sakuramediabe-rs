@@ -178,14 +178,10 @@ impl SubscriptionListItemResource {
             last_error: item.last_error,
             import_status: item.import_status.clone(),
             // 上游 `@computed_field`：未知取值回退原值，而不是 null。
-            import_status_label: item.import_status.map(|status| match status.as_str() {
-                "pending" => "待导入：下载已完成，等待自动导入触发".to_owned(),
-                "running" => "导入中：导入作业正在执行".to_owned(),
-                "completed" => "已导入：符合条件的媒体文件已入库".to_owned(),
-                "failed" => "导入失败：存在未成功导入的文件".to_owned(),
-                "skipped" => "已跳过：没有符合条件的媒体文件".to_owned(),
-                other => other.to_owned(),
-            }),
+            // 映射本尊在 `crate::dto`（`GET /download-tasks` 用的是同一份）。
+            import_status_label: item
+                .import_status
+                .map(|status| crate::dto::describe_import_status(&status)),
             dead_download_task_count: item.dead_download_task_count,
             media_count: item.media_count,
         }

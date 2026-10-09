@@ -148,6 +148,24 @@ impl SubtitleRepository {
         .map_err(|e| DbError::from(e).with_entity(SUBTITLE_ENTITY))
     }
 
+    /// 按主键取一条字幕。
+    ///
+    /// 上游 `Subtitle.get_or_none(Subtitle.id == subtitle_id)`
+    /// （`common/file_signatures.py:266`，字幕**下载**路由用的那条）。
+    ///
+    /// ⚠️ 与 [`Self::find_in_movie`] 的区别：这里**不带** `movie_id` 条件。
+    /// 下载路由只拿得到字幕 id（URL 里只有它），而那条 URL 的签名正是**按字幕
+    /// id** 签的 —— 能拿出合法签名就等于被授权访问这一条，不需要再按影片过滤。
+    /// 别的入口（读内容、列表）一律用 `find_in_movie`。
+    pub async fn find(&self, subtitle_id: i32) -> Result<Option<Subtitle>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Subtitle>("SELECT * FROM subtitle WHERE id = $1")
+                .bind(subtitle_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// 取该影片下的一条字幕。上游 `Subtitle.get_or_none((id == ..) & (movie == ..))`。
     ///
     /// 条件里带 `movie_id` 而不是只按主键查：字幕 id 来自 URL，光按 id 查会让

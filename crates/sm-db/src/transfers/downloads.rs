@@ -192,6 +192,110 @@ pub mod import_status {
     }
 }
 
+/// 失败条目的分类（上游 `FAILED_FILE_KIND_*`，`common/media_import_status.py:36-40`）。
+///
+/// # 它决定客户端**能对这一条做什么**
+///
+/// | kind | 含义 | 客户端可做的操作 |
+/// |---|---|---|
+/// | `file` | 单个媒体文件级失败 | 重导 / 删除 / 重命名 |
+/// | `skipped` | 主动跳过（小文件、格式不支持、已索引）| 仅信息展示 |
+/// | `warning` | 导入后告警（删源失败、多字幕）| 不做文件级操作 |
+/// | `job` | 任务级失败（`path` 通常是目录）| 不做文件级操作 |
+///
+/// # 分类由**写入侧**算好，读取侧直接读
+///
+/// `failed_files[].kind` 是**存进库里**的值（`make_failure_item` 是唯一来源，
+/// `common/media_import_status.py:78-85`），而 `import_task` 读失败项时是
+/// `item["kind"]` 原样投影（`shared/import_task_service.py:524`）。
+///
+/// **不要**在读侧重算：存量数据是用当时那张表算出来的，重算会让「改一次分类表」
+/// 与历史行不一致 —— 而那表现为「同一条失败项，列表里的分类与它能不能被删
+/// 对不上」，最难查的一类。
+///
+/// [`classify`](crate::transfers::downloads::failed_file_kind::classify)
+/// 只给写入侧用（`import_service` 还没落地）。
+pub mod failed_file_kind {
+    /// 单个媒体文件级失败 —— **未知原因也落这一档**。
+    pub const FILE: &str = "file";
+    /// 主动跳过。
+    pub const SKIPPED: &str = "skipped";
+    /// 导入后告警。
+    pub const WARNING: &str = "warning";
+    /// 任务级失败。
+    pub const JOB: &str = "job";
+
+    /// 全部取值。
+    pub const ALL: [&str; 4] = [FILE, SKIPPED, WARNING, JOB];
+
+    /// 按失败原因归类。对应上游 `classify_failed_file_kind`（`:73-75`）。
+    ///
+    /// 未知原因落 [`FILE`]（上游是 `_FAILED_FILE_KIND_BY_REASON.get(reason, FILE)`）
+    /// —— 未知原因多半是**新加的、还没归类**的文件级失败，当成「不可操作」
+    /// 会让用户连重导都点不到。
+    pub fn classify(reason: &str) -> &'static str {
+        use super::failure_reason as r;
+        match reason {
+            r::MOVIE_NUMBER_NOT_FOUND
+            | r::METADATA_FETCH_FAILED
+            | r::IMAGE_DOWNLOAD_FAILED
+            | r::METADATA_UPSERT_FAILED
+            | r::MEDIA_IMPORT_FAILED => FILE,
+            r::FILE_TOO_SMALL | r::UNSUPPORTED_FORMAT | r::ALREADY_INDEXED_PATH => SKIPPED,
+            r::SOURCE_DELETE_FAILED => WARNING,
+            r::NO_MEDIA_FILES_FOUND => JOB,
+            // 两个**已废弃的历史 reason** 不能删：merge_subtitle 的老告警行对应的
+            // 媒体**已经入库**，一旦掉到默认的 `file`，前端会把它当成可删除项，
+            // 误操作会删掉已入库媒体的源文件。上游为此在映射表里显式写死了这两条
+            // （`media_import_status.py:64-67` 的注释）。
+            "multi_part_merge_failed" => FILE,
+            "merge_subtitle_skipped_multiple_sidecars" => WARNING,
+            _ => FILE,
+        }
+    }
+}
+
+/// `failed_files[].reason`：单条导入失败的具体原因
+/// （上游 `media_import_status.py:42-52`，**十**个取值）。
+///
+/// # 为什么单独一个模块
+///
+/// 这些字符串会**落进 `background_task_run.result_summary` 的 JSON**，
+/// 也被两类逻辑当判据读：
+///
+/// - 失败项是否**用户可修**（只有
+///   [`movie_number_not_found`](crate::transfers::downloads::failure_reason::MOVIE_NUMBER_NOT_FOUND)
+///   与
+///   [`metadata_fetch_failed`](crate::transfers::downloads::failure_reason::METADATA_FETCH_FAILED)）——
+///   见 `sm_service::transfers::import_task::ImportTaskService::MANUAL_SEARCH_FAILURE_REASONS`；
+/// - 归类成哪个 [`failed_file_kind`]。
+///
+/// ⚠️ 骨架期 `sm-service` 另有一份**自造**的六项集合（`is_collection` /
+/// `unsafe_filename` / `stage_failed` / `finalize_failed` 四个上游**没有**，
+/// 且少四个真的）。已删，全仓只留这一份。
+pub mod failure_reason {
+    /// 番号识别不出来。
+    pub const MOVIE_NUMBER_NOT_FOUND: &str = "movie_number_not_found";
+    /// 元数据抓取失败。
+    pub const METADATA_FETCH_FAILED: &str = "metadata_fetch_failed";
+    /// 封面等图片下载失败。
+    pub const IMAGE_DOWNLOAD_FAILED: &str = "image_download_failed";
+    /// 元数据写库失败。
+    pub const METADATA_UPSERT_FAILED: &str = "metadata_upsert_failed";
+    /// 媒体入库失败（默认档）。
+    pub const MEDIA_IMPORT_FAILED: &str = "media_import_failed";
+    /// 文件太小，主动跳过。
+    pub const FILE_TOO_SMALL: &str = "file_too_small";
+    /// 格式不支持，主动跳过。
+    pub const UNSUPPORTED_FORMAT: &str = "unsupported_format";
+    /// 删源失败（`delete_after_commit` 之后）。
+    pub const SOURCE_DELETE_FAILED: &str = "source_delete_failed";
+    /// 这一趟没找到可导入的媒体文件（任务级）。
+    pub const NO_MEDIA_FILES_FOUND: &str = "no_media_files_found";
+    /// 这个路径已经索引过。
+    pub const ALREADY_INDEXED_PATH: &str = "already_indexed_path";
+}
+
 /// `download_task` 表：一次下载任务。
 ///
 /// 唯一索引 `(client, remote_id)` —— 同一下载器内的远端任务 id 唯一，
@@ -542,5 +646,99 @@ mod tests {
         assert!(make(None).parsed_config().is_none());
         let parsed = make(Some(r#"{"host":"h"}"#)).parsed_config().unwrap();
         assert_eq!(parsed["host"], "h");
+    }
+
+    // ------------------------------------------------ 失败项的 reason 与 kind
+
+    /// 十个 reason 字面量**逐个钉死**。
+    ///
+    /// 它们会落进 `background_task_run.result_summary` 的 JSON。改名不会报错，
+    /// 只表现为：存量失败项在新代码里读不出「原因」，而 `kind` 也会跟着错档
+    /// （未知原因落 `file`，于是「小文件」被当成「可删除的文件级失败」）。
+    #[test]
+    fn the_failure_reasons_are_upstreams_ten_literals() {
+        use failure_reason as r;
+        assert_eq!(r::MOVIE_NUMBER_NOT_FOUND, "movie_number_not_found");
+        assert_eq!(r::METADATA_FETCH_FAILED, "metadata_fetch_failed");
+        assert_eq!(r::IMAGE_DOWNLOAD_FAILED, "image_download_failed");
+        assert_eq!(r::METADATA_UPSERT_FAILED, "metadata_upsert_failed");
+        assert_eq!(r::MEDIA_IMPORT_FAILED, "media_import_failed");
+        assert_eq!(r::FILE_TOO_SMALL, "file_too_small");
+        assert_eq!(r::UNSUPPORTED_FORMAT, "unsupported_format");
+        assert_eq!(r::SOURCE_DELETE_FAILED, "source_delete_failed");
+        assert_eq!(r::NO_MEDIA_FILES_FOUND, "no_media_files_found");
+        assert_eq!(r::ALREADY_INDEXED_PATH, "already_indexed_path");
+    }
+
+    /// 分类表的**每一条**分支都要对上上游（含两个已废弃的历史 reason）。
+    #[test]
+    fn the_failed_file_kind_classification_matches_upstream() {
+        use failed_file_kind as k;
+        use failure_reason as r;
+
+        for reason in [
+            r::MOVIE_NUMBER_NOT_FOUND,
+            r::METADATA_FETCH_FAILED,
+            r::IMAGE_DOWNLOAD_FAILED,
+            r::METADATA_UPSERT_FAILED,
+            r::MEDIA_IMPORT_FAILED,
+        ] {
+            assert_eq!(k::classify(reason), k::FILE, "{reason} 是文件级失败");
+        }
+        for reason in [
+            r::FILE_TOO_SMALL,
+            r::UNSUPPORTED_FORMAT,
+            r::ALREADY_INDEXED_PATH,
+        ] {
+            assert_eq!(k::classify(reason), k::SKIPPED, "{reason} 是主动跳过");
+        }
+        assert_eq!(k::classify(r::SOURCE_DELETE_FAILED), k::WARNING);
+        assert_eq!(k::classify(r::NO_MEDIA_FILES_FOUND), k::JOB);
+
+        // 两条历史 reason 必须在表里**显式**锁死：掉到默认的 `file` 会让前端
+        // 把它们当可删除项，误删已入库媒体的源文件。
+        assert_eq!(k::classify("multi_part_merge_failed"), k::FILE);
+        assert_eq!(
+            k::classify("merge_subtitle_skipped_multiple_sidecars"),
+            k::WARNING
+        );
+    }
+
+    /// 未知原因落 `file`（上游 `dict.get(..., FILE)`）——
+    /// 那多半是**新加的、还没归类**的文件级失败，判成「不可操作」会让用户
+    /// 连重导都点不到。
+    #[test]
+    fn unknown_reasons_are_treated_as_actionable_file_failures() {
+        assert_eq!(
+            failed_file_kind::classify("brand-new-reason"),
+            failed_file_kind::FILE
+        );
+        assert_eq!(failed_file_kind::classify(""), failed_file_kind::FILE);
+    }
+
+    /// 分类只产出那四个合法取值 —— 客户端按它决定显示哪些操作。
+    #[test]
+    fn every_classification_lands_in_the_closed_kind_set() {
+        use failure_reason as r;
+        let reasons = [
+            r::MOVIE_NUMBER_NOT_FOUND,
+            r::METADATA_FETCH_FAILED,
+            r::IMAGE_DOWNLOAD_FAILED,
+            r::METADATA_UPSERT_FAILED,
+            r::MEDIA_IMPORT_FAILED,
+            r::FILE_TOO_SMALL,
+            r::UNSUPPORTED_FORMAT,
+            r::SOURCE_DELETE_FAILED,
+            r::NO_MEDIA_FILES_FOUND,
+            r::ALREADY_INDEXED_PATH,
+            "multi_part_merge_failed",
+            "merge_subtitle_skipped_multiple_sidecars",
+        ];
+        for reason in reasons {
+            assert!(
+                failed_file_kind::ALL.contains(&failed_file_kind::classify(reason)),
+                "{reason} 归类出了闭集"
+            );
+        }
     }
 }
