@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::host::{HostMovies, PAGE_SIZE};
-use crate::judge::{Decision, Stats, decide};
+use crate::judge::{decide, Decision, Stats};
 use crate::settings::DurationCollectionSettings;
 
 /// 上游 `JobDefinition` 的各字段。
@@ -55,7 +55,11 @@ impl Control {
         settings: DurationCollectionSettings,
         host: Option<Arc<dyn HostMovies>>,
     ) -> Self {
-        Self { plugin_id, settings, host }
+        Self {
+            plugin_id,
+            settings,
+            host,
+        }
     }
 
     pub fn job_definition() -> JobDefinition {
@@ -74,11 +78,13 @@ impl Control {
 
 fn progress_event(stats: &Stats) -> JobEvent {
     JobEvent {
-        event: Some(sm_plugin_api::v1::job_event::Event::Progress(ProgressEvent {
-            text: stats.progress_text(),
-            current: stats.scanned as i32,
-            total: 0,
-        })),
+        event: Some(sm_plugin_api::v1::job_event::Event::Progress(
+            ProgressEvent {
+                text: stats.progress_text(),
+                current: stats.scanned as i32,
+                total: 0,
+            },
+        )),
     }
 }
 
@@ -255,10 +261,15 @@ mod tests {
             _after_id: i64,
             _limit: i32,
         ) -> Result<crate::host::Page, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(self.pages.lock().unwrap().pop_front().unwrap_or(crate::host::Page {
-                movies: Vec::new(),
-                next_cursor: None,
-            }))
+            Ok(self
+                .pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(crate::host::Page {
+                    movies: Vec::new(),
+                    next_cursor: None,
+                }))
         }
 
         async fn patch_is_collection(
@@ -266,8 +277,16 @@ mod tests {
             movie_id: i64,
             expected_revision: i64,
         ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-            self.patches.lock().unwrap().push((movie_id, expected_revision));
-            Ok(self.patch_results.lock().unwrap().pop_front().unwrap_or(true))
+            self.patches
+                .lock()
+                .unwrap()
+                .push((movie_id, expected_revision));
+            Ok(self
+                .patch_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(true))
         }
     }
 
@@ -284,7 +303,10 @@ mod tests {
     }
 
     fn page(movies: Vec<MovieInput>, next_cursor: Option<i64>) -> crate::host::Page {
-        crate::host::Page { movies, next_cursor }
+        crate::host::Page {
+            movies,
+            next_cursor,
+        }
     }
 
     #[tokio::test]
@@ -296,7 +318,7 @@ mod tests {
             vec![
                 input(1, 180, "ABP-001", false), // 命中（阈值 120）
                 input(2, 60, "ABP-001", true),   // 已是合集
-                owned,                            // 手动判定，跳过
+                owned,                           // 手动判定，跳过
                 input(4, 0, "ABP-001", false),   // 太短
             ],
             None,
@@ -306,9 +328,11 @@ mod tests {
             ..Default::default()
         };
         let mut progresses = Vec::new();
-        let stats = run_scan(&host, &config, "test-plugin", |s| progresses.push(s.scanned))
-            .await
-            .unwrap();
+        let stats = run_scan(&host, &config, "test-plugin", |s| {
+            progresses.push(s.scanned)
+        })
+        .await
+        .unwrap();
         assert_eq!(stats.scanned, 4);
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.unchanged, 2);
@@ -325,7 +349,9 @@ mod tests {
             page(vec![input(2, 400, "ABP-002", false)], None),
         ]);
         let config = DurationCollectionSettings::default();
-        let stats = run_scan(&host, &config, "test-plugin", |_| {}).await.unwrap();
+        let stats = run_scan(&host, &config, "test-plugin", |_| {})
+            .await
+            .unwrap();
         assert_eq!(stats.scanned, 2);
         assert_eq!(stats.updated, 2);
     }
@@ -335,7 +361,9 @@ mod tests {
         let host = FakeHost::new(vec![page(vec![input(1, 400, "ABP-001", false)], None)]);
         host.patch_results.lock().unwrap().push_back(false);
         let config = DurationCollectionSettings::default();
-        let stats = run_scan(&host, &config, "test-plugin", |_| {}).await.unwrap();
+        let stats = run_scan(&host, &config, "test-plugin", |_| {})
+            .await
+            .unwrap();
         assert_eq!(stats.updated, 0);
         assert_eq!(stats.patch_failed, 1);
     }

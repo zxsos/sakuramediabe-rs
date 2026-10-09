@@ -79,7 +79,10 @@ fn normalize_tag_name(value: &str) -> Option<String> {
     }
 }
 
-fn read_string_set(value: Option<&Value>, normalize: fn(&str) -> Option<String>) -> HashSet<String> {
+fn read_string_set(
+    value: Option<&Value>,
+    normalize: fn(&str) -> Option<String>,
+) -> HashSet<String> {
     match value {
         Some(Value::Array(items)) => items
             .iter()
@@ -106,17 +109,23 @@ impl DurationCollectionSettings {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         let mut out = Self::default();
-        if let Some(t) = value.get("duration_threshold_minutes").and_then(Value::as_u64) {
+        if let Some(t) = value
+            .get("duration_threshold_minutes")
+            .and_then(Value::as_u64)
+        {
             out.duration_threshold_minutes = t.max(1);
         }
         // 上游 validator 里 `None` → 空集；这里缺字段就保留缺省（前缀那组
         // 上游缺省非空），显式给了（哪怕空数组）才覆盖。
         if value.get("number_features").is_some() {
-            out.number_features = read_string_set(value.get("number_features"), normalize_number_feature);
+            out.number_features =
+                read_string_set(value.get("number_features"), normalize_number_feature);
         }
         if value.get("suffix_number_features").is_some() {
-            out.suffix_number_features =
-                read_string_set(value.get("suffix_number_features"), normalize_number_feature);
+            out.suffix_number_features = read_string_set(
+                value.get("suffix_number_features"),
+                normalize_number_feature,
+            );
         }
         if value.get("tag_names").is_some() {
             out.tag_names = read_string_set(value.get("tag_names"), normalize_tag_name);
@@ -154,7 +163,9 @@ impl DurationCollectionSettings {
                 label: "番号后缀".to_owned(),
                 input: "text".to_owned(),
                 required: false,
-                description: Some("番号归一化后以后缀命中即判为合集；多个用英文逗号分隔".to_owned()),
+                description: Some(
+                    "番号归一化后以后缀命中即判为合集；多个用英文逗号分隔".to_owned(),
+                ),
                 multiline: true,
                 hint: None,
             },
@@ -204,8 +215,14 @@ mod tests {
         )
         .unwrap();
         let s = DurationCollectionSettings::load_from(&path);
-        assert_eq!(s.number_features, ["OFJE", "CJOB"].into_iter().map(str::to_owned).collect());
-        assert_eq!(s.tag_names, ["合集", "best"].into_iter().map(str::to_owned).collect());
+        assert_eq!(
+            s.number_features,
+            ["OFJE", "CJOB"].into_iter().map(str::to_owned).collect()
+        );
+        assert_eq!(
+            s.tag_names,
+            ["合集", "best"].into_iter().map(str::to_owned).collect()
+        );
         let _ = std::fs::remove_file(&path);
     }
 

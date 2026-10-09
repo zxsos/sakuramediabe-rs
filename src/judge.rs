@@ -213,7 +213,15 @@ mod tests {
 
     #[test]
     fn progress_text_format() {
-        let s = Stats { scanned: 10, updated: 3, skipped_owned: 1, ..Default::default() };
-        assert_eq!(s.progress_text(), "扫描 10 部，已更新 3 部，跳过 owner 1 部");
+        let s = Stats {
+            scanned: 10,
+            updated: 3,
+            skipped_owned: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.progress_text(),
+            "扫描 10 部，已更新 3 部，跳过 owner 1 部"
+        );
     }
 }

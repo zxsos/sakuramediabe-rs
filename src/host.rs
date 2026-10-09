@@ -78,7 +78,10 @@ impl HostMovies for GrpcHostMovies {
             .await?
             .into_inner();
         let movies = resp.movies.into_iter().map(movie_input_from).collect();
-        Ok(Page { movies, next_cursor: resp.next_cursor })
+        Ok(Page {
+            movies,
+            next_cursor: resp.next_cursor,
+        })
     }
 
     async fn patch_is_collection(
@@ -107,33 +110,40 @@ impl HostMovies for GrpcHostMovies {
 }
 
 fn value_as_u64(values: &HashMap<String, PbValue>, key: &str) -> u64 {
-    values.get(key).and_then(|v| match &v.kind {
-        Some(prost_types::value::Kind::NumberValue(n)) if *n >= 0.0 => Some(*n as u64),
-        _ => None,
-    }).unwrap_or(0)
+    values
+        .get(key)
+        .and_then(|v| match &v.kind {
+            Some(prost_types::value::Kind::NumberValue(n)) if *n >= 0.0 => Some(*n as u64),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 fn value_as_string(values: &HashMap<String, PbValue>, key: &str) -> String {
-    values.get(key).and_then(|v| match &v.kind {
-        Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
-        _ => None,
-    }).unwrap_or_default()
+    values
+        .get(key)
+        .and_then(|v| match &v.kind {
+            Some(prost_types::value::Kind::StringValue(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn value_as_bool(values: &HashMap<String, PbValue>, key: &str) -> bool {
-    values.get(key).and_then(|v| match &v.kind {
-        Some(prost_types::value::Kind::BoolValue(b)) => Some(*b),
-        _ => None,
-    }).unwrap_or(false)
+    values
+        .get(key)
+        .and_then(|v| match &v.kind {
+            Some(prost_types::value::Kind::BoolValue(b)) => Some(*b),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// 从 `owners: ["<field>=<owner>", ...]` 里取 `is_collection` 的归属。
 /// 也接受 `"<field>:<owner>"` 写法（取第一个 `=` 或 `:` 切分）。
 pub fn collection_owner_of(owners: &[String]) -> Option<String> {
     owners.iter().find_map(|entry| {
-        let (field, owner) = entry
-            .split_once('=')
-            .or_else(|| entry.split_once(':'))?;
+        let (field, owner) = entry.split_once('=').or_else(|| entry.split_once(':'))?;
         if field.trim() == "is_collection" {
             Some(owner.trim().to_owned())
         } else {
