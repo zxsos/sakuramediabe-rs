@@ -129,6 +129,10 @@ pub struct AppState {
     /// **组合根装配**；`None` = 插件平台没起。见 [`Self::metadata_search`]。
     metadata_search:
         Option<Arc<sm_service::catalog::movie_metadata_search::MovieMetadataSearchService>>,
+    /// 元数据刷新（覆盖式，覆盖式刷新端点用）。**组合根装配**；`None`
+    /// = 插件平台没起。见 [`Self::metadata_refresh`]。
+    metadata_refresh:
+        Option<Arc<sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService>>,
     /// 剧情图搜的检索服务。理由与 `image_search` 完全一致（同一组 router 依赖）。
     plot_image_search:
         Option<Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>>,
@@ -153,6 +157,7 @@ impl AppState {
             image_search: None,
             plot_image_search: None,
             metadata_search: None,
+            metadata_refresh: None,
         }
     }
 
@@ -207,6 +212,27 @@ impl AppState {
     ) -> Self {
         self.metadata_search = Some(search);
         self
+    }
+
+    /// 挂上元数据刷新。**只有组合根会调**。
+    pub fn with_metadata_refresh(
+        mut self,
+        refresh: Arc<sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService>,
+    ) -> Self {
+        self.metadata_refresh = Some(refresh);
+        self
+    }
+
+    /// 元数据刷新服务。未装配 → 503（理由同 [`Self::metadata_search`]）。
+    pub fn metadata_refresh(
+        &self,
+    ) -> Result<
+        &sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService,
+        ServiceError,
+    > {
+        self.metadata_refresh
+            .as_deref()
+            .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
     }
 
     /// 元数据搜索服务。

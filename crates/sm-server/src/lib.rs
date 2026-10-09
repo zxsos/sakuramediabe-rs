@@ -290,13 +290,45 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 None
             }
         };
-        sm_service::catalog::movie_metadata_search::MovieMetadataSearchService::new(
-            config_service.clone(),
-            Arc::new(
-                sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider),
+        let metadata_source = Arc::new(
+            sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider),
+        );
+        // 入库服务（元数据落地的唯一入口）：图片任务管线 + 真实下载器。
+        let image_root = sm_service::catalog::media_paths::media_image_root_path(&config_service)
+            .map_err(|error| {
+            anyhow::anyhow!(
+                "解析图片根目录失败（{}）：{}",
+                error.code(),
+                error.api.message
+            )
+        })?;
+        let metadata_import = sm_service::catalog::catalog_import::CatalogImportService::new(
+            &pool,
+            Box::new(sm_service::catalog::movie_image::MovieImageService::new(
+                &pool,
+                image_root,
+                sm_service::catalog::movie_image::http_image_downloader(),
+            )),
+            sm_service::catalog::movie_image::http_image_downloader(),
+        );
+        // 搜索与刷新共用同一条来源服务 —— 两个端点的「JavDB + 插件」顺序与
+        // 错误分类必须一致，分叉就会各漂各的。
+        let metadata_refresh =
+            sm_service::catalog::movie_metadata_refresh::MovieMetadataRefreshService::new(
+                &pool,
+                &config_service,
+                Arc::clone(&metadata_source),
+                metadata_import,
+            );
+        (
+            sm_service::catalog::movie_metadata_search::MovieMetadataSearchService::new(
+                config_service.clone(),
+                metadata_source,
             ),
+            metadata_refresh,
         )
     };
+    let (metadata_search, metadata_refresh) = metadata_search;
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
@@ -304,6 +336,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .with_playback_gateway(playback_gateway)
         .with_media_library_registry(media_library_gateway)
         .with_metadata_search(Arc::new(metadata_search))
+        .with_metadata_refresh(Arc::new(metadata_refresh))
         .with_plugin_admin(plugin_admin);
     // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
     //

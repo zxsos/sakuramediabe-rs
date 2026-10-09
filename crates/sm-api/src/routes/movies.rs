@@ -57,7 +57,10 @@ use crate::extract::Query as EnvelopeQuery;
 use crate::query::{deser_bool, one, twenty};
 use crate::routes::method_not_allowed;
 use crate::signing::{now_seconds, signing_secret};
+use crate::sse::{self, ServerEvent};
 use crate::state::AppState;
+use sm_service::catalog::movie_metadata_refresh::MetadataStreamFrame;
+use sm_service::transfers::import_task::ImportMetadataSearchRequest;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -1051,14 +1054,18 @@ async fn get_merged_playback(
 /// 覆盖式刷新（见 `catalog::catalog_import::refresh_movie_metadata_strict`）。
 /// 番号冲突是 **409**（`movie_metadata_number_conflict`），调 JavDB 失败是 **502**。
 async fn refresh_movie_metadata(
-    State(_state): State<AppState>,
-    _user: CurrentUser,
+    State(state): State<AppState>,
+    user: CurrentUser,
     Path(movie_number): Path<String>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let _ = movie_number;
-    todo!(
-        "骨架：接 MovieMetadataRefreshService::refresh_movie_metadata；409 番号冲突 / 502 调用失败"
-    )
+    // 覆盖式刷新（409 番号冲突 / 502 来源或写入失败都在服务层）。
+    state
+        .metadata_refresh()?
+        .refresh_movie_metadata(&movie_number)
+        .await?;
+    // 返回**刷新后的详情**：直接复用详情端点同一条装配路径 —— 「刷新后
+    // 看到的」与「刷新前看到的」必然同形状，客户端渲染无需分支。
+    get_movie_detail(State(state), user, Path(movie_number)).await
 }
 
 /// `POST /movies/{movie_number}/heat-recompute` —— ★ **202 Accepted**。
@@ -1109,21 +1116,177 @@ async fn unsubscribe_movie(
 /// ⚠️ 路径里 `search` 是**字面段**，不是 `{movie_number}`，所以与
 /// `/movies/{movie_number}` 不冲突（段数不同）。
 async fn search_javdb_movies_stream(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    EnvelopeJson(_payload): EnvelopeJson<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：SSE —— MovieMetadataRefreshService::stream_search_and_upsert_movie_from_javdb")
+    EnvelopeJson(payload): EnvelopeJson<ImportMetadataSearchRequest>,
+) -> Result<axum::response::Response, ErrorResponse> {
+    let frames = state
+        .metadata_refresh()?
+        .stream_search_and_upsert_movie_from_javdb(&payload.movie_number)
+        .await;
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let events = frames.into_iter().map(|frame| {
+        let (name, payload) = sse_frame_parts(frame, &secret, now);
+        ServerEvent::json(name, &payload).expect("帧载荷序列化不会失败")
+    });
+    Ok(sse::one_shot_response(events.collect()))
+}
+
+/// 帧 → SSE 的 `(事件名, 载荷)`。两条流共用 —— 事件名与可选键的取舍只此一份。
+///
+/// ★ `completed` 的 `movies` 是服务形态的卡片，这里转成带签名封面的线格式；
+/// 可选键只在**有内容**时出现：上游的早退帧不带 `failed_items`/`stats`，
+/// 缺键与空值在客户端是两种渲染。
+fn sse_frame_parts(
+    frame: MetadataStreamFrame,
+    secret: &str,
+    now: i64,
+) -> (&'static str, serde_json::Value) {
+    match frame {
+        MetadataStreamFrame::SearchStartedByNumber { movie_number } => (
+            sse::SEARCH_STARTED,
+            serde_json::json!({ "movie_number": movie_number }),
+        ),
+        MetadataStreamFrame::SearchStartedBySeries { series_id } => (
+            sse::SEARCH_STARTED,
+            serde_json::json!({ "series_id": series_id }),
+        ),
+        MetadataStreamFrame::SeriesFound {
+            series_id,
+            series_name,
+        } => (
+            sse::SERIES_FOUND,
+            serde_json::json!({ "series_id": series_id, "series_name": series_name }),
+        ),
+        MetadataStreamFrame::JavdbSeriesFound {
+            javdb_id,
+            javdb_type,
+            name,
+            videos_count,
+        } => (
+            sse::JAVDB_SERIES_FOUND,
+            serde_json::json!({
+                "javdb_id": javdb_id,
+                "javdb_type": javdb_type,
+                "name": name,
+                "videos_count": videos_count,
+            }),
+        ),
+        MetadataStreamFrame::MovieFound { movies, total } => (
+            sse::MOVIE_FOUND,
+            serde_json::json!({ "movies": movies, "total": total }),
+        ),
+        MetadataStreamFrame::UpsertStarted { total } => {
+            (sse::UPSERT_STARTED, serde_json::json!({ "total": total }))
+        }
+        MetadataStreamFrame::MovieSkipped {
+            javdb_id,
+            movie_number,
+            index,
+            total,
+        } => (
+            sse::MOVIE_SKIPPED,
+            serde_json::json!({
+                "javdb_id": javdb_id,
+                "movie_number": movie_number,
+                "index": index,
+                "total": total,
+            }),
+        ),
+        MetadataStreamFrame::MovieUpsertStarted {
+            javdb_id,
+            movie_number,
+            index,
+            total,
+        } => (
+            sse::MOVIE_UPSERT_STARTED,
+            serde_json::json!({
+                "javdb_id": javdb_id,
+                "movie_number": movie_number,
+                "index": index,
+                "total": total,
+            }),
+        ),
+        MetadataStreamFrame::MovieUpsertFinished {
+            javdb_id,
+            movie_number,
+            index,
+            total,
+        } => (
+            sse::MOVIE_UPSERT_FINISHED,
+            serde_json::json!({
+                "javdb_id": javdb_id,
+                "movie_number": movie_number,
+                "index": index,
+                "total": total,
+            }),
+        ),
+        MetadataStreamFrame::UpsertFinished {
+            total,
+            created_count,
+            already_exists_count,
+            failed_count,
+        } => (
+            sse::UPSERT_FINISHED,
+            serde_json::json!({
+                "total": total,
+                "created_count": created_count,
+                "already_exists_count": already_exists_count,
+                "failed_count": failed_count,
+            }),
+        ),
+        MetadataStreamFrame::Completed {
+            success,
+            reason,
+            movies,
+            failed_items,
+            skipped_items,
+            stats,
+        } => {
+            // `movies` 是服务形态的卡片，这里转成带签名封面的线格式。
+            let movies: Vec<serde_json::Value> = movies
+                .iter()
+                .map(|card| {
+                    serde_json::to_value(MovieListItemResource::from_movie_card(card, secret, now))
+                        .unwrap_or_default()
+                })
+                .collect();
+            let mut payload = serde_json::json!({ "success": success, "movies": movies });
+            // ★ 可选键只在**有内容**时出现：上游的早退帧不带
+            // `failed_items`/`stats`，缺键与空值在客户端是两种渲染。
+            if let Some(reason) = reason {
+                payload["reason"] = serde_json::json!(reason);
+            }
+            if let Some(skipped) = skipped_items {
+                payload["skipped_items"] = serde_json::json!(skipped);
+            }
+            if stats.is_some() {
+                payload["failed_items"] = serde_json::json!(failed_items);
+                payload["stats"] = serde_json::json!(stats);
+            }
+            (sse::COMPLETED, payload)
+        }
+    }
 }
 
 /// `POST /movies/series/{series_id}/javdb/import/stream` —— **SSE 流**。
 ///
-/// 导入一个系列的全部影片。**单部失败不中断整批**（事件里带 error）。
+/// 导入一个系列的全部影片。**单部失败不中断整批**（失败进 `failed_items`）。
 async fn import_series_movies_stream(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
     Path(series_id): Path<i64>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    let _ = series_id;
-    todo!("骨架：SSE —— MovieMetadataRefreshService::stream_import_series_movies_from_javdb")
+) -> Result<axum::response::Response, ErrorResponse> {
+    let frames = state
+        .metadata_refresh()?
+        .stream_import_series_movies_from_javdb(series_id)
+        .await;
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let events = frames.into_iter().map(|frame| {
+        let (name, payload) = sse_frame_parts(frame, &secret, now);
+        ServerEvent::json(name, &payload).expect("帧载荷序列化不会失败")
+    });
+    Ok(sse::one_shot_response(events.collect()))
 }

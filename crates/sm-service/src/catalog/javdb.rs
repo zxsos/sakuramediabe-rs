@@ -38,7 +38,9 @@
 
 use serde_json::Value;
 
-use crate::catalog::metadata_source::{MetadataProvider, MetadataSourceError};
+use crate::catalog::metadata_source::{
+    JavdbMovieListItem, JavdbSeries, MetadataProvider, MetadataSourceError,
+};
 
 /// 搜索接口（上游 `API_PATH_SEARCH`）。
 pub const API_PATH_SEARCH: &str = "/api/v2/search";
@@ -52,6 +54,14 @@ pub const API_PATH_RANKINGS_PLAYBACK: &str = "/api/v1/rankings/playback";
 pub const API_PATH_MOVIES_TOP: &str = "/api/v1/movies/top";
 /// 登录换 token（上游 `API_PATH_SESSIONS`）。
 pub const API_PATH_SESSIONS: &str = "/api/v1/sessions";
+/// 系列影片列表（上游 `API_PATH_MOVIES_TAGS`）。
+pub const API_PATH_MOVIES_TAGS: &str = "/api/v1/movies/tags";
+
+/// 系列搜索的固定参数（上游 `API_PARAMS_SERIES_SEARCH`，**不含 page** ——
+/// 上游常量里的 `page: 1` 会被调用方的显式 page 覆盖，这里不产生重复键）。
+const SERIES_SEARCH_PARAMS: [(&str, &str); 2] = [("from_recent", "false"), ("type", "series")];
+/// 系列影片列表的固定参数（上游 `API_PARAMS_SERIES_MOVIES`）。
+const SERIES_MOVIES_PARAMS: [(&str, &str); 2] = [("sort_by", "release"), ("order_by", "desc")];
 
 /// 搜索的固定查询参数（上游 `API_PARAMS_MOVIE_SEARCH`）。
 ///
@@ -673,6 +683,105 @@ impl MetadataProvider for JavdbProvider {
     /// 上游 `search_actors`（`:326-372`）要另一个 API 形状（`type=actor`）。
     /// 返回空列表会让调用方（演员 SSE，`metadata_source.rs:478`）报
     /// 「导入 0 个」—— 那是**谎报**：用户看到「没搜到」而不是「搜不了」。
+    async fn search_series(
+        &self,
+        series_name: &str,
+    ) -> Result<Vec<JavdbSeries>, MetadataSourceError> {
+        // 系列搜索的固定参数（上游 `API_PARAMS_SERIES_SEARCH`）。⚠️ 上游常量里
+        // 的 `page: 1` 会被调用方的显式 page **覆盖**（dict 后写胜出）—— 这里
+        // 不把 page 放进常量，直接追加，语义相同且不产生重复键。
+        let mut query: Vec<(&str, String)> = vec![("q", series_name.to_owned())];
+        for (key, value) in SERIES_SEARCH_PARAMS {
+            query.push((key, value.to_owned()));
+        }
+        query.push(("page", "1".to_owned()));
+        let url = self.api_url(API_PATH_SEARCH, &query);
+        let payload = self.request_json(&url).await?;
+
+        let series_list = payload
+            .get("data")
+            .and_then(|data| data.get("series"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(series_list
+            .iter()
+            .filter_map(|series| {
+                let javdb_id = series.get("id").and_then(Value::as_str)?;
+                if javdb_id.is_empty() {
+                    return None;
+                }
+                Some(JavdbSeries {
+                    javdb_id: javdb_id.to_owned(),
+                    javdb_type: series.get("type").and_then(Value::as_i64).unwrap_or(0),
+                    name: series
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    videos_count: series
+                        .get("videos_count")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                })
+            })
+            .collect())
+    }
+
+    async fn get_series_movies(
+        &self,
+        series_id: &str,
+        series_type: i64,
+    ) -> Result<Vec<JavdbMovieListItem>, MetadataSourceError> {
+        // 逐页拉到空页为止（上游 `get_series_movies:229-255` 同一循环）。
+        let mut movies: Vec<JavdbMovieListItem> = Vec::new();
+        let mut page = 1_i64;
+        loop {
+            let mut query: Vec<(&str, String)> =
+                vec![("filter_by", format!("{series_type}:s:{series_id}"))];
+            for (key, value) in SERIES_MOVIES_PARAMS {
+                query.push((key, value.to_owned()));
+            }
+            query.push(("page", page.to_string()));
+            let url = self.api_url(API_PATH_MOVIES_TAGS, &query);
+            let payload = self.request_json(&url).await?;
+
+            let batch = payload
+                .get("data")
+                .and_then(|data| data.get("movies"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            for movie in batch {
+                movies.push(JavdbMovieListItem {
+                    javdb_id: movie
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    movie_number: movie
+                        .get("number")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    title: movie
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    cover_image: normalize_image_url(
+                        movie.get("cover_url").and_then(Value::as_str),
+                    ),
+                });
+            }
+            page += 1;
+        }
+        Ok(movies)
+    }
+
     async fn search_actors(&self, _keyword: &str) -> Result<Vec<Value>, MetadataSourceError> {
         Err(MetadataSourceError::RequestFailed(
             "JavDB 演员搜索尚未移植（见 docs/handoff.md §7.2f）".to_owned(),

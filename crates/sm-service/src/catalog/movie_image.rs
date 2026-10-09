@@ -262,6 +262,41 @@ impl ImageTasksBuilder for MovieImageService {
     }
 }
 
+/// 生产用的图片下载器：`reqwest` 拉取 + 落盘。
+///
+/// # 只能在 `spawn_blocking` 里调用
+///
+/// `reqwest` 的 blocking feature 未开，不为这一个调用点引入整套阻塞栈；
+/// 而下载只发生在 `spawn_blocking` 里 —— 那条线程**有**运行时上下文，
+/// `Handle::block_on` 是合法的桥。直接在异步任务里调它会 panic
+/// （`Handle::try_current` 在异步上下文里拿到的是运行时句柄，
+/// `block_on` 会拒绝重入 —— 那是保护，不是缺陷）。
+pub fn http_image_downloader() -> ImageDownloader {
+    Box::new(|url: &str, target: &Path| {
+        let bytes = tokio::runtime::Handle::try_current()
+            .map_err(|_| {
+                ServiceError::from_status(500, "internal_error", "图片下载没有可用的运行时")
+            })?
+            .block_on(async {
+                match reqwest::get(url).await {
+                    Ok(response) => response.error_for_status()?.bytes().await,
+                    Err(error) => Err(error),
+                }
+            })
+            .map_err(|error| {
+                ServiceError::from_status(
+                    502,
+                    "image_download_failed",
+                    format!("图片下载失败：{error}"),
+                )
+            })?;
+        std::fs::write(target, &bytes).map_err(|error| {
+            ServiceError::from_status(500, "internal_error", format!("图片落盘失败：{error}"))
+        })?;
+        Ok(())
+    })
+}
+
 impl MovieImageService {
     /// 构造。
     pub fn new(db: &Db, root: PathBuf, downloader: ImageDownloader) -> Self {

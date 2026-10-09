@@ -307,6 +307,41 @@ impl Plugins {
             lock_providers(&self.providers).insert(entry.clone());
         }
         self.collect(&registration, &endpoint);
+        // ★ 注册时把 `settings_schema` 落盘到插件数据目录 —— 注册响应只在启动
+        // 时出现一次，不落盘的话「插件设置」端点的 `schema` 键就永远缺着（上游
+        // 读的是插件目录里的 pydantic 模型文件，本仓的对应物是这份落盘文件）。
+        // 失败只 warn：缺 schema 的后果是设置页少了字段说明，不是功能坏死。
+        if !registration.settings_schema.is_empty() {
+            let data_dir = self.config.data_dir_for(&plugin_id);
+            let path = data_dir.join("settings-schema.json");
+            // `SettingsField` 是 prost 类型（无 Serialize），手工投影成 JSON。
+            let schema: Vec<Value> = registration
+                .settings_schema
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "key": field.key,
+                        "label": field.label,
+                        "input": field.input,
+                        "required": field.required,
+                        "description": field.description,
+                        "multiline": field.multiline,
+                        "hint": field.hint,
+                        "default": field.default,
+                    })
+                })
+                .collect();
+            match serde_json::to_string_pretty(&schema) {
+                Ok(text) => {
+                    if let Err(err) = std::fs::write(&path, text) {
+                        tracing::warn!(plugin_id, path = %path.display(), %err, "settings schema 落盘失败");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(plugin_id, %error, "settings schema 序列化失败");
+                }
+            }
+        }
         self.loaded.push(LoadedPlugin {
             plugin_id,
             registration,

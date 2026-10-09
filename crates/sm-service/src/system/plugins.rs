@@ -129,6 +129,19 @@ pub const RESTART_CONTAINER: [&str; 1] = ["container"];
 /// 实现里每次操作都重新读磁盘（配置与目录），进程内不缓存任何东西 ——
 /// 缓存会让「另一个进程刚装了插件」看不见，而插件目录是**多进程共享**的
 /// （宿主、将来的 CLI 工具、运维手工拷贝）。
+/// 插件设置的读取结果（上游 `PluginSettingsResource` 的服务形态）。
+///
+/// `schema` / `defaults` 当前恒为 `None`：注册时的 `settings_schema` 尚未
+/// 持久化（上游读的是插件目录里的 pydantic 模型文件）。路由层据此省略这两个键
+/// —— 上游「插件没有设置模型」时 definition 同样是空表。
+#[derive(Debug, Clone, Default)]
+pub struct PluginSettingsBundle {
+    /// 当前值（`plugins.settings[plugin_id]`；从未设置过则空对象）。
+    pub settings: serde_json::Value,
+    pub schema: Option<serde_json::Value>,
+    pub defaults: Option<serde_json::Value>,
+}
+
 pub trait PluginAdmin: Send + Sync {
     /// 列出插件根目录下所有**装了**的插件。上游 `PluginManager.list_plugins`。
     ///
@@ -138,6 +151,37 @@ pub trait PluginAdmin: Send + Sync {
     /// 一个插件的详情。**不存在（或目录里没有清单）返回 `Ok(None)`** ——
     /// 由路由层转 404，而不是在这里报错。
     fn detail(&self, plugin_id: &str) -> Result<Option<PluginDetail>, ServiceError>;
+
+    /// 读插件私有配置。上游 `PluginManager.get_plugin_settings` +
+    /// `get_plugin_settings_definition` 的合并形态。
+    ///
+    /// 未安装 → 404 `plugin_not_found`。`schema` / `defaults` 当前恒为
+    /// `None`（注册时的 `settings_schema` 尚未持久化 —— 上游是读插件的
+    /// pydantic 模型文件；补齐要在注册时把它落盘），路由层据此**省略**这两个键
+    /// —— 上游 `model is None` 时 definition 也是空表，语义一致。
+    fn get_plugin_settings(&self, plugin_id: &str) -> Result<PluginSettingsBundle, ServiceError> {
+        let _ = plugin_id;
+        Err(ServiceError::not_found_with(
+            "plugin_not_found",
+            "插件未安装",
+            crate::error::details_of("plugin_id", plugin_id),
+        ))
+    }
+
+    /// 整体替换插件私有配置并落盘，返回替换后的值（PUT 响应的 `settings`）。
+    /// 未安装 → 404。
+    fn set_plugin_settings(
+        &self,
+        plugin_id: &str,
+        values: &serde_json::Value,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let _ = (plugin_id, values);
+        Err(ServiceError::not_found_with(
+            "plugin_not_found",
+            "插件未安装",
+            crate::error::details_of("plugin_id", plugin_id),
+        ))
+    }
 
     /// 启用 / 停用。上游 `PluginManager.set_enabled`。
     ///

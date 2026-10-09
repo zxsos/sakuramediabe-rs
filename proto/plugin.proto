@@ -133,6 +133,9 @@ message SettingsField {
   optional string description = 5;
   bool multiline = 6;
   optional string hint = 7;
+  // 字段默认值。设置值都是字符串（input = text | secret | path），所以
+  // default 也是字符串；缺省 = 该字段没有默认值（defaults 里不含它）。
+  optional string default = 8;
 }
 
 message RegisterRequest {

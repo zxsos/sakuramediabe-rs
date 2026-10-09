@@ -235,6 +235,25 @@ impl TapHeaders for Response {
     }
 }
 
+/// 把一批帧变成**一次性**的 SSE 响应（每请求一条流，跑完即结束）。
+///
+/// 三个 `stream_*` 端点用这个：流的生命周期与请求绑定（服务跑完流就完），
+/// 与 [`SseHub`] 的广播型（导入任务与 HTTP 连接解耦）是两种用法 ——
+/// 广播型的消费者中途加入也能收到后续帧，一次性型不会。
+///
+/// 收 `Vec` 而不是 `impl IntoIterator`：axum 的 `Sse` 要求流 `Send`，
+/// 向量迭代器天然满足；泛型参数则要把 `Send` 写进签名才过界。
+pub fn one_shot_response(frames: Vec<ServerEvent>) -> Response {
+    let stream = futures::stream::iter(
+        frames
+            .into_iter()
+            .map(|frame| Ok::<Event, Infallible>(frame.to_sse_event())),
+    );
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

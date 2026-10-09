@@ -89,6 +89,31 @@ pub trait MetadataProvider {
         javdb_id: &str,
     ) -> Result<Option<serde_json::Value>, MetadataSourceError>;
     /// 搜演员。
+    /// 按名称搜索 JavDB 系列（**可选能力**，上游 `search_series`）。
+    ///
+    /// 默认**不支持**：只有 JavDB 有系列能力。返回 `Err(RequestFailed)` 会被
+    /// 调用方（`stream_import_series_movies_from_javdb`）归成
+    /// `metadata_fetch_failed` 的 completed 帧。
+    async fn search_series(
+        &self,
+        _series_name: &str,
+    ) -> Result<Vec<JavdbSeries>, MetadataSourceError> {
+        Err(MetadataSourceError::RequestFailed(
+            "该来源不支持系列搜索".to_owned(),
+        ))
+    }
+
+    /// 取一个系列的全部影片列表项（**可选能力**，上游 `get_series_movies`）。
+    async fn get_series_movies(
+        &self,
+        _series_id: &str,
+        _series_type: i64,
+    ) -> Result<Vec<JavdbMovieListItem>, MetadataSourceError> {
+        Err(MetadataSourceError::RequestFailed(
+            "该来源不支持系列影片列表".to_owned(),
+        ))
+    }
+
     async fn search_actors(
         &self,
         keyword: &str,
@@ -141,6 +166,28 @@ pub enum DeliverySource {
 }
 
 /// 元数据来源服务。
+/// 一个 JavDB 系列（上游 `JavdbSeriesResource`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavdbSeries {
+    pub javdb_id: String,
+    /// JavDB 的系列类型标记（搜索结果原样带回，取系列影片时原样传回）。
+    pub javdb_type: i64,
+    pub name: String,
+    pub videos_count: i64,
+}
+
+/// 系列影片**列表项**（上游 `JavdbMovieListItemResource` 的对位投影）。
+///
+/// ⚠️ 列表项信息**不完整**（上游注释同款）—— 入库前必须再按 javdb_id 拉
+/// 详情，复用统一的导入链路。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavdbMovieListItem {
+    pub javdb_id: String,
+    pub movie_number: String,
+    pub title: String,
+    pub cover_image: Option<String>,
+}
+
 pub struct MetadataSourceService {
     /// 已注册且已启用的插件来源（顺序见 [`Self::enabled_plugin_sources`]）。
     sources: Vec<RegisteredSource>,
@@ -230,6 +277,34 @@ impl MetadataSourceService {
             // 没配 provider = 这个来源不存在：按「没收录」处置，不是故障
             //（与 `fetch_candidate` 的 JavDB 支同语义）。
             None => Ok(None),
+        }
+    }
+
+    /// ★ 系列搜索直通（provider 字段私有）。没有 provider → 来源失败
+    /// （调用方归成 `metadata_fetch_failed`）。
+    pub async fn search_series(
+        &self,
+        series_name: &str,
+    ) -> Result<Vec<JavdbSeries>, MetadataSourceError> {
+        match &self.provider {
+            Some(provider) => provider.search_series(series_name).await,
+            None => Err(MetadataSourceError::RequestFailed(
+                "没有配置 JavDB 来源".to_owned(),
+            )),
+        }
+    }
+
+    /// ★ 取系列影片列表直通。见 [`Self::search_series`]。
+    pub async fn get_series_movies(
+        &self,
+        series_id: &str,
+        series_type: i64,
+    ) -> Result<Vec<JavdbMovieListItem>, MetadataSourceError> {
+        match &self.provider {
+            Some(provider) => provider.get_series_movies(series_id, series_type).await,
+            None => Err(MetadataSourceError::RequestFailed(
+                "没有配置 JavDB 来源".to_owned(),
+            )),
         }
     }
 

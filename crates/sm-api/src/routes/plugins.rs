@@ -170,7 +170,26 @@ pub use sm_service::system::plugins::PluginDetail as PluginDetailResource;
 /// `PluginSettingsResource`，实现时要换成 `PluginSettingsUpdateResource`。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PluginSettingsResource {
-    // 形状由插件决定。实现时按插件 schema 动态生成并逐字段 skip_serializing_if。
+    /// 当前值。**形状由插件决定** —— 宿主只透传，不解释结构。
+    pub settings: serde_json::Value,
+    /// 插件的设置定义（JSON Schema）。**当前恒缺**：注册时的
+    /// `settings_schema` 尚未持久化（上游读插件目录里的 pydantic 模型文件）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// 各字段的默认值。同上，当前恒缺。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<serde_json::Value>,
+}
+
+/// `PUT /{plugin_id}/settings` 的响应（上游 `PluginSettingsUpdateResource`）。
+///
+/// `pending_restart` 照上游：设置改了要**重启才生效**，`api` 与 `aps`
+/// （调度器）两个进程都要重启 —— 与 enable/disable 的 `pending_restart`
+/// 同一语义，别把它当成「可以热更新」的提示。
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginSettingsUpdateResource {
+    pub settings: serde_json::Value,
+    pub pending_restart: Vec<String>,
 }
 
 /// 安装 / 升级 / 卸载的响应。
@@ -208,22 +227,41 @@ async fn get_plugin(
 }
 
 /// `GET /{plugin_id}/settings` —— **None 字段不输出**。
+///
+/// 未安装 → 404 `plugin_not_found`（服务层判定）。`schema` / `defaults`
+/// 当前恒缺（注册时的 `settings_schema` 尚未持久化），见
+/// [`PluginSettingsResource`] 的字段文档。
 async fn get_plugin_settings(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_plugin_id): Path<String>,
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
 ) -> Result<Json<PluginSettingsResource>, ErrorResponse> {
-    todo!("骨架：接插件设置（逐字段 skip_serializing_if）")
+    let bundle = state.plugin_admin()?.get_plugin_settings(&plugin_id)?;
+    Ok(Json(PluginSettingsResource {
+        settings: bundle.settings,
+        schema: bundle.schema,
+        defaults: bundle.defaults,
+    }))
 }
 
-/// `PUT /{plugin_id}/settings` —— 请求体 `dict[str, Any]`。
+/// `PUT /{plugin_id}/settings` —— 请求体 `dict[str, Any]`，**整体替换**。
+///
+/// 返回 `PluginSettingsUpdateResource`：骨架期把返回类型也写成了
+/// `PluginSettingsResource`，上游是 `{settings, pending_restart: ["api","aps"]}`
+/// —— 设置改了要重启才生效，与 enable/disable 的语义同源。
 async fn update_plugin_settings(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_plugin_id): Path<String>,
-    axum::extract::Json(_payload): axum::extract::Json<serde_json::Value>,
-) -> Result<Json<PluginSettingsResource>, ErrorResponse> {
-    todo!("骨架：settings 形状由插件决定，不要猜结构")
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    axum::extract::Json(payload): axum::extract::Json<serde_json::Value>,
+) -> Result<Json<PluginSettingsUpdateResource>, ErrorResponse> {
+    let settings = state
+        .plugin_admin()?
+        .set_plugin_settings(&plugin_id, &payload)?;
+    Ok(Json(PluginSettingsUpdateResource {
+        settings,
+        pending_restart: vec!["api".to_owned(), "aps".to_owned()],
+    }))
 }
 
 /// `POST ""` —— **201** + **multipart**。

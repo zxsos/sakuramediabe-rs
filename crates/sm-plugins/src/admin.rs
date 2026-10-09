@@ -200,6 +200,78 @@ impl PluginAdminService {
 }
 
 impl PluginAdmin for PluginAdminService {
+    /// 读插件私有配置。上游 `get_plugin_settings`（`manager.py:368-373`）。
+    fn get_plugin_settings(
+        &self,
+        plugin_id: &str,
+    ) -> Result<sm_service::system::plugins::PluginSettingsBundle, ServiceError> {
+        self.require_installed(plugin_id)?;
+        let snapshot = self.config.snapshot()?;
+        let settings = snapshot
+            .get("plugins")
+            .and_then(|plugins| plugins.get("settings"))
+            .and_then(|settings| settings.get(plugin_id))
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        // schema：注册时由宿主落盘到 `<data_dir>/settings-schema.json`
+        // （sm-server 的 `admit`），读不到 = 插件没声明或没落成 —— 键省略。
+        let schema_path = self
+            .root_dir()?
+            .join(plugin_id)
+            .join("data")
+            .join("settings-schema.json");
+        let schema = std::fs::read_to_string(&schema_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        // defaults：从 schema 里带 `default` 的字段提取 `{key: default}` ——
+        // 上游 `settings_defaults(model)` 的对位物（那边从 pydantic 模型读，
+        // 这边从落盘的字段清单读，同一个信息源）。
+        let defaults = schema.as_ref().and_then(|fields| {
+            let map: serde_json::Map<String, Value> = fields
+                .as_array()?
+                .iter()
+                .filter_map(|field| {
+                    let key = field.get("key")?.as_str()?;
+                    let default = field.get("default")?;
+                    if default.is_null() {
+                        return None;
+                    }
+                    Some((key.to_owned(), default.clone()))
+                })
+                .collect();
+            (!map.is_empty()).then_some(Value::Object(map))
+        });
+        Ok(sm_service::system::plugins::PluginSettingsBundle {
+            settings,
+            schema,
+            defaults,
+        })
+    }
+
+    /// 整体替换插件私有配置并落盘。上游 `set_plugin_settings`（`manager.py:393-401`）。
+    fn set_plugin_settings(&self, plugin_id: &str, values: &Value) -> Result<Value, ServiceError> {
+        self.require_installed(plugin_id)?;
+        let Some(values) = values.as_object() else {
+            // 上游 Body(...) 直接收 dict；非对象 = 调用方 bug 级别的形状错误。
+            return Err(ServiceError::from_status(
+                422,
+                "invalid_plugin_settings",
+                "插件设置必须是对象",
+            ));
+        };
+        let values = values.clone();
+        self.config.update_plugins_section(|plugins| {
+            let settings = plugins
+                .entry("settings")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            settings
+                .as_object_mut()
+                .expect("settings 段是对象（schema 约定）")
+                .insert(plugin_id.to_owned(), Value::Object(values.clone()));
+            Ok(())
+        })?;
+        Ok(Value::Object(values))
+    }
     fn list(&self) -> Result<Vec<PluginSummary>, ServiceError> {
         let root = self.root_dir()?;
         let enabled = self.enabled_ids()?;

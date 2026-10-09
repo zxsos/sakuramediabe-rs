@@ -30,18 +30,104 @@ use std::sync::Arc;
 use sm_db::repo::MovieRepository;
 use sm_db::Db;
 
-use super::metadata_source::MetadataSourceService;
+use super::metadata_source::{
+    import_detail_of, source_identity_of, DeliverySource, JavdbMovieListItem, MetadataSourceError,
+    MetadataSourceService,
+};
+use crate::catalog::movie::MovieCard;
 use crate::error::ServiceError;
+use crate::system::ConfigService;
 
-/// 一条流式事件。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MetadataStreamEvent {
-    /// 事件名：`progress` / `movie` / `done` / `error`。
-    pub event: String,
-    pub movie_number: String,
-    pub imported: bool,
-    /// 失败原因（`event = "error"` 时有值）。
-    pub message: Option<String>,
+/// `upsert_finished` / `completed.stats` 的统计。
+/// 键名与上游 stats 字典逐字一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct UpsertStats {
+    pub total: i64,
+    pub created_count: i64,
+    pub already_exists_count: i64,
+    pub failed_count: i64,
+}
+
+/// 流式事件（SSE 帧的类型化形态）。事件名与载荷照上游
+/// `movie_metadata_refresh_service.py:210-334` 逐帧对齐：
+///
+/// | 帧 | 载荷 |
+/// |---|---|
+/// | `search_started` | `{movie_number}` |
+/// | `movie_found` | `{movies: [{javdb_id, movie_number, title, cover_image}], total}` |
+/// | `upsert_started` | `{total}` |
+/// | `upsert_finished` | `{total, created_count, already_exists_count, failed_count}` |
+/// | `completed` | `{success, reason?, movies, failed_items?, stats?}` |
+///
+/// ★ `completed` 的 `movies` 留**服务形态**的卡片（[`MovieCard`]），线格式由
+/// 路由层经 `MovieListItemResource::from_movie_card` 转换 —— 封面签名密钥只有
+/// 路由层有。`reason` / `failed_items` / `stats` 是**可选键**：上游的成功帧
+/// 不带 `reason`，早退帧不带 `failed_items`/`stats` —— 缺键与空值在客户端
+/// 是两种渲染，别一律塞空值。
+#[derive(Debug)]
+pub enum MetadataStreamFrame {
+    /// `search_started`。影片流载荷是番号；系列流载荷是 `series_id`。
+    SearchStartedByNumber {
+        movie_number: String,
+    },
+    SearchStartedBySeries {
+        series_id: i64,
+    },
+    /// `series_found`：本地系列存在（仅系列流）。
+    SeriesFound {
+        series_id: i64,
+        series_name: String,
+    },
+    /// `javdb_series_found`：JavDB 上找到了同名系列（仅系列流）。
+    JavdbSeriesFound {
+        javdb_id: String,
+        javdb_type: i64,
+        name: String,
+        videos_count: i64,
+    },
+    /// `movie_skipped`：该条已存在被跳过（仅系列流）。
+    MovieSkipped {
+        javdb_id: Option<String>,
+        movie_number: String,
+        index: i64,
+        total: i64,
+    },
+    /// `movie_upsert_started`：单条落库开始（仅系列流）。
+    MovieUpsertStarted {
+        javdb_id: Option<String>,
+        movie_number: String,
+        index: i64,
+        total: i64,
+    },
+    /// `movie_upsert_finished`：单条落库完成（仅系列流）。
+    MovieUpsertFinished {
+        javdb_id: Option<String>,
+        movie_number: String,
+        index: i64,
+        total: i64,
+    },
+    MovieFound {
+        movies: Vec<serde_json::Value>,
+        total: i64,
+    },
+    UpsertStarted {
+        total: i64,
+    },
+    UpsertFinished {
+        total: i64,
+        created_count: i64,
+        already_exists_count: i64,
+        failed_count: i64,
+    },
+    Completed {
+        success: bool,
+        reason: Option<&'static str>,
+        movies: Vec<MovieCard>,
+        failed_items: Vec<serde_json::Value>,
+        /// 系列流**必有**（上游最终帧带 `skipped_items`），影片流**必无**。
+        skipped_items: Option<Vec<serde_json::Value>>,
+        stats: Option<UpsertStats>,
+    },
 }
 
 /// 元数据刷新服务。
@@ -49,9 +135,11 @@ pub struct MetadataStreamEvent {
 /// # 依赖是注入的
 ///
 /// [`MetadataSourceService`] 出网（JavDB），[`super::catalog_import`] 写库，
-/// 都由组合根装配；测试换成假来源与假入库 —— 本文件不知道「JavDB」是什么。
+/// [`ConfigService`] 现读启用插件 —— 都由组合根装配；测试换成假来源与假入库
+/// —— 本文件不知道「JavDB」是什么。
 pub struct MovieMetadataRefreshService {
     db: Db,
+    config: ConfigService,
     source: Arc<MetadataSourceService>,
     import: super::catalog_import::CatalogImportService,
 }
@@ -60,11 +148,13 @@ impl MovieMetadataRefreshService {
     /// 构造。
     pub fn new(
         db: &Db,
+        config: &ConfigService,
         source: Arc<MetadataSourceService>,
         import: super::catalog_import::CatalogImportService,
     ) -> Self {
         Self {
             db: db.clone(),
+            config: config.clone(),
             source,
             import,
         }
@@ -171,27 +261,528 @@ impl MovieMetadataRefreshService {
             .await
     }
 
-    /// ★ 流式搜索并入库。上游是生成器，`yield (movie_number, dict)`。
+    /// ★ 流式搜索并入库。上游 `stream_search_and_upsert_movie_from_javdb`
+    /// （`movie_metadata_refresh_service.py:210-334`），帧序列照上游：
+    ///
+    /// `search_started` →（[early return 分支]）→ `movie_found` →
+    /// `upsert_started` → `upsert_finished` → `completed`。
+    ///
+    /// # 两个 early return 分支（都不问「导入」那一段）
+    ///
+    /// 1. 番号归一后为空 → `completed {success: false, reason:
+    ///    "movie_number_not_found"}`；
+    /// 2. 本地**已存在**且是插件来源（无 javdb_id 有 metadata_source）→
+    ///    直接把本地影片作为「已存在」完成（`already_exists_count = 1`），
+    ///    **不问 JavDB** —— 插件先收录的片不该被 JavDB 再建一份。
+    ///
+    /// # fetch 的单结果语义在这里**适用**
+    ///
+    /// 搜索端点（`movie_metadata_search`）要遍历全部插件；这条流是「导入一条」，
+    /// 上游用的正是 `MetadataSourceService.fetch`（JavDB → 首个命中插件）。
     ///
     /// ⚠️ 本仓用 `Vec` 代替流式（async 生成器需额外依赖）。代价是**全部完成
-    /// 才返回** —— **不要**用它驱动进度条。
+    /// 才返回** —— **不要**用它驱动进度条；前端帧序不变，只是到达时间压缩。
     pub async fn stream_search_and_upsert_movie_from_javdb(
         &self,
         movie_number: &str,
-    ) -> Result<Vec<MetadataStreamEvent>, ServiceError> {
-        let _ = movie_number;
-        todo!("骨架：搜 JavDB -> 逐个候选 upsert -> 收集事件；番号冲突记 error 事件而非中断")
+    ) -> Vec<MetadataStreamFrame> {
+        use serde_json::Value;
+
+        let mut frames = Vec::new();
+        let normalized = crate::movie_numbers::normalize_movie_number(movie_number);
+        frames.push(MetadataStreamFrame::SearchStartedByNumber {
+            movie_number: normalized.clone(),
+        });
+
+        if normalized.is_empty() {
+            frames.push(MetadataStreamFrame::Completed {
+                success: false,
+                reason: Some("movie_number_not_found"),
+                movies: Vec::new(),
+                failed_items: Vec::new(),
+                skipped_items: None,
+                stats: None,
+            });
+            return frames;
+        }
+
+        let repo = MovieRepository::new(self.db.clone());
+        // ② 已存在的插件来源影片：不问 JavDB，直接完成（上游 `:222-234`）。
+        if let Ok(Some(existing)) = repo.find_by_number(movie_number).await {
+            if existing
+                .javdb_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+                && existing.metadata_source.is_some()
+            {
+                let movies = crate::catalog::movie::MovieService::new(&self.db)
+                    .load_cards(&[existing.id])
+                    .await
+                    .unwrap_or_default();
+                frames.push(MetadataStreamFrame::Completed {
+                    success: true,
+                    reason: None,
+                    movies,
+                    failed_items: Vec::new(),
+                    skipped_items: None,
+                    stats: Some(UpsertStats {
+                        total: 1,
+                        created_count: 0,
+                        already_exists_count: 1,
+                        failed_count: 0,
+                    }),
+                });
+                return frames;
+            }
+        }
+
+        // ③ fetch：JavDB → 首个命中插件（上游 `MetadataSourceService.fetch`）。
+        let config = match self.config.snapshot() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(code = error.code(), "读配置失败");
+                frames.push(MetadataStreamFrame::Completed {
+                    success: false,
+                    reason: Some("internal_error"),
+                    movies: Vec::new(),
+                    failed_items: Vec::new(),
+                    skipped_items: None,
+                    stats: None,
+                });
+                return frames;
+            }
+        };
+        let delivery = match self
+            .source
+            .fetch(&config, &normalized, |delivery| async { delivery })
+            .await
+        {
+            Ok(delivery) => delivery,
+            // 「JavDB 和插件都没收录」→ completed movie_not_found（上游 `:329-331`）。
+            Err(MetadataSourceError::NotFound) => {
+                frames.push(MetadataStreamFrame::Completed {
+                    success: false,
+                    reason: Some("movie_not_found"),
+                    movies: Vec::new(),
+                    failed_items: Vec::new(),
+                    skipped_items: None,
+                    stats: None,
+                });
+                return frames;
+            }
+            Err(error) => {
+                let (reason, detail) =
+                    crate::catalog::movie_metadata_search::source_error_parts(&error);
+                tracing::warn!(reason, detail = %detail, "元数据搜索失败");
+                frames.push(MetadataStreamFrame::Completed {
+                    success: false,
+                    reason: Some("internal_error"),
+                    movies: Vec::new(),
+                    failed_items: Vec::new(),
+                    skipped_items: None,
+                    stats: None,
+                });
+                return frames;
+            }
+        };
+
+        // ④ `movie_found`：**落库前**就把命中的原始远端信息回给前端。
+        // JavDB 命中带 javdb_id + cover_image；插件交付不带（上游 `source is None` 判定）。
+        let found_movie = match (&delivery.javdb_detail, &delivery.plugin_delivery) {
+            (Some(detail), _) => serde_json::json!({
+                "javdb_id": detail.get("javdb_id").cloned().unwrap_or(Value::Null),
+                "movie_number": detail.get("movie_number").cloned().unwrap_or(Value::Null),
+                "title": detail.get("title").cloned().unwrap_or(Value::Null),
+                "cover_image": detail.get("cover_image").cloned().unwrap_or(Value::Null),
+            }),
+            (None, Some(plugin)) => serde_json::json!({
+                "javdb_id": Value::Null,
+                "movie_number": plugin.movie_number,
+                "title": plugin.title,
+                "cover_image": Value::Null,
+            }),
+            _ => {
+                serde_json::json!({"javdb_id": Value::Null, "movie_number": normalized, "title": Value::Null, "cover_image": Value::Null})
+            }
+        };
+        frames.push(MetadataStreamFrame::MovieFound {
+            movies: vec![found_movie],
+            total: 1,
+        });
+        frames.push(MetadataStreamFrame::UpsertStarted { total: 1 });
+
+        // ⑤ 落库：JavDB 命中走 import_movie_if_missing（**纯新建语义**：已存在
+        // 跳过不更新）；插件命中走 import_plugin_movie。
+        let import_result = match (&delivery.source, &delivery.javdb_detail) {
+            (DeliverySource::Javdb, Some(detail)) => {
+                self.import.import_movie_if_missing(detail, false).await
+            }
+            (DeliverySource::Javdb, None) => Err(ServiceError::from_status(
+                500,
+                "internal_error",
+                "JavDB 交付缺详情",
+            )),
+            (
+                DeliverySource::Plugin {
+                    plugin_id,
+                    display_name,
+                },
+                _,
+            ) => match &delivery.plugin_delivery {
+                Some(plugin) => {
+                    let detail = import_detail_of(plugin);
+                    let source_identity = source_identity_of(plugin_id, display_name, plugin);
+                    self.import
+                        .import_plugin_movie(&detail, &source_identity, false)
+                        .await
+                }
+                None => Err(ServiceError::from_status(
+                    500,
+                    "internal_error",
+                    "插件交付缺失",
+                )),
+            },
+        };
+
+        let mut failed_items: Vec<Value> = Vec::new();
+        let mut stats = UpsertStats {
+            total: 1,
+            created_count: 0,
+            already_exists_count: 0,
+            failed_count: 0,
+        };
+        let mut imported_movie_id: Option<i32> = None;
+        match import_result {
+            Ok(result) => {
+                imported_movie_id = Some(result.movie_id);
+                if result.created {
+                    stats.created_count += 1;
+                } else {
+                    // 纯新建语义：已存在影片跳过不更新（上游注释 `:283`）。
+                    stats.already_exists_count += 1;
+                }
+            }
+            Err(error) => {
+                stats.failed_count += 1;
+                tracing::warn!(movie_number = %normalized, code = error.code(), "影片入库失败");
+                failed_items.push(serde_json::json!({
+                    "movie_number": normalized,
+                    "reason": "upsert_failed",
+                    "detail": error.api.message,
+                }));
+            }
+        }
+        frames.push(MetadataStreamFrame::UpsertFinished {
+            total: 1,
+            created_count: stats.created_count,
+            already_exists_count: stats.already_exists_count,
+            failed_count: stats.failed_count,
+        });
+
+        // ⑥ `completed`：有导入成功的影片 → success；否则 internal_error
+        // （stats 里带着 failed_count —— 上游 `:319-329` 同一结构）。
+        let movies = match imported_movie_id {
+            Some(movie_id) => crate::catalog::movie::MovieService::new(&self.db)
+                .load_cards(&[movie_id])
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let success = !movies.is_empty();
+        frames.push(MetadataStreamFrame::Completed {
+            success,
+            reason: if success {
+                None
+            } else {
+                Some("internal_error")
+            },
+            movies,
+            failed_items,
+            skipped_items: None,
+            stats: Some(stats),
+        });
+        frames
     }
 
     /// ★ 流式导入一个系列的全部影片。
     ///
     /// **单部失败不中断整批** —— 一个系列几十部，一部失败就全废掉不可接受。
+    ///
+    /// ★ 流式导入一个系列的全部影片。上游
+    /// `stream_import_series_movies_from_javdb`（`:336-535`）。
+    ///
+    /// **单部失败不中断整批** —— 一个系列几十部，一部失败就全废掉不可接受。
+    /// ★ 只接受**精确同名**的 JavDB 系列（`:370-377`），相似系列一律不导入。
+    ///
+    /// # 列表项信息不完整，入库前必须再拉详情
+    ///
+    /// 系列影片列表只有番号/标题/封面；详情才能走统一的导入链路
+    /// （`get_movie_by_javdb_id` → `import_movie_if_missing`，上游 `:462-467`
+    /// 的注释原话「外层已跳过已存在影片」）。
     pub async fn stream_import_series_movies_from_javdb(
         &self,
         series_id: i64,
-    ) -> Result<Vec<MetadataStreamEvent>, ServiceError> {
-        let _ = series_id;
-        todo!("骨架：取系列全部影片 -> 逐部 upsert -> 收集事件；单部失败记 error 事件继续")
+    ) -> Vec<MetadataStreamFrame> {
+        use serde_json::Value;
+
+        let mut frames = Vec::new();
+        frames.push(MetadataStreamFrame::SearchStartedBySeries { series_id });
+
+        let series_id_i32 = i32::try_from(series_id).unwrap_or(i32::MAX);
+        let series_repo = sm_db::repo::MovieSeriesRepository::new(self.db.clone());
+        let Some(local_series) = series_repo
+            .find_by_ids(&[series_id_i32])
+            .await
+            .ok()
+            .and_then(|map| map.get(&series_id_i32).cloned())
+        else {
+            frames.push(MetadataStreamFrame::Completed {
+                success: false,
+                reason: Some("local_series_not_found"),
+                movies: Vec::new(),
+                failed_items: Vec::new(),
+                skipped_items: Some(Vec::new()),
+                stats: None,
+            });
+            return frames;
+        };
+        let series_name = local_series.name.trim().to_owned();
+        frames.push(MetadataStreamFrame::SeriesFound {
+            series_id: i64::from(local_series.id),
+            series_name: series_name.clone(),
+        });
+
+        let series_candidates = match self.source.search_series(&series_name).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                let (reason, detail) =
+                    crate::catalog::movie_metadata_search::source_error_parts(&error);
+                tracing::warn!(series_name = %series_name, reason, detail = %detail, "JavDB 系列搜索失败");
+                frames.push(MetadataStreamFrame::Completed {
+                    success: false,
+                    reason: Some("metadata_fetch_failed"),
+                    movies: Vec::new(),
+                    failed_items: Vec::new(),
+                    skipped_items: Some(Vec::new()),
+                    stats: None,
+                });
+                return frames;
+            }
+        };
+
+        // ★ 只接受**精确同名**系列：模糊命中的相似系列一旦导入，就是把别的
+        // 系列的片子塞进用户的收藏，且事后只能手动删。
+        let Some(javdb_series) = series_candidates
+            .iter()
+            .find(|candidate| candidate.name.trim() == series_name)
+        else {
+            frames.push(MetadataStreamFrame::Completed {
+                success: false,
+                reason: Some("javdb_series_not_found"),
+                movies: Vec::new(),
+                failed_items: Vec::new(),
+                skipped_items: Some(Vec::new()),
+                stats: None,
+            });
+            return frames;
+        };
+        frames.push(MetadataStreamFrame::JavdbSeriesFound {
+            javdb_id: javdb_series.javdb_id.clone(),
+            javdb_type: javdb_series.javdb_type,
+            name: javdb_series.name.clone(),
+            videos_count: javdb_series.videos_count,
+        });
+
+        let remote_movies = match self
+            .source
+            .get_series_movies(&javdb_series.javdb_id, javdb_series.javdb_type)
+            .await
+        {
+            Ok(movies) => movies,
+            Err(error) => {
+                let (reason, detail) =
+                    crate::catalog::movie_metadata_search::source_error_parts(&error);
+                tracing::warn!(series_id, reason, detail = %detail, "JavDB 系列影片拉取失败");
+                frames.push(MetadataStreamFrame::Completed {
+                    success: false,
+                    reason: Some("metadata_fetch_failed"),
+                    movies: Vec::new(),
+                    failed_items: Vec::new(),
+                    skipped_items: Some(Vec::new()),
+                    stats: None,
+                });
+                return frames;
+            }
+        };
+
+        // 去重：javdb_id 优先，缺了退番号（上游 `:408-419`）。两条完全同键的
+        // 列表项只入一次库。
+        let mut seen = std::collections::BTreeSet::new();
+        let mut deduplicated: Vec<&JavdbMovieListItem> = Vec::new();
+        for item in &remote_movies {
+            let key = if item.javdb_id.is_empty() {
+                item.movie_number.clone()
+            } else {
+                item.javdb_id.clone()
+            };
+            if key.is_empty() || !seen.insert(key) {
+                continue;
+            }
+            deduplicated.push(item);
+        }
+        let total = i64::try_from(deduplicated.len()).unwrap_or(i64::MAX);
+        if total == 0 {
+            frames.push(MetadataStreamFrame::Completed {
+                success: false,
+                reason: Some("javdb_series_movies_not_found"),
+                movies: Vec::new(),
+                failed_items: Vec::new(),
+                skipped_items: Some(Vec::new()),
+                stats: None,
+            });
+            return frames;
+        }
+
+        frames.push(MetadataStreamFrame::MovieFound {
+            movies: deduplicated
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "javdb_id": item.javdb_id,
+                        "movie_number": item.movie_number,
+                        "title": item.title,
+                        "cover_image": item.cover_image,
+                    })
+                })
+                .collect(),
+            total,
+        });
+        frames.push(MetadataStreamFrame::UpsertStarted { total });
+
+        let repo = MovieRepository::new(self.db.clone());
+        let mut stats = UpsertStats {
+            total,
+            created_count: 0,
+            already_exists_count: 0,
+            failed_count: 0,
+        };
+        let mut skipped_items: Vec<Value> = Vec::new();
+        let mut failed_items: Vec<Value> = Vec::new();
+        let mut imported_ids: Vec<i32> = Vec::new();
+
+        for (position, item) in deduplicated.iter().enumerate() {
+            let index = i64::try_from(position + 1).unwrap_or(i64::MAX);
+            // 已存在（javdb_id 或番号任一命中）→ `movie_skipped`，不入库。
+            let exists_by_number = !item.movie_number.is_empty()
+                && repo
+                    .find_by_number(&item.movie_number)
+                    .await
+                    .map(|found| found.is_some())
+                    .unwrap_or(false);
+            let exists_by_javdb = !item.javdb_id.is_empty()
+                && repo
+                    .conflicting_number_by_javdb_id(&item.javdb_id, 0)
+                    .await
+                    .map(|found| found.is_some())
+                    .unwrap_or(false);
+            if exists_by_number || exists_by_javdb {
+                stats.already_exists_count += 1;
+                skipped_items.push(serde_json::json!({
+                    "javdb_id": item.javdb_id,
+                    "movie_number": item.movie_number,
+                }));
+                frames.push(MetadataStreamFrame::MovieSkipped {
+                    javdb_id: Some(item.javdb_id.clone()),
+                    movie_number: item.movie_number.clone(),
+                    index,
+                    total,
+                });
+                continue;
+            }
+
+            frames.push(MetadataStreamFrame::MovieUpsertStarted {
+                javdb_id: Some(item.javdb_id.clone()),
+                movie_number: item.movie_number.clone(),
+                index,
+                total,
+            });
+            // 列表项信息不完整，入库前必须再拉详情复用统一导入链路
+            // （上游 `:462-464` 注释原话）。
+            let detail = match self.source.fetch_by_javdb_id(&item.javdb_id).await {
+                Ok(detail) => detail,
+                Err(error) => {
+                    stats.failed_count += 1;
+                    let (_, message) =
+                        crate::catalog::movie_metadata_search::source_error_parts(&error);
+                    failed_items.push(serde_json::json!({
+                        "javdb_id": item.javdb_id,
+                        "movie_number": item.movie_number,
+                        "reason": "metadata_fetch_failed",
+                        "detail": message,
+                    }));
+                    continue;
+                }
+            };
+            match self.import.import_movie_if_missing(&detail, false).await {
+                Ok(result) => {
+                    stats.created_count += 1;
+                    imported_ids.push(result.movie_id);
+                    frames.push(MetadataStreamFrame::MovieUpsertFinished {
+                        javdb_id: Some(item.javdb_id.clone()),
+                        movie_number: detail
+                            .get("movie_number")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&item.movie_number)
+                            .to_owned(),
+                        index,
+                        total,
+                    });
+                }
+                Err(error) => {
+                    stats.failed_count += 1;
+                    tracing::warn!(javdb_id = %item.javdb_id, code = error.code(), "系列影片入库失败");
+                    failed_items.push(serde_json::json!({
+                        "javdb_id": item.javdb_id,
+                        "movie_number": item.movie_number,
+                        "reason": "upsert_failed",
+                        "detail": error.api.message,
+                    }));
+                }
+            }
+        }
+
+        frames.push(MetadataStreamFrame::UpsertFinished {
+            total,
+            created_count: stats.created_count,
+            already_exists_count: stats.already_exists_count,
+            failed_count: stats.failed_count,
+        });
+        // ★ `success` 判据与上游一致：有**导入**的或**跳过**的都算成功 ——
+        // 全部失败（`failed_count == total`）才是失败。
+        let movies = if imported_ids.is_empty() {
+            Vec::new()
+        } else {
+            crate::catalog::movie::MovieService::new(&self.db)
+                .load_cards(&imported_ids)
+                .await
+                .unwrap_or_default()
+        };
+        let success = !movies.is_empty() || !skipped_items.is_empty();
+        frames.push(MetadataStreamFrame::Completed {
+            success,
+            reason: if success {
+                None
+            } else {
+                Some("internal_error")
+            },
+            movies,
+            failed_items,
+            skipped_items: Some(skipped_items),
+            stats: Some(stats),
+        });
+        frames
     }
 }
 
@@ -298,32 +889,52 @@ mod tests {
         }
     }
 
-    /// 流式事件**必须**能表达「某部失败但整体继续」。
+    /// 流式失败**不中断**：失败进 `completed.failed_items`，末帧仍是 `completed`。
+    ///
+    /// ⚠️ 骨架期的 `error` 事件是**自造形状** —— 上游的失败记录在
+    /// `completed` 帧的 `failed_items` 里（`:287-302`），没有独立的 error 帧。
     #[test]
-    fn an_error_event_does_not_abort_the_stream() {
-        let events = [
-            MetadataStreamEvent {
-                event: "movie".to_owned(),
+    fn failures_live_in_completed_failed_items() {
+        let frames = [
+            MetadataStreamFrame::SearchStartedByNumber {
                 movie_number: "A-001".to_owned(),
-                imported: true,
-                message: None,
             },
-            MetadataStreamEvent {
-                event: "error".to_owned(),
-                movie_number: "A-002".to_owned(),
-                imported: false,
-                message: Some("番号冲突".to_owned()),
+            MetadataStreamFrame::UpsertFinished {
+                total: 1,
+                created_count: 0,
+                already_exists_count: 0,
+                failed_count: 1,
             },
-            MetadataStreamEvent {
-                event: "done".to_owned(),
-                movie_number: String::new(),
-                imported: false,
-                message: None,
+            MetadataStreamFrame::Completed {
+                success: false,
+                reason: Some("internal_error"),
+                movies: Vec::new(),
+                failed_items: vec![serde_json::json!({
+                    "movie_number": "A-002",
+                    "reason": "upsert_failed",
+                    "detail": "番号冲突",
+                })],
+                skipped_items: None,
+                stats: Some(UpsertStats {
+                    total: 1,
+                    created_count: 0,
+                    already_exists_count: 0,
+                    failed_count: 1,
+                }),
             },
         ];
-        assert_eq!(events.len(), 3, "错误事件后仍有后续事件");
-        assert_eq!(events[1].event, "error");
-        assert_eq!(events[2].event, "done", "整批仍会走到 done");
+        assert_eq!(frames.len(), 3, "失败后仍有后续帧");
+        match &frames[2] {
+            MetadataStreamFrame::Completed {
+                failed_items,
+                stats,
+                ..
+            } => {
+                assert_eq!(failed_items.len(), 1, "失败进了 failed_items");
+                assert_eq!(stats.expect("走完 upsert 就有 stats").failed_count, 1);
+            }
+            other => panic!("末帧是 completed：{other:?}"),
+        }
     }
 
     // ------------------------------------------------- refresh_movie_metadata
