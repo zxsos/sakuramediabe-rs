@@ -1,0 +1,33 @@
+[package]
+name = "plugin-115"
+version = "0.1.0"
+description = "115 网盘 StorageProvider gRPC 插件：目录浏览、影片导入、离线下载、播放代理、缩略图"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约仓 GitHub zxsos/sakuramedia-plugin-api，按 tag 依赖（与宿主 ABI_MAJOR=2 配套）。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+async-trait = "0.1"
+futures = "0.3"
+tonic = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+# 115 走 HTTPS JSON API。
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+thiserror = "2"
+
+[[bin]]
+name = "plugin-115"
+path = "src/bin/plugin-115.rs"
