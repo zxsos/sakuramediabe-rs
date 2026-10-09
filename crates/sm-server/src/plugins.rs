@@ -276,6 +276,14 @@ impl Plugins {
         };
         // `enabled` 的顺序就是优先级，不能并发拉起来打乱它。
         for plugin_id in plugins.config.enabled.clone() {
+            // 进程内插件：已 vendoring 进后端，不起进程。
+            // 9 个插件：javdb-ranking, javbus-metadata, actor-metadata,
+            // 115-provider, judge-collection, more-movies, scrape-translate,
+            // subtitlecat, plugin-ref-local
+            if is_inprocess_plugin(&plugin_id) {
+                tracing::info!(plugin_id, "插件已进程内化，跳过进程启动");
+                continue;
+            }
             match launch(&plugins.config.launch_spec(&plugin_id)).await {
                 Ok(launched) => {
                     tracing::info!(plugin_id, "插件已就绪");
@@ -687,6 +695,25 @@ pub fn job_specs(
             manual_trigger_allowed: true,
         })
         .collect()
+}
+
+/// 是否为进程内插件（已 vendoring，不起进程）。
+///
+/// 9 个插件已编译进后端二进制，通过 `inprocess_plugins` 模块直接调用，
+/// 无需 spawn 独立进程。
+fn is_inprocess_plugin(plugin_id: &str) -> bool {
+    matches!(
+        plugin_id,
+        "sakuramedia_javdb_ranking"
+            | "sakuramedia_javbus_metadata"
+            | "sakuramedia_actor_metadata"
+            | "sakuramedia_115_provider"
+            | "sakuramedia_judge_collecttion_movie"
+            | "sakuramedia_more_movies"
+            | "sakuramedia_movie_scrape_translate"
+            | "sakuramedia_subtitlecat"
+            | "plugin_ref_local"
+    )
 }
 
 #[cfg(test)]
