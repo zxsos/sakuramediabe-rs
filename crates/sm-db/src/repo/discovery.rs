@@ -589,3 +589,478 @@ impl ImageSearchIndexStateRepository {
         Ok(state.accepts_session(session.query_vector_dim(), expected_dim))
     }
 }
+
+// ================================================================ 热播女优新作
+
+/// 「恰好只有一位女优」的影片 id —— 上游 `_history_actor_evidence`
+/// （`hot_actress_release_service.py:53-66`）的 `single_female_history_ids`。
+///
+/// # 这条 SQL 是整个服务里最不能简化的一处
+///
+/// 上游用 peewee 写的：
+///
+/// ```python
+/// .group_by(MovieActor.movie)
+/// .having(fn.SUM(Case(None, [(Actor.gender == 1, 1)], 0)) == 1)
+/// ```
+///
+/// 语义是「**这部影片总共只有一位女优**」——
+/// `SUM(女优数) == 1` 而不是「至少有一位」。所以：
+///
+/// - 一部有 2 位女优的影片**不算**
+/// - 一部有 1 位女优 + 3 位男优的影片**算**
+///
+/// # 为什么不写成子查询
+///
+/// 这段被 `history_rows` 复用（`IN (...)`），所以必须是独立的一步 —— 但它是
+/// **同一份 SQL 里的子查询**，不是两次往返。
+///
+/// # `is_collection` / `is_blacklisted` 两个排除项
+///
+/// 集合片（`is_collection`）与黑名单影片不参与 —— 前者不是「某位女优的作品」，
+/// 后者是用户明确排除的。
+///
+/// # `gender = 1` 是**硬编码**在 SQL 里的
+///
+/// 上游是 `FEMALE_GENDER = 1` 类常量。SQL 里没法绑常量（要用 `$1` 会多一个
+/// 参数并让执行计划缓存变差），所以写死并在注释里标明来源。
+const HOT_ACTRESS_ENTITY: &str = "HotActressRelease";
+
+/// 女性性别值。对应上游 `FEMALE_GENDER = 1`（`:38`）。
+pub const FEMALE_GENDER: i32 = 1;
+
+/// 历史窗口里「只有一位女优」的影片，以及它们的女优与热度。
+///
+/// 一行 = 一部影片 × 它的**那位**女优（因为筛选过了，每部只有一行）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryActorRow {
+    pub movie_id: i32,
+    pub actor_id: i32,
+    /// 影片热度。**库里可能为 NULL**（上游写 `float(heat or 0)`）。
+    pub heat: Option<i32>,
+    /// 发行日。**库里可能带时分秒**（见 service 层 `_release_date` 的归一化）。
+    pub release_date: chrono::NaiveDate,
+}
+
+/// 候选窗口里带女优的影片。
+///
+/// 一行 = 一部影片 × 它的**每一位**女优（候选窗口不做「只有一位」筛选）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateRow {
+    pub movie_id: i32,
+    pub actor_id: i32,
+    pub release_date: chrono::NaiveDate,
+}
+
+/// 热播女优新作的查询。
+///
+/// **刻意不叫 `DiscoveryRepository`** —— 它查的是 `movie` / `movie_actor` /
+/// `actor` 三张表，不是 `discovery` 域自己的表。放在
+/// `repo/discovery.rs` 是因为**服务层**属��� discovery 域，��表归属不同。
+#[derive(Debug, Clone)]
+pub struct HotActressReleaseRepository {
+    pool: PgPool,
+}
+
+impl HotActressReleaseRepository {
+    /// 构造。
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 连接池。
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// 历史证据行：窗口 `[today - lookback_days, today - maturity_days)`。
+    ///
+    /// # `maturity_days` 是**下界**，不是「只算成熟的」
+    ///
+    /// 上游：`history_end = today - timedelta(days=cls.HISTORY_MATURITY_DAYS)`。
+    /// 也就是说，**最近 60 天发行的片子不进历史证据** —— 它们「太新了，
+    /// 还没有表现可评」。这与打分公式里的 `max(age_days, MATURITY_DAYS)`
+    /// 是**两处不同的机制**，别合并成一个。
+    ///
+    /// # 两次查询、同一快照
+    ///
+    /// 先筛「只有一位女优」的影片 id，再取这些影片的行。用
+    /// `in_snapshot_tx` 让两步看到**同一个快照** —— 否则并发写入时
+    /// 「筛出的 id 集合」与「取到的行」可能不匹配。
+    pub async fn history_actor_rows(
+        &self,
+        history_start: chrono::NaiveDate,
+        history_end: chrono::NaiveDate,
+    ) -> Result<Vec<HistoryActorRow>, DbError> {
+        let sql = r#"
+            WITH single_female_movies AS (
+                SELECT ma.movie AS movie_id
+                FROM movie_actor ma
+                JOIN movie m ON m.id = ma.movie
+                JOIN actor a ON a.id = ma.actor
+                WHERE m.is_collection = false
+                  AND m.is_blacklisted = false
+                  AND m.release_date >= $1
+                  AND m.release_date <  $2
+                GROUP BY ma.movie
+                HAVING SUM(CASE WHEN a.gender = 1 THEN 1 ELSE 0 END) = 1
+            )
+            SELECT ma.movie AS movie_id,
+                   ma.actor AS actor_id,
+                   m.heat AS heat,
+                   m.release_date AS release_date
+            FROM movie_actor ma
+            JOIN movie m ON m.id = ma.movie
+            JOIN actor a ON a.id = ma.actor
+            JOIN single_female_movies sfm ON sfm.movie_id = ma.movie
+            WHERE a.gender = 1
+            ORDER BY ma.movie, ma.actor
+        "#;
+        let rows = crate::common::page::in_snapshot_tx(&self.pool, |conn| {
+            Box::pin(async move {
+                sqlx::query_as::<_, HistoryActorRow>(sql)
+                    .bind(history_start)
+                    .bind(history_end)
+                    .fetch_all(&mut *conn)
+                    .await
+            })
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// 候选行：窗口 `[today - past_days, today + future_days)`。
+    ///
+    /// **候选窗口不做「只有一位女优」筛选** —— 那只用于历史证据。候选是
+    /// 「窗口内带女优的新片」，一位或多位都要（打分时会挑得分最高的那位）。
+    pub async fn candidate_rows(
+        &self,
+        candidate_start: chrono::NaiveDate,
+        candidate_end: chrono::NaiveDate,
+    ) -> Result<Vec<CandidateRow>, DbError> {
+        let sql = r#"
+            SELECT ma.movie AS movie_id,
+                   ma.actor AS actor_id,
+                   m.release_date AS release_date
+            FROM movie_actor ma
+            JOIN movie m ON m.id = ma.movie
+            JOIN actor a ON a.id = ma.actor
+            WHERE m.is_collection = false
+              AND m.is_blacklisted = false
+              AND m.release_date >= $1
+              AND m.release_date <  $2
+              AND a.gender = 1
+            ORDER BY m.id, ma.actor
+        "#;
+        let rows = crate::common::page::in_snapshot_tx(&self.pool, |conn| {
+            Box::pin(async move {
+                sqlx::query_as::<_, CandidateRow>(sql)
+                    .bind(candidate_start)
+                    .bind(candidate_end)
+                    .fetch_all(&mut *conn)
+                    .await
+            })
+        })
+        .await?;
+        Ok(rows)
+    }
+}
+// ================================================================ 索引完成的判定
+
+impl ImageSearchIndexStateRepository {
+    /// 是否存在**已成功索引**的记录（缩略图或剧情图任一）。
+    ///
+    /// 用途：区分「从没索引过」与「索引过但空间变了」。上游
+    /// `_has_completed_index_records`（`image_search_index_space_service.py:101-115`）。
+    ///
+    /// # 为什么这个查询是**状态机的一部分**，而不是可选的优化
+    ///
+    /// `image_search_index_state` 是**单例表**，可能还没有行。没有行时无法区分
+    /// 「从没索引过」（该走 `uninitialized`）与「索引过但记录掉了行」
+    /// （该走 `rebuild_required`）。**判据只能落在缩略图 / 剧情图的索引状态上。**
+    ///
+    /// 删掉这个查询的后果是：换 embedding 模型后，如果状态行恰好丢了，
+    /// 系统会当成「没索引过」而从零开始 —— 而 Qdrant 里还留着旧空间的向量。
+    /// 新查询会去比维度，**大概率被 `accepts_session` 拦住**（这是本仓库
+    /// 已经钉住的不变量），但错误信息会变成「会话不兼容」而不是「需重建」，
+    /// 指向错误的方向。
+    ///
+    /// # 用 `EXISTS` 而非 `COUNT(*)`
+    ///
+    /// 只需要「有没有」。`EXISTS` 命中第一行就停，而 `COUNT(*)` 要扫完 ——
+    /// 索引完成的记录可能有几十万行。
+    ///
+    /// # 两张表的 `SUCCESS` 都是 2，但**值域不同**
+    ///
+    /// | 表 | 模块 | 值域 |
+    /// |---|---|---|
+    /// | `media_thumbnail` | `playback::media::image_search_index_status` | 0/1/2/3（含 `SKIPPED`）|
+    /// | `movie_plot_image` | `catalog::asset::image_search_index_status` | 0/1/2（**无 SKIPPED**）|
+    ///
+    /// 「非 JAV 媒体的缩略图不参与检索」所以缩略图能有 `SKIPPED`，剧情图不能。
+    /// `SUCCESS = 2` 相同，所以这里的 SQL 两边写同一个字面量。
+    pub async fn has_completed_index_records(&self) -> Result<bool, DbError> {
+        let sql = r#"
+            SELECT EXISTS (
+                SELECT 1 FROM media_thumbnail
+                WHERE image_search_index_status = 2
+            )
+            OR EXISTS (
+                SELECT 1 FROM movie_plot_image
+                WHERE image_search_index_status = 2
+            )
+        "#;
+        let found: bool = sqlx::query_scalar(sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(INDEX_STATE_ENTITY))?;
+        Ok(found)
+    }
+}
+// ================================================================ 待索引图片
+
+impl ImageSearchSessionRepository {
+    /// **删除全部会话**（重建索引时用）。
+    ///
+    /// # 与 `delete_expired` 的区别是**故意的**
+    ///
+    /// 重建时上游 `ImageSearchSession.delete().execute()`（`image_search_index_service.py:213`）
+    /// —— **不按过期时间过滤，全删**。而 `delete_expired` 是日常清理。
+    ///
+    /// # 为什么必须全删
+    ///
+    /// 会话里存着**查询向量**。换 embedding 模型后维度变了，老会话的向量
+    /// 无法与新索引里的向量比较 —— `accepts_session` 会拦住它们。
+    ///
+    /// **但那只在维度也变时有效。** 如果换了模型而维度恰好相同（例如两个
+    /// 512 维模型），`accepts_session` **会放行**，于是老会话拿着旧空间的
+    /// 向量去比新空间的索引 —— **返回语义完全无关的结果，且不报错**。
+    ///
+    /// 所以重建时不能依赖 `accepts_session` 兜底，**必须物理删掉**。
+    pub async fn delete_all(&self) -> Result<u64, DbError> {
+        let result = sqlx::query("DELETE FROM image_search_session")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(SESSION_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// 待索引的缩略图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThumbnail {
+    pub thumbnail_id: i32,
+    pub media_id: i32,
+    /// 归属影片。**可能为 `None`** —— 候选查询只取 `Media.movie IS NOT NULL`，
+    /// 所以走这条路径的行一定有值。
+    pub movie_id: Option<i32>,
+    pub movie_number: Option<String>,
+    /// 图片字节（`image.data`）。**推理客户端直接吃这个**。
+    pub image_bytes: Vec<u8>,
+}
+
+/// 待索引的剧情图。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlotImage {
+    pub plot_image_id: i32,
+    pub movie_id: Option<i32>,
+    pub image_bytes: Vec<u8>,
+}
+
+/// 待索引图片的查询与状态回写。
+///
+/// # 缩略图与剧情图的候选条件**不对称**，这是上游的现状
+///
+/// | | 过滤条件 |
+/// |---|---|
+/// | 缩略图 | `status = PENDING` **且** `media.movie IS NOT NULL`（只覆盖归属 JAV 影片的）|
+/// | 剧情图 | 只看 `status = PENDING`，**无额外过滤** |
+///
+/// 理由在上游注释里：「图像检索只覆盖归属 JAV 影片的缩略图」。非 JAV 媒体
+/// （有 Movie 关联的那些）不参与图搜。
+///
+/// **重置时也不对称**（`image_search_index_service.py:214-224`）：缩略图重置
+/// 带 `Media.movie IS NOT NULL` 过滤，剧情图**全表**重置。照抄。
+#[derive(Debug, Clone)]
+pub struct PendingImageRepository {
+    pool: PgPool,
+}
+
+impl PendingImageRepository {
+    /// 构造。
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 连接池。
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// 一批待索引缩略图。
+    ///
+    /// **无 `ORDER BY`** —— 上游也没有。后果是分页顺序不保证稳定，靠
+    /// `status` 从 PENDING 翻到终态来推进。**不要**自己加 `ORDER BY id`：
+    /// 那会让「先到先处理」变成「按 id 顺序」，在失败重试时行为不同。
+    pub async fn pending_thumbnails(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingThumbnail>, DbError> {
+        let sql = r#"
+            SELECT t.id AS thumbnail_id,
+                   t.media AS media_id,
+                   m.movie AS movie_number,
+                   m.id AS movie_id,
+                   i.data AS image_bytes
+            FROM media_thumbnail t
+            JOIN image i ON i.id = t.image
+            JOIN media m ON m.id = t.media
+            JOIN movie mv ON mv.movie_number = m.movie
+            WHERE t.image_search_index_status = 0
+              AND m.movie IS NOT NULL
+            LIMIT $1
+        "#;
+        Ok(sqlx::query_as::<_, PendingThumbnail>(sql)
+            .bind(limit.max(1))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?)
+    }
+
+    /// 一批待索引剧情图。
+    pub async fn pending_plot_images(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PendingPlotImage>, DbError> {
+        let sql = r#"
+            SELECT p.id AS plot_image_id,
+                   p.movie AS movie_id,
+                   i.data AS image_bytes
+            FROM movie_plot_image p
+            JOIN image i ON i.id = p.image
+            WHERE p.image_search_index_status = 0
+            LIMIT $1
+        "#;
+        Ok(sqlx::query_as::<_, PendingPlotImage>(sql)
+            .bind(limit.max(1))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?)
+    }
+
+    /// 待处理总数（缩略图 + 剧情图）。
+    ///
+    /// 用两个 `COUNT(*)` 相加而不是一次 `UNION ALL` —— 上游就是两次 count
+    /// 相加（`:262-266`）。**单条 `UNION ALL` 会更省往返**，但会让两个计数
+    /// 不在同一快照里；这里照抄，边界那一行的差异不影响进度显示。
+    pub async fn pending_count(&self) -> Result<i64, DbError> {
+        let sql = r#"
+            SELECT (
+                SELECT COUNT(*) FROM media_thumbnail t
+                JOIN media m ON m.id = t.media
+                WHERE t.image_search_index_status = 0 AND m.movie IS NOT NULL
+            ) + (
+                SELECT COUNT(*) FROM movie_plot_image p
+                WHERE p.image_search_index_status = 0
+            ) AS total
+        "#;
+        let total: i64 = sqlx::query_scalar(sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(total)
+    }
+}
+impl PendingImageRepository {
+    /// 把缩略图的索引状态写成终态。
+    ///
+    /// # 为什么**必须**回写状态，而不是跳过失败的
+    ///
+    /// 上游 `_commit_statuses`（`:462`）/ `_set_status`（`:480`）。若失败不
+    /// 标记，那行仍是 `PENDING`，下一轮批处理会**又取到它** —— 无限重试同一条
+    /// 坏数据（编码失败的图片、维度不符的图），任务永远跑不完。
+    ///
+    /// 「宁可标记失败也不假装成功」是这里的核心。
+    pub async fn set_thumbnail_status(
+        &self,
+        thumbnail_id: i32,
+        status: i32,
+    ) -> Result<u64, DbError> {
+        // 0=PENDING 1=FAILED 2=SUCCESS 3=SKIPPED，见
+        // `sm_db::playback::media::image_search_index_status`。
+        if !crate::playback::media::image_search_index_status::is_valid(status) {
+            return Err(DbError::business(
+                HOT_ACTRESS_ENTITY,
+                format!("未知的 image_search_index_status: {status}"),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE media_thumbnail SET image_search_index_status = $2 WHERE id = $1",
+        )
+        .bind(thumbnail_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 把剧情图的索引状态写成终态。
+    ///
+    /// 剧情图的**值域没有 `SKIPPED`**（`sm_db::catalog::asset::
+    /// image_search_index_status` 只有 0/1/2），所以用**那套**校验而不是缩略图
+    /// 那套 —— 用错会让「跳过」这个状态被写进剧情图，而列约束可能不接受。
+    pub async fn set_plot_image_status(
+        &self,
+        plot_image_id: i32,
+        status: i32,
+    ) -> Result<u64, DbError> {
+        if !crate::catalog::asset::image_search_index_status::is_valid(status) {
+            return Err(DbError::business(
+                HOT_ACTRESS_ENTITY,
+                format!("未知的 image_search_index_status: {status}"),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE movie_plot_image SET image_search_index_status = $2 WHERE id = $1",
+        )
+        .bind(plot_image_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 重建时把缩略图状态**全部重置为 PENDING**。
+    ///
+    /// **带 `media.movie IS NOT NULL` 过滤** —— 只重置归属 JAV 影片的那些，
+    /// 与候选查询的条件一致。剧情图是**全表**重置（`reset_all_plot_images`）。
+    ///
+    /// 两者不对称是上游现状（`:214-224`），照抄。
+    pub async fn reset_all_thumbnails(&self) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE media_thumbnail SET image_search_index_status = 0
+            WHERE id IN (
+                SELECT t.id FROM media_thumbnail t
+                JOIN media m ON m.id = t.media
+                WHERE m.movie IS NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 重建时把剧情图状态**全部重置为 PENDING** —— **无过滤**。
+    pub async fn reset_all_plot_images(&self) -> Result<u64, DbError> {
+        let result = sqlx::query("UPDATE movie_plot_image SET image_search_index_status = 0")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+}

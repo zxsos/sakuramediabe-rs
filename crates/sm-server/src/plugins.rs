@@ -310,6 +310,50 @@ impl Plugins {
         JobCatalog::new(entries)
     }
 
+    /// 把插件注册表里的**排行源**转成 `sm-service` 的快照类型。
+    ///
+    /// 交给路由层的 `AppState`，供 `GET /ranking-sources` 用。
+    ///
+    /// # 为什么这个转换必须发生在**组合根**
+    ///
+    /// `sm-plugins -> sm-scheduler -> sm-service` 已经是一条依赖链 ——
+    /// `sm-service` 再依赖 `sm-plugins` 就成环；`sm-api` 同样不依赖它。
+    /// 所以读注册表这件事只有 `sm-server` 能做（它依赖全部 crate）。
+    ///
+    /// 这与 `catalog()`（`JobRegistry` -> `JobCatalog`）是**同一个模式**，
+    /// 不是新发明 —— `AppState::jobs` 就是这么来的。
+    ///
+    /// # 只取 `source_key` 与 `title`，**榜单定义是空的**
+    ///
+    /// 榜单定义（`supported_periods` / `default_period` / `descending`）来自
+    /// 插件**加载期**的注册载荷（上游
+    /// `register_plugin_ranking_sources(accepted, owners)`，
+    /// `ranking_plugin_adapter.py:109`）。而
+    /// `ProviderRegistration` 只有 `provider_key` / `display_name` /
+    /// `plugin_id` / `capabilities` / `data_plane_endpoint` —— **没有 boards**。
+    ///
+    /// 所以这里产出的是**空 boards**。后果是
+    /// `GET /ranking-sources/{key}/boards` 会返回 404
+    /// `ranking_board_definitions_unavailable`（service 层显式报错，不是空数组）。
+    ///
+    /// **不填一个假的 boards 列表** —— 那会让接口「成功」但周期校验永远失败，
+    /// 比报缺口更难查。两条修法记在
+    /// `sm_service::discovery::ranking::RankingSourceCatalog` 的文档里。
+    pub fn ranking_sources(&self) -> sm_service::discovery::ranking::RankingSourceCatalog {
+        use sm_plugins::registration::EXTENSION_RANKING_SOURCE;
+        let entries = self
+            .providers
+            .providers_with(EXTENSION_RANKING_SOURCE)
+            .into_iter()
+            .map(|provider| sm_service::discovery::ranking::RankingSourceDefinition {
+                source_key: provider.provider_key.clone(),
+                title: provider.display_name.clone(),
+                boards: Vec::new(),
+            })
+            .collect();
+        sm_service::discovery::ranking::RankingSourceCatalog::new(entries)
+    }
+
     /// 从**全部**已加载插件的注册声明重建三张注册表。
     ///
     /// 重启后整体重建而不是增量合并：插件重启后声明可能变（少一个 provider、

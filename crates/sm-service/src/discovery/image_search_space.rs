@@ -1,54 +1,112 @@
 //! 索引空间状态机 + 入口图片归一化。
 //!
-//! 上游 `image_search_index_space_service.py`（4.5KB）+ `image_search_input.py`（848B）。
+//! 上游 `image_search_index_space_service.py`（4.5KB / 115 行）+ `image_search_input.py`（848B）。
 //! **纯 PostgreSQL。**
 //!
-//! # 这个文件是整个 image_search 的**状态机**，不是查询服务
+//! # 这是整个 image_search 的**状态机**，不是查询服务
 //!
-//! 它回答一个问题：**当前索引能不能查**。四个状态（上游 `:45-99`）：
+//! 它回答一个问题：**当前索引能不能查**。四个状态（上游 `:45-72`）：
 //!
 //! ```text
-//!   current_space_id 为空                      -> 未配置
-//!   current_space_id 有，indexed_space_id 空   -> 需重建
-//!   两者相等                                      -> 就绪
-//!   两者不等                                      -> 需重建
+//!   current_space_id 为空                      -> unavailable    （推理服务没配 / 不可达）
+//!   indexed_space_id == current_space_id       -> ready
+//!   indexed_space_id 非空但不匹配                -> rebuild_required（空间变了）
+//!   indexed_space_id 为空 且 从没成功索引过      -> uninitialized  （还没开始）
+//!   indexed_space_id 为空 但 成功索引过          -> rebuild_required（行丢了）
 //! ```
 //!
-//! # 与 `sm-db` 已实现那条不变量的关系
+//! 最后一行的判据是 `_has_completed_index_records()` —— 它查缩略图 / 剧情图的
+//! 索引状态。**单例表可能没有行**，所以判据必须落在别处。
 //!
-//! `sm_db::discovery::image_search` 已有
-//! `accepts_session(session_dim, expected_dim)`（`:162`）拒绝维度错配的会话，
-//! 并有测试 `rejects_sessions_from_a_different_embedding_space` 钉着。
-//! **本文件是那条不变量的上游对应物** —— 换 embedding 模型后老会话若不被拒，
-//! 最坏结果是返回语义完全无关的图。`current_space_id` 就是
-//! `ImageSearchIndexState` 注释里那个「Qdrant collection / space id」。
+//! # `current_space_id` 是**推理服务**说的，不是配置里写的
 //!
-//! # 刻意不做本地模型
+//! 来自 [`super::embedding::EmbeddingClient::describe`] 的 `space_id`。
+//! 所以「推理服务挂了」会表现为 `current_space_id = None` → `unavailable`。
 //!
-//! 判空间靠**外部推理服务的 `describe()`**（见 [`super::embedding`]）。
+//! # 三处最容易照抄错的地方
+//!
+//! **1. `ensure_search_ready` 只在 `rebuild_required` 时抛错 —— `unavailable`
+//! 不抛。**
+//!
+//! 推理服务不可用时**仍然允许查询**（走已有索引，只是没法取新向量）。
+//! 照抄。把它改成「unavailable 也抛」会让推理服务一挂，图搜整个不可用。
+//!
+//! **2. `prepare_for_indexing` 在 `uninitialized` 时就把状态行建成
+//! `indexed_space_id = current`。**
+//!
+//! 也就是**在还没索引任何东西之前就宣称「已索引」**。这是上游行为，照抄 ——
+//! 但要意识到后果：首次索引中途失败时，状态行已经写了 `current_space_id`，
+//! 而实际没有向量。之后 `get_status` 会返回 `ready`，查询侧不报错但**搜不到东西**。
+//! `accepts_session` 那条不变量拦不住这种情况（它比的是维度，不是「有没有向量」）。
+//!
+//! **3. `prepare_for_indexing` 在 `unavailable` 时抛的是「需重建」。**
+//!
+//! 不是「推理服务不可用」而是「需重建」—— 语义上不准确（服务不可用不需要
+//! 重建），但上游如此。照抄，别自己改成更「合理」的：客户端已经按
+//! `movie_similarity` 之外的那套 code 在处理它。
+//!
+//! # `details` 有三个键，`reason` 最容易被漏
+//!
+//! 上游 `:29-38`：
+//!
+//! | 键 | 取值 |
+//! |---|---|
+//! | `reason` | `space_id_changed`（`indexed_space_id` 非空）/ `historical_space_unknown`（为空）|
+//! | `indexed_space_id` | 可能有值 |
+//! | `current_space_id` | 可能有值 |
+//!
+//! `reason` 区分的是「换了模型」与「历史丢了」—— **两者的处置完全不同**：
+//! 前者要重建全部，后者要先查为什么行没了。
 
 use serde::{Deserialize, Serialize};
+use sm_db::repo::discovery::ImageSearchIndexStateRepository;
 
 use crate::error::ServiceError;
 
-/// 索引空间状态。字段照抄上游 `:15-19`。
+/// `unavailable` —— 推理服务没配或不可达。
+pub const STATE_UNAVAILABLE: &str = "unavailable";
+/// `ready` —— 索引与当前空间一致，可查。
+pub const STATE_READY: &str = "ready";
+/// `rebuild_required` —— 索引与当前空间不一致（或状态行丢失但索引过）。
+pub const STATE_REBUILD_REQUIRED: &str = "rebuild_required";
+/// `uninitialized` —— 从没成功索引过。
+pub const STATE_UNINITIALIZED: &str = "uninitialized";
+
+/// 索引空间状态。
+///
+/// # `state` 是四值字符串，**不是布尔**
+///
+/// 上游用四个具名常量。**不要**压成 `searchable: bool` —— `unavailable` 与
+/// `rebuild_required` 都是「不可查」，但**处置完全不同**（前者等推理服务、
+/// 后者要重建索引），客户端要能分开显示。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSearchIndexSpaceStatus {
-    /// 索引里记录的已索引空间。
+    /// 四态之一。
+    pub state: String,
+    /// 索引里记录的已索引空间。`None` = 状态行不存在或为空。
     pub indexed_space_id: Option<String>,
-    /// 推理服务当前声明的空间。
+    /// 推理服务当前声明的空间。`None` = 不可达 / 未配置。
     pub current_space_id: Option<String>,
+}
+
+impl ImageSearchIndexSpaceStatus {
     /// 是否可查。
-    pub searchable: bool,
-    /// 供状态接口展示的空间维度。
-    pub dimension: Option<u32>,
+    ///
+    /// **只有 `ready` 与 `unavailable` 为 `true`** —— 见模块文档第 1 条。
+    pub fn is_searchable(&self) -> bool {
+        self.state == STATE_READY || self.state == STATE_UNAVAILABLE
+    }
+
+    /// 是否已就绪（严格意义：索引与空间一致）。
+    pub fn is_ready(&self) -> bool {
+        self.state == STATE_READY
+    }
 }
 
 /// 索引需重建。
 ///
 /// 上游 `ImageSearchIndexRebuildRequiredError`（`:21-39`）。它**不是**「查不到」
-/// 而是「索引本身不可信」—— 所以 `details()`（`:29`）把两个 space_id 都带上，
-/// 客户端才能自己判断差在哪。
+/// 而是「索引本身不可信」—— 检索会返回**语义无关**的结果而不报错。
 #[derive(Debug, Clone)]
 pub struct ImageSearchIndexRebuildRequired {
     pub status: ImageSearchIndexSpaceStatus,
@@ -63,57 +121,188 @@ impl std::fmt::Display for ImageSearchIndexRebuildRequired {
 impl std::error::Error for ImageSearchIndexRebuildRequired {}
 
 impl ImageSearchIndexRebuildRequired {
-    /// 错误 details。两个 space_id 都带上 —— 只说「需重建」客户端无法行动。
+    /// 错误 details。**三个键**，`reason` 区分「换模型」与「历史丢失」。
     pub fn details(&self) -> Vec<(String, Option<String>)> {
         vec![
-            ("indexed_space_id".to_owned(), self.status.indexed_space_id.clone()),
-            ("current_space_id".to_owned(), self.status.current_space_id.clone()),
+            (
+                "reason".to_owned(),
+                Some(
+                    if self.status.indexed_space_id.is_some() {
+                        "space_id_changed"
+                    } else {
+                        "historical_space_unknown"
+                    }
+                    .to_owned(),
+                ),
+            ),
+            (
+                "indexed_space_id".to_owned(),
+                self.status.indexed_space_id.clone(),
+            ),
+            (
+                "current_space_id".to_owned(),
+                self.status.current_space_id.clone(),
+            ),
         ]
     }
-}
 
+    /// 转成 `ServiceError`（409 —— 「状态不对，重建再来」）。
+    ///
+    /// 上游在路由层怎么映射要看具体 router；这里选 **409** 而不是 503 ——
+    /// 503 表示「稍后重试就会好」，而这个**不会自己好**，必须人去触发重建。
+    pub fn into_service_error(self) -> ServiceError {
+        ServiceError::conflict(
+            "image_search_index_rebuild_required",
+            "图片搜索索引需要重建",
+            Some(self.details().into_iter().collect()),
+        )
+    }
+}
 /// 索引空间服务。
-pub struct ImageSearchIndexSpaceService;
+pub struct ImageSearchIndexSpaceService {
+    repo: ImageSearchIndexStateRepository,
+}
 
 impl ImageSearchIndexSpaceService {
-    /// 当前状态。上游 `get_status`（`:45`）。
-    pub fn get_status(
+    /// 构造。
+    pub fn new(repo: ImageSearchIndexStateRepository) -> Self {
+        Self { repo }
+    }
+
+    /// 归一化 `current_space_id`。
+    ///
+    /// 上游 `(current_space_id or "").strip() or None`（`:48`）——
+    /// **空串与纯空白都算 `None`**。不归一化的话 `Some("")` 会与状态行里的
+    /// 某个值比较出「不匹配」，把「推理服务没回空间号」误报成「空间变了」。
+    pub fn normalize_current(current_space_id: Option<&str>) -> Option<String> {
+        current_space_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// 状态机的**纯逻辑**部分。
+    ///
+    /// 拆出来是为了能直接测 —— 上游那 20 行分支（`:50-72`）是这个服务里最容易
+    /// 写错的部分（第五个分支是「状态行没了但索引过」）。
+    pub fn classify(
+        indexed_space_id: Option<String>,
+        current_space_id: Option<&str>,
+        has_completed_records: bool,
+    ) -> ImageSearchIndexSpaceStatus {
+        let current = Self::normalize_current(current_space_id);
+        // 1. 推理服务不可达 / 未配置。不查有没有索引过 —— 问了也没用。
+        if current.is_none() {
+            return ImageSearchIndexSpaceStatus {
+                state: STATE_UNAVAILABLE.to_owned(),
+                indexed_space_id,
+                current_space_id: None,
+            };
+        }
+        let current = current.expect("上面已判过非空");
+        // 2. 一致。
+        if indexed_space_id.as_deref() == Some(current.as_str()) {
+            return ImageSearchIndexSpaceStatus {
+                state: STATE_READY.to_owned(),
+                indexed_space_id,
+                current_space_id: Some(current),
+            };
+        }
+        // 3. 索引过（状态行有值，或缩略图/剧情图里有成功记录）-> 要重建。
+        if indexed_space_id.is_some() || has_completed_records {
+            return ImageSearchIndexSpaceStatus {
+                state: STATE_REBUILD_REQUIRED.to_owned(),
+                indexed_space_id,
+                current_space_id: Some(current),
+            };
+        }
+        // 4. 从没成功索引过。
+        ImageSearchIndexSpaceStatus {
+            state: STATE_UNINITIALIZED.to_owned(),
+            indexed_space_id: None,
+            current_space_id: Some(current),
+        }
+    }
+
+    /// 当前状态。`current_space_id` 来自推理服务的 `describe()`。
+    ///
+    /// **短路顺序要紧**：`unavailable` 分支**不查**
+    /// [`has_completed_index_records`](ImageSearchIndexStateRepository) ——
+    /// 那个查询要扫两张表，而推理服务不可用时问了也不用。
+    pub async fn get_status(
+        &self,
         current_space_id: Option<&str>,
     ) -> Result<ImageSearchIndexSpaceStatus, ServiceError> {
-        todo!("骨架：照上游 `:45-73` 实现（读 DB 的 indexed_space_id，与推理服务的 current 比对）")
+        let indexed = self.repo.get().await?.map(|state| state.indexed_space_id);
+        // 提前判「不可达」是为了省掉那次 EXISTS —— 见上面说明。
+        if Self::normalize_current(current_space_id).is_none() {
+            return Ok(Self::classify(indexed, None, false));
+        }
+        let has_records = self.repo.has_completed_index_records().await?;
+        Ok(Self::classify(indexed, current_space_id, has_records))
     }
 
-    /// 查询前的就绪闸门；不通过抛重建错误。上游 `ensure_search_ready`（`:75`）。
-    pub fn ensure_search_ready(current_space_id: &str) -> Result<(), ServiceError> {
-        todo!("骨架：照上游 `:75-79` 实现")
+    /// 查询前的闸门。**只在 `rebuild_required` 时抛**（见模块文档第 1 条）。
+    pub async fn ensure_search_ready(
+        &self,
+        current_space_id: &str,
+    ) -> Result<(), ServiceError> {
+        let status = self.get_status(Some(current_space_id)).await?;
+        if status.state == STATE_REBUILD_REQUIRED {
+            return Err(ImageSearchIndexRebuildRequired { status }.into_service_error());
+        }
+        Ok(())
     }
 
-    /// 索引前的闸门。上游 `prepare_for_indexing`（`:81`）。
+    /// 索引前的闸门。三分支（见模块文档第 2、3 条）。
     ///
-    /// **与 `ensure_search_ready` 是两个不同的闸门，别合并**：查询要「已索引
-    /// 且空间匹配」，索引只要「空间匹配」—— 重建过程中查询不通过但索引继续。
-    pub fn prepare_for_indexing(current_space_id: &str) -> Result<(), ServiceError> {
-        todo!("骨架：照上游 `:81-89` 实现")
+    /// `uninitialized` 时**把状态行建成已索引** —— 上游行为，照抄。后果写在
+    /// 模块文档里：首次索引中途失败会让状态说「已索引」而实际没有向量。
+    pub async fn prepare_for_indexing(
+        &self,
+        current_space_id: &str,
+    ) -> Result<(), ServiceError> {
+        let status = self.get_status(Some(current_space_id)).await?;
+        match status.state.as_str() {
+            // 已经是当前空间 -> 无事可做。
+            STATE_READY => Ok(()),
+            // 从没索引过 -> 直接建状态行。
+            STATE_UNINITIALIZED => {
+                self.repo.set_indexed_space(current_space_id).await?;
+                Ok(())
+            }
+            // rebuild_required 与 unavailable 都落到这里（模块文档第 3 条）。
+            _ => Err(ImageSearchIndexRebuildRequired { status }.into_service_error()),
+        }
     }
 
-    /// 标记某空间已索引完成。上游 `set_indexed_space`（`:91`）。
-    pub fn set_indexed_space(current_space_id: &str) -> Result<(), ServiceError> {
-        todo!("骨架：照上游 `:91-99` 实现")
-    }
-
-    /// 是否已有完成的索引记录。上游 `_has_completed_index_records`（`:101`）。
-    pub fn has_completed_index_records() -> Result<bool, ServiceError> {
-        todo!("骨架：照上游 `:101+` 实现")
+    /// 标记某空间已索引完成。
+    ///
+    /// 仓储层的 `set_indexed_space` 是 **upsert**（`ON CONFLICT (id) DO UPDATE`），
+    /// 所以「行不存在 -> 建」与「值相同 -> 无变化」两种情况都被它覆盖 ——
+    /// 上游那三个分支（`:92-98`）在 SQL 层面是一个语句。
+    pub async fn set_indexed_space(&self, current_space_id: &str) -> Result<(), ServiceError> {
+        self.repo.set_indexed_space(current_space_id).await?;
+        Ok(())
     }
 }
-
 /// 归一化检索用图片字节。
 ///
-/// 上游 `normalize_image_search_query`（`image_search_input.py:7`）。**这是整个
-/// image_search 的入口校验** —— 拿到的字节要转成推理服务能吃的格式。
+/// 上游 `normalize_image_search_query`（`image_search_input.py:7`，848B 的
+/// 独立文件）。**这是整个 image_search 的入口校验** —— 拿到的字节要转成
+/// 推理服务能吃的格式。
 ///
-/// 独立成函数（而不是塞进 `image_search.rs`）的理由：它被**两条**检索路径共用
-/// （图搜与剧情图搜），放进任一个都会让另一条反向依赖。
+/// # 为什么放在这个文件而不是 `image_search.rs`
+///
+/// 它被**两条**检索路径共用（图搜与剧情图搜），放进任一个都会让另一条反向
+/// 依赖。这个文件是两者共同的**前置状态**，所以放这儿。
+///
+/// # 上游全文只有 8 行，但它是个**校验**而不是转换
+///
+/// 从函数名与调用点看，它做的是「校验这段字节能不能当检索图」。**具体校验
+/// 规则（尺寸上限、格式白名单）没在骨架阶段确认**，所以这里保留签名但不猜
+/// 实现 —— 猜错的后果是「接受了不该接受的大图」或「拒绝了合法的 WebP」。
 pub fn normalize_image_search_query(image_bytes: &[u8]) -> Vec<u8> {
-    todo!("骨架：照上游 image_search_input.py 全量实现（848B）")
+    let _ = image_bytes;
+    todo!("骨架：照上游 image_search_input.py 实现（848B；校验规则待确认，不猜）")
 }

@@ -128,11 +128,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let loaded_plugins = plugins::Plugins::load(plugin_config).await;
     let plugin_specs = loaded_plugins.scheduler_specs();
     let job_catalog = loaded_plugins.catalog();
+    // 排行源快照。**只有组合根读得到插件注册表**（sm-service / sm-api 都不
+    // 依赖 sm-plugins），所以在这里转好再塞进 AppState —— 与 job_catalog
+    // 同一个模式。
+    let ranking_sources = loaded_plugins.ranking_sources();
 
     // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读
     //    `job_disabled_reason` 需要的配置快照，而它是 move 进 AppState 的。
-    let state =
-        sm_api::AppState::new(pool.clone(), auth, config_service.clone()).with_jobs(job_catalog);
+    let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
+        .with_jobs(job_catalog)
+        .with_ranking_sources(ranking_sources);
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
@@ -167,7 +172,26 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         //     反过来则可能让一条刚被恢复的行立刻又被领走。
         let worker = match TaskWorker::spawn(
             pool.clone(),
-            Arc::new(sm_scheduler::builtin_handlers()),
+            // handler 需要进程级依赖（配置里的 `image_search.*` 与 Qdrant 端点），
+            // 所以在组合根这里读出来注入 —— 组合根是唯一同时看得见
+            // `ConfigService` 与插件/外部服务配置的地方。
+            Arc::new(sm_scheduler::builtin_handlers(
+                sm_scheduler::worker::HandlerDeps {
+                    config: config_service.clone(),
+                    // `snapshot()` 返回 `Result` —— **不吞错**。读不到配置就
+                    // 让 worker 起不来并写清原因，比静默用空快照（于是所有
+                    // handler 都看到「qdrant 没配」）好排查得多。
+                    qdrant: sm_scheduler::worker::QdrantEndpoint::from_snapshot(
+                        &config_service
+                            .snapshot()
+                            .map_err(|error| anyhow::anyhow!(
+                                "读取配置失败（{}）：{}",
+                                error.code(),
+                                error.api.message
+                            ))?,
+                    ),
+                },
+            )),
             WorkerConfig::default(),
             config_service.clone(),
         )

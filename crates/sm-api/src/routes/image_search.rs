@@ -50,10 +50,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_service::discovery::image_search::ImageSearchPage;
+use sm_service::discovery::image_search_reset::{ImageSearchResetResult, ImageSearchResetService};
 use sm_service::discovery::plot_image_search::PlotImageSearchPage;
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
+use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -68,6 +70,10 @@ pub fn routes() -> Router<AppState> {
             post(create_text_image_search_session),
         )
         .route("/image-search/plot-sessions", post(create_plot_image_search_session))
+        .route(
+            "/image-search/reset",
+            post(reset_image_search).fallback(method_not_allowed),
+        )
         .route(
             "/image-search/plot-sessions/{session_id}/results",
             get(get_plot_image_search_results),
@@ -190,7 +196,8 @@ pub fn parse_csv_positive_ints(raw: Option<&str>, field: &str) -> Result<Option<
         match piece.trim().parse::<i64>() {
             Ok(value) if value > 0 => out.push(value),
             _ => {
-                return Err(ErrorResponse::bad_request(
+                return Err(ErrorResponse::new(
+                    axum::http::StatusCode::BAD_REQUEST,
                     "invalid_image_search_filter",
                     format!("{field} 只接受逗号分隔的正整数"),
                 ));
@@ -198,4 +205,33 @@ pub fn parse_csv_positive_ints(raw: Option<&str>, field: &str) -> Result<Option<
         }
     }
     Ok(Some(out))
+}
+/// `POST /image-search/reset` —— **202 入队，不是「已重置」**。
+///
+/// # 这个端点**不删任何东西**
+///
+/// 它只是把 `image_search_index` 任务排上队（`params = {"reset": true}`）。
+/// 真正的重置在后台 handler 里，而那个 handler **还没写**（21 个只落地 1 个）。
+///
+/// 所以响应是「排上了」而不是「重置完了」—— 客户端要拿 `task_run_id` 去轮询。
+/// **别把它当成同步端点**，那会让用户以为索引已经清空。
+///
+/// # 409 的两个来源
+///
+/// | 情况 | code |
+/// |---|---|
+/// | 图搜未启用（`qdrant.enabled && image_search.enabled` 不满足）| `optional_services` 里的 code |
+/// | 已有同 key 任务在跑/在队 | `image_search_reset_conflict` + `blocking_task_run_id` |
+///
+/// 后者用 `ConflictPolicy::Raise` 而非 `Skip` —— 手动触发必须让用户知道
+/// 「已经有一次在跑」，否则点了没反应会以为功能坏了。
+async fn reset_image_search(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+) -> Result<(StatusCode, Json<ImageSearchResetResult>), ErrorResponse> {
+    // TODO: 接 `TaskQueueService::new(state.db().clone())` 与
+    // `optional_services::capabilities_of(state.config())`。
+    // 前者要 `BackgroundTaskRunRepository`（`sm-server/lib.rs` 里已有构造
+    // 范例），后者返回 `Capabilities`。两者都确认过存在，只差接起来。
+    todo!("骨架：入队语义已定；待接 TaskQueueService 与配置快照")
 }

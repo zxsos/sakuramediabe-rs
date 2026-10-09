@@ -10,22 +10,31 @@ pub mod actors;
 pub mod auth;
 pub mod clip_collections;
 pub mod config;
+pub mod download_clients;
+pub mod download_tasks;
 pub mod downloads;
+pub mod files;
 pub mod image_search;
 pub mod indexer_settings;
 pub mod jobs;
 pub mod media_clips;
 pub mod media;
+pub mod media_import;
+pub mod moment_collections;
 pub mod media_libraries;
 pub mod media_playback;
 pub mod media_points;
+pub mod media_transfer;
 pub mod movie_subscriptions;
 pub mod movies;
 pub mod playlists;
+pub mod plugins;
 pub mod ranking_sources;
 pub mod recommendations;
 pub mod status;
 pub mod tags;
+pub mod video_collections;
+pub mod videos;
 
 /// 路径命中但方法不匹配 → 405 `http_error`。
 ///

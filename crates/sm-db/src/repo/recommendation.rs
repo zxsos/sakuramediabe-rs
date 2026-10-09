@@ -482,3 +482,178 @@ impl MomentRecommendationRepository {
         Ok(result.rows_affected())
     }
 }
+
+// ================================================================ 影片特征（稀疏向量来源）
+
+/// 一部影片的特征：演员 id 列表 + 标签 id 列表。
+///
+/// # 两者都可能为空，但**不会同时为空**
+///
+/// `_iter_movie_features`（`recommendation_service.py:118-121`）显式跳过
+/// 「既无演员也无标签」的影片 —— 那种影片**构造不出向量**，入索引也没有意义。
+/// 所以这里能拿到 `Some` 的行，两个列表至少有一个非空。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovieFeatures {
+    pub movie_id: i32,
+    pub actor_ids: Vec<i32>,
+    pub tag_ids: Vec<i32>,
+}
+
+/// 影片特征的查询。
+///
+/// # 与本文件其他仓储的差别：它**只读**
+///
+/// `DailyRecommendationItemRepository` 与 `MomentRecommendationRepository` 都
+/// 写结果表，而这个只读源数据（`movie` / `movie_actor` / `movie_tag`）。
+/// 放在这里是因为**消费者**（`discovery::recommendation`）与那些结果表同属
+/// 推荐族，而不是因为表本身相关。
+#[derive(Debug, Clone)]
+pub struct MovieFeatureRepository {
+    pool: sqlx::PgPool,
+}
+
+impl MovieFeatureRepository {
+    /// 构造。
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 连接池。
+    pub fn pool(&self) -> &sqlx::PgPool {
+        &self.pool
+    }
+
+    /// 非集合影片的总数 —— IDF 公式里的 `total_movies`。
+    ///
+    /// **排除 `is_collection`** —— 集合片不是「某部影片」，不该进相似度索引，
+    /// 也不该计入 IDF 的分母。
+    pub async fn total_movies(&self) -> Result<i64, DbError> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM movie WHERE is_collection = false",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        Ok(total)
+    }
+
+    /// 演员 / 标签的文档频次（有多少部非集合影片用了它）。
+    ///
+    /// # `COUNT(*)` 而**不是** `COUNT(DISTINCT movie)`
+    ///
+    /// 上游写的是 `fn.COUNT(link_model.movie)`（`:65`）—— **数行数**。
+    /// 而 `movie_actor` / `movie_tag` 若有唯一约束则两者等价。
+    ///
+    /// **不去改成 `DISTINCT`**：若将来加了「同一部影片同一演员多条」的合法
+    /// 场景（比如出演多个角色），改了会让 IDF 与索引端算法不一致 —— 那种
+    /// 不一致表现为「检索结果略差」，很难归因。照抄。
+    ///
+    /// # DF 缺失时取 0 是**正常路径**
+    ///
+    /// 上游注释（`:137`）：「重建期间新入库的演员/标签取 DF=0（IDF 拉满）」——
+    /// 这样新特征会被当作「稀有」而更容易匹配上。是特性不是 bug。
+    pub async fn actor_document_frequencies(&self) -> Result<HashMap<i32, i64>, DbError> {
+        self.document_frequencies("movie_actor", "actor").await
+    }
+
+    /// 标签的文档频次。
+    pub async fn tag_document_frequencies(&self) -> Result<HashMap<i32, i64>, DbError> {
+        self.document_frequencies("movie_tag", "tag").await
+    }
+
+    /// 通用 DF 查询。`link_table` / `feature_column` 是**受控常量**，
+    /// 不是用户输入 —— 用 `format!` 拼在这里而不是绑参数，因为标识符不能绑。
+    async fn document_frequencies(
+        &self,
+        link_table: &str,
+        feature_column: &str,
+    ) -> Result<HashMap<i32, i64>, DbError> {
+        debug_assert!(
+            matches!((link_table, feature_column), ("movie_actor", "actor") | ("movie_tag", "tag")),
+            "只允许两张已知的关联表"
+        );
+        let sql = format!(
+            "SELECT l.{feature_column} AS feature_id, COUNT(l.movie) AS df \
+             FROM {link_table} l \
+             JOIN movie m ON m.id = l.movie \
+             WHERE m.is_collection = false \
+             GROUP BY l.{feature_column}"
+        );
+        let rows: Vec<(i32, i64)> = sqlx::query_as(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 按影片 id 升序取一页影片 id（keyset 分页）。
+    ///
+    /// # 用 keyset（`id > last`）而**不是** `OFFSET`
+    ///
+    /// 上游注释（`:93`）：「按影片 id 分段读取特征；段内一次取全，无需长事务与
+    /// 服务端游标」。`OFFSET` 在大偏移量下要扫过并丢弃前面的行，30 万影片
+    /// 重建时会越来越慢；keyset 恒定。
+    ///
+    /// **不含任何特征过滤** —— 「跳过无特征影片」在上层做（因为要同时看演员
+    /// 与标签两张表，一层 SQL 判不了）。
+    pub async fn page_movie_ids(
+        &self,
+        after_id: i32,
+        limit: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        let sql = "SELECT id FROM movie WHERE is_collection = false AND id > $1 ORDER BY id LIMIT $2";
+        Ok(sqlx::query_scalar::<_, i32>(sql)
+            .bind(after_id)
+            .bind(limit.max(1))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?)
+    }
+
+    /// 一次取一批影片的演员 / 标签，按影片聚合。
+    ///
+    /// **两次查询而不是一次 JOIN** —— 演员与标签是多对多，一次 JOIN 会产生
+    /// 笛卡尔积（5 演员 × 3 标签 = 15 行），还得去重。分开查再拼更省。
+    pub async fn features_for_movies(
+        &self,
+        movie_ids: &[i32],
+    ) -> Result<HashMap<i32, MovieFeatures>, DbError> {
+        let mut out: HashMap<i32, MovieFeatures> = movie_ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    MovieFeatures { movie_id: *id, actor_ids: Vec::new(), tag_ids: Vec::new() },
+                )
+            })
+            .collect();
+        if movie_ids.is_empty() {
+            return Ok(out);
+        }
+        let actor_rows: Vec<(i32, i32)> = sqlx::query_as(
+            "SELECT movie, actor FROM movie_actor WHERE movie = ANY($1) ORDER BY movie, actor",
+        )
+        .bind(movie_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        for (movie, actor) in actor_rows {
+            if let Some(entry) = out.get_mut(&movie) {
+                entry.actor_ids.push(actor);
+            }
+        }
+        let tag_rows: Vec<(i32, i32)> = sqlx::query_as(
+            "SELECT movie, tag FROM movie_tag WHERE movie = ANY($1) ORDER BY movie, tag",
+        )
+        .bind(movie_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        for (movie, tag) in tag_rows {
+            if let Some(entry) = out.get_mut(&movie) {
+                entry.tag_ids.push(tag);
+            }
+        }
+        Ok(out)
+    }
+}

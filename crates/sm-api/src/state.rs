@@ -3,6 +3,7 @@
 use sm_db::Db;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
+use sm_service::discovery::ranking::RankingSourceCatalog;
 use sm_service::system::JobCatalog;
 
 /// 所有路由共享的运行时状态。
@@ -35,6 +36,15 @@ pub struct AppState {
     /// 缺省为空目录 —— 只有组合根会填它，而没填时「任务中心」应当什么都没有，
     /// 而不是把内建任务凭空编出来。
     jobs: JobCatalog,
+    /// 排行源目录（来自插件注册表）。**快照**，理由与 `jobs` 完全一样：
+    ///
+    /// `sm-plugins -> sm-scheduler -> sm-service` 已是一条链，所以 `sm-service`
+    /// 与 `sm-api` 都**不能**依赖 `sm-plugins`（前者会成环，后者本来就不
+    /// 依赖）。只有组合根 `sm-server` 读得到注册表，所以它读完塞进来。
+    ///
+    /// 缺省为空 —— 没装排行插件时 `GET /ranking-sources` 返回空列表，与
+    /// 「装了插件但没配排行源」表现一致。
+    ranking: RankingSourceCatalog,
 }
 
 impl AppState {
@@ -46,6 +56,7 @@ impl AppState {
             auth,
             config,
             jobs: JobCatalog::default(),
+            ranking: RankingSourceCatalog::default(),
         }
     }
 
@@ -56,6 +67,17 @@ impl AppState {
     }
 
     /// 任务目录。
+    /// 挂上排行源目录。**只有组合根会调。**
+    pub fn with_ranking_sources(mut self, ranking: RankingSourceCatalog) -> Self {
+        self.ranking = ranking;
+        self
+    }
+
+    /// 排行源目录。
+    pub fn ranking(&self) -> &RankingSourceCatalog {
+        &self.ranking
+    }
+
     pub fn jobs(&self) -> &JobCatalog {
         &self.jobs
     }

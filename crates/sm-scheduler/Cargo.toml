@@ -13,6 +13,9 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# worker::build_image_search_service 要建 Qdrant 客户端（image_search_index handler）。
+# 与 sm-service 用**同一个** workspace 版本 —— 两个版本会在同一二进制里编两套 gRPC。
+qdrant-client = { workspace = true }
 anyhow = { workspace = true }
 # 只解析表达式。刻意不用 `tokio-cron-scheduler`：它自带 job store 与执行器，
 # 会与 `background_task_run` 表形成两套状态源（ADR §2 / §3.1）。

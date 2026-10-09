@@ -153,10 +153,11 @@ async fn list_duplicate_media_groups(
     axum::extract::Query(query): axum::extract::Query<DuplicatesQuery>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     if query.kind.is_none() {
-        return Err(ErrorResponse::validation(
+        return Err(sm_service::error::ServiceError::validation(
             "validation_error",
             "kind 是必填项，取值为 jav 或 video",
-        ));
+        )
+        .into());
     }
     todo!("骨架：kind 只接受 jav / video；接重复媒体组查询")
 }

@@ -109,8 +109,16 @@ impl MoviePlotImageSearchService {
 
     /// 归一化请求里的 id 列表。上游 `_normalize_ids`（`:44-45`）。
     ///
-    /// `None` 与 `Some(&[])` 语义不同，见 [`super::image_search::ImageSearchService::normalize_ids`]。
+    /// **空列表归一成 `None`（不过滤）** —— 上游是 `if not ids: return None`，
+    /// Python 里 `[]` 是 falsy。
+    ///
+    /// ⚠️ **我早先写的是 `ids.map(|s| s.to_vec())` —— 那是错的**，它让
+    /// `Some(&[])` 透传成「排除零部影片」，与上游相反。见
+    /// [`super::image_search`] 模块文档里的更正。
+    ///
+    /// **直接复用图搜那一份**（上游两个服务用的是同一个函数），不重复实现 ——
+    /// 这次的教训正是「两份实现漂移」。
     pub fn normalize_ids(ids: Option<&[i64]>) -> Option<Vec<i64>> {
-        ids.map(|slice| slice.to_vec())
+        super::image_search::normalize_ids(ids)
     }
 }

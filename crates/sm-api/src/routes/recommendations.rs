@@ -30,7 +30,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_service::discovery::daily_recommendation::DailyRecommendationItem;
-use sm_service::discovery::hot_actress_release::HotActressReleaseItem;
+use sm_db::repo::discovery::HotActressReleaseRepository;
+use sm_service::discovery::hot_actress_release::{HotActressReleaseItem, HotActressReleaseQuery};
 use sm_service::discovery::moment_recommendation::MomentRecommendationItem;
 
 use crate::auth::CurrentUser;
@@ -117,10 +118,35 @@ async fn list_moment_recommendations(
 }
 
 /// `GET /hot-actress-releases`
+///
+/// # 分页校验用**专用错误码**
+///
+/// 上游 `validate_page(..., error_code="invalid_hot_actress_release_filter")`。
+/// 照抄 —— 客户端要靠它区分「分页参数错了」与「筛选条件错了」。
+///
+/// # `total` 是**打分后的候选数**，不是数据库行数
+///
+/// 上游 `len(scored_movies)`。所以 `total` 依赖打分结果（要跑完历史证据 +
+/// 候选 + 排序），**不能用 `COUNT(*)` 顶替**。这也是该端点比看起来贵的原因。
 async fn list_hot_actress_releases(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    axum::extract::Query(_query): axum::extract::Query<BoundedPageQuery>,
+    axum::extract::Query(query): axum::extract::Query<BoundedPageQuery>,
 ) -> Result<Json<PageResponse<HotActressReleaseItem>>, ErrorResponse> {
-    todo!("骨架：接 HotActressReleaseService::list_items")
+    let page = query.page;
+    let page_size = query.page_size;
+    // 越界要 422 而不是夹到边界（FastAPI 的行为）。
+    HotActressReleaseQuery::validate_page(page, page_size)?;
+
+    let repo = HotActressReleaseRepository::new(state.db().clone());
+    let query_service = HotActressReleaseQuery::new(repo);
+    let scored = query_service.scored_today().await?;
+    let total = scored.len() as i64;
+    let start = ((page - 1) * page_size) as usize;
+    let _ = (scored, start);
+    // TODO: 填影片卡片与女优资料（`PageContext` 的两个方法）。
+    // 依赖 `repo/movie.rs` 的 `with_movie_card_relations` 等价物与
+    // `repo/actor.rs` 的双 LEFT JOIN（`profile_image_override` 优先）——
+    // 两者都还没确认形态，不猜字段。
+    todo!("骨架：分页与打分已接；待补卡片与女优资料")
 }

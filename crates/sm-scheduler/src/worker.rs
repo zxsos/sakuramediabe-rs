@@ -97,6 +97,70 @@ const HOUSEKEEPING_FLOOR_SECONDS: u64 = 5;
 ///
 /// 收 `&Value` 形参（持久化的 `params`）是因为**带参任务**要从这里读
 /// `params`（上游 `JobDefinition.build_executor`）。无参任务的实现忽略它。
+
+/// handler 需要的**进程级依赖**。
+///
+/// # 为什么是这个形状
+///
+/// [`HandlerFactory`] 的签名是 `Fn(&Db, &Value) -> Result<TaskHandler, _>` ——
+/// **每次调用只拿到 `&Db` 与参数**。而 `image_search_index` 还需要配置
+/// （`image_search.inference_base_url`）与 Qdrant 端点。
+///
+/// 三种做法：
+///
+/// | 做法 | 问题 |
+/// |---|---|
+/// | 改 `HandlerFactory` 签名 | 破坏所有已注册的 handler，且 `&Db` 是每次调用的，配置不是 |
+/// | 用全局 `static` | 测试没法注入不同配置 —— 而 `AppState::auth` 之所以进 state 就是为了这个 |
+/// | **工厂闭包捕获 `Arc<HandlerDeps>`** | ✅ 无破坏、可注入、`Fn + Send + Sync` 满足 |
+///
+/// 选第三种。`ConfigService` 的 `Clone` 只复制一个 `PathBuf`，很便宜。
+#[derive(Debug, Clone)]
+pub struct HandlerDeps {
+    /// 配置服务。`image_search_index` 从这里读 `image_search.*`。
+    pub config: sm_service::system::config::ConfigService,
+    /// Qdrant 端点。**只存连接信息，不存活客户端** ——
+    /// 建客户端可能失败，而那应该由工厂返回的 `Err` 报出来，
+    /// 而不是让 `builtin_handlers()` 整个 panic。
+    pub qdrant: QdrantEndpoint,
+}
+
+/// Qdrant 连接信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QdrantEndpoint {
+    /// gRPC 端点。**注意上游 `qdrant.url` 默认是 REST 端口**（`http://qdrant:6333`），
+    /// 而 `qdrant-client` 走 gRPC —— 调用方要转换。
+    pub url: String,
+    pub api_key: Option<String>,
+}
+
+impl QdrantEndpoint {
+    /// 从配置快照读。
+    ///
+    /// **缺 `qdrant` 节时给空串**（而不是报错）—— 那等价于「Qdrant 没配」，
+    /// 由 `image_search_enabled` 那道闸门去拦。**这里报错会让「没配 Qdrant」
+    /// 变成进程起不来。**
+    pub fn from_snapshot(values: &serde_json::Value) -> Self {
+        let section = values.get("qdrant");
+        Self {
+            url: section
+                .and_then(|q| q.get("url"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            api_key: section
+                .and_then(|q| q.get("api_key"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned),
+        }
+    }
+
+    /// 是否配了端点。
+    pub fn is_configured(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+}
 pub type HandlerFactory =
     Box<dyn Fn(&Db, &Value) -> Result<TaskHandler, WorkerError> + Send + Sync>;
 
@@ -212,15 +276,33 @@ impl HandlerRegistry {
 
 /// 已落地的内建处理器。
 ///
-/// # 现在只有一个
+/// # 现在有两个
 ///
-/// 21 个任务里 20 个的 service 还没写（Qdrant / zip / provider 各挡一批，
+/// 21 个任务里 19 个的 service 还没写（zip / provider 各挡一批，
 /// 见 `docs/service-progress.md`）。**不注册就没有处理器**，那些任务被领到
 /// 时会明确 `failed` 并写清「未在处理器注册表中」，而不是静默跳过。
 ///
-/// `activity_record_cleanup` 是唯一一个 service 已就位的（`system` 域），
-/// 用它把链路端到端跑通。
-pub fn builtin_handlers() -> HandlerRegistry {
+/// | task_key | service 域 | 外部依赖 |
+/// |---|---|---|
+/// | `activity_record_cleanup` | `system` | 无 |
+/// | `image_search_index` | `discovery` | 推理服务 + Qdrant（都已在 `sm-service` 侧就位）|
+///
+/// `activity_record_cleanup` 用它把链路端到端跑通；`image_search_index` 是第一个
+/// 带外部依赖的 handler，它的 service（`discovery::image_search_index`）与依赖
+/// 通路（[`HandlerDeps`]）都已落地。
+///
+/// # 依赖怎么进的 handler
+///
+/// [`builtin_handlers`] 接收 [`HandlerDeps`] 并用 `Arc` 捕获进每个工厂闭包。
+/// 组合根 `sm-server` 负责读配置并注入 —— 它是唯一同时看得见
+/// `ConfigService` 与 Qdrant 端点的地方。
+///
+/// **没有改 `HandlerFactory` 的签名**：它是 `Fn(&Db, &Value)`，每次调用只拿到
+/// 数据库连接，而配置是进程级的。改签名会破坏所有已注册 handler。
+pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
+    // 闭包捕获用 `Arc` —— `HandlerFactory` 要求 `Fn + Send + Sync + 'static`，
+    // 而工厂是**多次**调用的（每个任务运行一次），不能把依赖 move 进去。
+    let deps = Arc::new(deps);
     let mut registry = HandlerRegistry::new();
 
     registry.register(
@@ -256,7 +338,160 @@ pub fn builtin_handlers() -> HandlerRegistry {
         }),
     );
 
+    // `image_search_index` —— 图搜索索引构建 / 重建。
+    //
+    // **第二个落地的 handler**，也是第一个「有外部依赖」的：推理服务（取向量）
+    // + Qdrant（存向量）。三个依赖都已在 `sm-service` 侧就位，所以它能真正
+    // 端到端跑。
+    //
+    // # `params.reset` 决定单阶段还是双阶段
+    //
+    // | 来源 | params | 行为 |
+    // |---|---|---|
+    // | cron tick | 无 / `{}` | 单阶段：只补齐 PENDING 的图片 |
+    // | `POST /image-search/reset` | `{"reset": true}` | 双阶段：先清库重建，再全量索引 |
+    //
+    // 这个 `reset` 键是 `discovery::image_search_reset::reset_params()` 定的
+    // **契约** —— 那边改名这里就静默失效（变成单阶段，`reset: true` 被忽略）。
+    registry.register(
+        "image_search_index",
+        Box::new(move |db: &Db, params: &Value| {
+            let deps = Arc::clone(&deps);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    // `reset` 决定单阶段还是双阶段（见上面的表格）。
+                    let reset = params.get("reset").and_then(Value::as_bool).unwrap_or(false);
+                    let batch_size = image_search_batch_size(&deps.config, "index_upsert_batch_size");
+                    let inference_batch = image_search_batch_size(&deps.config, "inference_batch_size");
+
+                    // 图搜未启用时**正常返回 None**（不干活），不是 Err ——
+                    // `optional_services::job_disabled_reason` 已经把这类任务
+                    // 在任务中心置灰，这里再报错会让「未启用」看起来像「坏了」。
+                    let Some(service) = build_image_search_service(db, &deps)? else {
+                        // **不能返回 `Ok(None)`** —— `TaskHandlerResult = Result<Value, String>`，
+                        // `None` 编不过。用一个显式的 `skipped` 摘要。
+                        //
+                        // 键名 `skipped` 是自定的：不像 `stats` 那样要与上游逐字
+                        // 一致，因为上游「未启用」时 worker 根本不领这个任务。
+                        return Ok(serde_json::json!({
+                            "skipped": true,
+                            "reason": "image_search 未启用",
+                        }));
+                    };
+                    let mut sink: ProgressSink<'_> =
+                        Box::new(move |current, total, text, patch| {
+                            Box::pin(async move { reporter.emit(current, total, Some(text), patch).await })
+                        });
+                    let summary = service
+                        .index_pending_images(batch_size, inference_batch, reset, Some(&mut sink))
+                        .await
+                        .map_err(|error| format!("图搜索索引失败：{}", error.code()))?;
+                    // `summary` 的键与上游**逐字一致** —— 它会进 `signal_scores`
+                    // 一类的列，改名会让历史记录对不上。
+                    serde_json::to_value(summary)
+                        .map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
     registry
+}
+
+/// 读 `image_search.<key>` 的批量大小，缺省 16。
+///
+/// 上游 `settings.image_search.index_upsert_batch_size` 与
+/// `inference_batch_size` 都有默认值，且 `max(1, ...)` —— **0 或负数会被抬到 1**
+/// 而不是报错（`image_search_index_service.py:72-73`）。照抄。
+fn image_search_batch_size(config: &sm_service::system::config::ConfigService, key: &str) -> i64 {
+    let snapshot = config.snapshot();
+    snapshot
+        .get("image_search")
+        .and_then(|section| section.get(key))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(16)
+        .max(1)
+}
+
+/// 构造 `ImageSearchIndexService`。`None` = 图搜未启用。
+fn build_image_search_service(
+    db: &Db,
+    deps: &HandlerDeps,
+) -> Result<Option<sm_service::discovery::image_search_index::ImageSearchIndexService>, String> {
+    use sm_service::discovery::image_search_index::ImageSearchIndexService;
+    use sm_service::discovery::qdrant::dense::{
+        DenseStore, PLOT_IMAGE_COLLECTION, PLOT_IMAGE_PAYLOAD_INDEX, THUMBNAIL_COLLECTION,
+        THUMBNAIL_PAYLOAD_INDEX,
+    };
+    use sm_service::discovery::embedding::EmbeddingClient;
+
+    // `snapshot()` 返回 `Result`。**这里不 `?`** —— 读不到配置时按「未启用」
+    // 处理（返回 `None`）。理由：调用点在 worker 的领取循环里，让它因为配置
+    // 读失败而把整条任务判失败不合适。
+    //
+    // 组合根那侧**已经把 worker 启动时的读配置错误显式抛出**了，所以走到这里
+    // 读失败只可能是运行中文件被删 —— 那种情况下「图搜不可用」是正确判断。
+    let Ok(snapshot) = deps.config.snapshot() else {
+        return Ok(None);
+    };
+    // 未启用 -> None。不报错：那不是故障。
+    if !sm_service::system::optional_services::image_search_enabled(&snapshot) {
+        return Ok(None);
+    }
+    if !deps.qdrant.is_configured() {
+        // 这一条**报错**而不是 None —— `image_search_enabled` 已经检查过
+        // `qdrant.enabled`，走到这里说明配置自相矛盾（enabled 为真但没 url）。
+        return Err("image_search 已启用但 qdrant.url 为空：配置不一致".to_owned());
+    }
+    let base = deps.qdrant.url.trim_end_matches('/');
+    let client = || -> Result<Qdrant, String> {
+        qdrant_client::config::QdrantConfig::from_url(base.to_owned())
+            .map_err(|error| format!("向量库地址无法解析：{error}"))
+            .and_then(|mut config| {
+                config.api_key = deps.qdrant.api_key.clone();
+                config.build().map_err(|error| error.to_string())
+            })
+    };
+    let embedding = || -> Result<EmbeddingClient, String> {
+        let base_url = snapshot
+            .get("image_search")
+            .and_then(|section| section.get("inference_base_url"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or("image_search.inference_base_url 未配置")?;
+        let api_key = snapshot
+            .get("image_search")
+            .and_then(|section| section.get("inference_api_key"))
+            .and_then(serde_json::Value::as_str);
+        Ok(EmbeddingClient::new(
+            base_url,
+            api_key,
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(10),
+        ))
+    };
+    // `api_key` 是 `Option<&str>` 而 `deps` 是借用 —— 直接传 `as_deref()`。
+    //
+    // `payload_index_fields` 传各自那份常量：缩略图按 `movie_id` + `media_id`
+    // 过滤，剧情图**只有** `movie_id`（见 dense.rs 的两个常量）。
+    let api_key = deps.qdrant.api_key.as_deref();
+    Ok(Some(ImageSearchIndexService::new(
+        Arc::new(DenseStore::connect(
+            base,
+            api_key,
+            THUMBNAIL_COLLECTION,
+            THUMBNAIL_PAYLOAD_INDEX,
+        )?),
+        Arc::new(DenseStore::connect(
+            base,
+            api_key,
+            PLOT_IMAGE_COLLECTION,
+            PLOT_IMAGE_PAYLOAD_INDEX,
+        )?),
+        Arc::new(embedding()?),
+        sm_db::repo::discovery::PendingImageRepository::new(db.clone()),
+        sm_db::repo::discovery::ImageSearchIndexStateRepository::new(db.clone()),
+    )))
 }
 
 /// worker 的构造参数。
