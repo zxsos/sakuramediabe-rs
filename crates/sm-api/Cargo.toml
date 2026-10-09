@@ -1,0 +1,16 @@
+[package]
+name = "sm-api"
+version = "0.1.0"
+description = "axum 路由层，126 个端点，契约逐字节不变"
+
+[dependencies]
+sm-core = { workspace = true }
+sm-service = { workspace = true }
+sm-db = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

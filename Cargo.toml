@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hashing",
+    "crates/media-file-hash",
+    "crates/svc-hash",
+    "crates/parity-cli",
+    "crates/sm-core",
+    "crates/sm-db",
+    "crates/sm-plugin-api",
+    "crates/sm-plugins",
+    "crates/sm-service",
+    "crates/sm-api",
+    "crates/sm-scheduler",
+    "crates/sm-server",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+hashing = { path = "crates/hashing" }
+media-file-hash = { path = "crates/media-file-hash" }
+svc-hash = { path = "crates/svc-hash" }
+sm-core = { path = "crates/sm-core" }
+sm-db = { path = "crates/sm-db" }
+sm-plugin-api = { path = "crates/sm-plugin-api" }
+sm-plugins = { path = "crates/sm-plugins" }
+sm-service = { path = "crates/sm-service" }
+sm-api = { path = "crates/sm-api" }
+sm-scheduler = { path = "crates/sm-scheduler" }
+
+# 契约层：客户端是 Flutter，API 契约必须逐字节不变
+# 126 端点 / 156 DTO / 80 枚举 / SSE 13 事件 / 错误信封 {error:{code,message,details}}
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 异步运行时（替代 asyncio + uvicorn）
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP 服务（替代 FastAPI / starlette）
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors"] }
+
+# 数据库（替代 Peewee 4.5）：schema 完全保留，只做查询不引迁移框架
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "json", "chrono", "uuid"] }
+
+# gRPC 插件 ABI（替代进程内 Python import）
+tonic = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# HTTP 客户端（替代 httpx）
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+
+# 时间与标识
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# 认证（替代 python-jose + bcrypt）
+jsonwebtoken = "11"
+argon2 = "0.6"
+password-hash = { version = "0.5", features = ["rand_core"] }
+rand = "0.8"
+
+# 调度（替代 APScheduler）
+tokio-cron-scheduler = "0.15"
+
+# 配置（替代 pydantic-settings + toml）
+config = { version = "0.15", default-features = false, features = ["toml"] }
+
+# 编码与解析（替代 Python 内建）
+base64 = "0.23"
+percent-encoding = "2"
+url = "2"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

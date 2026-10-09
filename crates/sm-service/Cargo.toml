@@ -1,0 +1,17 @@
+[package]
+name = "sm-service"
+version = "0.1.0"
+description = "业务逻辑层，对应 Python 的 114 个 service 文件"
+
+[dependencies]
+sm-core = { workspace = true }
+sm-db = { workspace = true }
+sm-plugins = { workspace = true }
+media-file-hash = { workspace = true }
+svc-hash = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+regex = { workspace = true }

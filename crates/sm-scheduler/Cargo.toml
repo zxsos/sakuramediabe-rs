@@ -1,0 +1,12 @@
+[package]
+name = "sm-scheduler"
+version = "0.1.0"
+description = "后台任务调度，替代 APScheduler（14 个内建任务）"
+
+[dependencies]
+sm-core = { workspace = true }
+sm-service = { workspace = true }
+tokio = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
