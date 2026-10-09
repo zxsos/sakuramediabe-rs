@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --bin sakuramedia_javdb_ranking
+
+      - name: Create manifest
+        run: |
+          cat > manifest.json << 'MANIFEST'
+          {
+            "id": "sakuramedia_javdb_ranking",
+            "version": "${{ github.ref_name }}",
+            "entry": "sakuramedia_javdb_ranking",
+            "display_name": "JavDB Ranking"
+          }
+          MANIFEST
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/sakuramedia_javdb_ranking dist/
+          cp manifest.json dist/
+          cd dist && zip -r ../sakuramedia_javdb_ranking-${{ github.ref_name }}.zip manifest.json sakuramedia_javdb_ranking
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sakuramedia_javdb_ranking-${{ github.ref_name }}.zip
