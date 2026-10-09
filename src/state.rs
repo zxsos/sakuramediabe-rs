@@ -83,9 +83,8 @@ pub struct DmmState {
 impl DmmState {
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -140,9 +139,7 @@ impl DmmState {
             .conn
             .prepare("SELECT * FROM movie_cache WHERE movie_number = ?1")?;
         let mut rows = stmt.query(params![movie_number])?;
-        rows.next()?
-            .map(MovieCache::from_row)
-            .transpose()
+        rows.next()?.map(MovieCache::from_row).transpose()
     }
 
     pub fn load_many(

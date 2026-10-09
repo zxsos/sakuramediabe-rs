@@ -130,7 +130,10 @@ impl Settings {
         if let Some(v) = value.get("request_timeout_seconds").and_then(Value::as_f64) {
             s.request_timeout_seconds = v.clamp(REQUEST_TIMEOUT_MIN, REQUEST_TIMEOUT_MAX);
         }
-        if let Some(v) = value.get("request_interval_seconds").and_then(Value::as_f64) {
+        if let Some(v) = value
+            .get("request_interval_seconds")
+            .and_then(Value::as_f64)
+        {
             s.request_interval_seconds = v.clamp(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX);
         }
         if let Some(v) = value.get("translation_enabled").and_then(Value::as_bool) {
@@ -294,7 +297,10 @@ mod tests {
     #[test]
     fn api_type_parsing() {
         assert_eq!(ApiType::from_str("responses"), ApiType::Responses);
-        assert_eq!(ApiType::from_str("chat_completions"), ApiType::ChatCompletions);
+        assert_eq!(
+            ApiType::from_str("chat_completions"),
+            ApiType::ChatCompletions
+        );
         assert_eq!(ApiType::from_str("bogus"), ApiType::ChatCompletions);
     }
 

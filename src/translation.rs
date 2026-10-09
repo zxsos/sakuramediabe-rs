@@ -84,7 +84,10 @@ fn is_model_error(status: StatusCode, body: &Value) -> bool {
     };
     if let Some(obj) = error.as_object() {
         if let Some(code) = obj.get("code").and_then(|v| v.as_str()) {
-            if matches!(code, "model_not_found" | "invalid_model" | "unsupported_model") {
+            if matches!(
+                code,
+                "model_not_found" | "invalid_model" | "unsupported_model"
+            ) {
                 return true;
             }
         }
@@ -126,9 +129,8 @@ impl TranslationClient {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "x-opencode-session",
-            reqwest::header::HeaderValue::from_str(&session).map_err(|_| {
-                TranslationError::new("bad_session", "构造会话头失败", false)
-            })?,
+            reqwest::header::HeaderValue::from_str(&session)
+                .map_err(|_| TranslationError::new("bad_session", "构造会话头失败", false))?,
         );
         if !settings.api_key.is_empty() {
             headers.insert(
@@ -139,7 +141,9 @@ impl TranslationClient {
         }
         let client = Client::builder()
             .default_headers(headers)
-            .timeout(Duration::from_secs_f64(settings.translation_timeout_seconds))
+            .timeout(Duration::from_secs_f64(
+                settings.translation_timeout_seconds,
+            ))
             .build()
             .map_err(|e| {
                 TranslationError::new("client_build", &format!("构造 HTTP 客户端失败: {e}"), false)
@@ -211,14 +215,18 @@ impl TranslationClient {
         if status.is_client_error() || status.is_server_error() {
             let body: Value = response.json().await.unwrap_or(Value::Null);
             let abort = matches!(status.as_u16(), 401 | 403) || is_model_error(status, &body);
-            let retryable = !abort
-                && (matches!(status.as_u16(), 408 | 429) || status.is_server_error());
+            let retryable =
+                !abort && (matches!(status.as_u16(), 408 | 429) || status.is_server_error());
             let mut err = TranslationError::new(
                 &format!("http_{}", status.as_u16()),
                 &format!(
                     "翻译服务返回 HTTP {}{}",
                     status.as_u16(),
-                    if abort { "：认证或模型配置错误" } else { "" }
+                    if abort {
+                        "：认证或模型配置错误"
+                    } else {
+                        ""
+                    }
                 ),
                 retryable,
             );
@@ -227,13 +235,10 @@ impl TranslationClient {
             }
             return Err(err);
         }
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| {
-                TranslationError::new("invalid_response", "翻译服务返回了非法响应", true)
-                    .with_source(&e.to_string())
-            })?;
+        let body: Value = response.json().await.map_err(|e| {
+            TranslationError::new("invalid_response", "翻译服务返回了非法响应", true)
+                .with_source(&e.to_string())
+        })?;
         self.response_content(&body)
     }
 
@@ -252,7 +257,11 @@ impl TranslationClient {
                     .get("output")
                     .and_then(|v| v.as_array())
                     .ok_or_else(|| {
-                        TranslationError::new("invalid_response", "翻译服务返回了非法响应结构", true)
+                        TranslationError::new(
+                            "invalid_response",
+                            "翻译服务返回了非法响应结构",
+                            true,
+                        )
                     })?;
                 let mut parts: Vec<String> = Vec::new();
                 for item in output {
@@ -395,9 +404,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"choices": [{"message": {"content": "   "}}]}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"choices": [{"message": {"content": "   "}}]}),
+                ),
+            )
             .mount(&server)
             .await;
 

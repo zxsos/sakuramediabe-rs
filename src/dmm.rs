@@ -86,8 +86,7 @@ fn cid_of(url: &str) -> String {
 ///
 /// 仅转换有字母前缀的 DMM 品番，不折叠纯数字番号的有效分隔符。
 fn matches(cid: &str, number: &str) -> bool {
-    let number_re =
-        Regex::new(r"(?i)^([a-z]{2,10})[-_ ]?(\d{2,8})$").expect("番号正则是常量");
+    let number_re = Regex::new(r"(?i)^([a-z]{2,10})[-_ ]?(\d{2,8})$").expect("番号正则是常量");
     let Some(caps) = number_re.captures(number) else {
         return cid.eq_ignore_ascii_case(number);
     };
@@ -154,7 +153,9 @@ impl DmmClient {
                 headers
             })
             .build()
-            .map_err(|e| DmmError::new("client_build", &format!("构造 HTTP 客户端失败: {e}"), false))?;
+            .map_err(|e| {
+                DmmError::new("client_build", &format!("构造 HTTP 客户端失败: {e}"), false)
+            })?;
         Ok(Self {
             client,
             request_interval: Duration::from_secs_f64(settings.request_interval_seconds),
@@ -182,13 +183,9 @@ impl DmmClient {
             format!("{}{}", self.base_url, url)
         };
         self.throttle().await;
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| DmmError::new("request_failed", "DMM 请求失败或超时", true)
-                .with_source(&e.to_string()))?;
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            DmmError::new("request_failed", "DMM 请求失败或超时", true).with_source(&e.to_string())
+        })?;
         self.last_request_at = Some(tokio::time::Instant::now());
 
         let status = response.status();
@@ -231,14 +228,18 @@ impl DmmClient {
                 ));
             }
         }
-        let text = response
-            .text()
-            .await
-            .map_err(|e| DmmError::new("request_failed", "读取 DMM 响应失败", true)
-                .with_source(&e.to_string()))?;
+        let text = response.text().await.map_err(|e| {
+            DmmError::new("request_failed", "读取 DMM 响应失败", true).with_source(&e.to_string())
+        })?;
         let page = DmmPage::parse(&text);
         let title = html::text(&page.page_title).to_lowercase();
-        for marker in ["年齢認証", "年齢確認", "access denied", "just a moment", "captcha"] {
+        for marker in [
+            "年齢認証",
+            "年齢確認",
+            "access denied",
+            "just a moment",
+            "captcha",
+        ] {
             if title.contains(marker) {
                 return Err(DmmError::new("challenge", "DMM 返回验证页", true));
             }
@@ -288,7 +289,8 @@ impl DmmClient {
         };
         if matched.is_empty() {
             let visible = html::text(&search.visible);
-            if !is_test && visible.contains("に一致する商品は見つかりませんでした") {
+            if !is_test && visible.contains("に一致する商品は見つかりませんでした")
+            {
                 return Ok(DmmFetchResult::not_found());
             }
             if is_test {
@@ -305,7 +307,10 @@ impl DmmClient {
         matched.sort_by_key(|url| {
             (
                 !url.contains("/mono/"),
-                cid_of(url).chars().next().is_some_and(|c| c.is_ascii_digit()),
+                cid_of(url)
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit()),
             )
         });
         let mut best: Option<DmmFetchResult> = None;

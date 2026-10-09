@@ -22,8 +22,7 @@
 use futures::stream::BoxStream;
 use sm_plugin_api::v1::plugin_control_server::PluginControl;
 use sm_plugin_api::v1::{
-    JobDefinition, JobEvent, ProgressEvent, RegisterRequest, RegisterResponse,
-    RunJobRequest,
+    JobDefinition, JobEvent, ProgressEvent, RegisterRequest, RegisterResponse, RunJobRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -106,7 +105,9 @@ fn params_schema() -> prost_types::Struct {
     props.insert(
         "movie_number".to_owned(),
         Value {
-            kind: Some(Kind::StructValue(Struct { fields: movie_number })),
+            kind: Some(Kind::StructValue(Struct {
+                fields: movie_number,
+            })),
         },
     );
     fields.insert(
@@ -288,7 +289,10 @@ mod tests {
     fn the_manual_job_requires_a_movie_number() {
         let jobs = job_definitions();
         let manual = jobs.iter().find(|j| j.task_key == TASK_SYNC).unwrap();
-        let schema = manual.params_schema.as_ref().expect("手动任务要有参数 schema");
+        let schema = manual
+            .params_schema
+            .as_ref()
+            .expect("手动任务要有参数 schema");
         let required = schema.fields.get("required").expect("要有 required");
         let list = match required.kind.as_ref() {
             Some(prost_types::value::Kind::ListValue(l)) => l,

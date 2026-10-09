@@ -225,7 +225,11 @@ fn flags_for(tag: &Tag<'_>) -> Vec<Flag> {
     if tag.is("script") || tag.is("style") {
         flags.push(Flag::Hidden);
     }
-    if tag.is("script") && tag.attr("type").is_some_and(|t| t.eq_ignore_ascii_case("application/ld+json")) {
+    if tag.is("script")
+        && tag
+            .attr("type")
+            .is_some_and(|t| t.eq_ignore_ascii_case("application/ld+json"))
+    {
         flags.push(Flag::Json);
     }
     if tag.is("title") {
@@ -267,9 +271,7 @@ fn is_void(tag: &Tag<'_>) -> bool {
 /// 解析一个开始标签的标签名与属性。
 fn parse_tag(raw: &str) -> Tag<'_> {
     let raw = raw.trim();
-    let name_end = raw
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(raw.len());
+    let name_end = raw.find(|c: char| c.is_whitespace()).unwrap_or(raw.len());
     let name = &raw[..name_end];
     let mut attrs = Vec::new();
     let mut rest = raw[name_end..].trim();
@@ -292,7 +294,10 @@ fn parse_tag(raw: &str) -> Tag<'_> {
                 rest = rest[end + 1..].trim_start();
                 v
             } else if rest.starts_with('\'') {
-                let end = rest[1..].find('\'').map(|p| p + 1).unwrap_or(rest.len() - 1);
+                let end = rest[1..]
+                    .find('\'')
+                    .map(|p| p + 1)
+                    .unwrap_or(rest.len() - 1);
                 let v = &rest[1..end];
                 rest = rest[end + 1..].trim_start();
                 v
@@ -341,10 +346,7 @@ fn read_products(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
 pub fn text(parts: &[String]) -> String {
     let joined: String = parts.iter().map(|s| s.as_str()).collect();
     let decoded = decode_entities(&joined);
-    decoded
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]

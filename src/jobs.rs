@@ -249,8 +249,8 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     }
     let _guard = Guard(_lock);
 
-    let state = DmmState::open(&data_dir.join("dmm_state.sqlite3"))
-        .map_err(PipelineError::State)?;
+    let state =
+        DmmState::open(&data_dir.join("dmm_state.sqlite3")).map_err(PipelineError::State)?;
 
     // ---- 阶段 1：读取和筛选 ----
     let started = Instant::now();
@@ -321,12 +321,8 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                         stats.translation_exhausted += 1;
                         ctx.failed_ids.insert(movie.movie_id);
                     } else {
-                        ctx.translations.push((
-                            movie.clone(),
-                            field,
-                            source.clone(),
-                            attempts,
-                        ));
+                        ctx.translations
+                            .push((movie.clone(), field, source.clone(), attempts));
                         stats.pending_translation += 1;
                     }
                 }
@@ -469,9 +465,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
             let client = match dmm.as_mut() {
                 Some(c) => c,
                 None => {
-                    dmm = Some(
-                        DmmClient::new(settings).map_err(PipelineError::Dmm)?,
-                    );
+                    dmm = Some(DmmClient::new(settings).map_err(PipelineError::Dmm)?);
                     dmm.as_mut().unwrap()
                 }
             };
@@ -481,9 +475,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                     state
                         .record_fetch_result(&number, &result)
                         .map_err(PipelineError::State)?;
-                    if let Ok(Some(cache)) =
-                        state.load(&number).map_err(PipelineError::State)
-                    {
+                    if let Ok(Some(cache)) = state.load(&number).map_err(PipelineError::State) {
                         let mut ctx = QueueCtx {
                             translations: &mut translations,
                             writebacks: &mut writebacks,
@@ -495,7 +487,11 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                     }
                 }
                 Err(e) => {
-                    let attempts = if e.retryable { attempts + 1 } else { MAX_ATTEMPTS };
+                    let attempts = if e.retryable {
+                        attempts + 1
+                    } else {
+                        MAX_ATTEMPTS
+                    };
                     state
                         .save(
                             &number,
@@ -523,18 +519,12 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                 _ => ("summary", "简介", crate::translation::DESC_PROMPT),
             };
             let number = movie.movie_number.clone();
-            progress.emit(
-                idx,
-                total,
-                &format!("{number} · 正在翻译{label}，等待响应"),
-            );
+            progress.emit(idx, total, &format!("{number} · 正在翻译{label}，等待响应"));
             let client = match translator.as_mut() {
                 Some(c) => c,
                 None => {
-                    translator = Some(
-                        TranslationClient::new(settings)
-                            .map_err(PipelineError::Translation)?,
-                    );
+                    translator =
+                        Some(TranslationClient::new(settings).map_err(PipelineError::Translation)?);
                     translator.as_mut().unwrap()
                 }
             };
@@ -601,7 +591,11 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     writebacks.sort_by_key(|(m, _, _)| priority.get(&m.movie_id).copied().unwrap_or((9, 0, 0, 0)));
     let total = writebacks.len();
     for (idx, (movie, host_field, value)) in writebacks.into_iter().enumerate() {
-        let label = if host_field == "title" { "标题" } else { "简介" };
+        let label = if host_field == "title" {
+            "标题"
+        } else {
+            "简介"
+        };
         progress.emit(
             idx,
             total,
@@ -745,7 +739,14 @@ mod tests {
             .unwrap();
         let mut progress = NoProgress;
         let err = rt
-            .block_on(run_pipeline(&store, &settings, &dir, None, false, &mut progress))
+            .block_on(run_pipeline(
+                &store,
+                &settings,
+                &dir,
+                None,
+                false,
+                &mut progress,
+            ))
             .unwrap_err();
         assert!(matches!(err, PipelineError::Busy));
         let _ = std::fs::remove_dir_all(&dir);
@@ -770,7 +771,14 @@ mod tests {
             .unwrap();
         let mut progress = NoProgress;
         let err = rt
-            .block_on(run_pipeline(&store, &settings, &dir, None, true, &mut progress))
+            .block_on(run_pipeline(
+                &store,
+                &settings,
+                &dir,
+                None,
+                true,
+                &mut progress,
+            ))
             .unwrap_err();
         assert!(matches!(err, PipelineError::TranslationDisabled));
         let _ = std::fs::remove_dir_all(&dir);
