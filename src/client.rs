@@ -206,13 +206,14 @@ impl Cloud115Client {
             req = req.header(key, value);
         }
         let response = req.send().await?;
-        let payload: ApiEnvelope<SpaceData> = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析 115 响应失败: {e}"))
-        })?;
+        let payload: ApiEnvelope<SpaceData> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析 115 响应失败: {e}")))?;
         check_envelope(&payload, "user/space")?;
-        payload.data.ok_or_else(|| {
-            Cloud115Error::Request("115 响应缺少 data: user/space".to_owned())
-        })
+        payload
+            .data
+            .ok_or_else(|| Cloud115Error::Request("115 响应缺少 data: user/space".to_owned()))
     }
 
     /// 存活检查。
@@ -244,7 +245,9 @@ impl Cloud115Client {
         limit: u64,
     ) -> Result<(Vec<Cloud115Entry>, u64), Cloud115Error> {
         if cid.is_empty() || limit == 0 || limit > 1150 {
-            return Err(Cloud115Error::Request("invalid 115 directory page".to_owned()));
+            return Err(Cloud115Error::Request(
+                "invalid 115 directory page".to_owned(),
+            ));
         }
         let offset_s = offset.to_string();
         let limit_s = limit.to_string();
@@ -262,9 +265,10 @@ impl Cloud115Client {
             ])
             .send()
             .await?;
-        let payload: ApiEnvelope<Vec<FileItem>> = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析 115 目录失败: {e}"))
-        })?;
+        let payload: ApiEnvelope<Vec<FileItem>> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析 115 目录失败: {e}")))?;
         check_envelope(&payload, "files")?;
         if let Some(response_cid) = &payload.cid {
             let response_cid = response_cid.to_string().trim_matches('"').to_owned();
@@ -274,15 +278,26 @@ impl Cloud115Client {
         }
         let total = payload.count.unwrap_or(0).max(0) as u64;
         let items = payload.data.unwrap_or_default();
-        let entries = items.into_iter().map(|item| Cloud115Entry {
-            id: if item.fc == "0" { item.fid.clone() } else { item.cid.clone() },
-            parent_id: item.pid,
-            name: item.n,
-            is_dir: item.fc == "0",
-            size_bytes: item.s,
-            pickcode: item.pc,
-            sha1: if item.sha.is_empty() { None } else { Some(item.sha) },
-        }).collect();
+        let entries = items
+            .into_iter()
+            .map(|item| Cloud115Entry {
+                id: if item.fc == "0" {
+                    item.fid.clone()
+                } else {
+                    item.cid.clone()
+                },
+                parent_id: item.pid,
+                name: item.n,
+                is_dir: item.fc == "0",
+                size_bytes: item.s,
+                pickcode: item.pc,
+                sha1: if item.sha.is_empty() {
+                    None
+                } else {
+                    Some(item.sha)
+                },
+            })
+            .collect();
         Ok((entries, total))
     }
 
@@ -308,9 +323,7 @@ impl Cloud115Client {
         pickcode: &str,
         user_agent: &str,
     ) -> Result<String, Cloud115Error> {
-        let mut req = self
-            .http
-            .post("https://proapi.115.com/app/chrome/downurl");
+        let mut req = self.http.post("https://proapi.115.com/app/chrome/downurl");
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }
@@ -320,9 +333,10 @@ impl Cloud115Client {
             .form(&[("pickcode", pickcode)])
             .send()
             .await?;
-        let payload: serde_json::Value = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析直链响应失败: {e}"))
-        })?;
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析直链响应失败: {e}")))?;
         // Python 版会对 payload 做解密；这里取明文字段，加密形态走错误通道。
         let url = payload
             .pointer("/data/url/url")
@@ -344,7 +358,9 @@ impl Cloud115Client {
             let found = entries
                 .iter()
                 .find(|e| e.is_dir && e.name == segment)
-                .ok_or_else(|| Cloud115Error::NotFound(format!("115 路径不存在: {absolute_path}")))?;
+                .ok_or_else(|| {
+                    Cloud115Error::NotFound(format!("115 路径不存在: {absolute_path}"))
+                })?;
             cid = found.id.clone();
         }
         Ok(cid)
@@ -360,15 +376,20 @@ impl Cloud115Client {
             .form(&[("pid", parent_cid), ("cname", name)])
             .send()
             .await?;
-        let payload: ApiEnvelope<serde_json::Value> = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析 mkdir 响应失败: {e}"))
-        })?;
+        let payload: ApiEnvelope<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析 mkdir 响应失败: {e}")))?;
         check_envelope(&payload, "files/add")?;
         let cid = payload
             .data
             .as_ref()
             .and_then(|d| d.get("cid"))
-            .and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.as_i64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
             .ok_or_else(|| Cloud115Error::Request("mkdir 响应缺少 cid".to_owned()))?;
         Ok(cid)
     }
@@ -397,7 +418,9 @@ impl Cloud115Client {
         source_url: &str,
         save_cid: &str,
     ) -> Result<String, Cloud115Error> {
-        let mut req = self.http.post("https://115.com/web/lixian/?ct=lixian&ac=add_task_urls");
+        let mut req = self
+            .http
+            .post("https://115.com/web/lixian/?ct=lixian&ac=add_task_urls");
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }
@@ -405,9 +428,10 @@ impl Cloud115Client {
             .form(&[("url", source_url), ("wp_path_id", save_cid)])
             .send()
             .await?;
-        let payload: ApiEnvelope<serde_json::Value> = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析离线任务响应失败: {e}"))
-        })?;
+        let payload: ApiEnvelope<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析离线任务响应失败: {e}")))?;
         check_envelope(&payload, "lixian/add_task_urls")?;
         let info_hash = payload
             .data
@@ -421,14 +445,17 @@ impl Cloud115Client {
 
     /// 列出离线任务。
     pub async fn list_offline_tasks(&self) -> Result<Vec<OfflineTask>, Cloud115Error> {
-        let mut req = self.http.get("https://115.com/web/lixian/?ct=lixian&ac=task_lists");
+        let mut req = self
+            .http
+            .get("https://115.com/web/lixian/?ct=lixian&ac=task_lists");
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }
         let response = req.send().await?;
-        let payload: ApiEnvelope<serde_json::Value> = response.json().await.map_err(|e| {
-            Cloud115Error::Request(format!("解析离线任务列表失败: {e}"))
-        })?;
+        let payload: ApiEnvelope<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析离线任务列表失败: {e}")))?;
         check_envelope(&payload, "lixian/task_lists")?;
         let tasks = payload
             .data
@@ -440,9 +467,21 @@ impl Cloud115Client {
         Ok(tasks
             .iter()
             .map(|t| OfflineTask {
-                info_hash: t.get("info_hash").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                name: t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
-                status: t.get("status").and_then(|v| v.as_str()).unwrap_or("").to_owned(),
+                info_hash: t
+                    .get("info_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                name: t
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                status: t
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
                 percent: t.get("percent").and_then(|v| v.as_f64()).unwrap_or(0.0),
             })
             .collect())
@@ -450,7 +489,9 @@ impl Cloud115Client {
 }
 
 fn check_envelope<T>(envelope: &ApiEnvelope<T>, endpoint: &str) -> Result<(), Cloud115Error> {
-    if AUTH_ERRNOS.contains(&envelope.errno) || !envelope.state && envelope.errno != 0 && is_auth_message(&envelope.error) {
+    if AUTH_ERRNOS.contains(&envelope.errno)
+        || !envelope.state && envelope.errno != 0 && is_auth_message(&envelope.error)
+    {
         return Err(Cloud115Error::Auth(format!(
             "115 认证失效 ({}): {}",
             endpoint, envelope.error

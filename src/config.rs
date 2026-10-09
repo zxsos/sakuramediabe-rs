@@ -78,8 +78,7 @@ impl Plugin115Config {
             web_cookie: struct_str(config, "web_cookie").unwrap_or_default(),
             device_cookie: struct_str(config, "device_cookie").unwrap_or_default(),
             media_root_path: struct_str(config, "media_root_path").unwrap_or_default(),
-            downloads_root_path: struct_str(config, "downloads_root_path")
-                .unwrap_or_default(),
+            downloads_root_path: struct_str(config, "downloads_root_path").unwrap_or_default(),
             provider_key: struct_str(config, "provider_key").unwrap_or_default(),
         };
         // 环境变量兜底。
@@ -90,8 +89,7 @@ impl Plugin115Config {
             out.device_cookie = std::env::var("PLUGIN_115_DEVICE_COOKIE").unwrap_or_default();
         }
         if out.media_root_path.is_empty() {
-            out.media_root_path =
-                std::env::var("PLUGIN_115_MEDIA_ROOT").unwrap_or_default();
+            out.media_root_path = std::env::var("PLUGIN_115_MEDIA_ROOT").unwrap_or_default();
         }
         if out.downloads_root_path.is_empty() {
             out.downloads_root_path =

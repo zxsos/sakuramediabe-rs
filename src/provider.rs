@@ -20,9 +20,10 @@ use sm_plugin_api::provider::StorageProviderExt;
 use sm_plugin_api::v1::{
     generate_thumbnails_response, playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType,
     GenerateThumbnailsRequest, GenerateThumbnailsResponse, GetSpaceUsageRequest,
-    GetSpaceUsageResponse, ImportFile, ImportFileEntry, LibraryHandle,
-    PlanPlaybackRequest, PlanPlaybackResponse, PlaybackDelivery, PlaybackPlan, PrepareLibraryRequest,
-    PrepareLibraryResponse, ProgressEvent, RedirectPlan, ScanImportSourceRequest, StorageSpaceUsage,
+    GetSpaceUsageResponse, ImportFile, ImportFileEntry, LibraryHandle, PlanPlaybackRequest,
+    PlanPlaybackResponse, PlaybackDelivery, PlaybackPlan, PrepareLibraryRequest,
+    PrepareLibraryResponse, ProgressEvent, RedirectPlan, ScanImportSourceRequest,
+    StorageSpaceUsage,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -100,9 +101,15 @@ impl Provider115 {
 /// 115 错误 → gRPC Status。
 fn client_error(error: Cloud115Error, operation: &str) -> Status {
     match error {
-        Cloud115Error::Auth(message) => Status::unauthenticated(format!("115 {operation}认证失败: {message}")),
-        Cloud115Error::NotFound(message) => Status::not_found(format!("115 {operation}: {message}")),
-        Cloud115Error::Request(message) => Status::internal(format!("115 {operation}失败: {message}")),
+        Cloud115Error::Auth(message) => {
+            Status::unauthenticated(format!("115 {operation}认证失败: {message}"))
+        }
+        Cloud115Error::NotFound(message) => {
+            Status::not_found(format!("115 {operation}: {message}"))
+        }
+        Cloud115Error::Request(message) => {
+            Status::internal(format!("115 {operation}失败: {message}"))
+        }
         Cloud115Error::Transport(source) => {
             Status::unavailable(format!("115 {operation}网络错误: {source}"))
         }
@@ -139,7 +146,9 @@ const VIDEO_EXTENSIONS: [&str; 9] = [
 
 fn is_video_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    VIDEO_EXTENSIONS.iter().any(|ext| lower.ends_with(&format!(".{ext}")))
+    VIDEO_EXTENSIONS
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{ext}")))
 }
 
 #[async_trait]
@@ -235,18 +244,12 @@ impl StorageProviderExt for Provider115 {
             self.check_library(library)?;
         }
 
-        let pickcode = ref_pickcode(media.storage_ref.as_ref()).ok_or_else(|| {
-            Status::invalid_argument("115 媒体句柄缺少 pickcode")
-        })?;
-        let client = self.client(
-            &media
-                .library
-                .clone()
-                .unwrap_or_else(|| LibraryHandle {
-                    provider_key: self.provider_key.clone(),
-                    ..Default::default()
-                }),
-        )?;
+        let pickcode = ref_pickcode(media.storage_ref.as_ref())
+            .ok_or_else(|| Status::invalid_argument("115 媒体句柄缺少 pickcode"))?;
+        let client = self.client(&media.library.clone().unwrap_or_else(|| LibraryHandle {
+            provider_key: self.provider_key.clone(),
+            ..Default::default()
+        }))?;
 
         let url = client
             .get_download_url(pickcode, "Mozilla/5.0")
@@ -322,9 +325,7 @@ impl StorageProviderExt for Provider115 {
             usage: Some(StorageSpaceUsage {
                 total_bytes: Some(usage.total_bytes as i64),
                 used_bytes: Some(usage.used_bytes as i64),
-                free_bytes: Some(
-                    usage.total_bytes.saturating_sub(usage.used_bytes) as i64
-                ),
+                free_bytes: Some(usage.total_bytes.saturating_sub(usage.used_bytes) as i64),
             }),
         }))
     }
@@ -346,9 +347,11 @@ impl StorageProviderExt for Provider115 {
         let cookie = config.cookie().ok_or_else(|| {
             Status::invalid_argument("115 Cookie 未配置：请填写 web_cookie 或 device_cookie")
         })?;
-        let client =
-            Cloud115Client::new(cookie).map_err(|e| client_error(e, "校验配置"))?;
-        let alive = client.check_alive().await.map_err(|e| client_error(e, "校验登录"))?;
+        let client = Cloud115Client::new(cookie).map_err(|e| client_error(e, "校验配置"))?;
+        let alive = client
+            .check_alive()
+            .await
+            .map_err(|e| client_error(e, "校验登录"))?;
         if !alive {
             return Err(Status::unauthenticated("115 登录已失效，请更新 Cookie"));
         }
@@ -363,7 +366,9 @@ impl StorageProviderExt for Provider115 {
 
         // 回显 provider_config（Struct），让宿主存下来。
         let mut fields = std::collections::BTreeMap::new();
-        let put = |fields: &mut std::collections::BTreeMap<String, prost_types::Value>, k: &str, v: &str| {
+        let put = |fields: &mut std::collections::BTreeMap<String, prost_types::Value>,
+                   k: &str,
+                   v: &str| {
             fields.insert(
                 k.to_owned(),
                 prost_types::Value {
@@ -371,11 +376,19 @@ impl StorageProviderExt for Provider115 {
                 },
             );
         };
-        put(&mut fields, "provider_key", config.provider_key_or_default());
+        put(
+            &mut fields,
+            "provider_key",
+            config.provider_key_or_default(),
+        );
         put(&mut fields, "web_cookie", &config.web_cookie);
         put(&mut fields, "device_cookie", &config.device_cookie);
         put(&mut fields, "media_root_path", &config.media_root_path);
-        put(&mut fields, "downloads_root_path", &config.downloads_root_path);
+        put(
+            &mut fields,
+            "downloads_root_path",
+            &config.downloads_root_path,
+        );
 
         Ok(Response::new(PrepareLibraryResponse {
             provider_config: Some(prost_types::Struct { fields }),
