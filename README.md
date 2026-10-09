@@ -1,244 +1,128 @@
 # sakuramediabe-rs
 
-SakuraMedia 后端的 Rust 重写实现。
+SakuraMedia 后端的 Rust 实现。
 
 > **这是 [`sakuramediabe`](https://github.com/tinypinglite/sakuramediabe)
 > （Python/FastAPI，作者 tinypinglite）的衍生作品**，与其同以
 > **GPL-3.0** 授权。取自上游的代码范围见 [NOTICE.md](NOTICE.md)。
-> GPL-3.0 的 copyleft 条款决定了本项目**无法**以更宽松的许可证分发。
 
-采用**渐进式**策略：按模块逐个替换，客户端与 API 契约保持不变。
+高性能、内存安全的媒体库管理后端，提供完整的 REST API、插件系统与定时任务调度。
 
-## 为什么渐进式而非全量重写
+## 特性
 
-后端 38,802 行 + 19,802 行测试、126 个 API 端点。真正的约束不是性能，而是：
+- **完整的 REST API**：126 个端点，覆盖影片、演员、合集、播放列表、下载、系统管理等
+- **插件系统**：gRPC 插件架构，支持存储、元数据、字幕、翻译等扩展
+- **定时任务**：内置 cron 调度器，支持幂等任务执行
+- **向量搜索**：集成 Qdrant，支持以图搜图与语义搜索
+- **高性能**：Rust 原生性能，无 GIL 限制，支持多核并发
 
-- `uvicorn --workers 1`（`docker/backend/supervisord.conf:16`）—— 插件是进程内
-  Python 包，多 worker 会各自加载一份副本，状态与文件锁全乱。后端因此**无法
-  水平扩展**，吞吐上限锁死在单进程 GIL。
-- 主后端只有 4 个文件真正需要重量级媒体库，且全部落在同一批模块里。
+## 架构
 
-## 现状
-
-| crate | 作用 | 替代掉 | 测试 |
-|---|---|---|---|
-| `hashing` | SHA-1 / SHA-256 / Base32 | — | 13 |
-| `media-file-hash` | `media-file-hash-v1` 采样指纹 | 两个 provider 里的重复实现 | 10 |
-| `svc-hash` | BT info hash 解析 | **`libtorrent`** | 32 |
-| `svc-image` | 封面分割（Sobel）+ 无损 WebP + **EXIF 方向转正** | Pillow / OpenCV 的相关部分 | 30 |
-| `sm-core` | JWT / Argon2 / 签名 URL / 分页原语 / 统一错误信封 | — | 127 |
-| `sm-db` | **模型映射 40/40 + 仓储层 + DDL 生成器** | `model/` + 部分 Peewee → sqlx | 426 |
-| `sm-plugin-api` | 插件 gRPC 契约（prost/tonic 生成）+ 插件侧默认实现层 | 插件 ABI（进程内 import → 独立进程） | 20 |
-| `sm-plugins` | 插件宿主：拉起 / 注册校验 / 看门狗 / 扩展点与 provider 调用面 / **插件包的安装、升级、卸载与盘点** | `src/plugins/` | 128 |
-| `sm-service` | 业务规则（**7 个域里 6 个有代码**） | 114 个 service 文件中的 106 个 | 888 |
-| `sm-api` | 错误信封 / 鉴权 / CORS / 端点 / multipart / **query 信封** / SSE 骨架 | FastAPI 路由层 | 340 |
-| `sm-scheduler` | cron 解析 + 到点幂等入队 | APScheduler 的调度那一半 | 32 |
-| `sm-server` | 组合根（配置/池/日志/HTTP/调度器/优雅关闭） | uvicorn + 独立 APS 进程 | 44 |
-| `plugin-ref-local` | gRPC 参考插件（把本地目录包成 StorageProvider） | 插件 ABI 可行性验证 | 18 |
-| `parity-cli` | 对拍入口（开发工具） | — | — |
-
-- `cargo test`：**2110 passed / 0 failed**，117 个 suite（含真实 PostgreSQL 集成测试与 Qdrant）
-- `python parity/compare.py`：**44/44** Rust 与 Python 逐条一致
-- `python parity/compare_core.py`：**64/64** 核心原语逐条一致
-- `python parity/compare_schema.py`：**40/40** 张表列名/类型/可空性一致
-
-### 重构进度
-
-| 层 | 规模 | 已完成 | 进度 |
-|---|---|---|---|
-| 模型 `model/` | 40 表 | 40 表 | **100% ✅** |
-| 仓储层 | 40 张表的读写 | 40 张表 | **100% ✅** |
-| 服务 `service/` | 43 文件 / 13,715 行 | `system`(17) + `catalog`(7) + `playback`(6) + `collections`(4) + `transfers`(3) + `videos`(3) | 6/7 域有代码 |
-| Schema `schema/` | 44 文件 | DTO 随端点落地（`sm-api::dto`） | 按需 |
-| API `api/` | 126 端点 | 76 个（account 3 + activity 6 + actors 11 + auth 2 + clip-collections 9 + config 2 + downloads 1 + indexer-settings 3 + jobs 2 + media-clips 7 + movie-subscriptions 3 + movies 11 + playlists 9 + status 4 + tags 3） | **~60%** |
-| 调度 `scheduler` | 19 个内建任务 | **cron 注册 16/16 = 100%**；worker 骨架已落地；**handler 1/21** | 见下 |
-| 插件宿主 `sm-plugins` | 12 文件 / 3,090 行 | 注册 / 加载 / 执行 / 生命周期 / 扩展点 | 宿主可用，**已有 9 个真实插件**（local-ref、javbus-metadata、judge-collection、115-provider、actor-metadata、javdb-ranking、more-movies、scrape-translate、subtitlecat） |
-| 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | ⚠️ **未复核**（用户要求先不管插件） | — |
-
-> 端点口径是**方法级**（path + method 组合），统计只取 `routes()` 函数体且**剥掉注释**。
-> 曾经用 `\.route\(` 计数会漏掉链式首调，用正则直接数又会漏掉 `axum::routing::put(...)`
-> 这种限定写法 —— 两种错法都让数字偏小，而偏小的进度看起来是「还差一些」而不是
-> 「统计口径本身就不可信」。
-
-### 调度的真实缺口不在 cron
-
-原文写「16/19 = 84%」，**分母是错的**。19 个内建任务里有 3 个是
-`manual_only=True`（`media_video_info_backfill`、`media_thumbnail_pack_backfill`、
-`movie_asset_pack_backfill`），而 `contracts.py:43-49` 的校验器**禁止 manual_only
-任务声明 cron** —— 所以应该有 cron 的就是 16 个，而 16 个已全部注册，**cron 这一半
-早就是 100%**。
-
-真正的缺口是 **handler 落地 6/21**（`sm-scheduler/src/worker.rs` 的
-`HandlerRegistry` 目前注册了 `activity_record_cleanup`、`movie_asset_pack_backfill`、
-`movie_heat_update`、`image_search_index`、`movie_similarity_recompute`、
-`daily_recommendation_generate`）。其余 15 个按各自域的
-阻塞原因分布，见 [docs/service-progress.md](docs/service-progress.md) 的阻塞地图。
-
-> 逐域台账（已落规则 / 刻意不复刻 / 待核对项）见
-> [docs/service-progress.md](docs/service-progress.md)。**为什么只有 76 个端点**
-> 与「哪些端点在等哪个域」也记在那里 —— 百分比本身看不出这些。
->
-> 上面这张表的数字实测于 **2026-10-09**。端点一项做了逐文件交叉校验：12 个原有
-> 文件的计数与旧表逐个吻合（合计 65），新增 11 个（account 3 + activity 6 +
-> jobs 由 1 增至 2）。改动端点时请一并更新此表，**并用同样的口径复算** ——
-> 口径错了数字只会偏小，而偏小的进度看不出「统计本身不可信」。
->
-> **为什么重构、最终怎么部署** 见 [docs/deployment.md](docs/deployment.md)：
-> 上游那个 4GB Python 镜像的体积逐条归因（带 `文件:行号`）、还要移植哪些插件、
-> **什么时候才能删掉 Python 运行时**，以及替换时的灰度方案。
-
-## 零外部依赖
-
-`hashing` / `media-file-hash` / `svc-hash` 三个库不引入任何第三方 crate。
-SHA-1 / SHA-256 / Base32 / bencode 全部自实现：
-
-1. 产物是塞进 `sakuramedia` 镜像的静态二进制，依赖越少交叉编译与审计面越小。
-2. 四个算法都是固定标准实现，总计约 500 行，每处都有公开测试向量兜底。
-3. 能在无外网环境完成 `cargo build`（CI / 离线 NAS 构建）。
-
-`bencode` 只做单遍扫描 + 深度上限（32），不做完整反序列化 —— 需求仅仅是
-定位顶层 `info` 字典并取出它的**原始字节区间**（v1 hash 是对原始编码字节做
-SHA-1，重新编码会得到不同哈希）。
-
-## 关键语义：不可改动的部分
-
-替换 Python 实现时，下列行为必须逐字节对齐，否则已入库的 `file_hash`
-会全部失效、重复文件识别会出现假阳性/假阴性。
-
-### `media-file-hash-v1`
-
-```text
-size < 8 MiB  ->  payload = "media-file-hash-v1" + b"\x00full\x00" + size_be64 + sha1(全文)
-size >= 8 MiB ->  采样：头 3 MiB + 尾 3 MiB + 两段中间采样各 1 MiB（共 8 MiB，恒定）
-                   槽位由头/尾摘要前 8 字节决定 => 同一文件在任何机器上命中同一组槽位
-                   payload = "media-file-hash-v1" + b"\x00sampled\x00" + size_be64 + 四段 sha1
-结果 = "media-file-hash-v1:" + sha1(payload).hexdigest()
-```
-
-三个协议向量（两个插件测试里共享同一组）：
-
-| 输入 | 期望 |
+| crate | 作用 |
 |---|---|
-| `hash_fixture(8 MiB)` | `media-file-hash-v1:52385d3512a8a9ff8b6e6c5aa315e46633b28d9a` |
-| 空文件 | `media-file-hash-v1:524935ebf533f3b952f2397f80691a87a7b289c7` |
-| `b"abc"` | `media-file-hash-v1:da6ba51927337cc1035be69e84f851f48dbe7d71` |
+| `sm-server` | HTTP 服务入口（配置/连接池/日志/调度器/优雅关闭） |
+| `sm-api` | REST 端点 / 鉴权 / 错误信封 / CORS / multipart / SSE |
+| `sm-service` | 业务逻辑层（7 个业务域） |
+| `sm-db` | 数据访问层（40 张表 / 仓储模式 / sqlx） |
+| `sm-core` | 基础原语（JWT / Argon2 / 签名 URL / 分页） |
+| `sm-plugins` | 插件宿主（加载 / 注册 / 生命周期管理） |
+| `sm-plugin-api` | 插件 gRPC 契约定义 |
+| `sm-scheduler` | cron 调度器与任务队列 |
+| `hashing` | SHA-1 / SHA-256 / Base32（零依赖） |
+| `media-file-hash` | 媒体文件指纹（`media-file-hash-v1`） |
+| `svc-hash` | BT info hash 解析 |
+| `svc-image` | 封面处理（Sobel 分割 / WebP / EXIF 转正） |
 
-### BT info hash
+## 快速开始
 
-- `canonical_info_hash`：40 位 hex（v1）优先判定，其次 32 位 base32（v2）。
-  Python 侧是 `b32decode(value.upper())`，因此**小写 base32 也必须接受**。
-- `_magnet_hash`：先 `unquote` 再不区分大小写搜 `urn:btih:`。
-- `_torrent_hash`：**强制要求 v1**。纯 v2 种子（`info` 无 `pieces`）必须被判为
-  `invalid_download_torrent`，对应 libtorrent 的 `info_hashes().has_v1() == false`。
-
-### 错误码契约
-
-| Rust | HTTP | code |
-|---|---|---|
-| `InvalidResourceHash` | 422 | `invalid_download_resource_hash` |
-| `InvalidTorrent` | 422 | `invalid_download_torrent` |
-| `InvalidSource` | 422 | `invalid_download_source` |
-| `SourceNotFound` | 404 | `download_source_not_found` |
-| `SourceUnavailable` | 503 | `download_source_unavailable` |
-| `TorrentTooLarge` | 422 | `download_torrent_too_large` |
-
-这张表同时被 `svc-hash/src/lib.rs` 的 `status_and_code()` 与对拍脚本断言，
-改动任一侧都必须同步 `src/service/transfers/downloads/resource_hash.py`。
-
-## 分工：HTTP 抓取仍在 Python
-
-原实现里紧邻哈希解析的还有 HTTP 重定向链追踪（≤5 跳、10 MiB 上限），
-**故意不复刻** —— `httpx` 已经在后端跑得好好的，为它引入 `reqwest` + `tokio`
-会让这些 crate 从「零依赖纯逻辑」变成重量级网络服务。Python 侧继续负责抓取，
-只把最终字节交给 Rust。
-
-## 构建与验证
-
-```bash
-bash scripts/verify.sh                 # 全部七道门禁（Linux/macOS）
-bash scripts/verify.sh --skip-tests    # 跳过要连库的测试
-powershell -File scripts/verify.ps1    # Windows 等价物
-```
-
-七道门禁：`cargo fmt --check` → `cargo doc -D warnings` →
-`clippy -D warnings` → `cargo test` → schema 对拍 → 哈希对拍 →
-核心原语对拍，外加一道「`paged_list!` 手写包装」静态检查。
-
-**前置**（`scripts/verify.sh` 的 preflight 会逐项检查并给出可执行的修复提示）：
+### 依赖
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Rust | ≥ 1.85（`rust-version`） | 另需 `clippy` 与 `rustfmt` 组件 |
-| PostgreSQL | 16 | `docker compose up -d`（127.0.0.1:**5433**，timezone **UTC**） |
-| C 工具链 | 任意 | `build-essential` —— 缺 `cc` 时链接失败 |
-| 上游源码 | — | `git clone --depth 1 <repo> upstream/sakuramediabe`（`schema` 对拍要读它的 Peewee 模型） |
+| Rust | ≥ 1.85 | 需 `clippy` 与 `rustfmt` 组件 |
+| PostgreSQL | 16+ | 时区必须为 UTC |
+| Qdrant | 1.x | 向量搜索引擎（可选，用于以图搜图） |
 
-集成测试读 `SMDB_TEST_DATABASE_URL`（回退 `DATABASE_URL`）。
-**没设时会 panic 而不是跳过** —— 此前「拿不到库就跳过」让 151 个集成测试
-在无库环境下显示为「通过」，藏了至少六个真实缺陷；`sm_db::testing::db`
-的文档记着那六个。想在无库环境跑单元测试用 `cargo test --lib`。
+### 构建
 
-时间列是 `timestamp without time zone`，**时区必须为 UTC**：容器时区不是
-UTC 时 PG 写入/读出的 naive datetime 会整体偏移，且这种偏移不报错，只让
-时间字段静默错位。
+```bash
+cargo build --release
+```
 
-## 对拍框架
+### 配置
 
-`parity/compare.py` 的两条原则：
+```bash
+export SAKURAMEDIA_DATABASE_URL="postgres://user:pass@localhost:5432/sakuramedia"
+export SAKURAMEDIA_JWT_SECRET="your-secret-key"
+# 可选
+export SAKURAMEDIA_QDRANT_URL="http://localhost:6333"
+```
 
-1. Python 侧**不复用**后端源码，而是照着插件/后端语义独立重写一遍。
-   两份独立实现一致，才说明 Rust 侧正确。
-2. 同时比对**成功路径与失败路径**。错误码必须逐条对齐 —— 迁移最容易漏的
-   恰恰是「本该报错却成功了」这种反向失败。
+### 运行
 
-它已经抓出过两类真实问题：bencode 少写一个闭合符导致 `unwrap` 失败，
-以及参照实现错把「整个种子」而非「info 字典」做哈希。
+```bash
+./target/release/sm-server
+```
 
-> 大块数据必须走 `fingerprint <path>`：Windows 命令行有 32 KiB 上限，
-> 8 MiB 的十六进制传不进去。
+服务默认监听 `0.0.0.0:8000`。
 
-`parity/` 下另有三个辅助脚本：
+### 鉴权
 
-- `gen_bencode_fixtures.py` —— 用标准编码器生成 bencode 测试数据并自校验。
-  bencode 的长度前缀极易写错（`13:meta version` 的 13 是**字符数**，
-  而 `meta version` 13 个字符、`file tree` 只有 10 个），手写几乎必错。
-- `trace_bencode.py` —— 逐行模拟 `parse_torrent`，用于定位解析失败点。
-  写 Rust 测试时先在这里验证，能省掉大量「为什么 unwrap 挂了」的往返。
-- `check_paged_wrappers.py` —— 第七道门禁。`paged_list!` 自己会生成整个方法，
-  在外面再手写一层包装会让函数体返回 `()`：编译器会报，但指向宏展开处而
-  不是真正的错误位置。这个错在重构里犯了五次，每次都要等编译失败才发现。
+```bash
+# 获取 token
+curl -X POST http://localhost:8000/auth/tokens \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "password"}'
 
-## 路线图
+# 使用 token
+curl http://localhost:8000/movies \
+  -H "Authorization: Bearer <access_token>"
 
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| **0** | 工具链 / PG 16 / 上游 clone / 七道门禁（`scripts/verify.sh`） | **完成** |
-| **1** | `sm-core` 原语（JWT / Argon2 / 签名 URL / 分页） | **完成** |
-| **2** | `sm-db` 模型 40/40 + 仓储层 + DDL 生成器 | **完成** |
-| **3** | `sm-service` 最小域定型：`collections` → `videos` | **完成** |
-| **4** | `sm-api` 骨架：错误信封 / 鉴权 / CORS / 405 / 慢日志 / multipart / SSE 骨架 | **完成** |
-| **5** | `sm-scheduler`（cron + 自研 tick，只入队）+ `sm-server` 组合根 | **完成**（worker 未做） |
-| **6** | `sm-service` 剩余域：`system`(15) → `playback` → `transfers` → `discovery` → `catalog` | 进行中（`system` 落了 4 个） |
-| **7** | 后台任务 **worker**（队列侧已就位，只差 handler 分发） | 进行中 |
-| **8** | 插件 ABI：**参考插件已落地**（`plugin-ref-local`，4/37 rpc + 开销实测 + 4 条 P1 缺口）；宿主侧 `sm-plugin-api` 重生成与 `sm-plugins` 未做 | 进行中 |
-| **9** | `svc-probe`（ffprobe）与封面生成的有损 WebP 路径 | 待做 |
+# API Key（sk- 前缀）
+curl http://localhost:8000/movies \
+  -H "Authorization: Bearer sk-your-api-key"
+```
 
-`playlists` 域 **9/9 个端点全部落地**。最后那个 `GET /playlists/{id}/movies`
-（影片卡片）先在这里落地，而不是等 `catalog` 侧 —— 它与 `catalog` 的影片列表
-是同一套东西，先把 `MovieListItemResource` + `with_movie_card_relations` 的
-等价实现定下来，`catalog` 侧直接复用同一组 DTO 与仓储查询，不必两边各写一份
-聚合。今天的实现是「一条分页查询定顺序 + 四条批量查询补影片/封面/系列/媒体」，
-而不是上游那条 20 多列的 JOIN。
+## 插件
 
-原先记在这里的「`playback` 的 `movie_resolution_service` 被 `collections`
-的 4 个列表端点引用，所以 `playback` 早于 `catalog`」这条约束**已解除**：
-`resolution_interval` / 档位分桶已随 `sm_service::catalog::resolution` 落地，
-档位筛选的 `EXISTS` 子查询随影片卡片一起进了 `sm_db::repo::collection`
-（与 `max_resolution_levels_by_playlist` 共用同一份
-`RESOLUTION_LEVEL_CASE`）。
+插件是独立的 gRPC 进程，通过 `sm-plugins` 宿主管理。
 
-`svc-hash` / `media-file-hash` 的 Python 侧接入（改
-`resource_hash.py` 调 Rust）仍按 ADR §6 的「独立进程 + Unix socket 或 FFI」
-待定 —— 那是部署形态问题，与本仓库的代码进度无关。
+已发布的官方插件：
 
+| 插件 | 功能 |
+|---|---|
+| 115-provider | 115 网盘存储（浏览/导入/离线下载/直链播放） |
+| plugin-ref-local | 本地目录存储（参考实现） |
+| javbus-metadata | JavBus 元数据刮削 |
+| javdb-ranking | JavDB 排行榜 |
+| actor-metadata | 演员元数据 |
+| judge-collection | 合集评分 |
+| scrape-translate | 刮削翻译 |
+| subtitlecat | 字幕下载 |
+| more-movies | 更多影片源 |
 
+安装插件：
+
+```bash
+curl -X POST http://localhost:8000/plugins \
+  -H "Authorization: Bearer <token>" \
+  -F "file=@plugin.zip"
+```
+
+## 开发
+
+```bash
+# 运行测试
+cargo test
+
+# 代码检查
+cargo fmt --check
+cargo clippy -- -D warnings
+
+# 生成文档
+cargo doc --no-deps
+```
+
+## 许可证
+
+GPL-3.0-or-later
