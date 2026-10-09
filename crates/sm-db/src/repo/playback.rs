@@ -545,6 +545,29 @@ impl MediaPointRepository {
         .await?)
     }
 
+    /// 一批 Media 的**全部**时刻点，按 `(media_id, id)` 升序。**批量版**
+    /// [`Self::list_all_by_media`] —— 视频详情的 `media_items` 要一次性给每条媒体
+    /// 挂上时刻点，逐条调就是 N+1。
+    ///
+    /// 排序与上游 `_media_items` 的 `ORDER BY MediaPoint.media, MediaPoint.id`
+    /// 逐字一致：先按媒体分组，组内按 id。调用方按 `media_id` 归组即可。
+    ///
+    /// 空入参直接返回空：`= ANY('{}')` 合法但没必要跑一趟。
+    pub async fn list_all_by_media_ids(
+        &self,
+        media_ids: &[i32],
+    ) -> Result<Vec<MediaPoint>, DbError> {
+        if media_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, MediaPoint>(
+            "SELECT * FROM media_point WHERE media_id = ANY($1) ORDER BY media_id, id",
+        )
+        .bind(media_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 跨媒体的时刻列表（上游 `_point_query_with_image` + `list_media_points`）。
     ///
     /// `kind`：`jav` = 有番号（`movie_number IS NOT NULL`）；`video` = 有视频条目

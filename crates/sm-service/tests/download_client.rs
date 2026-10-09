@@ -5,7 +5,10 @@
 //! | `list_clients` | `:257-265` | 排序是 `created_at DESC, id DESC`（**最新在前**），不是骨架期注释说的「按 id 升序」|
 //! | `delete_client` | `:333-351` | 两道 409 的**码、先后、details**，以及 404 与删除本身 |
 //!
-//! `create` / `update` / `test_client` 不在这里 —— 它们要 provider seam（阶段二）。
+//! | `update_client` 的配置合并 | `:145-154` | 未提交的 `secret` 从**库里的旧值**回填 |
+//!
+//! `create` / `test_client` 不在这里 —— `test_client` 要真 provider 往返，
+//! `create` 与 `update` 同一套合并规则，这里只钉 `update` 那条（它才有「旧值」）。
 
 use sm_db::repo::{
     DownloadClientRepository, DownloadTaskRepository, IndexerDownloadClientRepository,
@@ -254,6 +257,97 @@ async fn the_two_conflicts_follow_the_upstream_order() {
         .await
         .expect("解绑");
     service.delete_client(client_id).await.expect("终于能删");
+}
+
+/// 读回一个下载器的**存储配置**。
+///
+/// 响应里看不到 `secret`（被 `_resource` 剥掉），所以「provider 有没有收到 token」
+/// 只能看库里那一行 —— `FakeCapability::prepare_client` 原样返回它收到的东西，
+/// 而服务层把那个返回值落库。
+async fn stored_config(db: &TestDb, client_id: i32) -> serde_json::Value {
+    let row = DownloadClientRepository::new(db.pool().clone())
+        .find_by_id(client_id)
+        .await
+        .expect("查下载器")
+        .expect("行还在");
+    serde_json::from_str(row.provider_config.as_deref().expect("配置文本")).expect("配置是 JSON")
+}
+
+/// ★ 只改 `host` 时 `token` **从旧值回填**（上游 `_prepare` `:145-154`）。
+///
+/// 这是那条「改一次地址就把凭据抹掉」的 bug 的回归钉。
+#[tokio::test]
+async fn updating_one_field_keeps_the_stored_secret() {
+    let db = TestDb::require().await;
+    let service = DownloadClientService::new_with_downloads(db.pool(), Arc::new(FakeDownloads));
+    let library_id = seed_library(&db).await;
+    let client_id = seed_client(&db, library_id, Some(r#"{"host":"h1","token":"s3cr3t"}"#)).await;
+
+    service
+        .update_client(
+            client_id,
+            DownloadClientUpdateRequest {
+                name: None,
+                library_id: None,
+                provider_config: Some(serde_json::json!({"host": "h2"})),
+            },
+        )
+        .await
+        .expect("只改 host 应当成功");
+
+    let config = stored_config(&db, client_id).await;
+    assert_eq!(config["host"], "h2", "提交的值生效");
+    assert_eq!(config["token"], "s3cr3t", "★ 没提交的 token 必须带过去");
+}
+
+/// 提交了新 `token` → **用提交的**，旧值不覆盖。
+#[tokio::test]
+async fn a_resubmitted_secret_wins_over_the_stored_one() {
+    let db = TestDb::require().await;
+    let service = DownloadClientService::new_with_downloads(db.pool(), Arc::new(FakeDownloads));
+    let library_id = seed_library(&db).await;
+    let client_id = seed_client(&db, library_id, Some(r#"{"host":"h","token":"old"}"#)).await;
+
+    service
+        .update_client(
+            client_id,
+            DownloadClientUpdateRequest {
+                name: None,
+                library_id: None,
+                provider_config: Some(serde_json::json!({"host": "h", "token": "new"})),
+            },
+        )
+        .await
+        .expect("更新应当成功");
+
+    assert_eq!(stored_config(&db, client_id).await["token"], "new");
+}
+
+/// 只动 `library_id`（**没提交** `provider_config`）也保留配置 —— 上游那条
+/// `allow_read_only` 分支（`:324`）走的就是这里。
+#[tokio::test]
+async fn moving_to_another_library_keeps_the_whole_config() {
+    let db = TestDb::require().await;
+    let service = DownloadClientService::new_with_downloads(db.pool(), Arc::new(FakeDownloads));
+    let first = seed_library(&db).await;
+    let second = seed_library(&db).await;
+    let client_id = seed_client(&db, first, Some(r#"{"host":"h","token":"s3cr3t"}"#)).await;
+
+    service
+        .update_client(
+            client_id,
+            DownloadClientUpdateRequest {
+                name: None,
+                library_id: Some(second),
+                provider_config: None,
+            },
+        )
+        .await
+        .expect("换库应当成功");
+
+    let config = stored_config(&db, client_id).await;
+    assert_eq!(config["host"], "h");
+    assert_eq!(config["token"], "s3cr3t");
 }
 
 /// 更新请求的**空更新**判据：三个字段都没给 → 走 422（由 `update_client` 报）。

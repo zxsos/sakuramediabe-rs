@@ -219,6 +219,30 @@ pub fn verify_media(
     Ok(path)
 }
 
+/// 校验合并播放签名，返回归一后的资源路径。
+///
+/// # ★ 顺序敏感 —— 传进来的 `media_ids` 必须**原样**
+///
+/// 载荷是 `merged-media:{id1,id2,...}:{resource_path}:{expires}`
+/// （[`merged_signature`] 用 `,` 拼接）。所以调用方**不能**在验签前去排序或去重：
+/// 那会让一份「调换了分段顺序」的 URL 验成合法 —— 而顺序恰恰是合并播放的全部
+/// 语义（它决定时间轴怎么拼）。
+///
+/// 上游 `verify_merged_media_signature` 同样要求传入「解析后的原始顺序」。
+pub fn verify_merged(
+    secret: &str,
+    media_ids: &[i32],
+    resource_path: &str,
+    expires: i64,
+    signature: &str,
+    now_seconds: i64,
+) -> Result<String, SignatureError> {
+    let path = normalize_resource_path(resource_path)?;
+    let expected = merged_signature(secret, media_ids, &path, expires);
+    checked(&expected, signature, expires, now_seconds)?;
+    Ok(path)
+}
+
 /// 校验片段串流签名。
 pub fn verify_clip(
     secret: &str,
@@ -554,6 +578,48 @@ mod tests {
         assert_eq!(
             build_signed_media_url(SECRET, 7, "", "bogus", 0),
             Err(SignatureError::PathInvalid)
+        );
+    }
+
+    /// ★ 合并播放验签**顺序敏感** —— 这是它唯一的坑。
+    ///
+    /// 载荷是 `merged-media:{id1,id2}:...`（[`merged_signature`] 用 `,` 拼接），
+    /// 所以调换顺序就是另一份签名。验签前若顺手排序或去重，一份被改过顺序的 URL
+    /// 会验成合法 —— 而顺序正是合并播放的全部语义（它决定时间轴怎么拼）。
+    #[test]
+    fn merged_verification_accepts_only_the_exact_sequence() {
+        let expires = signature_expires(1_800_000_000);
+        let signature = merged_signature(SECRET, &[3, 7], "a.mp4", expires);
+        let now = 1_800_000_000;
+
+        assert_eq!(
+            verify_merged(SECRET, &[3, 7], "a.mp4", expires, &signature, now).unwrap(),
+            "a.mp4"
+        );
+        assert_eq!(
+            verify_merged(SECRET, &[7, 3], "a.mp4", expires, &signature, now),
+            Err(SignatureError::Invalid),
+            "调换顺序必须拒"
+        );
+        assert_eq!(
+            verify_merged(SECRET, &[3], "a.mp4", expires, &signature, now),
+            Err(SignatureError::Invalid),
+            "少一段必须拒"
+        );
+        assert_eq!(
+            verify_merged(SECRET, &[3, 7, 9], "a.mp4", expires, &signature, now),
+            Err(SignatureError::Invalid),
+            "多一段必须拒"
+        );
+        // 过期优先于比对（与 `verify_image` 同一顺序）。
+        assert_eq!(
+            verify_merged(SECRET, &[3, 7], "a.mp4", expires, &signature, expires),
+            Err(SignatureError::Expired)
+        );
+        // 路径也进载荷：换个路径就失效。
+        assert_eq!(
+            verify_merged(SECRET, &[3, 7], "b.mp4", expires, &signature, now),
+            Err(SignatureError::Invalid)
         );
     }
 

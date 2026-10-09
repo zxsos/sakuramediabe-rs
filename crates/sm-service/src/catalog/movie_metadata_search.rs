@@ -17,7 +17,14 @@
 //!
 //! ⚠️ 缓存**必须有 TTL**，否则临时目录会无限增长（每次搜索都建一个 uuid 目录）。
 
+use std::sync::Arc;
+
+use super::metadata_source::{
+    import_detail_of, source_identity_of, DeliverySource, MetadataSourceError,
+    MetadataSourceService, PluginDelivery,
+};
 use crate::error::ServiceError;
+use crate::system::ConfigService;
 
 /// 候选资产缓存目录名。
 pub const SEARCH_ASSET_DIR: &str = "metadata-search";
@@ -57,9 +64,36 @@ pub struct CandidateReference {
 }
 
 /// 元数据搜索服务。
-pub struct MovieMetadataSearchService;
+///
+/// # 依赖放在字段里，而不是全 builtin
+///
+/// 上游是 classmethod + `build_javdb_provider()`（自己 new 一个 provider）。
+/// 本仓的 provider 是**注入**的 —— 组合根建、测试换替身 —— 所以它必须被持有，
+/// 与 [`MetadataSourceService`] 同一个取向。
+///
+/// # 配置**每次现读**
+///
+/// `plugins.enabled` 既决定候选顺序，也决定「这个候选还算不算数」：候选 id 会
+/// 随搜索结果在客户端缓存几小时，那时插件可能已经被停用。所以这里存
+/// [`ConfigService`]（它每次操作都读当前磁盘快照），**不**存一份快照。
+pub struct MovieMetadataSearchService {
+    /// 配置来源。见类型文档「每次现读」。
+    config: ConfigService,
+    /// JavDB provider + 已注册的插件来源。
+    ///
+    /// `Arc` 而**不是**各持一份：provider 不可克隆，而同一个实例要同时服务
+    /// 「按番号导入」与「按候选取详情」两条路（见
+    /// [`CatalogMovieMetadataImporter`](super::movie_metadata_importer::CatalogMovieMetadataImporter)）。
+    source: Arc<MetadataSourceService>,
+}
 
 impl MovieMetadataSearchService {
+    /// 构造。`source` 同时决定 JavDB 那支取不取得到详情（`provider` 为 `None`
+    /// 时按「没收录」处置）。
+    pub fn new(config: ConfigService, source: Arc<MetadataSourceService>) -> Self {
+        Self { config, source }
+    }
+
     /// ★ 按番号搜候选。**不建任何记录**（见模块文档）。
     ///
     /// 上游 `search_by_number(cls, movie_number) -> ImportMetadataSearchResponse`。
@@ -138,15 +172,92 @@ impl MovieMetadataSearchService {
     /// 上游 `fetch_candidate(cls, candidate_id)` 是 contextmanager，yield
     /// `(detail, source, provider, None)`。
     ///
-    /// 错误码：id 指向的来源与详情**不匹配** → `422 metadata_candidate_mismatch`。
-    /// 那条检查防的是「id 被篡改成另一个来源的 id」。
+    /// # 闭包的第二个参数是**插件身份对象**
+    ///
+    /// 插件那一支给 `plugin_id` / `display_name` / `source_id` / `source_url`
+    /// 四个键 —— 与 [`MetadataSourceService::import_by_number`] 交给
+    /// `import_plugin_movie` 的**是同一个构造函数**（改一处两处一起改）。
+    /// JavDB 那一支给 `Null`：它没有插件身份。
+    ///
+    /// 调用方要分支就**自己** `resolve_candidate_reference`：别从「第二参数
+    /// 是不是 `Null`」去反推来源，那是把两个独立的事实绑在一起。
+    ///
+    /// # 错误码
+    ///
+    /// | 情况 | 状态 | 码 |
+    /// |---|---|---|
+    /// | id 格式不对 / 插件已停用 / **来源已不再收录这条** | 422 | `invalid_metadata_candidate` |
+    /// | 详情里的番号与 id 里那一段不一致 | 422 | `metadata_candidate_mismatch` |
+    /// | 来源调用失败（连不上 / 插件崩了 / 交付不合法） | 500 | `internal_error` |
+    ///
+    /// ⚠️ 第一行的「已不再收录」与第三行都是**刻意偏离上游**的，理由逐条写在
+    /// 文件私有函数 `candidate_error` 上（那里是唯一的映射点）。
+    /// （不写成 intra-doc 链接：`candidate_error` 是私有项，链接会让
+    /// `cargo doc -D warnings` 报警。）
     pub async fn fetch_candidate<R>(
         &self,
         candidate_id: &str,
         consume: impl AsyncFnOnce(serde_json::Value, serde_json::Value) -> R,
     ) -> Result<R, ServiceError> {
-        let _ = (candidate_id, consume);
-        todo!("骨架：解析 id -> 取详情 -> 校验来源匹配(422) -> use(detail, source).await")
+        let config = self.config.snapshot()?;
+        // 「这个插件还算不算数」**现读**配置：候选 id 可能已经在客户端缓存了
+        // 几小时，期间插件被停用/卸载是完全正常的。
+        let enabled = self.source.enabled_plugin_sources(&config);
+        let reference = Self::resolve_candidate_reference(candidate_id, |plugin_id| {
+            enabled.iter().any(|source| source.plugin_id == plugin_id)
+        })?;
+
+        match reference.source {
+            // JavDB 那一支：按 **id** 取（见 `fetch_by_javdb_id` 的理由）。
+            MetadataCandidateSource::Javdb => {
+                let javdb_id = reference.javdb_id.as_deref().unwrap_or_default();
+                let detail = self
+                    .source
+                    .fetch_by_javdb_id(javdb_id)
+                    .await
+                    .map_err(candidate_error)?;
+                // id 是客户端能改的：不校验就会把 A 的详情写进 B 的名下。
+                ensure_candidate_number(&detail, &reference.movie_number)?;
+                Ok(consume(detail, serde_json::Value::Null).await)
+            }
+            // 插件那一支：交付文件在闭包退出时被清理（见 `fetch_plugin`），
+            // 所以 `consume` 必须在闭包里面把话说完。
+            MetadataCandidateSource::Plugin => {
+                let plugin_id = reference.plugin_id.clone().unwrap_or_default();
+                self.source
+                    .fetch_plugin(
+                        &config,
+                        &plugin_id,
+                        &reference.movie_number,
+                        |delivery: PluginDelivery| async move {
+                            match (delivery.plugin_delivery, delivery.source) {
+                                (
+                                    Some(plugin),
+                                    DeliverySource::Plugin {
+                                        plugin_id,
+                                        display_name,
+                                    },
+                                ) => {
+                                    consume(
+                                        import_detail_of(&plugin),
+                                        source_identity_of(&plugin_id, &display_name, &plugin),
+                                    )
+                                    .await
+                                }
+                                // 到不了：`fetch_plugin` 的两个构造点都只给出
+                                // 插件交付 + 插件来源。给 `Null` 而不是 panic ——
+                                // 一个来源身份的缺失不该让整条重试挂掉。
+                                (_, source) => {
+                                    tracing::warn!(?source, "插件来源没有交付体");
+                                    consume(serde_json::Value::Null, serde_json::Value::Null).await
+                                }
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(candidate_error)
+            }
+        }
     }
 
     /// 清理过期缓存目录，返回清掉多少个。上游 `cleanup_search_assets() -> int`。
@@ -224,9 +335,70 @@ fn invalid_candidate() -> ServiceError {
     ServiceError::validation("invalid_metadata_candidate", "元数据候选无效或已失效")
 }
 
+/// 来源调用失败（连不上 / 插件崩了 / 交付不合法）→ 500。
+///
+/// **消息不含来源的内部细节**（那些进日志），因为 `ApiError.message` 是
+/// 面向客户端的正文。
+fn source_call_failed() -> ServiceError {
+    ServiceError::from_status(500, "internal_error", "元数据来源调用失败")
+}
+
+/// [`MetadataSourceError`] → 本次重试的 HTTP 错误。
+///
+/// # 两处**刻意偏离上游**（都在这里，便于一起复核）
+///
+/// 1. **「来源已不再收录这条」→ 422**。上游 `:270` 把 `get_movie_by_javdb_id`
+///    的返回值直接当对象用：`None` 时对 `None.movie_number` 取属性 →
+///    `AttributeError` → **500**。而候选 id 会随搜索结果在客户端缓存几小时
+///    （影片、插件都可能已经变了），用一个 422 表达它 —— 文案就用上游自己
+///    那句「元数据候选无效或已失效」。
+/// 2. **来源调用失败 → 500 `internal_error`，不新增错误码**。上游让异常冒出去，
+///    落到 FastAPI 的兜底 500；这里照抄状态码，只换消息。将来若要给客户端
+///    「可重试」语义，改这一处（502 [`ServiceError::bad_gateway`]，与「索引器
+///    全挂了」同一取向）—— 那是一次**契约决定**，别顺手改。
+fn candidate_error(error: MetadataSourceError) -> ServiceError {
+    match error {
+        // 「已停用」与「已失效」同一类：插件在两步之间被停用，候选就不该再算数。
+        MetadataSourceError::NotFound | MetadataSourceError::Disabled(_) => invalid_candidate(),
+        MetadataSourceError::InvalidDelivery(problem) => {
+            tracing::warn!(problem, "元数据来源交付不合法");
+            source_call_failed()
+        }
+        MetadataSourceError::RequestFailed(detail) => {
+            tracing::warn!(detail, "元数据来源调用失败");
+            source_call_failed()
+        }
+    }
+}
+
+/// 详情里的番号必须与 id 里那一段**归一等价**。
+///
+/// 上游 `_ensure_candidate_number`（`:280-283`）。防的是「id 被改成另一个来源
+/// 的 id」：客户端能自己拼 `candidate_id`，而入库用的是**详情里**的番号 ——
+/// 不校验就会把 A 的详情写进 B 的名下。
+fn ensure_candidate_number(detail: &serde_json::Value, expected: &str) -> Result<(), ServiceError> {
+    let actual = detail
+        .get("movie_number")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if crate::movie_numbers::normalize_movie_number(actual)
+        != crate::movie_numbers::normalize_movie_number(expected)
+    {
+        return Err(ServiceError::validation(
+            "metadata_candidate_mismatch",
+            "元数据候选番号不匹配",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `impl MetadataProvider for FakeJavdb` 要用它；文件级不导入（非测试代码
+    // 用不到，导了会被判 unused）。注意这里是 `crate::catalog::metadata_source`
+    // —— 本模块里的 `super` 是 `movie_metadata_search`，不是 `catalog`。
+    use crate::catalog::metadata_source::MetadataProvider;
 
     /// 缓存 TTL 是 24 小时，且目录名固定。
     #[test]
@@ -362,5 +534,152 @@ mod tests {
             MovieMetadataSearchService::cleanup_search_assets(root).expect("不报错"),
             0
         );
+    }
+
+    // ------------------------------------------------- fetch_candidate（取详情）
+
+    /// 只认 id 的假 JavDB。`by_id` 里没有的 id = 「已经不在 JavDB 了」。
+    struct FakeJavdb {
+        by_id: std::collections::HashMap<String, serde_json::Value>,
+        /// 为真时按「来源坏了」回应 —— 与「没收录」是两回事。
+        fail: bool,
+    }
+
+    #[tonic::async_trait]
+    impl MetadataProvider for FakeJavdb {
+        async fn get_movie_by_number(
+            &self,
+            _movie_number: &str,
+        ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+            // `fetch_candidate` 的 JavDB 支按 **id** 取，问番号就是走错路了。
+            panic!("fetch_candidate 不该按番号取详情");
+        }
+
+        async fn get_movie_by_javdb_id(
+            &self,
+            javdb_id: &str,
+        ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+            if self.fail {
+                return Err(MetadataSourceError::RequestFailed("连不上".to_owned()));
+            }
+            Ok(self.by_id.get(javdb_id).cloned())
+        }
+
+        async fn search_actors(
+            &self,
+            _keyword: &str,
+        ) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 一份**一个插件来源都没启用**的临时配置。
+    fn temp_config() -> ConfigService {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|delta| delta.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "sm-metadata-search-{}-{seq}-{nanos}.toml",
+            std::process::id()
+        ));
+        // 缺 `plugins.enabled` 与「空列表」同义：一个都没启用，不是错误。
+        std::fs::write(&path, "[plugins]\nenabled = []\n").expect("写临时配置");
+        ConfigService::new(path)
+    }
+
+    /// 被测对象。**不注册任何插件来源**：插件那一支要真起一个 gRPC 插件进程
+    /// （属跨仓集成测试），所以这里覆盖 JavDB 支 + 「插件没注册」那条拒绝。
+    fn service(by_id: &[(&str, serde_json::Value)], fail: bool) -> MovieMetadataSearchService {
+        MovieMetadataSearchService::new(
+            temp_config(),
+            Arc::new(MetadataSourceService::new(
+                Vec::new(),
+                Some(Box::new(FakeJavdb {
+                    by_id: by_id
+                        .iter()
+                        .map(|(id, detail)| ((*id).to_owned(), detail.clone()))
+                        .collect(),
+                    fail,
+                })),
+            )),
+        )
+    }
+
+    fn detail_with_number(number: &str) -> serde_json::Value {
+        serde_json::json!({
+            "movie_number": number,
+            "title": "测试标题",
+            "javdb_id": "xyz",
+        })
+    }
+
+    /// ★ 详情按 **javdb_id** 取（不是按番号），第二个参数是 `Null`。
+    #[tokio::test]
+    async fn a_javdb_candidate_yields_the_detail_by_id() {
+        let service = service(&[("xyz", detail_with_number("ABC-123"))], false);
+        let (detail, source) = service
+            .fetch_candidate("javdb:ABC-123:xyz", |detail, source| async move {
+                (detail, source)
+            })
+            .await
+            .expect("候选取得到");
+        assert_eq!(detail["title"], "测试标题");
+        assert_eq!(source, serde_json::Value::Null, "JavDB 支没有插件身份");
+    }
+
+    /// ★ 详情里的番号与 id 里那一段不一致 → 422。
+    ///
+    /// id 是客户端能改的，而入库用的是详情里的番号 —— 这条不拦就会把 A 的
+    /// 详情写进 B 的名下。
+    #[tokio::test]
+    async fn a_candidate_whose_number_does_not_match_is_rejected() {
+        // id 说 `ABC-123`，JavDB 那份详情说 `OTHER-9`。
+        let service = service(&[("xyz", detail_with_number("OTHER-9"))], false);
+        let error = service
+            .fetch_candidate("javdb:ABC-123:xyz", |_, _| async {})
+            .await
+            .expect_err("不匹配就该拒");
+        assert_eq!(error.code(), "metadata_candidate_mismatch");
+    }
+
+    /// ★ 来源已经不再收录这条 → 422「已失效」（**不是** 500）。
+    ///
+    /// ⚠️ 上游在这里是 `None.movie_number` → `AttributeError` → 500。偏离的
+    /// 理由写在 `candidate_error` 上。
+    #[tokio::test]
+    async fn a_candidate_the_source_no_longer_has_is_expired() {
+        let service = service(&[], false);
+        let error = service
+            .fetch_candidate("javdb:ABC-123:xyz", |_, _| async {})
+            .await
+            .expect_err("已失效就该拒");
+        assert_eq!(error.code(), "invalid_metadata_candidate");
+    }
+
+    /// 真故障（连不上）→ 500，**不**混进「已失效」那一类。
+    ///
+    /// 两类错误对客户端的处置相反：一个要用户重挑候选，一个该重试/报障。
+    #[tokio::test]
+    async fn a_broken_source_is_not_reported_as_an_expired_candidate() {
+        let service = service(&[("xyz", detail_with_number("ABC-123"))], true);
+        let error = service
+            .fetch_candidate("javdb:ABC-123:xyz", |_, _| async {})
+            .await
+            .expect_err("来源坏了就该报错");
+        assert_eq!(error.code(), "internal_error");
+    }
+
+    /// 插件候选但插件没注册（= 已停用）→ 422，**连取详情都不发生**。
+    #[tokio::test]
+    async fn a_plugin_candidate_needs_its_plugin_registered() {
+        let service = service(&[], false);
+        let error = service
+            .fetch_candidate("plugin:javbus:ABC-123", |_, _| async {})
+            .await
+            .expect_err("插件没注册就该拒");
+        assert_eq!(error.code(), "invalid_metadata_candidate");
     }
 }

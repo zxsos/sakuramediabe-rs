@@ -606,7 +606,7 @@ impl DenseStore {
     /// 更省事也更准。
     ///
     /// 向量维度 / 数据类型 / 集合状态则**必须**从 `collection_info` 取
-    /// （`count` 给不了），取法与 [`Self::validate_collection`] 同一套路径。
+    /// （`count` 给不了），取法与 `Self::validate_collection` 同一套路径。
     pub async fn status(&self) -> Result<DenseStoreStatus, ServiceError> {
         // ⚠️ **刻意不复用 `self.exists()`**：那个方法把错误吞成 `false`
         //（`search` 路径要求「向量库挂了也当没结果」，见模块文档第 1 条），

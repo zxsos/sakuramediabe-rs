@@ -26,7 +26,7 @@ use sm_plugin_api::v1::{
 use tonic::transport::{Channel, Endpoint};
 
 use crate::registration::{validate_registration, RegistrationProblem};
-use crate::registry::{ProviderRegistration, ProviderRegistry};
+use crate::registry::{ConfigFieldSpec, ProviderRegistration, ProviderRegistry};
 
 /// 连接阶段的失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,9 +137,74 @@ pub fn collect_providers(response: &RegisterResponse, plugin_endpoint: &str) -> 
                 .clone()
                 .or_else(|| response.data_plane_endpoint.clone()),
             plugin_endpoint: plugin_endpoint.to_owned(),
+            // ★ bundle 描述符。注册期**只搬形状**，不解释语义 ——
+            // 白名单 / secret / 默认交付方式的语义在宿主服务层。
+            library_config_fields: bundle
+                .library_config_fields
+                .iter()
+                .map(config_field_spec)
+                .collect(),
+            playback_deliveries: bundle
+                .playback_deliveries
+                .iter()
+                .filter_map(|value| playback_delivery_name(*value).map(str::to_owned))
+                .collect(),
+            merged_playback_format: bundle
+                .merged_playback_format
+                .and_then(merged_playback_format_name)
+                .map(str::to_owned),
+            download_config_fields: bundle
+                .download_config_fields
+                .iter()
+                .map(config_field_spec)
+                .collect(),
         });
     }
     registry
+}
+
+/// proto 的 `ConfigField` → 宿主纯值。
+///
+/// `INPUT_UNSPECIFIED` 按 `"text"` 处理：proto 里它是「没填」，而上游的
+/// `Literal["text","secret","path"]` 没有「未指定」这一档 —— 插件违约时取最中性的
+/// `text`（没有 secret 剥离、没有只读约束），不 panic。
+fn config_field_spec(field: &sm_plugin_api::v1::ConfigField) -> ConfigFieldSpec {
+    use sm_plugin_api::v1::config_field::Input;
+    let input = match Input::try_from(field.input).unwrap_or(Input::Unspecified) {
+        Input::Secret => "secret",
+        Input::Path => "path",
+        Input::Text | Input::Unspecified => "text",
+    };
+    ConfigFieldSpec {
+        key: field.key.clone(),
+        label: field.label.clone(),
+        input: input.to_owned(),
+        required: field.required,
+        description: field.description.clone(),
+        multiline: field.multiline,
+        read_only: field.read_only,
+        hint: field.hint.clone(),
+    }
+}
+
+/// proto 的 `PlaybackDelivery` → 上游字面量。`UNSPECIFIED` 丢弃（不算一种方式）。
+fn playback_delivery_name(value: i32) -> Option<&'static str> {
+    use sm_plugin_api::v1::PlaybackDelivery;
+    match PlaybackDelivery::try_from(value).ok()? {
+        PlaybackDelivery::Redirect => Some("redirect"),
+        PlaybackDelivery::Proxy => Some("proxy"),
+        PlaybackDelivery::Unspecified => None,
+    }
+}
+
+/// proto 的 `MergedPlaybackFormat` → 上游字面量。
+fn merged_playback_format_name(value: i32) -> Option<&'static str> {
+    use sm_plugin_api::v1::MergedPlaybackFormat;
+    match MergedPlaybackFormat::try_from(value).ok()? {
+        MergedPlaybackFormat::Mp4 => Some("mp4"),
+        MergedPlaybackFormat::Hls => Some("hls"),
+        MergedPlaybackFormat::Unspecified => None,
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +285,60 @@ mod tests {
 
         let registry = collect_providers(&response, "http://127.0.0.1:60001");
         assert!(registry.is_empty(), "只收 media_provider：{registry:?}");
+    }
+
+    /// ★ bundle 描述符要**原样收进注册表** —— 宿主服务层的白名单 / secret 剥离 /
+    /// 默认交付方式全指望它。丢掉不会编译报错，只会在运行期表现为「建库 422」。
+    #[test]
+    fn the_bundle_descriptor_is_collected() {
+        use sm_plugin_api::v1::config_field::Input;
+        use sm_plugin_api::v1::{ConfigField, MergedPlaybackFormat, PlaybackDelivery};
+
+        let response = RegisterResponse {
+            plugin_id: "local".to_owned(),
+            abi_major: sm_plugin_api::ABI_MAJOR,
+            extensions: vec![sm_plugin_api::v1::Extension {
+                key: "media.provider".to_owned(),
+                data: Some(Data::MediaProvider(
+                    sm_plugin_api::v1::MediaProviderBundle {
+                        provider_key: "local".to_owned(),
+                        display_name: "本地盘".to_owned(),
+                        library_config_fields: vec![ConfigField {
+                            key: "root".to_owned(),
+                            label: "根目录".to_owned(),
+                            input: Input::Path as i32,
+                            required: true,
+                            read_only: true,
+                            ..Default::default()
+                        }],
+                        playback_deliveries: vec![
+                            PlaybackDelivery::Proxy as i32,
+                            PlaybackDelivery::Redirect as i32,
+                        ],
+                        merged_playback_format: Some(MergedPlaybackFormat::Mp4 as i32),
+                        download_config_fields: vec![ConfigField {
+                            key: "token".to_owned(),
+                            input: Input::Secret as i32,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            }],
+            ..Default::default()
+        };
+
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
+        let entry = registry.require("local").unwrap();
+
+        assert_eq!(entry.library_config_fields.len(), 1);
+        assert_eq!(entry.library_config_fields[0].input, "path");
+        assert!(entry.library_config_fields[0].read_only);
+        // 首项是默认交付方式，顺序**不能乱**。
+        assert_eq!(entry.playback_deliveries, vec!["proxy", "redirect"]);
+        assert_eq!(entry.merged_playback_format.as_deref(), Some("mp4"));
+        assert_eq!(entry.download_config_fields.len(), 1);
+        assert_eq!(entry.download_config_fields[0].input, "secret");
     }
 
     #[test]

@@ -404,11 +404,15 @@ pub struct PluginStorageProvider {
 }
 
 /// 空间占用。
+///
+/// ★ 三个字段都是 `Option` —— 与上游 `StorageSpaceUsage`（`int | None = None`，
+/// `provider_protocol.py:466-475`）一致。`None` 是「provider 没报这一项」，
+/// **不是 `0`**：渲染层把 `0` 当成「磁盘满了」，把「不知道」说成 `0` 会误导用户。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpaceUsage {
-    pub total_bytes: i64,
-    pub used_bytes: i64,
-    pub free_bytes: i64,
+    pub total_bytes: Option<i64>,
+    pub used_bytes: Option<i64>,
+    pub free_bytes: Option<i64>,
 }
 
 #[cfg(test)]

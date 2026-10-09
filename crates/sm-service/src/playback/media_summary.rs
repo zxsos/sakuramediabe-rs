@@ -168,6 +168,62 @@ pub async fn list_movie_media_summaries(
     Ok(grouped)
 }
 
+/// [`list_movie_media_summaries`] 的**按视频条目**版本，供详情页的 `media_items`。
+///
+/// 与按番号那版的差别只有两个：
+///
+/// - 分组键是 `video_item_id`（`i32`）而不是 `movie_number`（`String`）；
+/// - **不过滤 `valid`** —— 详情要列出全部媒体（含失效的），失效的那几条在
+///   接口层拿空 `play_url` 由前端禁用播放。按番号那版服务的是「能不能播/有多少条」
+///   这类派生统计，本版服务的是「逐条渲染」。
+///
+/// 空输入直接返回空 map，不发查询。
+pub async fn list_video_media_summaries(
+    db: &Db,
+    video_ids: &[i32],
+) -> Result<HashMap<i32, Vec<MediaSummary>>, ServiceError> {
+    if video_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sm_db::repo::MediaRepository::new(db.clone())
+        .summaries_for_video_items(video_ids)
+        .await?;
+
+    let mut grouped: HashMap<i32, Vec<MediaSummary>> = HashMap::new();
+    for row in rows {
+        // 元组解包顺序与 `MediaRepository::VideoMediaSummaryRow` 的定义逐条对应。
+        let (
+            video_item_id,
+            media_id,
+            library_id,
+            library_name,
+            provider_key,
+            file_name,
+            resolution,
+            file_size_bytes,
+            duration_seconds,
+            video_info,
+            valid,
+        ) = row;
+        grouped
+            .entry(video_item_id)
+            .or_default()
+            .push(MediaSummary {
+                media_id,
+                library_id,
+                library_name,
+                provider_key,
+                file_name,
+                resolution,
+                file_size_bytes,
+                duration_seconds,
+                video_info,
+                valid,
+            });
+    }
+    Ok(grouped)
+}
+
 /// 上游 `attach_movie_list_media` 的等价物：给每个番号算出派生字段。
 ///
 /// 一次查询 + 内存分组，与上游一致。返回 `HashMap` 而不是原地修改 ——

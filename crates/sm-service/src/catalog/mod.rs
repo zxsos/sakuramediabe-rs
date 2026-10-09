@@ -86,6 +86,7 @@ pub mod movie_heat;
 pub mod movie_image;
 pub mod movie_interaction_sync;
 pub mod movie_javdb_backfill;
+pub mod movie_metadata_importer;
 pub mod movie_metadata_refresh;
 pub mod movie_metadata_search;
 pub mod movie_subscription;

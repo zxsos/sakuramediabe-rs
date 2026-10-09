@@ -9,27 +9,37 @@
 //! | `video_cover_service.py` | 95 | **不落地**，见下 | — |
 //! | `__init__.py` | 7 | 无逻辑 | — |
 //!
-//! # 这一批只落「规则」，不落「查询编排」
+//! # 查询编排落在仓储的裸 SQL 里
 //!
 //! `VideoItemService.list_videos` 与 `VideoCollectionService.list_collection_items`
-//! 的主体是 Peewee 表达式树：每条目 `MIN(Media.id)` 分组子查询 + 三次
-//! `LEFT JOIN` + `COALESCE` 取第一条媒体的时长/大小，再分两次批量回填
-//! 媒体统计与合集引用（避免 N+1）。按 [`crate`] 的分层约定，那部分应当
-//! 直接写 SQL 放进仓储，而不是照搬表达式树的形状 —— 所以它不在本批。
+//! 在上游是 Peewee 表达式树：每条目 `MIN(Media.id)` 分组子查询 + 三次
+//! `LEFT JOIN` + `COALESCE` 取第一条媒体的时长/大小，再批量回填媒体统计与合集
+//! 引用（避免 N+1）。本仓按分层约定把它写成仓储里的批量 SQL（`first_valid_media`
+//! / `media_stats` / `collections_map` / `summaries_for_video_items`），
+//! **结果集与上游逐字段相同**，只是不照搬表达式树的形状。
 //!
-//! # 刻意不复刻的三处
+//! # 播放地址的 provider 交互落在 **API 层**
 //!
-//! **① 播放地址与 `can_play`。** `_media_items` 与
-//! `_query_item_resources` 都要 `MEDIA_PROVIDER_REGISTRY.require(provider_key)`
-//! 拿 `playback_deliveries[0]` 才能签出播放地址。插件 ABI（gRPC）还没接，
-//! 这里**不**用假 provider 顶替 —— 契约由错误码与字段位置决定，值等
-//! 插件落地后自然接上。
+//! `_media_items` 与 `_query_item_resources` 都要
+//! `MEDIA_PROVIDER_REGISTRY.require(provider_key)` 拿 `playback_deliveries[0]`
+//! 才能签出播放地址 —— 注册表与签名密钥都在 API 层，所以本模块只把原始数据
+//! （`provider_key` / `valid` / `media_items`）交出去，由 `sm-api` 组装。
 //!
-//! **② 首帧封面生成。** `video_cover_service` 依赖 PyAV 解码第 0 帧、写
+//! ⚠️ 两条端点的容错程度**不同**（照上游，别统一）：
+//!
+//! - 合集成员：`require` 失败时上游只把 `can_play` 打成 `false`；
+//! - 视频详情：上游**漏了 `try/except`**，`ProviderUnavailableError` 冒到兜底
+//!   处理器 → **500 `internal_error`**。
+//!
+//! 见 `sm-api` 的 `routes/video_collections.rs` / `routes/videos.rs`。
+//!
+//! # 刻意不复刻的两处
+//!
+//! **① 首帧封面生成。** `video_cover_service` 依赖 PyAV 解码第 0 帧、写
 //! `videos/<id>/cover/0.webp`。它是 `svc-image`（有损 WebP 目前走进程外
 //! `cwebp`，见 ADR §3.4）与 `svc-probe` 的职责，不属于 service 层。
 //!
-//! **③ 换封面时旧图片的回收。** `update` 换掉 `video_item.cover_image_id`
+//! **② 换封面时旧图片的回收。** `update` 换掉 `video_item.cover_image_id`
 //! 之后，那张旧图可能已经没人引用，该调 `ImageCleanupService` 删掉它的行与
 //! 磁盘文件 —— 这一步**还没做**（本批只改 id，旧图行会留下）。
 //!
@@ -63,7 +73,8 @@ use crate::error::{details_of, ServiceError};
 
 pub use collection::{Added, VideoCollectionService, VideoCollectionUpdate};
 pub use item::{
-    VideoCollectionRef, VideoItemCreate, VideoItemService, VideoItemUpdate, VideoListItem,
+    VideoCollectionRef, VideoItemCreate, VideoItemDetail, VideoItemService, VideoItemUpdate,
+    VideoListItem, VideoMediaItem, VideoMediaPoint,
 };
 
 /// 分页与筛选类校验的错误码。

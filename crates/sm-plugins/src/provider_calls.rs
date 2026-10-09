@@ -707,6 +707,52 @@ pub async fn generate_thumbnails(
     })
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// bundle 级能力（准备媒体库 / 容量）
+//
+// 上游 `MediaProviderBundle.prepare_library` 与 `StorageProvider.get_space_usage`。
+// 这两个 rpc 早就定义在 `proto/storage.proto`（`:419` / `:400`），只是宿主侧一直
+// 没有调用面 —— 组合根实现 `MediaLibraryRegistry` 才第一次要用它们。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 让 provider 校验 / 归一化媒体库配置。上游 `bundle.prepare_library`。
+///
+/// `previous` 只在更新时给：secret / 只读字段的回填语义在**宿主服务层**
+/// （`_prepare_config`），这里只负责过线。
+pub async fn prepare_library(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    submitted_config: &serde_json::Value,
+    previous: Option<LibraryHandle>,
+) -> Result<sm_plugin_api::v1::PrepareLibraryResponse, ProviderOperationError> {
+    client
+        .prepare_library(sm_plugin_api::v1::PrepareLibraryRequest {
+            submitted_config: sm_plugin_api::json_struct::json_to_struct(submitted_config),
+            previous,
+        })
+        .await
+        .map(|response| response.into_inner())
+        .map_err(|status| classify_status(provider_key, "prepare_library", status))
+}
+
+/// 问 provider 要存储容量。上游 `storage.get_space_usage`。
+///
+/// 声明了 `CAPABILITY_SPACE_USAGE` 才该调；未实现的插件会回 `Unimplemented`，
+/// 由调用方按「不支持」处理（`None`），不是 502。
+pub async fn get_space_usage(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+) -> Result<sm_plugin_api::v1::StorageSpaceUsage, ProviderOperationError> {
+    client
+        .get_space_usage(sm_plugin_api::v1::GetSpaceUsageRequest {
+            library: Some(library),
+        })
+        .await
+        .map(|response| response.into_inner().usage.unwrap_or_default())
+        .map_err(|status| classify_status(provider_key, "get_space_usage", status))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

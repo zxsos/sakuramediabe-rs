@@ -13,20 +13,22 @@
 
 | 项 | 状态 |
 |---|---|
-| P0 契约仓同步（`proto/*.proto` + `src/*.rs` 共 9 个文件） | ✅ 已提交**到契约仓本地**（`cargo check --all-targets` 绿） |
+| P0 契约仓同步（`proto/*.proto` + `src/*.rs` 共 9 个文件） | ✅ 已提交并**推送**（`cargo check --all-targets` 绿） |
 | `ABI_MAJOR` 1 → 2（两仓同时） | ✅ 已做（`sm-plugins` / `sm-plugin-api` 测试 76 项全绿） |
-| 契约仓 tag `v0.2.0` | ⚠️ **本地已打，未推送** |
+| 契约仓 tag `v0.2.0` | ✅ **已推送**（GitHub，指向 `1b1edbf`） |
 | 防漂移门禁 `parity/check_contract_sync.py`（接进 `verify.ps1`） | ✅ 已做（人为制造两种漂移验证过会红） |
-| 插件改 `tag = "v0.2.0"` + `plugin-ref-local` 补 `done` 帧 | ⬜ **待契约仓推送后做**（否则拉不到 tag） |
+| 插件改 `tag = "v0.2.0"` + `plugin-ref-local` 补 `done` 帧 | ✅ **已做**（两插件在 `v0.2.0` 下 `cargo test` 绿） |
 | P1-2 决策 | ⬜ 待拍板（§三 已给精确 diff） |
 
-> **唯一卡住的是推送**：本机对 `https://cnb.cool/zxsos1/sakuramedia-plugin-api.git`
-> 没有可用凭据 —— `git push --dry-run` 报
-> `fatal: could not read Username for 'https://cnb.cool'`。
-> 所以契约仓的提交与 `v0.2.0` 都只在本地。
+> **推送已解决（2026-10-08）**：契约仓改放到 **GitHub** ——
+> [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)
+> （public；`main` + `v0.1.0` + `v0.2.0` 已推）。本机原来那个 `cnb.cool` 远端
+> **已从仓配置里删除**（对它提交也没有可用凭据：
+> `fatal: could not read Username for 'https://cnb.cool'`）；
+> cnb 的**服务端那份仍在**、且匿名可读（`git ls-remote` 不需要凭据），
+> 需要时 `git remote add cnb <url>` 即可加回来 —— **发布源已改为 GitHub**。
 >
-> ⚠️ **在推送之前不要动两个插件的 `Cargo.toml`** —— 它们会拉不到那个 tag。
-> 推送后按 §2.4 的第 4、5 步做完即可。
+> 所以 §2.4 的第 4、5 步已做完，不再是「等推送」。
 
 ---
 
@@ -50,7 +52,7 @@
 
 | | 宿主侧 | 插件侧 |
 |---|---|---|
-| 来源 | 本仓 `crates/sm-plugin-api` + `proto/` | 契约仓 `sakuramedia-plugin-api` **tag `v0.1.0`** |
+| 来源 | 本仓 `crates/sm-plugin-api` + `proto/` | 契约仓 `sakuramedia-plugin-api` **tag `v0.1.0`**（分叉时的值） |
 | `proto/` | `storage.proto` **已含 P1-1**（15888 B） | `storage.proto` 旧版（14963 B） |
 | `src/` | **5 个模块**：`lib` / `provider` / `error` / `json_struct` / `movie_delivery` | **2 个**：`lib` / `provider` |
 | `ABI_MAJOR` | `1` | `1` |
@@ -64,6 +66,9 @@
 # sakuramedia-plugin-ref-local/Cargo.toml / sakuramedia-javbus-metadata/Cargo.toml
 sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
 ```
+
+> 上面是**分叉当时**的地址与 tag。发布源现已改为 GitHub，插件已改指
+> `tag = "v0.2.0"`（见 §零）。
 
 ### 2.2 后果：**一个指错方向的解码错误**
 
@@ -101,17 +106,17 @@ sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", ta
 
 | # | 动作 | 状态 | 判据 |
 |---|---|---|---|
-| 1 | 把本仓 `proto/*.proto` 与 `crates/sm-plugin-api/src/*.rs` 同步到契约仓 | ✅ **已做**（契约仓提交 `待推送`） | `parity/check_contract_sync.py` 报 9 个受管文件一致 |
+| 1 | 把本仓 `proto/*.proto` 与 `crates/sm-plugin-api/src/*.rs` 同步到契约仓 | ✅ **已做并推送**（契约仓提交 `1b1edbf`） | `parity/check_contract_sync.py` 报 9 个受管文件一致 |
 | 2 | **`ABI_MAJOR` 1 → 2**（两仓同时） | ✅ **已做** | 两边 `lib.rs` 都是 `pub const ABI_MAJOR: i32 = 2;` |
-| 3 | 契约仓打 tag **`v0.2.0`** | ⚠️ **本地已打，未推送** | 远端有 `v0.2.0` |
-| 4 | 两个插件的 `Cargo.toml` 改 `tag = "v0.2.0"` | ⬜ **待做**（依赖第 3 步推送） | 两插件 `cargo test` 绿 |
-| 5 | `plugin-ref-local` 的 `generate_thumbnails` 改成发 `done` 帧 | ⬜ **待做**（依赖第 4 步） | 它自己 `src/provider.rs:318` 的 `GAP:` 注释可以删掉；流末帧是 `done` |
+| 3 | 契约仓打 tag **`v0.2.0`** | ✅ **已推送**（GitHub） | 远端有 `v0.2.0` |
+| 4 | 两个插件的 `Cargo.toml` 改 `tag = "v0.2.0"` | ✅ **已做** | 两插件 `cargo test` 绿（`ref-local` 13 项 / `javbus` 33 项） |
+| 5 | `plugin-ref-local` 的 `generate_thumbnails` 改成发 `done` 帧 | ✅ **已做**（宿主内置副本早已实现，按它镜像过去；`GAP:` 注释已删） | 流末帧是 `done`；`tests/roundtrip.rs` 断言 `payload` 必须在 |
 | 6 | ~~跨仓集成测试~~ → **改为 `parity/check_contract_sync.py`** | ✅ **已做**（并接进 `verify.ps1`） | 见下 |
 
-**第 3~5 步卡在同一件事上：契约仓推不出去。** 本机对
-`https://cnb.cool/zxsos1/sakuramedia-plugin-api.git` 没有可用凭据
-（`git push --dry-run` 报 `could not read Username`），所以 tag `v0.2.0` 只在本地。
-**在推送之前不要执行第 4 步** —— 插件会拉不到那个 tag 而构建失败。
+**第 3~5 步原卡在「契约仓推不出去」，现已随改放 GitHub 解开**（见 §零）。两个插件
+按 GitHub 上的 `v0.2.0` 重新编译、自带测试全绿 —— 这同时是「两仓契约确实一致」的
+一次端到端检验：`check_contract_sync.py` 只比字节，它多证明了一件事 ——
+「那个 tag 拉得下来，而且按它编得过」。
 
 > ✅ **第 2 步可以现在就生效的原因**：宿主与契约仓**同时**改成了 2。
 > 唯一还在用旧契约的是「按 `v0.1.0` 编译出来的插件二进制」，而

@@ -146,7 +146,12 @@ pub struct MetadataSourceService {
     sources: Vec<RegisteredSource>,
     /// JavDB provider。`None` = 这一轮没有 JavDB 可用 —— 上游 `fetch` 的
     /// `provider` 也是调用方给的，不是类成员。
-    provider: Option<Box<dyn MetadataProvider>>,
+    ///
+    /// `+ Send + Sync`：这个服务要进组合根、在异步任务里被持有（`transfers`
+    /// 那个 `MovieMetadataImporter` 就要求实现是 `Send + Sync`），少了这两个
+    /// 约束整条链都装不进去。实现方（`JavdbProvider`、测试替身）本来就是
+    /// `Send + Sync` —— 约束写在这里，只是别让 trait 对象把它擦掉。
+    provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
 }
 
 /// 一个已注册的插件来源。
@@ -169,7 +174,7 @@ impl MetadataSourceService {
     /// 构造。
     pub fn new(
         sources: Vec<RegisteredSource>,
-        provider: Option<Box<dyn MetadataProvider>>,
+        provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
     ) -> Self {
         Self { sources, provider }
     }
@@ -364,6 +369,30 @@ impl MetadataSourceService {
         Err(MetadataSourceError::NotFound)
     }
 
+    /// 按 **JavDB id** 取详情。上游 `movie_metadata_search_service.py:270`
+    /// （`fetch_candidate` 的 javdb 支）。
+    ///
+    /// # 为什么另开一个窄口子，而不是把 `provider` 暴露出去
+    ///
+    /// 候选重试时客户端手里是**一个 javdb_id**，不是番号。用 [`Self::fetch`]
+    /// （按番号、JavDB 优先、还会兜底到插件）是**另一条语义** —— 同一个番号
+    /// 可能对到另一部片，而上游在那里明确按 id 取。
+    ///
+    /// JavDB 没配置、或该 id 已不在 JavDB → [`MetadataSourceError::NotFound`]
+    /// （「这个来源没有这条记录」，不是故障）。真故障原样透传。
+    pub async fn fetch_by_javdb_id(
+        &self,
+        javdb_id: &str,
+    ) -> Result<serde_json::Value, MetadataSourceError> {
+        let Some(provider) = &self.provider else {
+            return Err(MetadataSourceError::NotFound);
+        };
+        provider
+            .get_movie_by_javdb_id(javdb_id)
+            .await?
+            .ok_or(MetadataSourceError::NotFound)
+    }
+
     /// 按番号导入（JavDB 优先）。上游 `import_by_number`
     /// （`metadata_source_service.py:30-44`）。
     ///
@@ -396,11 +425,18 @@ impl MetadataSourceService {
     /// 与 [`Self::match_actors`] 同一个取向：本模块的错误语义属于「来源」，
     /// HTTP 状态码由调用方决定（见模块文档）。导入侧的 `ServiceError` 在这里
     /// 被折成 [`MetadataSourceError::RequestFailed`]。
+    /// # 为什么这个参数带 `+ Send + Sync`
+    ///
+    /// 本函数在 await 之间持有 `import_service`，于是它返回的 future 只有在
+    /// `&dyn CatalogImport` 是 `Send + Sync` 时才是 `Send`。少了这两个约束，
+    /// 上游那一整条链（`transfers::MovieMetadataImporter` 要求实现
+    /// `Send + Sync`）直接编译不过。约束补在 `dyn` 这一层 —— 不去动那个 trait
+    /// 的声明，它的实现（`CatalogImportService`）本来就是 `Send + Sync`。
     pub async fn import_by_number(
         &self,
         config: &serde_json::Value,
         movie_number: &str,
-        import_service: &dyn crate::catalog::catalog_import::CatalogImport,
+        import_service: &(dyn crate::catalog::catalog_import::CatalogImport + Send + Sync),
         force_subscribed: bool,
     ) -> Result<(i32, bool), MetadataSourceError> {
         // ① 已存在 → 直接返回（上游第一行）。`false` = 没有新建。
@@ -468,7 +504,9 @@ impl MetadataSourceService {
     pub async fn match_actors(
         &self,
         keyword: &str,
-        import_service: &dyn crate::catalog::catalog_import::CatalogImport,
+        // 约束的理由同 [`Self::import_by_number`]（在 await 之间持有它，
+        // 所以必须是 `Send + Sync` 才不把调用方的 future 拖成不 Send）。
+        import_service: &(dyn crate::catalog::catalog_import::CatalogImport + Send + Sync),
     ) -> Result<usize, MetadataSourceError> {
         let provider = self
             .provider
@@ -520,7 +558,10 @@ fn import_failed(error: crate::error::ServiceError) -> MetadataSourceError {
 /// `create_movie` 现在**不读**它们（系列要 join、演员与标签要那两张表的写入
 /// 方法，都还没接 —— 见 `catalog_import` 的模块文档）。这里给不给结果一样，
 /// 所以不给：一个「看起来在传、其实被丢掉」的键比不传更容易让人误解。
-fn import_detail_of(delivery: &MovieDelivery) -> serde_json::Value {
+/// [`crate::catalog::movie_metadata_search::MovieMetadataSearchService::fetch_candidate`]
+/// 的插件支也要这一层翻译 —— 两处必须是**同一个**形状，否则「按番号导入」与
+/// 「按候选重试」会往 `create_movie` 交出两份不同的键。
+pub(crate) fn import_detail_of(delivery: &MovieDelivery) -> serde_json::Value {
     serde_json::json!({
         "movie_number": delivery.movie_number,
         "title": delivery.title,
@@ -547,7 +588,10 @@ fn import_detail_of(delivery: &MovieDelivery) -> serde_json::Value {
 /// 前两个描述**哪个插件**（来自 [`DeliverySource::Plugin`]），后两个描述
 /// **这一条记录**（来自插件交付本身）—— 同一个插件的两部影片 `source_url`
 /// 不同，所以它们属于交付而不属于插件的注册信息。
-fn source_identity_of(
+/// 理由同 [`import_detail_of`]：`fetch_candidate` 的插件支要给出**同一份**
+/// 来源身份，否则「按番号导入」与「按候选重试」写进 `movie.metadata_source`
+/// 的对象会不一样。
+pub(crate) fn source_identity_of(
     plugin_id: &str,
     display_name: &str,
     delivery: &MovieDelivery,

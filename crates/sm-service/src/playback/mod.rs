@@ -32,7 +32,13 @@ pub mod media_thumbnail_pack_backfill;
 pub mod media_validity_scan;
 pub mod media_video_info_backfill;
 pub mod operation_locks;
+// 「这次播放实际用了哪种投递方式」的记忆。上游是**进程内 + TTL 的字典**，
+// 不是数据库表 —— 见模块文档。
+pub mod playback_mode;
 pub mod provider_helpers;
+// `proxy` 投递的透明转发：拼 URL、转发请求头、镜像响应头与状态码。
+// **不做** Range 解析 —— 理由见模块文档（Range 归「持有字节的那一侧」）。
+pub mod proxy;
 pub mod search_filters;
 pub mod thumbnails;
 

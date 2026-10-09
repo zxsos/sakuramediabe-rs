@@ -9,7 +9,7 @@
     插件侧（契约仓）：    sakuramedia-plugin-api/proto/*.proto  +  src/*.rs
 
 插件按契约仓的 **git tag** 依赖它
-（`sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.2.0" }`），
+（`sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }`），
 而宿主按**本仓**的 `proto/` 编译 —— 两者靠手工同步。
 
 P1-1（`GenerateThumbnails` 的流从 `stream ProgressEvent` 换成

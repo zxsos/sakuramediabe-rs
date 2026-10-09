@@ -385,11 +385,15 @@ pub fn video_list_sort_column(key: &str) -> Option<&'static str> {
 pub type VideoMediaStats = (i32, i64, i64);
 
 /// 每个条目的**首条有效媒体**：`(video_item_id, media_id, duration_seconds,
-/// file_size_bytes, resolution)`。**投影行**，同上。
+/// file_size_bytes, resolution, provider_key)`。**投影行**，同上。
 ///
 /// `media_id` 在里面是因为合集成员端点的 `first_media_id` 要它
 /// （上游 `COALESCE(first_media.id, 0)` 那个哨兵值，归一为 `None`）。
-pub type VideoFirstMedia = (i32, i32, i32, i64, Option<String>);
+///
+/// `provider_key` 是这条媒体**所属库**的 provider 键（`LEFT JOIN media_library`）——
+/// 合集成员的 `play_url` 要靠它查 `playback_deliveries[0]`。库是外键，正常不会
+/// 为空，`LEFT JOIN` 只是防御「库被删了留下孤儿媒体」。
+pub type VideoFirstMedia = (i32, i32, i32, i64, Option<String>, Option<String>);
 
 /// 条目归属的合集：`(video_item_id, collection_id, name)`。
 ///
@@ -483,27 +487,31 @@ impl VideoItemRepository {
     /// `MIN(Media.id) WHERE valid GROUP BY video_item` 子查询同值。
     ///
     /// 没有有效媒体的条目**不出现在结果里**，调用方按
-    /// `(0, 0, 0, None)` 兜底（上游 `COALESCE(..., 0)` 是同一件事）。
+    /// `(0, 0, 0, None, None)` 兜底（上游 `COALESCE(..., 0)` 是同一件事）。
     pub async fn first_valid_media(
         &self,
         video_ids: &[i32],
-    ) -> Result<std::collections::HashMap<i32, (i32, i32, i64, Option<String>)>, DbError> {
+    ) -> Result<
+        std::collections::HashMap<i32, (i32, i32, i64, Option<String>, Option<String>)>,
+        DbError,
+    > {
         if video_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         let rows = sqlx::query_as::<_, VideoFirstMedia>(
-            "SELECT DISTINCT ON (video_item_id) video_item_id, id, duration_seconds, \
-                    file_size_bytes, resolution \
-             FROM media WHERE video_item_id = ANY($1) AND valid \
-             ORDER BY video_item_id, id",
+            "SELECT DISTINCT ON (m.video_item_id) m.video_item_id, m.id, m.duration_seconds, \
+                    m.file_size_bytes, m.resolution, l.provider_key \
+             FROM media m LEFT JOIN media_library l ON l.id = m.library_id \
+             WHERE m.video_item_id = ANY($1) AND m.valid \
+             ORDER BY m.video_item_id, m.id",
         )
         .bind(video_ids)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, media_id, duration, size, resolution)| {
-                (id, (media_id, duration, size, resolution))
+            .map(|(id, media_id, duration, size, resolution, provider_key)| {
+                (id, (media_id, duration, size, resolution, provider_key))
             })
             .collect())
     }

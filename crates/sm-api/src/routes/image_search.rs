@@ -377,10 +377,15 @@ impl RawFilters {
     fn parse(self) -> Result<SessionFilters, ErrorResponse> {
         Ok(SessionFilters {
             page_size: self.page_size,
-            movie_ids: parse_csv_positive_ints(self.movie_ids.as_deref(), "movie_ids")?,
+            movie_ids: parse_csv_positive_ints(
+                self.movie_ids.as_deref(),
+                "movie_ids",
+                "invalid_image_search_filter",
+            )?,
             exclude_movie_ids: parse_csv_positive_ints(
                 self.exclude_movie_ids.as_deref(),
                 "exclude_movie_ids",
+                "invalid_image_search_filter",
             )?,
             score_threshold: self.score_threshold,
         })
@@ -584,9 +589,18 @@ fn details_of(key: &str, value: &str) -> serde_json::Map<String, serde_json::Val
 /// 上游抛的是 `ApiError(422, ...)` —— 它是**校验**错误，不是业务错误，所以
 /// 与「图片无效」那条 400 **不同码**。客户端据此区分「改改参数」（422）与
 /// 「换个文件」（400）。骨架期这里写的是 400。
+///
+/// # ★ 错误码是**参数**
+///
+/// 上游 `parse_csv_positive_ints(value, name, error_code=...)`
+/// （`api/routers/_utils.py:21-36`）—— 同一套解析规则服务多个端点，每个端点有
+/// 自己的码。本仓先前把码写死成 `invalid_image_search_filter`，那只够图搜用；
+/// 合并播放要的是 `invalid_merged_playback`。写死两个副本会让「正整数 + 无空项」
+/// 这套规则各写一遍，改一处漏一处。
 pub fn parse_csv_positive_ints(
     raw: Option<&str>,
     field: &str,
+    error_code: &str,
 ) -> Result<Option<Vec<i64>>, ErrorResponse> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -596,19 +610,22 @@ pub fn parse_csv_positive_ints(
         match piece.trim().parse::<i64>() {
             // 空项在这里落进 `_`：`"".parse()` 失败，`"1,,2"` 的中间项也是。
             Ok(value) if value > 0 => out.push(value),
-            _ => return Err(invalid_image_search_filter(field, raw)),
+            _ => return Err(invalid_csv(error_code, field, raw)),
         }
     }
     Ok(Some(out))
 }
 
-/// `invalid_image_search_filter` 错误。**422**，且 `details` 回显原始串。
-fn invalid_image_search_filter(field: &str, raw: &str) -> ErrorResponse {
+/// CSV 校验失败。**422**，码由调用方给，`details` 回显原始串。
+///
+/// `details` 回显**原始串**而不是出错的那一段：客户端拿到的应是「你传的值不
+/// 认」，而不是一个它自己拼出来的片段。
+fn invalid_csv(code: &str, field: &str, raw: &str) -> ErrorResponse {
     let mut details = serde_json::Map::new();
     details.insert(field.to_owned(), serde_json::Value::from(raw));
     ErrorResponse::new(
         axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-        "invalid_image_search_filter",
+        code,
         "Invalid filter value",
     )
     .with_details(details)
@@ -662,7 +679,7 @@ mod tests {
 
     /// 期望**报错**，否则 panic。返回那个错误。
     fn expect_error(raw: &str) -> ErrorResponse {
-        match parse_csv_positive_ints(Some(raw), "movie_ids") {
+        match parse_csv_positive_ints(Some(raw), "movie_ids", "invalid_image_search_filter") {
             Err(error) => error,
             Ok(other) => panic!("{raw} 该报错，实际解析成了 {other:?}"),
         }
@@ -708,9 +725,13 @@ mod tests {
     /// 正常解析：`None` 与合法串（**允许空格**，上游 `strip()` 过每一项）。
     #[test]
     fn a_valid_csv_parses() {
-        assert_eq!(parse_csv_positive_ints(None, "movie_ids").unwrap(), None);
         assert_eq!(
-            parse_csv_positive_ints(Some("1, 2,3"), "movie_ids").unwrap(),
+            parse_csv_positive_ints(None, "movie_ids", "invalid_image_search_filter").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_csv_positive_ints(Some("1, 2,3"), "movie_ids", "invalid_image_search_filter")
+                .unwrap(),
             Some(vec![1, 2, 3])
         );
     }

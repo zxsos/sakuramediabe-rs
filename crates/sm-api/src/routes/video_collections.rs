@@ -51,21 +51,20 @@
 //! 还有一处**文档写反**的：骨架写「添加条目已存在 → 409」，而上游
 //! `add_item` 查到已有成员就 `return` —— **幂等 204**（见下面 handler）。
 //!
-//! # 本轮只接线了 5 个合集级端点
+//! # 八个端点都已接线
 //!
-//! `GET ""` / `POST ""` / `GET /{id}` / `PATCH /{id}` / `DELETE /{id}` 已接通。
-//! 剩下四个成员端点（`GET /{id}/items`、`POST /{id}/items`、
-//! `DELETE /{id}/items/{item_id}`、`POST /{id}/items/reorder`）**仍是
-//! `todo!()`** —— 它们要组装 `VideoCollectionItemResource`，而那条资源的
-//! `video` 字段是完整的 `VideoItemListItemResource`（14 个字段，含
-//! 首条有效媒体的时长/大小/分辨率 + 合集引用），与 `GET /videos` 共用同一套
-//! 组装，属下一批。
+//! 5 个合集级 + 3 个成员操作全部接通。成员端点组装
+//! `VideoCollectionItemResource`，其 `video` 字段是完整的
+//! `VideoItemListItemResource`（14 字段），与 `GET /videos` 共用同一套组装。
 //!
-//! 那四个端点里 `play_url` 还需要**插件 ABI**（上游
-//! `MEDIA_PROVIDER_REGISTRY.require(provider_key)` 拿 `playback_deliveries[0]`）。
-//! 它的默认值是 `false`，所以默认路径不受影响；但
-//! `include_play_url=true` 在插件落地前做不到 —— **不要用空串冒充**，
-//! 客户端会把空地址当成「不可播放」而禁用整条播放列表。
+//! `include_play_url=true` 时 `play_url` 由**媒体库能力缝**提供：服务层给出
+//! `provider_key → playback_deliveries`（见 `MediaLibraryService::playback_deliveries`），
+//! 这里取 `[0]` 交给 [`signed_play_url`] 签地址。两处细节：
+//!
+//! - provider **没装**时（`play_provider_key` 查不到）与上游一致地把
+//!   `video.can_play` **打成 `false`**，不是只丢 `play_url`（上游 `:263-264`）。
+//! - `play_url` 无值发 **`null`**，**绝不用空串** —— 空串在客户端是「有媒体但
+//!   播不了」，会让整条播放列表被判成不可播放。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -84,6 +83,7 @@ use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
 use crate::query::{one, twenty};
 use crate::routes::method_not_allowed;
+use crate::signing::signed_play_url;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -144,8 +144,8 @@ pub struct VideoCollectionItemResource {
     pub video: VideoItemListItemResource,
     /// 「首个有效媒体」的签名播放地址。
     ///
-    /// **仅在 `include_play_url=true` 时才有值**；而它需要插件 ABI
-    /// （`playback_deliveries[0]`），插件落地前恒为 `None`。
+    /// **仅在 `include_play_url=true` 且成员有有效媒体时才有值** —— 由
+    /// [`signed_play_url`] 用 provider 的 `playback_deliveries[0]` 签出。
     ///
     /// **不要用空串冒充** —— 空串在客户端是「这个媒体有，但播不了」，
     /// 会让整条播放列表被判成不可播放。`None` 才是「没提供」。
@@ -403,13 +403,31 @@ async fn list_collection_items(
         )
         .await?;
     let now = now_seconds();
-    // `include_play_url=true` 需要插件 ABI 才能签出地址（见
-    // `VideoCollectionItemResource::play_url`），所以现在**恒为 `None`** ——
-    // 客户端会退化成逐集拉详情，而不是拿到一个「不可播放」的空串。
-    let _ = query.include_play_url;
+    // `provider_key → 交付顺序`。**没注入注册表时是空表**，行为退化成「全部无
+    // play_url」，而不是报错 —— 目录数据是可选增强。
+    let deliveries = state.media_library_service().playback_deliveries();
     let items = rows
         .iter()
-        .map(|row| item_resource(&secret, now, row, None))
+        .map(|row| {
+            let mut resource = item_resource(&secret, now, row, None);
+            // 上游 `_query_item_resources`（`:259-268`）：
+            // `if include_play_url and link.play_media_id:` 才去查 provider。
+            if query.include_play_url {
+                if let (Some(media_id), Some(provider_key)) =
+                    (row.first_media_id, row.provider_key.as_deref())
+                {
+                    match deliveries.get(provider_key) {
+                        Some(list) => {
+                            resource.play_url = signed_play_url(&secret, now, media_id, list);
+                        }
+                        // `MEDIA_PROVIDER_REGISTRY.require` 抛 `ProviderUnavailableError`：
+                        // 上游**顺手把 can_play 打成 false**（`:263-264`），不是只丢 play_url。
+                        None => resource.video.can_play = false,
+                    }
+                }
+            }
+            resource
+        })
         .collect();
     Ok(Json(sm_core::pagination::Paginated::new(
         items,

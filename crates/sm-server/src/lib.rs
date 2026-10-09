@@ -36,6 +36,7 @@ pub mod logging;
 /// 宿主能力出口（`PluginHost`）的服务端。同样只在组合根：它要同时用
 /// `sm_db`（查影片/演员）与 `sm-plugin-api`（proto），而 `sm-plugins` 不该
 /// 反向依赖业务层的数据。
+pub mod media_library_gateway;
 pub mod plugin_host;
 pub mod plugins;
 // provider 数据面的**实现**只能在这里：`sm-service` 不能依赖 `sm-plugins`
@@ -164,11 +165,15 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读
     //    `job_disabled_reason` 需要的配置快照，而它是 move 进 AppState 的。
-    // ⚠️ 还有两个注入 seam **故意没接**（不是漏了）：`.with_downloads(...)` 与
-    //    `.with_media_library_registry(...)`。它们的 trait 是活的，但**没有实现** ——
-    //    要由插件 ABI 那批补上（见 docs/handoff.md）。在那之前的表现是契约化的：
-    //    `/media-libraries` 的写方法一律 503 `provider_not_installed`、providers 目录
-    //    空表；`/download-clients` 三个写方法同样 503。
+    //
+    // ⚠️ 还剩一个注入 seam **故意没接**（不是漏了）：`.with_downloads(...)`。
+    //    它的 trait 是活的，但**没有实现** —— 要由插件 ABI 那批补上（见
+    //    docs/handoff.md）。在那之前的表现是契约化的：`/download-clients` 三个写
+    //    方法一律 503 `provider_not_installed`。
+    //
+    // 媒体库那条缝**本刀已接**：目录来自注册期收下的 bundle 描述符，动作
+    // （`prepare_library` / `get_space_usage`）现连插件 —— 与数据面同一个「活的
+    // 注册表」纪律。见 `crate::media_library_gateway`。
     // 插件管理**必须**接上：它的 trait 已经有实现（`sm_plugins::admin`），
     // 而 `AppState::plugin_admin()` 在没接时会报 500 `plugin_admin_unavailable`
     // —— 那是「组合根漏了接线」的信号，不是「没装插件」。
@@ -193,11 +198,19 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let playback_gateway: std::sync::Arc<
         dyn sm_service::playback::provider_helpers::PlaybackGateway,
     > = gateway;
+    // 媒体库能力缝：描述符来自注册表（注册期收下），`prepare_library` /
+    // `get_space_usage` 现连插件。同一个「活的注册表」纪律（插件重启换端点）。
+    let media_library_gateway: std::sync::Arc<
+        dyn sm_service::playback::media_library::MediaLibraryRegistry,
+    > = std::sync::Arc::new(media_library_gateway::MediaLibraryGateway::new(
+        loaded_plugins.provider_registry(),
+    ));
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
         .with_storage_gateway(storage_gateway)
         .with_playback_gateway(playback_gateway)
+        .with_media_library_registry(media_library_gateway)
         .with_plugin_admin(plugin_admin);
     // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
     //

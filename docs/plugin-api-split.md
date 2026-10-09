@@ -31,7 +31,7 @@ Cargo.toml  README.md
 ## 依赖方式：锁 tag，不要锁 branch
 
 ```toml
-sm-plugin-api = { git = "https://cnb.cool/zxsos1/sakuramedia-plugin-api.git", tag = "v0.1.0" }
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
 ```
 
 用 branch 会让宿主与插件静默漂移到不同版本，症状是「插件按旧 proto 编译、宿主按新
@@ -44,7 +44,7 @@ proto 校验」—— 这种不一致**不报错**，只在运行时表现为「
 - 上游 `manifest.json` 的 `host_api_version: 6` 是 **Python 侧编号**，与
   `ABI_MAJOR` 不是同一套，**不要拿来比**。
 
-## 本仓库这边的待办（等远端仓库建好后做）
+## 本仓库这边的待办（远端仓已建好：GitHub `zxsos/sakuramedia-plugin-api`）
 
 - [ ] 删 `crates/sm-plugin-api/`，根 `Cargo.toml` 去掉对应的 `members` 与
       `[workspace.dependencies]` 行

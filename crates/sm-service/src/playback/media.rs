@@ -330,7 +330,7 @@ impl MediaService {
     /// （换一种能成）与「根本不支持播放」（换也没用），两者都报 422。想分清就得
     /// 回到 (a)。这是 (b) 明码标价的代价，不是遗漏。
     ///
-    /// 上游**不做逐媒体分级**的两级 404 在 [`Self::require_media`] 与这里各一次：
+    /// 上游**不做逐媒体分级**的两级 404 在 `Self::require_media` 与这里各一次：
     /// 媒体缺失 → 404 `media_not_found`；媒体在但库为空 → 404
     /// `media_library_not_found`。**两者都在 404 之前查签名** —— 那是路由的事。
     pub async fn plan_playback(
@@ -379,6 +379,145 @@ impl MediaService {
             .map_err(|failure| Self::map_playback_failure(&failure))
     }
 
+    /// 多媒体的**合并**投递计划。上游 `play_merged_media`
+    /// （`media.py:322-379`）里属于服务层的那部分。
+    ///
+    /// # 五道门，顺序**不能改**
+    ///
+    /// 上游是「先把行全取回来 → 再逐项判」，因为每道门的判据都来自行数据。
+    /// 顺序错的表现不是崩溃而是**码错**（客户端会照着码去修错的东西）：
+    ///
+    /// | 序 | 条件 | 码 |
+    /// |---|---|---|
+    /// | 1 | 有 id 取不到 | 404 `media_not_found` |
+    /// | 2 | 任一分段 `valid = false` | 422 `merged_playback_unavailable` |
+    /// | 3 | `movie_number` 不唯一**或为空** | 422 `merged_playback_cross_movie` |
+    /// | 4 | `library_id` 不唯一 | 422 `merged_playback_cross_library` |
+    /// | 5 | 库记录不存在 | 404 `media_library_not_found` |
+    ///
+    /// 门 1 用**逐个查映射**而不是比 `len`：入参本身可能带重复（那样 `len` 不等
+    /// 会被误报成「媒体不存在」），去重是路由层的事（`invalid_merged_playback`）。
+    ///
+    /// 门 3 的空值判据不能省 —— `{None}` 这个集合大小也是 1，光判「集合大小」
+    /// 会放过一整组孤儿媒体。
+    ///
+    /// # 没有对应的「声明」门（(b) 的取舍）
+    ///
+    /// 上游另有两道门查「provider 声明了 `merged_playback_format ∈ {mp4,hls}`」
+    /// 与「`handle_merged_playback` 可调用」（`media.py:356-357`、`:364-366`），
+    /// 那要求宿主持有能力清单 —— 本仓没有（ADR `2026-10-08-provider-seam.md`）。
+    /// 改为把请求交给插件，其 `unsupported` 由 `Self::map_merged_failure` 落成
+    /// **同一个** 422 `merged_playback_unavailable`。
+    ///
+    /// 投递方式**强制 `proxy`**（上游 `media.py:370`）：合并流没有单个 provider
+    /// 地址可指，所以不存在 302 这个选项 —— 这也让本方法的码没有歧义
+    /// （对比 [`Self::plan_playback`] 的已知近似）。
+    pub async fn plan_merged_playback(
+        &self,
+        ordered_ids: &[i32],
+        resource_path: &str,
+    ) -> Result<provider_helpers::PlaybackPlan, ServiceError> {
+        let media_by_id = self.media.find_by_ids(ordered_ids).await?;
+
+        // 门 1：逐个查，缺失即 404。返回**引用**，不 clone 整行。
+        let mut medias: Vec<&sm_db::Media> = Vec::with_capacity(ordered_ids.len());
+        for id in ordered_ids {
+            medias.push(media_by_id.get(id).ok_or_else(|| {
+                ServiceError::not_found("media_not_found", "部分媒体不存在", "media_id", *id)
+            })?);
+        }
+
+        // 门 2：无效分段。上游的措辞**不指出是哪一个** —— 照抄，别自作主张加 id。
+        if medias.iter().any(|media| !media.valid) {
+            return Err(ServiceError::validation(
+                "merged_playback_unavailable",
+                "合并分段存在无效媒体",
+            ));
+        }
+
+        // 门 3：同一部影片。`None` 与「多个番号」都拒。
+        let mut movie_numbers = std::collections::HashSet::new();
+        for media in &medias {
+            let Some(number) = media.movie_number.as_deref() else {
+                return Err(ServiceError::validation(
+                    "merged_playback_cross_movie",
+                    "合并分段必须属于同一部影片",
+                ));
+            };
+            movie_numbers.insert(number);
+        }
+        if movie_numbers.len() != 1 {
+            return Err(ServiceError::validation(
+                "merged_playback_cross_movie",
+                "合并分段必须属于同一部影片",
+            ));
+        }
+
+        // 门 4：同一个媒体库。
+        //
+        // 上游还判了 `None in library_ids`，本仓**不需要**：`media.library_id` 是
+        // NOT NULL（`sm-db/src/playback/media.rs:94`），判据恒假。
+        let mut library_ids = std::collections::HashSet::new();
+        for media in &medias {
+            library_ids.insert(media.library_id);
+        }
+        if library_ids.len() != 1 {
+            return Err(ServiceError::validation(
+                "merged_playback_cross_library",
+                "合并分段必须来自同一媒体库",
+            ));
+        }
+
+        // 门 5：库记录在（拿 `provider_key` / `provider_config` 要用它）。
+        let library_id = medias[0].library_id;
+        let library = sm_db::repo::MediaLibraryRepository::new(self.pool.clone())
+            .find_by_id(library_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(
+                    "media_library_not_found",
+                    "Media library not found",
+                    "library_id",
+                    library_id,
+                )
+            })?;
+
+        let Some(gateway) = self.playback.as_deref() else {
+            return Err(ServiceError::unavailable(
+                "provider_not_installed",
+                "媒体提供方未安装",
+            ));
+        };
+
+        // 句柄按**入参顺序**建（`ordered_ids` 的顺序进了签名载荷，不能按查询
+        // 返回顺序重排）。
+        let handles: Vec<provider_helpers::MediaHandle> = medias
+            .iter()
+            .map(|media| {
+                provider_helpers::media_handle_for(&provider_helpers::MediaRecord {
+                    id: i64::from(media.id),
+                    library_id: i64::from(media.library_id),
+                    storage_ref: json_or_null(media.storage_ref.as_deref()),
+                    provider_config: json_or_null(library.provider_config.as_deref()),
+                    provider_key: library.provider_key.clone(),
+                    account_key: library.account_key.clone(),
+                    file_name: media.file_name.clone(),
+                    file_size_bytes: media.file_size_bytes,
+                    duration_seconds: media.duration_seconds,
+                })
+            })
+            .collect();
+
+        gateway
+            .plan_merged_playback(
+                &handles,
+                resource_path,
+                provider_helpers::RequestedDelivery::Proxy,
+            )
+            .await
+            .map_err(|failure| Self::map_merged_failure(&failure))
+    }
+
     /// 播放投递失败的映射。
     ///
     /// ★ `unsupported` **不走** [`Self::map_provider_failure`]：上游在这个端点给
@@ -390,6 +529,24 @@ impl MediaService {
             return ServiceError::validation(
                 "provider_playback_delivery_unsupported",
                 "媒体提供方不支持该播放方式",
+            );
+        }
+        Self::map_provider_failure(failure)
+    }
+
+    /// 合并播放失败的映射。
+    ///
+    /// `unsupported` → 422 `merged_playback_unavailable`
+    /// （上游 `media.py:356-357` 与 `:364-366` 两道门给的就是这个码）。
+    ///
+    /// ★ 与 [`Self::map_playback_failure`] **不是**同一个码，且这里**没有歧义**：
+    /// 合并播放的投递方式不由客户端选（永远是 `proxy`），所以 `unsupported` 只
+    /// 可能意味着「不支持合并播放」。那边分不清是因为 `play` 的投递方式来自请求。
+    fn map_merged_failure(failure: &ProviderFailure) -> ServiceError {
+        if failure.code == provider_helpers::PROVIDER_UNSUPPORTED {
+            return ServiceError::validation(
+                "merged_playback_unavailable",
+                "媒体提供方不支持合并播放",
             );
         }
         Self::map_provider_failure(failure)

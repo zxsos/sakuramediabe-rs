@@ -213,6 +213,29 @@ pub type MediaSummaryRow = (
     bool,           // valid
 );
 
+/// 一行**按视频条目分组**的媒体摘要。列与 [`MediaSummaryRow`] 相同，只是分组键
+/// 从 `movie_number` 换成 `video_item_id`。
+///
+/// # 为什么不能复用 [`MediaSummaryRow`]
+///
+/// 分组键的类型不同（`String` vs `i32`）。硬塞进同一个元组就要把 `i32` 转成
+/// 字符串，调用方再从字符串转回来 —— 那是两处只为了「少一个类型」而存在的转换。
+///
+/// 与 [`MediaSummaryRow`] 同因，声明成元组而不是具名 `pub struct`（schema 对拍）。
+pub type VideoMediaSummaryRow = (
+    i32,            // video_item_id
+    i32,            // media_id
+    Option<i32>,    // library_id
+    Option<String>, // library_name
+    Option<String>, // provider_key
+    String,         // file_name
+    Option<String>, // resolution
+    i64,            // file_size_bytes
+    i32,            // duration_seconds
+    Option<String>, // video_info（JsonText：可能是脏文本，不解析）
+    bool,           // valid
+);
+
 impl MediaRepository {
     /// 构造仓储。
     pub fn new(pool: PgPool) -> Self {
@@ -523,6 +546,33 @@ impl MediaRepository {
                 .fetch_optional(&self.pool)
                 .await?,
         )
+    }
+
+    /// 按主键**批量**查询，返回 `id -> Media` 的映射。
+    ///
+    /// # 为什么是映射而不是 `Vec`
+    ///
+    /// 调用方接下来要**按自己的顺序**取值。合并播放的分段顺序由客户端给定
+    /// （且进了签名载荷），而 `WHERE id = ANY(...)` 的返回顺序**不保证**与入参
+    /// 一致 —— 直接 `zip` 会让时间轴按数据库的返回顺序拼，看起来只是「顺序有点
+    /// 怪」，实际是**签了名的顺序与实际用的顺序不一致**。
+    ///
+    /// 上游同样是先建 `{media.id: media}` 字典再按 `ordered_ids` 取值
+    /// （`media.py:335-341`）。
+    ///
+    /// 空入参直接返回空表：`= ANY('{}')` 虽然合法，但没必要跑一趟。
+    pub async fn find_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Media>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|media| (media.id, media)).collect())
     }
 
     /// 按主键查询，未命中返回 [`DbError::NotFound`]。
@@ -1034,6 +1084,38 @@ impl MediaRepository {
              ORDER BY m.movie_number, m.id",
         )
         .bind(movie_numbers)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// [`Self::summaries_for_movies`] 的**按视频条目**版本：详情页的
+    /// `media_items` 要的是「这个条目的全部媒体」，而不是「这个番号的全部媒体」。
+    ///
+    /// 形状完全照抄上游 `VideoItemService::_media_items`
+    /// （`Media.select(...).join(MediaLibrary, JOIN.LEFT_OUTER).where(Media.video_item == video)
+    /// .order_by(Media.id)`）—— 一条带 `LEFT JOIN` 的查询，按 `m.id` 升序，
+    /// **不按 `valid` 过滤**（失效媒体也要出现在详情里，前端据空地址禁用播放）。
+    ///
+    /// ⚠️ 上游用的是 `IN`，这里用 `= ANY($1)`：语义相同，`sqlx` 对数组绑定更直接。
+    #[allow(clippy::type_complexity)]
+    pub async fn summaries_for_video_items(
+        &self,
+        video_ids: &[i32],
+    ) -> Result<Vec<VideoMediaSummaryRow>, DbError> {
+        if video_ids.is_empty() {
+            // 空数组绑定会得到 `IN ()` 那种非法/无意义 SQL（同 `summaries_for_movies`）。
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, VideoMediaSummaryRow>(
+            "SELECT m.video_item_id, m.id, m.library_id, l.name, l.provider_key, \
+                    m.file_name, m.resolution, m.file_size_bytes, \
+                    m.duration_seconds, m.video_info, m.valid \
+             FROM media m \
+             LEFT JOIN media_library l ON l.id = m.library_id \
+             WHERE m.video_item_id = ANY($1) \
+             ORDER BY m.video_item_id, m.id",
+        )
+        .bind(video_ids)
         .fetch_all(&self.pool)
         .await?)
     }

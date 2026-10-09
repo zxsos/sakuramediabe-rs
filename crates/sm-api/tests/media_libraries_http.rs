@@ -37,10 +37,10 @@ use sm_db::repo::{
 use sm_db::testing::TestDb;
 use sm_db::Db;
 use sm_service::playback::media_library::{
-    LibraryConfigField, MediaLibraryCapability, MediaLibraryRegistry, PreparedLibrary,
-    PreviousLibraryHandle, ProviderCatalogEntry,
+    LibraryConfigField, LibraryForFuture, MediaLibraryCapability, MediaLibraryRegistry,
+    PrepareLibraryFuture, PreparedLibrary, PreviousLibraryHandle, ProviderCatalogEntry,
+    SpaceUsageFuture,
 };
-use sm_service::playback::provider_helpers::SpaceUsage;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::ConfigService;
 use sm_service::transfers::download_client::ProviderFailureInfo;
@@ -83,53 +83,52 @@ impl MediaLibraryCapability for FakeCapability {
         ]
     }
 
-    /// 复刻上游语义：**已声明的 secret 字段若未提交，从旧值回填**。
-    /// 这样 `PATCH` 只改 `root` 时 `token` 不会丢。
+    /// ★ **刻意不做**「未提交的 secret 从旧值回填」—— 那是**宿主**的活
+    /// （`MediaLibraryService::merge_previous_config`，上游 `_prepare_config`
+    /// `:144-151`）。
+    ///
+    /// 替身若顺手替宿主做了这件事，[`patch_refills_secrets_and_missing_library_is_404`]
+    /// 就会在「宿主根本没合并」时**照样绿** —— 那是替身替被测代码把断言做掉了。
+    /// 所以这里只在**没收到** `token` 时报 `invalid_config`：宿主漏合并时，
+    /// 那个 PATCH 会变成 422 而不是 200，测试当场红。
     fn prepare_library(
         &self,
         submitted: &Value,
-        previous: Option<&PreviousLibraryHandle>,
-    ) -> Result<PreparedLibrary, ProviderFailureInfo> {
-        let mut config = submitted.as_object().cloned().unwrap_or_default();
-        let had_token = config.contains_key("token");
-        if !had_token {
-            if let Some(previous) = previous {
-                if let Some(token) = previous.provider_config.get("token") {
-                    config.insert("token".to_owned(), token.clone());
-                }
-            }
-        }
-        if !config.contains_key("token") {
+        _previous: Option<&PreviousLibraryHandle>,
+    ) -> PrepareLibraryFuture<'_> {
+        let config = submitted.as_object().cloned().unwrap_or_default();
+        let outcome = if !config.contains_key("token") {
             // 首次创建又没给 token → provider 报配置无效（上游会返回 failed 项）。
-            return Err(ProviderFailureInfo {
+            Err(ProviderFailureInfo {
                 code: "invalid_config".to_owned(),
                 message: "token is required".to_owned(),
-            });
-        }
-        Ok(PreparedLibrary {
-            provider_config: Value::Object(config),
-            account_key: Some("acct-1".to_owned()),
-        })
+            })
+        } else {
+            Ok(PreparedLibrary {
+                provider_config: Value::Object(config),
+                account_key: Some("acct-1".to_owned()),
+            })
+        };
+        Box::pin(async move { outcome })
     }
 }
 
 impl MediaLibraryRegistry for FakeRegistry {
-    fn library_for(
-        &self,
-        provider_key: &str,
-    ) -> Result<Option<Box<dyn MediaLibraryCapability>>, ProviderFailureInfo> {
-        match self.mode {
-            // 裸码：服务层 `bundle_for` 会补 `provider_` 前缀，拼出
-            // `provider_not_installed`（见 `MediaLibraryRegistry::library_for` 的文档）。
-            // 写 `unavailable` 会拼成 `provider_unavailable` —— 那是「装了但连不上」，
-            // 与「没安装」是两种语义，`provider_failure` 的状态分流也靠这个区分。
-            Mode::NotInstalled => Err(ProviderFailureInfo {
-                code: "not_installed".to_owned(),
-                message: "provider not installed".to_owned(),
-            }),
-            Mode::Installed if provider_key == PROVIDER => Ok(Some(Box::new(FakeCapability))),
-            Mode::Installed | Mode::NoCapability => Ok(None),
-        }
+    fn library_for(&self, provider_key: &str) -> LibraryForFuture<'_> {
+        let outcome: Result<Option<Box<dyn MediaLibraryCapability>>, ProviderFailureInfo> =
+            match self.mode {
+                // 裸码：服务层 `bundle_for` 会补 `provider_` 前缀，拼出
+                // `provider_not_installed`（见 `MediaLibraryRegistry::library_for` 的文档）。
+                // 写 `unavailable` 会拼成 `provider_unavailable` —— 那是「装了但连不上」，
+                // 与「没安装」是两种语义，`provider_failure` 的状态分流也靠这个区分。
+                Mode::NotInstalled => Err(ProviderFailureInfo {
+                    code: "not_installed".to_owned(),
+                    message: "provider not installed".to_owned(),
+                }),
+                Mode::Installed if provider_key == PROVIDER => Ok(Some(Box::new(FakeCapability))),
+                Mode::Installed | Mode::NoCapability => Ok(None),
+            };
+        Box::pin(async move { outcome })
     }
 
     fn supports_in_place_import(&self, provider_key: &str) -> bool {
@@ -151,8 +150,8 @@ impl MediaLibraryRegistry for FakeRegistry {
         _library_id: i32,
         _provider_key: &str,
         _provider_config: &Value,
-    ) -> Option<SpaceUsage> {
-        None
+    ) -> SpaceUsageFuture<'_> {
+        Box::pin(async { None })
     }
 }
 
@@ -452,6 +451,12 @@ async fn an_empty_patch_is_422() {
 }
 
 /// ★ 改 `root` 时 `token` 从旧值回填，不会丢；不存在的库 → **404**。
+///
+/// # 这一条怎么"看见"回填
+///
+/// 响应里**看不到** `token`（被剥掉了，见下面的断言），所以不能靠响应证明。
+/// 证明在**替身那里**：`FakeCapability::prepare_library` 收到没有 `token` 的配置
+/// 就报 `invalid_config`（→ 422）。宿主一旦不合并，本用例第一段立刻从 200 变 422。
 #[tokio::test]
 async fn patch_refills_secrets_and_missing_library_is_404() {
     let db = TestDb::require().await;

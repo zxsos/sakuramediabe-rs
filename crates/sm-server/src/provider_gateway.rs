@@ -493,6 +493,10 @@ mod tests {
             capabilities: Vec::new(),
             data_plane_endpoint: None,
             plugin_endpoint: endpoint.to_owned(),
+            library_config_fields: Vec::new(),
+            playback_deliveries: Vec::new(),
+            merged_playback_format: None,
+            download_config_fields: Vec::new(),
         });
     }
 

@@ -21,6 +21,8 @@
 //! 数据看五分钟。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -106,14 +108,38 @@ pub struct PreviousLibraryHandle {
     pub provider_config: serde_json::Value,
 }
 
+/// `prepare_library` 的返回类型别名（只为过 `clippy::type_complexity`）。
+pub type PrepareLibraryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PreparedLibrary, ProviderFailureInfo>> + Send + 'a>>;
+
+/// `library_for` 的返回类型别名。
+pub type LibraryForFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<Box<dyn MediaLibraryCapability>>, ProviderFailureInfo>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// `space_usage` 的返回类型别名。
+pub type SpaceUsageFuture<'a> = Pin<Box<dyn Future<Output = Option<SpaceUsage>> + Send + 'a>>;
+
 /// 插件的**媒体库**能力。注入 seam —— 组合根实现，本模块不认识 gRPC。
+///
+/// # 为什么 `prepare_library` 是 async（返回 boxed future）
+///
+/// 它要打插件的 gRPC（`StorageProvider.PrepareLibrary`），而插件是独立进程。
+/// 同步签名会被逼成 `block_on`，在异步上下文里阻塞线程池线程 —— 本仓在
+/// `catalog/metadata_source.rs` 已把这条定为纪律。写法与
+/// [`super::provider_helpers::StorageGateway`] 一致（不用宏，实现者返回
+/// `Box::pin`），这样测试替身不必给测试 crate 拉进 tonic。
 pub trait MediaLibraryCapability: Send + Sync {
     fn library_config_fields(&self) -> Vec<LibraryConfigField>;
     fn prepare_library(
         &self,
         submitted: &serde_json::Value,
         previous: Option<&PreviousLibraryHandle>,
-    ) -> Result<PreparedLibrary, ProviderFailureInfo>;
+    ) -> PrepareLibraryFuture<'_>;
 }
 
 /// 插件目录里的一项。`GET /media-libraries/provider-catalog` 的输出，
@@ -130,12 +156,11 @@ pub struct ProviderCatalogEntry {
 }
 
 /// 媒体 provider 注册表。**组合根实现。**
+///
+/// 与 [`MediaLibraryCapability`] 同一理由，会打 gRPC 的两个方法返回 boxed future。
 pub trait MediaLibraryRegistry: Send + Sync {
     /// `Err` = 没安装 → 503 `provider_not_installed`；`Ok(None)` = 装了但**没有库能力**。
-    fn library_for(
-        &self,
-        provider_key: &str,
-    ) -> Result<Option<Box<dyn MediaLibraryCapability>>, ProviderFailureInfo>;
+    fn library_for(&self, provider_key: &str) -> LibraryForFuture<'_>;
     /// 该 provider 是否支持原地导入。查不到按 `false` 处理（不阻断）。
     fn supports_in_place_import(&self, provider_key: &str) -> bool;
     /// 已装插件的目录。**逐个插件失败不影响其它**（由实现保证跳过坏的那个）。
@@ -147,7 +172,7 @@ pub trait MediaLibraryRegistry: Send + Sync {
         library_id: i32,
         provider_key: &str,
         provider_config: &serde_json::Value,
-    ) -> Option<SpaceUsage>;
+    ) -> SpaceUsageFuture<'_>;
 }
 
 /// 空间占用的**进程内缓存条目**。
@@ -215,7 +240,7 @@ impl MediaLibraryService {
         })
     }
 
-    fn bundle_for(
+    async fn bundle_for(
         &self,
         provider_key: &str,
     ) -> Result<Box<dyn MediaLibraryCapability>, ServiceError> {
@@ -225,9 +250,12 @@ impl MediaLibraryService {
                 "媒体提供方未安装",
             ));
         };
-        let capability = registry.library_for(provider_key).map_err(|failure| {
-            ServiceError::unavailable(format!("provider_{}", failure.code), failure.message)
-        })?;
+        let capability = registry
+            .library_for(provider_key)
+            .await
+            .map_err(|failure| {
+                ServiceError::unavailable(format!("provider_{}", failure.code), failure.message)
+            })?;
         capability.ok_or_else(|| {
             ServiceError::validation_with(
                 "provider_library_unsupported",
@@ -239,17 +267,27 @@ impl MediaLibraryService {
 
     /// 投影响应体 —— 与下载客户端同一个规则：**剥掉** `input == "secret"` 的字段，
     /// 拿不到字段表时整个 `provider_config` 发 `{}`（上游 `:70-88`）。
-    fn resource_of(&self, library: &sm_db::playback::media::MediaLibrary) -> MediaLibraryResource {
+    async fn resource_of(
+        &self,
+        library: &sm_db::playback::media::MediaLibrary,
+    ) -> MediaLibraryResource {
         let raw = parse_provider_config(library.provider_config.as_deref());
         let supports_in_place_import = self
             .registry
             .as_deref()
             .is_some_and(|registry| registry.supports_in_place_import(&library.provider_key));
-        let provider_config = self
-            .registry
-            .as_deref()
-            .and_then(|registry| registry.library_for(&library.provider_key).ok().flatten())
-            .map(|capability| {
+        // ★ 拿不到字段表（未注入 / 未安装 / 不支持）就发空对象：不知道哪些是
+        // secret 时，原样发出去=泄漏。`library_for` 是 async，`and_then` 链改成 match。
+        let capability = match self.registry.as_deref() {
+            Some(registry) => registry
+                .library_for(&library.provider_key)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let provider_config = match capability {
+            Some(capability) => {
                 let secret_keys: std::collections::BTreeSet<String> = capability
                     .library_config_fields()
                     .into_iter()
@@ -266,9 +304,9 @@ impl MediaLibraryService {
                         })
                         .unwrap_or_default(),
                 )
-            })
-            // ★ 拿不到字段表就发空对象：不知道哪些是 secret 时，原样发出去=泄漏。
-            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            }
+            None => serde_json::Value::Object(Default::default()),
+        };
         MediaLibraryResource {
             id: library.id,
             name: library.name.clone(),
@@ -284,7 +322,11 @@ impl MediaLibraryService {
     /// `GET /media-libraries` —— 上游 `:182-186`：`created_at DESC, id DESC`。
     pub async fn list_libraries(&self) -> Result<Vec<MediaLibraryResource>, ServiceError> {
         let rows = self.repo().list_ordered().await?;
-        Ok(rows.iter().map(|row| self.resource_of(row)).collect())
+        let mut resources = Vec::with_capacity(rows.len());
+        for row in &rows {
+            resources.push(self.resource_of(row).await);
+        }
+        Ok(resources)
     }
 
     /// ★ 空间占用，**带 300 秒缓存**。上游 `storage_space_usages`（`:188-196`）。
@@ -298,7 +340,7 @@ impl MediaLibraryService {
         let rows = self.repo().list_ordered().await?;
         let mut usages = HashMap::new();
         for library in rows {
-            let usage = self.space_usage_of(&library, now);
+            let usage = self.space_usage_of(&library, now).await;
             if let Some(usage) = usage {
                 usages.insert(library.id, usage);
             }
@@ -307,7 +349,7 @@ impl MediaLibraryService {
     }
 
     /// 单个库的容量：命中未过期缓存就用，否则问 provider。**失败不写缓存。**
-    fn space_usage_of(
+    async fn space_usage_of(
         &self,
         library: &sm_db::playback::media::MediaLibrary,
         now: i64,
@@ -320,7 +362,9 @@ impl MediaLibraryService {
             }
         }
         let raw = parse_provider_config(library.provider_config.as_deref());
-        let usage = registry.space_usage(library.id, &library.provider_key, &raw)?;
+        let usage = registry
+            .space_usage(library.id, &library.provider_key, &raw)
+            .await?;
         let mut cache = self.cache.lock().ok()?;
         cache.insert(
             key,
@@ -345,6 +389,25 @@ impl MediaLibraryService {
             .collect())
     }
 
+    /// ★ 有类型的 **`provider_key` → 播放交付方式**（**首项为默认**）。
+    ///
+    /// 供合集成员 / 视频详情的 `play_url` 用：知道 `provider_key` 就能取到该
+    /// provider 声明的交付顺序，再拼签名地址。
+    ///
+    /// **别改用 `list_provider_catalog()`** —— 那是给 HTTP 直接吐的
+    /// `serde_json::Value`，从 JSON 里再读一次等于把类型推到运行期。
+    /// 没有注入（未接缝）时返回空表，调用方按「无 `play_url`」处理。
+    pub fn playback_deliveries(&self) -> HashMap<String, Vec<String>> {
+        match self.registry.as_deref() {
+            Some(registry) => registry
+                .list_bundles()
+                .into_iter()
+                .map(|entry| (entry.provider_key, entry.playback_deliveries))
+                .collect(),
+            None => HashMap::new(),
+        }
+    }
+
     /// `POST /media-libraries`。上游 `create_library`（`:262-280`）。
     ///
     /// ★ **`prepare_library` 在落库之前**：provider 侧建目录失败时不该留下
@@ -363,11 +426,12 @@ impl MediaLibraryService {
             "invalid_media_library_provider",
             "provider_key cannot be empty",
         )?;
-        let capability = self.bundle_for(&provider_key)?;
+        let capability = self.bundle_for(&provider_key).await?;
         let submitted = Self::submitted_config(&payload.provider_config)?;
         Self::validate_fields(capability.as_ref(), &submitted, false)?;
         let prepared = capability
             .prepare_library(&submitted, None)
+            .await
             .map_err(|failure| self.provider_failure(&failure))?;
         let provider_config = Self::prepared_object(&prepared)?;
         self.ensure_name_available(&name, None).await?;
@@ -380,7 +444,7 @@ impl MediaLibraryService {
                 account_key: prepared.account_key,
             })
             .await?;
-        Ok(self.resource_of(&row))
+        Ok(self.resource_of(&row).await)
     }
 
     /// `PATCH /media-libraries/{id}`。上游 `update_library`（`:282-311`）。
@@ -413,15 +477,21 @@ impl MediaLibraryService {
             }
         }
         if let Some(submitted) = payload.provider_config.as_ref() {
-            let capability = self.bundle_for(&library.provider_key)?;
+            let capability = self.bundle_for(&library.provider_key).await?;
             let submitted = Self::submitted_config(submitted)?;
             Self::validate_fields(capability.as_ref(), &submitted, false)?;
+            // ★ 未提交的 secret / 只读字段从旧值回填。少了这一步，一次「只改目录」
+            //   的更新会把凭据当成「用户清空了」发给 provider，而接口仍返回 200。
+            let previous_config = parse_provider_config(library.provider_config.as_deref());
+            let merged =
+                Self::merge_previous_config(capability.as_ref(), submitted, &previous_config);
             let previous = PreviousLibraryHandle {
                 library_id: library.id,
-                provider_config: parse_provider_config(library.provider_config.as_deref()),
+                provider_config: previous_config,
             };
             let prepared = capability
-                .prepare_library(&submitted, Some(&previous))
+                .prepare_library(&merged, Some(&previous))
+                .await
                 .map_err(|failure| self.provider_failure(&failure))?;
             let provider_config = Self::prepared_object(&prepared)?;
             self.repo()
@@ -433,7 +503,7 @@ impl MediaLibraryService {
         }
         let updated = self.require(library_id).await?;
         self.forget_space_usage(&updated);
-        Ok(self.resource_of(&updated))
+        Ok(self.resource_of(&updated).await)
     }
 
     /// `DELETE /media-libraries/{id}` —— **204**。
@@ -499,6 +569,49 @@ impl MediaLibraryService {
             ));
         }
         Ok(provider_config.clone())
+    }
+
+    /// 更新时把**未提交**的 `secret` / 只读字段从旧配置回填（上游
+    /// `_prepare_config`，`:140-151`）。
+    ///
+    /// # 为什么必须有
+    ///
+    /// 客户端改一个库时通常只重发**能改**的字段（例如只改目录）。`secret` 类字段
+    /// （token / 密码）**不会回传** —— 它本来就被 [`Self::resource_of`] 剥掉了。
+    /// 不回填就等于告诉 provider「凭据清空了」：一次「改路径」的更新会把库改成
+    /// 用不了的状态，而接口照样 200、响应里也看不出区别。
+    ///
+    /// ⚠️ 只读字段走同一个回填。它们**提交即 422**（[`Self::validate_fields`]），
+    /// 所以永远不在 `submitted` 里 —— provider 归一化出来的只读值（例如它实际
+    /// 落盘的位置）只能靠旧值带过去。
+    ///
+    /// 顺序照上游：**先校验、后合并**，所以合并结果里出现只读键是正常的。
+    /// 新建时 `previous` 是空对象，本函数等价于原样返回。
+    fn merge_previous_config(
+        capability: &dyn MediaLibraryCapability,
+        submitted: serde_json::Value,
+        previous: &serde_json::Value,
+    ) -> serde_json::Value {
+        // `submitted_config` 已保证是对象；万一不是就原样交给下游。
+        let mut merged = match submitted {
+            serde_json::Value::Object(map) => map,
+            other => return other,
+        };
+        let Some(previous) = previous.as_object() else {
+            return serde_json::Value::Object(merged);
+        };
+        for field in capability.library_config_fields() {
+            if merged.contains_key(&field.key) {
+                continue;
+            }
+            if field.input != "secret" && !field.read_only {
+                continue;
+            }
+            if let Some(value) = previous.get(&field.key) {
+                merged.insert(field.key.clone(), value.clone());
+            }
+        }
+        serde_json::Value::Object(merged)
     }
 
     /// `prepare_library` 的返回**必须是对象**，否则 502（上游 `:173-178`）。
@@ -615,9 +728,9 @@ mod tests {
     fn the_cache_boundary_is_inclusive() {
         let entry = CachedUsage {
             usage: SpaceUsage {
-                total_bytes: 100,
-                used_bytes: 50,
-                free_bytes: 50,
+                total_bytes: Some(100),
+                used_bytes: Some(50),
+                free_bytes: Some(50),
             },
             cached_at: 1_000,
         };
@@ -689,6 +802,115 @@ mod tests {
             ..library.clone()
         };
         assert_eq!(space_cache_key(&without_account), "115:library:7");
+    }
+
+    /// 只验 `library_config_fields` 的替身：本组测试只碰合并，不碰 `prepare_library`。
+    struct FieldTable(Vec<LibraryConfigField>);
+
+    impl MediaLibraryCapability for FieldTable {
+        fn library_config_fields(&self) -> Vec<LibraryConfigField> {
+            self.0.clone()
+        }
+
+        fn prepare_library(
+            &self,
+            _submitted: &serde_json::Value,
+            _previous: Option<&PreviousLibraryHandle>,
+        ) -> PrepareLibraryFuture<'_> {
+            unreachable!("合并测试不调 prepare_library")
+        }
+    }
+
+    fn field(key: &str, input: &str, read_only: bool) -> LibraryConfigField {
+        LibraryConfigField {
+            key: key.to_owned(),
+            input: input.to_owned(),
+            read_only,
+        }
+    }
+
+    /// 缩短每处调用（被测函数是私有关联函数）。
+    fn merge(
+        capability: &dyn MediaLibraryCapability,
+        submitted: serde_json::Value,
+        previous: serde_json::Value,
+    ) -> serde_json::Value {
+        MediaLibraryService::merge_previous_config(capability, submitted, &previous)
+    }
+
+    /// ★ **未提交的 `secret` 从旧值回填**（上游 `_prepare_config` `:144-151`）。
+    ///
+    /// 这是那个「改一次路径就把凭据抹掉」的 bug 的回归钉：客户端只发 `root`，
+    /// 而库里有 `token`。
+    #[test]
+    fn an_unsubmitted_secret_is_carried_over_from_the_old_config() {
+        let capability = FieldTable(vec![
+            field("root", "path", false),
+            field("token", "secret", false),
+        ]);
+        let merged = merge(
+            &capability,
+            serde_json::json!({ "root": "/mnt/new" }),
+            serde_json::json!({ "root": "/mnt/old", "token": "s3cr3t" }),
+        );
+        assert_eq!(merged["root"], "/mnt/new", "提交的值优先");
+        assert_eq!(merged["token"], "s3cr3t", "没提交的凭据必须带过去");
+    }
+
+    /// 提交了 `secret` → **用提交的**，旧值不覆盖。
+    #[test]
+    fn a_resubmitted_secret_beats_the_old_value() {
+        let capability = FieldTable(vec![field("token", "secret", false)]);
+        let merged = merge(
+            &capability,
+            serde_json::json!({ "token": "new" }),
+            serde_json::json!({ "token": "old" }),
+        );
+        assert_eq!(merged["token"], "new");
+    }
+
+    /// 只读字段同样回填 —— 它们**提交即 422**，所以永远只能从旧值来。
+    #[test]
+    fn read_only_fields_are_carried_over_too() {
+        let capability = FieldTable(vec![
+            field("root", "path", true),
+            field("token", "secret", false),
+        ]);
+        let merged = merge(
+            &capability,
+            serde_json::json!({ "token": "s3cr3t" }),
+            serde_json::json!({ "root": "/mnt/old" }),
+        );
+        assert_eq!(merged["root"], "/mnt/old");
+    }
+
+    /// ★ **普通字段不回填** —— 上游的条件是 `input == "secret" or read_only`。
+    ///
+    /// 把 `root` 也带过去是另一套语义（「缺省即保留」），上游不是那样：
+    /// 没提交的普通字段就是**没提交**，由 provider 自己决定默认值。
+    #[test]
+    fn an_unsubmitted_plain_field_is_not_carried_over() {
+        let capability = FieldTable(vec![field("root", "path", false)]);
+        let merged = merge(
+            &capability,
+            serde_json::json!({}),
+            serde_json::json!({ "root": "/mnt/old" }),
+        );
+        assert!(merged.get("root").is_none(), "普通字段不该被回填");
+    }
+
+    /// 旧配置里的字段**已经不在字段表里** → 不带过去（上游只遍历字段表）。
+    ///
+    /// 这条挡的是「provider 升级后删掉了一个字段，宿主还把它塞回去」。
+    #[test]
+    fn a_field_the_bundle_no_longer_declares_is_dropped() {
+        let capability = FieldTable(vec![field("root", "path", false)]);
+        let merged = merge(
+            &capability,
+            serde_json::json!({ "root": "/mnt" }),
+            serde_json::json!({ "root": "/mnt/old", "legacy_token": "s3cr3t" }),
+        );
+        assert!(merged.get("legacy_token").is_none());
     }
 
     /// 目录条目里 `download_config_fields` 是 **`null` 而不是空数组** ——

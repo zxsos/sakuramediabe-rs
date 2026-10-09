@@ -328,8 +328,15 @@ impl AppState {
     /// `MediaService` 本身是廉价的值类型（几个仓储 + 两个 `Arc`）。
     pub fn media_service(&self) -> sm_service::playback::media::MediaService {
         let service = sm_service::playback::media::MediaService::new(self.db(), self.config());
-        match self.storage_gateway() {
+        let service = match self.storage_gateway() {
             Some(gateway) => service.with_gateway(Arc::clone(gateway)),
+            None => service,
+        };
+        // ★ 两条缝**都要接**。少接播放这条的症状极隐蔽：端点能编译、能返回
+        // 200，只在真播时 503 `provider_not_installed` —— 与「没装插件」长得
+        // 一模一样。这正是上面那段文档说的分叉，只是多了一条缝。
+        match self.playback_gateway() {
+            Some(gateway) => service.with_playback_gateway(Arc::clone(gateway)),
             None => service,
         }
     }

@@ -113,6 +113,11 @@ pub struct VideoCollectionItemRow {
     /// 调 `GET /media/{id}/thumbnails`。没有有效媒体时为 `None`
     /// （上游那个 `COALESCE(first_media.id, 0) or None` 的 0 哨兵）。
     pub first_media_id: Option<i32>,
+    /// 首条有效媒体**所属库**的 provider 键（`LEFT JOIN media_library`）。
+    ///
+    /// API 层拿它查 `playback_deliveries[0]` 来拼 `play_url` —— 所以本层必须
+    /// 把它带出来，不能只给 `first_media_id`。没有有效媒体 / 库缺失时为 `None`。
+    pub provider_key: Option<String>,
 }
 
 /// 视频合集 service。
@@ -608,10 +613,12 @@ impl VideoCollectionService {
                 // 外键保证条目存在；真丢了（并发删）就跳过这一行。
                 continue;
             };
+            let first_media = first_media.get(&item.video_item_id);
             out.push(VideoCollectionItemRow {
-                first_media_id: first_media
-                    .get(&item.video_item_id)
-                    .map(|(media_id, _, _, _)| *media_id),
+                first_media_id: first_media.map(|(media_id, _, _, _, _)| *media_id),
+                // 与 `first_media_id` 同源：有媒体才有 provider_key。
+                provider_key: first_media
+                    .and_then(|(_, _, _, _, provider_key)| provider_key.clone()),
                 video: video.clone(),
                 item,
             });

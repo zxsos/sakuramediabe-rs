@@ -29,6 +29,29 @@ use std::collections::HashMap;
 
 use crate::registration::capability;
 
+/// 插件声明的一个配置项（`MediaProviderBundle` 的 `ConfigField`）。
+///
+/// # 为什么是**纯值**而不是 `sm_plugin_api::v1::ConfigField`
+///
+/// `ProviderRegistration` 要 `Eq`（注册表用它做条目比较），而 prost 生成的
+/// 消息没有 `Eq`。更关键的是：这份字段表要被组合根拿去喂服务层的白名单校验与
+/// 目录端点，两边都用宿主自己的值类型 —— 本模块不把 gRPC 生成类型泄漏出去。
+///
+/// `input` 用上游的字符串字面量（`"text"` / `"secret"` / `"path"`），不是 proto 枚举。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFieldSpec {
+    pub key: String,
+    pub label: String,
+    /// `"text"` / `"secret"` / `"path"`。
+    pub input: String,
+    pub required: bool,
+    pub description: Option<String>,
+    pub multiline: bool,
+    /// 只读字段：更新时**从旧值回填**，且用户不能提交（上游 `_prepare_config`）。
+    pub read_only: bool,
+    pub hint: Option<String>,
+}
+
 /// 一个 provider 的注册条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRegistration {
@@ -55,6 +78,25 @@ pub struct ProviderRegistration {
     /// 与上面的 `data_plane_endpoint` 是两回事：那个是**数据面**（大文件字节
     /// 流），这个是**控制面**（结构化 rpc）。
     pub plugin_endpoint: String,
+    /// 媒体库配置字段表（`MediaProviderBundle.library_config_fields`）。
+    ///
+    /// # 为什么注册表必须存它
+    ///
+    /// 这是**白名单 / secret / 只读**的唯一判据来源：服务层的 `_validate_config`
+    /// 拿它判「未知字段 / 只读字段」，`_resource` 拿它决定剥哪些 secret。
+    /// 不存的话字段表为空 → 用户提交的每个字段都被判未知 → **建库/改配置一律 422**。
+    pub library_config_fields: Vec<ConfigFieldSpec>,
+    /// 播放交付方式，**首项为默认**（proto 注释：非空且不重复，必含 REDIRECT 或
+    /// PROXY）。取值 `"redirect"` / `"proxy"`。
+    ///
+    /// `videos` / `video_collections` 的 `play_url` 取 `[0]` —— 没有它那些端点
+    /// 无法生成签名播放地址。
+    pub playback_deliveries: Vec<String>,
+    /// 合并播放的封装格式（`"mp4"` / `"hls"`）。未声明为 `None`。
+    pub merged_playback_format: Option<String>,
+    /// 下载组件的配置字段（`MediaProviderBundle.download_config_fields`）。
+    /// 未声明下载能力时为空。
+    pub download_config_fields: Vec<ConfigFieldSpec>,
 }
 
 impl ProviderRegistration {
@@ -185,6 +227,10 @@ mod tests {
             capabilities,
             data_plane_endpoint: None,
             plugin_endpoint: "http://127.0.0.1:0".to_owned(),
+            library_config_fields: Vec::new(),
+            playback_deliveries: Vec::new(),
+            merged_playback_format: None,
+            download_config_fields: Vec::new(),
         }
     }
 

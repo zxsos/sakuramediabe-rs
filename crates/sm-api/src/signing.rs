@@ -49,6 +49,26 @@ pub fn now_seconds() -> i64 {
 /// 组合根另有一次启动期校验（`ConfigService::validate`），所以真实部署里
 /// 坏配置到不了这里；这里是第二道防线，而且它必须**吵**，否则第一道防线
 /// 被人绕过时（运行期改坏配置）就又静默了。
+/// 给一条媒体签「首个媒体」的播放地址。合集成员与视频详情共用。
+///
+/// 上游两处都**不带资源路径**（`build_signed_media_url(media.id,
+/// delivery=bundle.playback_deliveries[0])`），所以这里 `resource_path` 传空串 ——
+/// 播放端点自己按 `media_id` 反查文件。
+///
+/// `deliveries` 是 provider 声明的交付顺序，**取首项**（默认交付方式）。
+///
+/// 返回 `None`（**不是空串**）表示「没提供地址」：空串在客户端是「这个媒体在、
+/// 但播不了」，会让整条播放列表被判成不可播放。空表或非法 delivery 都归 `None`。
+pub fn signed_play_url(
+    secret: &str,
+    now: i64,
+    media_id: i32,
+    deliveries: &[String],
+) -> Option<String> {
+    let delivery = deliveries.first()?;
+    sm_core::signing::build_signed_media_url(secret, media_id, "", delivery, now).ok()
+}
+
 pub fn signing_secret(state: &AppState) -> Result<String, ErrorResponse> {
     let config = crate::config::snapshot_or_500(state)?;
     Ok(

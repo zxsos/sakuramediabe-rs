@@ -41,6 +41,37 @@ $env:SMDB_TEST_DATABASE_URL = 'postgres://sakuramedia:sakuramedia@127.0.0.1:5433
 # speaks); the 6333 default in config_schema is REST and will not work.
 $env:SMVEC_TEST_QDRANT_URL = 'http://127.0.0.1:6334'
 
+# A stray `sm-server` locks the build output (`<target>/debug/sm-server.exe`).
+# Cargo then dies with "failed to remove file ... sm-server.exe" *before* it
+# runs a single test -- an error that points at the filesystem instead of at
+# the process that is holding it, so the whole run reports FAIL with no test
+# having executed. That happened on 2026-10-08 and cost a full investigation.
+#
+# Where the stray comes from: crates/sm-server/tests/server_smoke.rs spawns the
+# real binary with `kill_on_drop`, so a test run that gets interrupted (Ctrl-C,
+# a killed harness) leaves the child alive with a dead parent.
+#
+# Only orphans are stopped: a process whose parent is still alive is somebody's
+# server, and killing it would be a surprise. Labels are ASCII, like the rest of
+# this file.
+$stray = @(Get-CimInstance Win32_Process -Filter "Name='sm-server.exe'" -ErrorAction SilentlyContinue)
+foreach ($process in $stray) {
+    $parentAlive = $false
+    if ($process.ParentProcessId) {
+        $parentAlive = $null -ne (Get-Process -Id $process.ParentProcessId -ErrorAction SilentlyContinue)
+    }
+    if ($parentAlive) {
+        Write-Host ('  NOTE  sm-server PID ' + $process.ProcessId + ' is running under PID ' + $process.ParentProcessId + ' -- leaving it alone (stop it if the tests fail to link)')
+    }
+    else {
+        Write-Host ('  KILL  orphan sm-server PID ' + $process.ProcessId + ' (parent ' + $process.ParentProcessId + ' is gone; it locks the build output)')
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
+if ($stray.Count -gt 0) {
+    Start-Sleep -Milliseconds 300
+}
+
 $failed = New-Object System.Collections.ArrayList
 
 function Step {

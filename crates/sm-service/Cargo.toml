@@ -28,6 +28,9 @@ serde_json = { workspace = true }
 # `discovery::qdrant` 的 upsert 重试要用 `tokio::time::sleep` 做退避。
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# `playback::proxy` 要把 reqwest 的 `bytes_stream()`（`stream` feature）重新装箱成
+# `Stream<Item = Result<Vec<u8>, _>>`，让上层不必为了拿字节而依赖 reqwest。
+futures = { workspace = true }
 # discovery 域的向量库存储层。Qdrant 走 gRPC，与插件 ABI 共用同一套 tonic/prost。
 qdrant-client = { workspace = true }
 # 影片相似度的别名**原子**切换要用生成的 gRPC stub：Qdrant 封装的

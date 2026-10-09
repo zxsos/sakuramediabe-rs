@@ -383,6 +383,43 @@ impl DownloadClientService {
         Ok(submitted.clone())
     }
 
+    /// ★ 更新时把**未提交**的 `secret` / 只读字段从旧配置回填（上游 `_prepare`，
+    /// `client_config_service.py:145-154`）。
+    ///
+    /// 与媒体库那份（`playback::media_library::MediaLibraryService`）是同一条规则、
+    /// 同一批理由：客户端改下载器时通常只重发 `host`，而 `token` **不会回传**
+    /// （它被 [`Self::resource_of`] 剥掉了）。不回填就等于告诉 provider
+    /// 「凭据清空了」—— 接口照样 200，响应里看不出区别。
+    ///
+    /// ⚠️ 只读字段走同一个回填：它们**提交即 422**（[`Self::validate_config`]），
+    /// 所以只能从旧值来。顺序照上游：**先校验、后合并**。
+    fn merge_previous_config(
+        capability: &dyn DownloadClientCapability,
+        submitted: serde_json::Value,
+        previous: &serde_json::Value,
+    ) -> serde_json::Value {
+        // `validate_config` 已保证是对象；万一不是就原样交给下游。
+        let mut merged = match submitted {
+            serde_json::Value::Object(map) => map,
+            other => return other,
+        };
+        let Some(previous) = previous.as_object() else {
+            return serde_json::Value::Object(merged);
+        };
+        for field in capability.config_fields() {
+            if merged.contains_key(&field.key) {
+                continue;
+            }
+            if field.input != "secret" && !field.read_only {
+                continue;
+            }
+            if let Some(value) = previous.get(&field.key) {
+                merged.insert(field.key.clone(), value.clone());
+            }
+        }
+        serde_json::Value::Object(merged)
+    }
+
     /// 名字可用性。上游 `_ensure_name_available`（`:130-141`）→ **409**，
     /// `details.name`。排除自己（`exclude_client_id`）用于更新。
     async fn ensure_name_available(
@@ -552,39 +589,38 @@ impl DownloadClientService {
         // ★ 只有动了 `library_id` 或 `provider_config` 才重跑 `_prepare`
         // —— 改个名字不该触发一次 provider 往返。
         if payload.library_id.is_some() || payload.provider_config.is_some() {
-            let Some(submitted) = payload.provider_config.as_ref() else {
-                return Err(ServiceError::validation(
-                    "invalid_download_client_provider_config",
-                    "provider_config must be an object",
-                ));
-            };
-            if !submitted.is_object() {
-                return Err(ServiceError::validation(
-                    "invalid_download_client_provider_config",
-                    "provider_config must be an object",
-                ));
-            }
             let library = require_library(&self.db, target_library_id).await?;
             let capability = self.bundle_for(&library.provider_key)?;
-            // 没传 `provider_config` 只是改别的字段 → 用旧配置过一遍，
-            // 此时**允许**只读字段（它们本来就躺在库里）。
+            // ★ 「旧配置」= **库里存的那一份**，已经解析成对象了
+            //   （`DownloadClientRow::from_entity` 走的就是 `provider_config_object`）
+            //   —— 上游 `_prepare` 的 `previous.provider_config`（`:145`）。
+            //
+            // ⚠️ 别写成 `provider_config_object(client.provider_config.as_str())`：
+            // 那个字段是 `serde_json::Value`，`as_str()` 对对象是 `None` —— 于是
+            // 「旧配置」永远是 `{}`，一次「只换库」的更新会把配置整份抹掉。
+            let previous_config = client.provider_config.clone();
+            // 没传 `provider_config` 只是改别的字段（例如换库）→ 拿旧配置过一遍，
+            // 此时**允许**只读字段（它们本来就躺在库里）。上游 `:313-317`。
             let config_submitted = payload.provider_config.is_some();
-            let submitted_value = payload.provider_config.clone().unwrap_or_else(|| {
-                crate::transfers::download_common::provider_config_object(
-                    client.provider_config.as_str(),
-                )
-            });
-            // 用户提交了配置 → 只读字段不许出现；只是改别的字段 → 放行
-            // （库里本来就有那些派生值）。
+            let submitted_value = match payload.provider_config.as_ref() {
+                Some(value) => value.clone(),
+                None => previous_config.clone(),
+            };
+            // 用户提交了配置 → 只读字段不许出现；只是改别的字段 → 放行。
+            // 非对象（含显式 `null`）一律 422 —— 上游 `:307-312` 与 `:100-105` 同码。
             let submitted =
                 Self::validate_config(capability.as_ref(), &submitted_value, !config_submitted)?;
+            // ★ 未提交的 secret / 只读字段从旧值回填（上游 `:146-154`）。少了这一步，
+            //   一次「只改 host」的更新会把 `token` 当成「用户清空了」发给 provider。
+            let merged =
+                Self::merge_previous_config(capability.as_ref(), submitted, &previous_config);
             let previous = PreviousClientHandle {
                 client_id: client.id,
                 library_id: client.library_id,
-                provider_config: submitted.clone(),
+                provider_config: previous_config,
             };
             let prepared = capability
-                .prepare_client(&submitted, library.id, Some(&previous))
+                .prepare_client(&merged, library.id, Some(&previous))
                 .map_err(provider_config_failed)?;
             let repo = DownloadClientRepository::new(self.db.clone());
             repo.set_provider_config(client.id, &prepared.to_string())

@@ -15,11 +15,21 @@
 //! # 列表与详情是**两个不同的响应模型**
 //!
 //! `VideoItemListItemResource`（列表）vs `VideoItemDetailResource`（详情）——
-//! **不要**用同一个类型。列表项不该带完整详情字段（描述、完整元数据），
-//! 否则 20 条一页会显著变大。
+//! **不要**用同一个类型。详情是**列表项的派生**：14 字段原样在顶层
+//! （`#[serde(flatten)]`），外加 `media_items: list[MovieMediaResource]`
+//! （上游 `schema/videos/items.py:37-38`）。
 //!
 //! 写 / `PATCH` 返回的是**详情**模型（不是列表模型）—— 所以「改完拿到的
 //! 对象」与「列表里那个对象」字段不同。这是刻意的，别统一。
+//!
+//! # 详情的 `media_items[].play_url`
+//!
+//! 逐条签名，交付方式取 provider 的 `playback_deliveries[0]`。两条细节：
+//!
+//! - **失效媒体给空串**（不是 `null`）：`play_url` 在详情里是**非空 `str`**，
+//!   空串是明确的「这条播不了」。别套用合集成员那条「空串 ≠ null」的红线。
+//! - **provider 查不到就是 500**（不是 503）：上游这里漏了 `try/except`，
+//!   见 `detail_resource`。
 //!
 //! # 与 `video_collections.rs` 是**两个资源**
 //!
@@ -32,12 +42,17 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use sm_service::videos::VideoItemService;
+use sm_service::videos::{
+    Field, VideoItemCreate, VideoItemDetail, VideoItemService, VideoItemUpdate,
+};
 
 use crate::auth::CurrentUser;
-use crate::dto::{deserialize_double_option, VideoItemListItemResource};
+use crate::dto::{
+    deserialize_double_option, MovieMediaResource, VideoItemDetailResource,
+    VideoItemListItemResource,
+};
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
@@ -60,32 +75,6 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_video)
                 .fallback(method_not_allowed),
         )
-}
-
-/// 详情 —— = 列表项 + `media_items`。
-///
-/// ⚠️ **本轮未接线，且这个形状本身就是错的**：骨架期写成了
-/// `{ id, title, duration_seconds, thumbnail_url, description, metadata }`，
-/// 而上游 `VideoItemDetailResource` 是
-/// **`VideoItemListItemResource` + `media_items: list[MovieMediaResource]`**
-/// —— `description` / `metadata` / `thumbnail_url` 三个键前端一个都不读，
-/// 真正的 14 个字段反而一个没有。
-///
-/// **不接线的原因是缺依赖，不是缺代码**：`media_items[].play_url` 要
-/// `MEDIA_PROVIDER_REGISTRY.require(provider_key)` 拿 `playback_deliveries[0]`
-/// 才能签出播放地址，而插件 ABI 还没落地。**不要用空串冒充** —— 客户端会把
-/// 空地址当成「不可播放」而禁用播放，那是**可见的功能回退**。
-///
-/// 接线时改成内嵌 [`VideoItemListItemResource`] +
-/// `media_items`（`MovieMediaResource` 也还没在 Rust 侧建模）。
-#[derive(Debug, Clone, Serialize)]
-pub struct VideoItemDetail {
-    pub id: i64,
-    pub title: Option<String>,
-    pub duration_seconds: Option<i64>,
-    pub thumbnail_url: Option<String>,
-    pub description: Option<String>,
-    pub metadata: Option<serde_json::Value>,
 }
 
 /// `POST ""` 的请求体（上游 `VideoItemCreateRequest`）。
@@ -192,32 +181,118 @@ async fn list_videos(
     )))
 }
 
+/// 三态搬运：`Option<Option<T>>` → [`Field<T>`]。
+///
+/// 与 `video_collections.rs` 的同名函数是一回事，只是这里的四个字段类型不同
+/// （`String` / `NaiveDateTime` / `i32`），所以要泛型版。
+fn to_field<T>(value: Option<Option<T>>) -> Field<T> {
+    match value {
+        None => Field::Absent,
+        Some(None) => Field::Null,
+        Some(Some(value)) => Field::Value(value),
+    }
+}
+
+/// 服务层详情 → 响应资源。三条详情端点（`POST` / `GET` / `PATCH`）共用。
+///
+/// # `media_items[].play_url` 的 provider 查找：查不到就是**上游的 500**
+///
+/// 上游 `_media_items`（`video_item_service.py:309`）直接
+/// `MEDIA_PROVIDER_REGISTRY.require(...)`，**没有** `try/except` —— 于是
+/// `ProviderUnavailableError` 冒到 FastAPI 的兜底处理器，返回
+/// **500 `internal_error`**（`api/exception/exception.py:63-73`）。
+///
+/// 这里照做：**不**把它降级成 503 或「没有 `play_url`」。理由与
+/// `video_collections.rs` 那处**故意不同** —— 那边上游显式 `except` 并只把
+/// `can_play` 打成 `false`，是**容错**；这边是上游漏了处理，而 `play_url` 是非空
+/// 字段，硬给空串会把「插件没装」伪装成「这条媒体播不了」。
+fn detail_resource(
+    state: &AppState,
+    detail: &VideoItemDetail,
+) -> Result<VideoItemDetailResource, ErrorResponse> {
+    let secret = secret(state)?;
+    // 同一批条目用**同一个** `now` 签名（与列表同一理由）。
+    let now = now_seconds();
+    let deliveries = state.media_library_service().playback_deliveries();
+    let mut media_items = Vec::with_capacity(detail.media_items.len());
+    for item in &detail.media_items {
+        // provider_key 为 `None`（孤儿媒体：库被删）在上游等价于
+        // `require(None)`，同样是 `ProviderUnavailableError` —— 同一个 500。
+        let declared = item
+            .summary
+            .provider_key
+            .as_deref()
+            .and_then(|key| deliveries.get(key))
+            .cloned()
+            .ok_or_else(|| {
+                ErrorResponse::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Internal server error",
+                )
+            })?;
+        media_items.push(MovieMediaResource::from_media_item(
+            item, &secret, now, &declared,
+        ));
+    }
+    Ok(VideoItemDetailResource {
+        list: VideoItemListItemResource::from_list_item(&secret, now, &detail.list),
+        media_items,
+    })
+}
+
 /// `POST ""` —— **201** + **详情**模型。
 async fn create_video(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    EnvelopeJson(_payload): EnvelopeJson<CreateRequest>,
-) -> Result<(StatusCode, Json<VideoItemDetail>), ErrorResponse> {
-    todo!("骨架：接创建（201；返回详情模型 —— 卡在 media_items 的签名播放地址要插件 ABI）")
+    State(state): State<AppState>,
+    EnvelopeJson(payload): EnvelopeJson<CreateRequest>,
+) -> Result<(StatusCode, Json<VideoItemDetailResource>), ErrorResponse> {
+    let service = VideoItemService::new(state.db());
+    // 上游 `create_video` 结尾是 `get_video_detail(video.id)`（`:356-362`）——
+    // 所以返回的是**详情**模型，不是刚插进去的那行。
+    let created = service
+        .create(&VideoItemCreate {
+            title: payload.title,
+            summary: payload.summary,
+            release_date: payload.release_date,
+        })
+        .await?;
+    let detail = service.detail(created.id).await?;
+    Ok((StatusCode::CREATED, Json(detail_resource(&state, &detail)?)))
 }
 
 /// `GET /{id}` —— **详情**模型；不存在 → 404。
 async fn get_video(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_video_id): Path<i32>,
-) -> Result<Json<VideoItemDetail>, ErrorResponse> {
-    todo!("骨架：接详情查询 —— 卡在 media_items 的签名播放地址要插件 ABI")
+    State(state): State<AppState>,
+    Path(video_id): Path<i32>,
+) -> Result<Json<VideoItemDetailResource>, ErrorResponse> {
+    let service = VideoItemService::new(state.db());
+    let detail = service.detail(video_id).await?;
+    Ok(Json(detail_resource(&state, &detail)?))
 }
 
 /// `PATCH /{id}` —— 部分更新，返回**详情**模型。
 async fn update_video(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_video_id): Path<i32>,
-    EnvelopeJson(_payload): EnvelopeJson<UpdateRequest>,
-) -> Result<Json<VideoItemDetail>, ErrorResponse> {
-    todo!("骨架：接部分更新 —— 卡在 media_items 的签名播放地址要插件 ABI")
+    State(state): State<AppState>,
+    Path(video_id): Path<i32>,
+    EnvelopeJson(payload): EnvelopeJson<UpdateRequest>,
+) -> Result<Json<VideoItemDetailResource>, ErrorResponse> {
+    let service = VideoItemService::new(state.db());
+    service
+        .update(
+            video_id,
+            VideoItemUpdate {
+                title: to_field(payload.title),
+                summary: to_field(payload.summary),
+                release_date: to_field(payload.release_date),
+                cover_thumbnail_id: to_field(payload.cover_thumbnail_id),
+            },
+        )
+        .await?;
+    let detail = service.detail(video_id).await?;
+    Ok(Json(detail_resource(&state, &detail)?))
 }
 
 /// `DELETE /{id}` —— **204，无 body**。

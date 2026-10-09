@@ -32,6 +32,7 @@ use sm_service::catalog::movie::MovieCard;
 use sm_service::collections::playlist::PlaylistMovieCard;
 use sm_service::discovery::daily_recommendation::DailyRecommendationCard;
 use sm_service::playback::media_summary::{MediaSummary, MovieMediaAttachment};
+use sm_service::videos::VideoMediaItem;
 
 /// 播放列表响应体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -994,6 +995,107 @@ impl From<&MediaSummary> for MediaSummaryResource {
             valid: value.valid,
         }
     }
+}
+
+/// 详情页一条媒体（上游 `MovieMediaResource`，`schema/catalog/movies.py:125-129`）。
+///
+/// # 为什么用 `#[serde(flatten)]` 而不是重抄那 10 个字段
+///
+/// 上游是**继承**（`MovieMediaResource(MediaSummaryResource)`）。照抄字段名意味着
+/// `MediaSummaryResource` 将来加字段时这里会**静默**漏掉 —— JSON 里只是少一个键，
+/// 没有任何编译期信号。`flatten` 让两个类型只维护一处。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MovieMediaResource {
+    /// 10 个摘要字段，**扁平整**在顶层（不是嵌套对象）。
+    #[serde(flatten)]
+    pub summary: MediaSummaryResource,
+    /// 签名播放地址。**非空 `str`** —— 失效媒体给**空串**。
+    ///
+    /// ⚠️ 这里的空串与合集成员那条「空串 ≠ null」的红线**不冲突**：合集成员的
+    /// `play_url` 是**可空**字段，空串意味着「有媒体但播不了」的误导；而本字段
+    /// 上游声明就是 `str`（非空），空串是**明确**的「这条播不了」信号，前端据此
+    /// 禁用单条播放（上游 `_media_items` 原话）。
+    pub play_url: String,
+    /// 该 provider 声明的交付方式，**首项为默认**（与 `play_url` 用的同一个）。
+    pub playback_deliveries: Vec<String>,
+    pub progress: Option<MovieMediaProgressResource>,
+    pub points: Vec<MovieMediaPointResource>,
+}
+
+/// 上游 `MovieMediaProgressResource`（`movies.py:113-115`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MovieMediaProgressResource {
+    pub last_position_seconds: i32,
+    /// naive UTC 输出 `YYYY-MM-DDTHH:MM:SS`（与全仓其它时间戳同一偏差）。
+    pub last_watched_at: Option<String>,
+}
+
+/// 上游 `MovieMediaPointResource`（`movies.py:118-122`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MovieMediaPointResource {
+    pub point_id: i32,
+    pub thumbnail_id: Option<i32>,
+    pub offset_seconds: i32,
+    pub image: ImageResource,
+}
+
+impl MovieMediaResource {
+    /// 由服务层的一条媒体组装。`play_url` 按上游 `_media_items`（`:309-317`）：
+    /// **失效媒体给空串**，有效媒体才签名。
+    ///
+    /// `deliveries` 是**该媒体所属 provider 声明的**交付顺序（调用方查注册表得到）。
+    /// provider 查不到时上游会抛错（**不是**给空 `play_url`），所以那一步在调用方。
+    pub fn from_media_item(
+        item: &VideoMediaItem,
+        secret: &str,
+        now: i64,
+        deliveries: &[String],
+    ) -> Self {
+        let play_url = if item.summary.valid {
+            crate::signing::signed_play_url(secret, now, item.summary.media_id, deliveries)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Self {
+            summary: MediaSummaryResource::from(&item.summary),
+            play_url,
+            playback_deliveries: deliveries.to_vec(),
+            progress: item
+                .progress
+                .as_ref()
+                .map(|progress| MovieMediaProgressResource {
+                    last_position_seconds: progress.position_seconds,
+                    last_watched_at: progress
+                        .last_watched_at
+                        .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                }),
+            points: item
+                .points
+                .iter()
+                .map(|row| MovieMediaPointResource {
+                    point_id: row.point.id,
+                    thumbnail_id: row.point.thumbnail_id,
+                    offset_seconds: row.point.offset_seconds,
+                    image: ImageResource {
+                        id: row.image.id,
+                        origin: sign_image_origin(secret, &row.image.origin, now),
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+/// 视频条目详情（上游 `VideoItemDetailResource`，`schema/videos/items.py:37-38`）。
+///
+/// = [`VideoItemListItemResource`]（14 字段，扁平）+ `media_items`。同
+/// [`MovieMediaResource`] 的理由用 `flatten` 而不是重抄 14 个字段。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VideoItemDetailResource {
+    #[serde(flatten)]
+    pub list: VideoItemListItemResource,
+    pub media_items: Vec<MovieMediaResource>,
 }
 
 /// 影片卡片（上游 `MovieListItemResource`）。

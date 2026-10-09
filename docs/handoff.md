@@ -5,20 +5,20 @@
 ## 一、当前状态
 
 > **数字以 `docs/progress-baseline.md` 为准** —— 跑 `pwsh -File scripts/progress.ps1 -Diff`
-> 核对，漂移即失败。下表同步到 **2026-10-07 晚**（HEAD `803337f`）。
+> 核对，漂移即失败。下表同步到 **2026-10-08 晚**（HEAD `df0c39a`）。
 
 | 项 | 值 |
 |---|---|
 | 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
 | 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
-| 端点方法体 | **实测 `todo!()` 共 59 个**：`sm-service` **28** + `sm-api` **31**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
-| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **33 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
-| 完成的域 | `collections`、`system`、**`videos`（3/7）** —— `system` 本轮清零 |
+| 端点方法体 | **实测 `todo!()` 共 47 个**：`sm-service` **27** + `sm-api` **20**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
+| 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **20 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
+| 完成的域 | `collections`、`system`、**`playback`（`media_playback.rs` 3/3 ✅ 清零）**、**`videos`（3/7）** |
 | 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 6/21** |
 | 门禁 | `verify.ps1 -Tier full` **全绿**（fmt / doc / clippy / 单测 / 真库集成 / 对拍 / **契约两仓同步** / 进度基线，共 12 项） |
 | 提交 | 推送状态以 `git status -sb` 为准（`cnb` 从未推过） |
 
-**下一步看 §七「交接快照（2026-10-07）」与 §八「接下来做什么」** —— 前者是剩余 63 条的
+**下一步看 §七「交接快照」与 §八「接下来做什么」** —— 前者是剩余 47 条的
 **卡点表**与待拍板项，后者是可立即开工的**执行清单**。§一之二以下的数字是**历史计划**，
 别照它开工。**部署形态与瘦身目标见 [`deployment.md`](deployment.md)。**
 
@@ -1351,9 +1351,12 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
    查 `ProviderRegistration.plugin_endpoint` → `connect_storage` →
    `provider_calls::generate_thumbnails`）；
 4. 接线 `MediaService::delete_media`（`provider_calls::delete_media` 已就绪）；
-4. `videos` 的 `play_url` —— ⚠️ 需要 `MediaProviderBundle.playback_deliveries[0]`，
-   而 `ProviderRegistration` **目前没存**它（也没存 `merged_playback_format`），
-   要先补；
+4. `videos` 的 `play_url` —— ⚠️ **前置步骤比原先写的多**：不只是
+   `ProviderRegistration` 没存 `playback_deliveries`（也没存 `merged_playback_format`），
+   而是**整条 `MediaLibraryRegistry` seam 没有生产实现**（全仓只有测试替身，
+   `AppState::with_media_library_registry` 也没人调）。按序补：
+   ① `sm-plugins` 注册表存下 bundle 的四个字段 → ② 组合根实现 `list_bundles()`
+   → ③ API 层签 URL。详见 §7.2k 的订正与 §8.0 的 **step 0**；
 5. `plan_playback`（P1-2 说 `PlaybackPlan` 缺 `LocalPathPlan`，本地/NFS 类
    provider 只能退化成 `file://` 伪直链 —— 那是个待定的 proto 改动）。
 
@@ -1370,7 +1373,7 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 | ~~`download_tasks`~~ | ✅ 已收尾（`list_tasks` 落地）；`import_task` 的入队也已落地，两者各剩 `delete_task` / `execute` 一族被插件 ABI 与 `import_service` 挡 |
 | `system/telemetry`(2) | 依赖最少 |
 | worker handler 3/19 → 19/19 | 每个 handler 的 service 都已就绪 |
-| `videos` 详情/创建/更新/删除 | ⚠️ **被插件 ABI 卡住** —— `media_items[].play_url` 要 `MEDIA_PROVIDER_REGISTRY` 拿 `playback_deliveries[0]`。**不要用空串冒充**：客户端会把空地址当成「不可播放」 |
+| `videos` 详情/创建/更新/删除 | ⚠️ **卡在宿主侧 seam，不是 ABI** —— `media_items[].play_url` 要 `playback_deliveries[0]`：声明在 proto 里**有**，但 `MediaLibraryRegistry` **没有生产实现**、`AppState` 也**没人注入**（§7.2k 订正、§8.0 step 0）。**不要用空串冒充**：客户端会把空地址当成「不可播放」 |
 
 **每次接一族都要做的固定动作**：先读上游 router → schema → 每一处
 `ApiError`，再读前端同名 DTO 交叉验证，最后才对照骨架的 DTO。
@@ -1454,9 +1457,16 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 
 剩下的 `telemetry`（约 188 行）可做；`plugins` 那部分要等插件宿主，`image_search_reset` 与 `metadata_provider_probe` 要等 Qdrant 与 metadata source。
 
-### 块 C：插件 ABI 之后才解锁的（约 40 条端点）
+### 块 C：要插件宿主才解锁的（约 40 条端点）
 
-transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB 导入。
+transfers 编排、multipart 上传、`system/plugins`、`{n}/reviews`、JavDB 导入。
+
+⚠️ **本条已收窄**：`/files/*` 也**已落地**（`routes/files.rs` 零 `todo!()`），
+`/media/{id}/play/{path}` 连同 merged / playback-attempts
+**三个播放端点已落地**（`4a7f6d7` / `4aa347c` / `df0c39a`），且**没有等插件 ABI**
+—— 走的是「宿主提供缝、投递判定交给插件」的 (b)，见 §7.2k 与
+`adr/2026-10-08-provider-seam.md`。所以「在插件 ABI **之后**才解锁」这个前提对
+那一族**不成立**：它们只需要宿主侧多一层缝。**动本块任何一项前，先核它到底缺什么。**
 
 ### 卡死的（不用试）
 
@@ -1683,11 +1693,11 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
   真调用要 DB 与图片目录。该函数落地后**必须换成真实调用**，
   否则这条用例会一直「绿着但什么都没验」。同类占位用例在做 parity 时一并排查。
 
-## 七、交接快照（2026-10-07，HEAD `803337f`）
+## 七、交接快照（2026-10-08，HEAD `df0c39a`）
 
 **开工前先做两件事**：`pwsh -File scripts/progress.ps1 -Diff`（应回 `OK`）与
 `cargo clippy --workspace --all-targets -- -D warnings`（应 exit 0）。
-工作区干净、门禁绿、`todo!()` **63** 个（口径见 `docs/progress-baseline.md`）。
+工作区干净、门禁绿、`todo!()` **47** 个（口径见 `docs/progress-baseline.md`）。
 
 ### 7.1 这一批刚落地的（最近 8 个提交）
 
@@ -2123,7 +2133,70 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 
 > 与 §7.2h / §7.2i 同源：**能编译、有测试、零 `todo!()`，都不等于接对了。**
 
-### 7.3 剩余 50 条的**卡点表**（按卡点而非按文件归类）
+### 7.2k ★ 播放投递缝：**5 处「卡在插件 ABI」的注释是错的**（2026-10-08）
+
+播放域三个端点落地，`media_playback.rs` **清零**：
+
+| 提交 | 端点 | 计数 |
+|---|---|---|
+| `4a7f6d7` | `GET /media/{id}/play/{*resource_path}` | `50 -> 49` |
+| `4aa347c` | `GET /media/merged-play/{*resource_path}` | `49 -> 48` |
+| `df0c39a` | `GET /media/playback-attempts/{id}` | `48 -> 47` |
+
+缝本身（`PlaybackGateway` trait / `provider_calls` 播放组 / `provider_gateway.rs` 的
+proto→宿主转换 / 转发层）在 `5bf2d63`、`d573ecc`、`e8e51d5`、`26ea96d`、`1410cd9`、
+`8e33ae4`。决策见 [`adr/2026-10-08-provider-seam.md`](adr/2026-10-08-provider-seam.md)。
+
+**但这一轮真正的发现是下面这件事。** 仓库里有 **5 处**注释声称「播放地址 / 媒体条目
+要**插件 ABI**（`playback_deliveries[0]`），插件落地前做不到」：
+
+`videos.rs:74-77`、`video_collections.rs:64-68` / `:147-151`、
+`videos/collection.rs:97-99`、`videos/item.rs:393-395`。
+
+**全部过期。** `playback_deliveries` 一直都在：
+
+| 层 | 位置 | 状态 |
+|---|---|---|
+| 契约 | `proto/plugin.proto:50-64` `MediaProviderBundle.playback_deliveries`（注释：「非空且不重复，必须包含 REDIRECT 或 PROXY；**首项为默认方式**」）| ✅ 在 ABI 里 |
+| 宿主服务层 | `playback/media_library.rs` `ProviderCatalogEntry.playback_deliveries: Vec<String>` ← `MediaLibraryRegistry::list_bundles()` | ⚠️ 字段在，但 `list_bundles()` **无人实现** —— 见下方订正 |
+| 装配 | `sm-api/src/state.rs:85` `media_libraries`（访问器 `media_library_service()`，`:285`）| ⚠️ **字段在，但生产组合根没人调 `with_media_library_registry`** |
+
+#### ⚠️ 本节结论的第一版是**错的** —— 这里是订正（同日）
+
+我先把结论写成「**不需要改 proto、不碰 `sm-plugins`**，宿主运行期就能拿到」。
+**不成立。** 核到底之后：
+
+| 层 | 实情 |
+|---|---|
+| ABI 契约 | ✅ `MediaProviderBundle.playback_deliveries` 在 |
+| 宿主侧**形状** | ✅ `ProviderCatalogEntry.playback_deliveries` + `MediaLibraryService::list_provider_catalog()` |
+| 宿主侧**实现** | ❌ **`MediaLibraryRegistry` 全仓只有 trait 定义与一个测试替身**。`impl MediaLibraryRegistry for` 在 `crates/` 里**只命中 `sm-api/tests/media_libraries_http.rs:116` 的 `FakeRegistry`** |
+| 组合根注入 | ❌ `AppState::with_media_library_registry`（`state.rs:278`）**没有任何生产调用点** |
+
+所以运行期 `media_libraries` 是 `None` → provider 目录**空表** →
+`playback_deliveries` **拿不到**。而且「不碰 `sm-plugins`」也错了：
+`ProviderRegistration`（`sm-plugins/src/registry.rs:34-58`，字段止于 `plugin_endpoint`）
+**没存**那份声明，实现 `list_bundles()` 必须先把 bundle 的四个字段
+（`library_config_fields` / `playback_deliveries` / `merged_playback_format` /
+`download_config_fields`）存进去。
+
+**净结论：`videos.rs` 那 3 条仍然被挡**，但挡它的是「**宿主侧没有 seam 实现**」，
+不是「ABI 里没有声明」。这个差别很大：前者要动 `sm-plugins` + 组合根，后者什么都不用动。
+
+> ★ 讽刺的是：本节原标题是「**读注释会停**」，而我这次栽在自己的**第一版结论**上
+> —— 查到「形状都在」就收手了，没往下问一句「那谁实现它？」。
+> **「有形状」≠「有数据」**，中间隔着一趟 `grep 'impl .* for'`。
+
+同批核清的还有两条：「进度 / 时刻点仓储不存在」（**错**，`MediaProgressRepository` /
+`MediaPointRepository` 都在 `sm-db/src/repo/playback.rs`）；「`video_collections.rs`
+四个成员端点还是 `todo!()`」（**错**，该文件**零 `todo!()`**）。
+
+> 教训与 §7.2h / §7.2i / §7.2j 同源，但方向**反过来**：前三节讲「照抄也会错」，
+> 这一节讲「**读注释会停**」。「卡在 X」这种结论必须回去核 **X 到底有没有** ——
+> 一条过期的「做不到」会让整片区域被后面的每一个人跳过。§7.2j 结尾那句
+> 「别只信『已完成』的结论」在这里要对偶成：**也别只信「做不到」的结论。**
+
+### 7.3 剩余 47 条的**卡点表**（按卡点而非按文件归类）
 
 > 总数与分域计数以 `docs/progress-baseline.md` 为准（那份由脚本生成）；下表按
 > **卡点**归类，只用来判断「下一步该动哪一块」。
@@ -2136,12 +2209,16 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 >
 > 同日再动一次：`status.rs` 的图搜状态落地（`51 -> 50`，路由 `24 -> 23`），
 > 见 §7.2j。**`system` 域的路由至此清零**（`status.rs` 再无 `todo!()`）。
+>
+> 同日再动三次：播放域三端点（`50 -> 47`，路由 `23 -> 20`），见 §7.2k。
+> **`media_playback.rs` 至此清零**，且那批「卡在插件 ABI」的注释已订正。
 
-**路由 23 条：**
+**路由 20 条：**
 
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
-| **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `library_handle` / `playback_deliveries` / 下载器注册表。**13 条**，最大一块 |
+| ~~**插件 ABI**~~ | ~~`media_playback.rs` 3~~ | ✅ **本文件已清零**（`4a7f6d7` / `4aa347c` / `df0c39a`，见 §7.2k）|
+| **provider 能力** | `videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `library_handle` / 浏览与暂存 / 转存源目标 / **下载器注册表**。**10 条**，仍最大一块。⚠️ 其中 `playback_deliveries` **已经有了**（§7.2k）——`videos.rs` 那 3 条**不再是**「等 ABI」，见 §八 |
 | **JavBus provider 不存在** | `movies.rs` 2（SSE）、`actors.rs` 1（SSE） | 见 §7.2f |
 | **`MovieService` 缺方法** | `movies.rs` 3 | `get_movie_reviews`（要 JavBus）/ `get_merged_playback`（要 provider）/ `refresh_movie_metadata`。⚠️ 三个的**服务层方法都不存在**（不是「有方法只差接线」），别照骨架注释当成接线做。`refresh_movie_metadata` 尤其容易读错：`catalog_import.rs:468` 那个是**已实现的辅助函数** `refresh_movie_metadata_strict`，端点真正要的 `MovieMetadataRefreshService::refresh_movie_metadata`（`movie_metadata_refresh.rs:49`）**本身就是 `todo!()`** —— 所以「JavDB host 定下来」也解不开它（2026-10-08 核过）|
 | ~~**`status.rs` 1**~~ | ~~`status.rs`~~ | ✅ **本文件已清零**。`GET /status/image-search` → ✅ **已落**（§7.2j）；`GET /status/metadata-providers/{provider}/test` → ✅ **已落**（§7.5 项 3，依赖 §7.2i 的 `jdsignature` 修复才真能用）|
@@ -2154,8 +2231,13 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 `movie_metadata_search` 2 / `catalog_import` 1）、`playback` 3（`media_file_hash_backfill` /
 `media_validity_scan` / `media_video_info_backfill`）、`discovery` 2（`moment_recommendation`）。
 
-**按卡点合并后的真相**：`transfers` 16 + `playback` 3 + 路由那 13 条 ≈ **32 条压在同一件
-事上 —— 插件 provider ABI**。剩下的才各自有独立卡点。
+**按卡点合并后的真相**：`transfers` 16 + `playback` 3（服务层：`media_file_hash_backfill` /
+`media_validity_scan` / `media_video_info_backfill`）+ 路由那 10 条 ≈ **29 条压在
+provider 插件上**。剩下 18 条各自有独立卡点。
+
+⚠️ 但「压在 provider 上」**不等于**「等 ABI」—— §7.2k 就是一次反例：原来那 13 条里有 3 条
+（`media_playback.rs`）的卡点被写成「等 ABI」，实际 ABI 早就够用，真正的缺口是**宿主侧
+少了一层缝**。**动任何一条之前，先核「缺的那个东西到底在不在」。**
 
 ### 7.4 结论：**逐条「接线」已经没有空间了**
 
@@ -2219,6 +2301,83 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 **权威依据**：[`deployment.md`](deployment.md)（部署形态与瘦身路线）。§一~§七 讲
 「为什么」，这一节只讲**先做哪个、怎么算做完**。
 
+### 8.0 ★ 正在做的一刀（2026-10-08，**代码未动，从这继续**）
+
+一份已确认的计划（`provider-play-url`）走完第 1 步（核实），
+**但核实的结论在收尾时被自己推翻了一次**（见 §7.2k 的订正）：
+`playback_deliveries` 的**形状**处处都在，**生产实现**一处都没有。
+所以开工前多了一个 step 0。
+
+按可验证粒度切成四条，**每条都控制在一个回合内能写完 + 编译 + 反向验证 + 提交**
+（合成一刀就会「开一半」）：
+
+**step 0 —— 把 seam 接上（新发现，原先没算到）**
+
+- `sm-plugins/src/registry.rs` 的 `ProviderRegistration`（`:34-58`，字段止于
+  `plugin_endpoint`）补上 `MediaProviderBundle` 的四个字段：
+  `library_config_fields` / `playback_deliveries` / `merged_playback_format` /
+  `download_config_fields`。**不补就没有数据来源。**
+- 组合根实现 `MediaLibraryRegistry`（全仓目前只有测试替身 `FakeRegistry`），
+  并由 `AppState::with_media_library_registry`（`state.rs:278`）注入 —— 该 setter
+  **没有任何生产调用点**。不接的话 provider 目录是空表、写路径一律 503。
+- 顺带解掉 `media_libraries` 那 5 条（它们等的就是这个字段表，见 L1070-1083
+  那段「`config_fields` 没有来源」—— 那段**是对的**）。
+
+**2a —— 纯管道，可单测**
+
+- `sm-service`：给 `MediaLibraryService` 加**有类型**的
+  `playback_deliveries() -> HashMap<String, Vec<String>>`。
+  ⚠️ **不能**直接用 `list_provider_catalog()`（`media_library.rs:337-346`）—— 它返回
+  `Vec<serde_json::Value>`，**已经序列化**了，API 层读不到有类型的字段。
+- `sm-db` + `sm-service`：让成员行携带**首条有效媒体所属库的 `provider_key`**。
+  ⚠️ `VideoItemRepository::first_valid_media`（`video_item.rs:487-509`）现在返回
+  `(media_id, duration_seconds, file_size_bytes, resolution)` —— **没有
+  `provider_key` / `library_id`，SQL 也没 join `media_library`**；而
+  `VideoCollectionService::item_rows` 把这 4 元组里 3 个字段**直接丢掉**
+  （`collection.rs:612-614`）。要扩查询 + 给 `VideoCollectionItemRow`
+  （`collection.rs:100-116`）加字段。
+
+**2b —— 可验证的用户可见修复**
+
+- `sm-api`：加 `provider_key → playback_deliveries[0] → build_signed_media_url` 的助手
+  （`sm_core::signing::build_signed_media_url`，路径传 `""`，`sm-core/src/signing.rs:308-332`）。
+- 接进 `video_collections.rs` 的 `list_collection_items` —— 它现在
+  `let _ = query.include_play_url;` 并**恒传 `None`**。
+  ⚠️ `reorder_collection_items` 那个 `None` **是对的**（上游那里没有这个参数），别一起改。
+- 红线：**空串 ≠ `null`**。合集条目 `play_url` 是**可空**：
+  `include_play_url && 有有效媒体 → 签名 URL，否则 null`。
+
+**3 —— 丢 `todo!()` 的一刀（`47 -> 44`）**
+
+- 建模 `MovieMediaResource`（= `MediaSummaryResource` + `play_url` +
+  `playback_deliveries` + `progress` + `points`）与 `VideoItemDetailResource`
+  （= 列表项资源**派生** + `media_items`；上游 `schema/videos/items.py:37-38`），
+  接通 `videos.rs` 的 `create_video` / `get_video` / `update_video`。
+- ✅ **已核（2026-10-08）：`MediaSummaryResource` 与 Rust `MediaSummary` 逐字对齐。**
+  `sm-service/src/playback/media_summary.rs:53-78` 的 10 个字段与上游一一对应
+  （`media_id` / `library_id` / `library_name` / `provider_key` / `file_name` /
+  `resolution` / `file_size_bytes` / `duration_seconds` / `video_info` / `valid`）。
+  **`provider_key` 与 `valid` 本来就在里面** —— 所以 `MovieMediaResource` 只差
+  `play_url` / `playback_deliveries` / `progress` / `points` 四样。
+- ⚠️ 组装原语**已存在，但是按番号的**：`attach_movie_list_media(pool, &numbers)` /
+  `list_movie_media_summaries(...)`（`media_summary.rs` 的自由函数，
+  `playback/mod.rs:45-47` 再导出）都按 **`movie_number`** 取，
+  **没有按 `video_item_id` 的变体**。详情的 `media_items` 要新写一条
+  —— `media` 表有 `video_item_id` 列，照 `attach_movie_list_media` 的**批量**形状写，
+  别退化成 N+1。
+- ⚠️ `MediaLibraryRepository` 只有 `find_by_id`（`sm-db/src/repo/library.rs:110`），
+  **没有 `find_by_ids`**。要按「媒体 → 库 → provider_key」批量取的话，
+  得照 `ImageRepository::find_by_ids` / `MediaRepository::find_by_ids` 的批量形状补一个
+  —— **别在服务层写 SQL**（本仓的分层纪律）。
+- ⚠️ `VideoItemService::assemble` / `assemble_without_collections` 是 **`pub(crate)`**
+  （`item.rs:427-449`），API 层调不到 —— 需要一个**新的 pub 方法**，别想着「直接复用」。
+- 详情里 `play_url` 是**非空 `str`**：`valid ? 签名URL : ""`（**失效媒体给空串是上游
+  刻意的** —— 条目仍返回，前端据空地址禁用单条播放）；`progress` 可空、`points` 缺省空列表。
+  合成空串的原因不同，别把这条红线套反。
+- 依赖都齐：`MediaProgressRepository::{find_by_media, load_many}`、
+  `MediaPointRepository::list_all_by_media`（`sm-db/src/repo/playback.rs`）、
+  图片签名 `dto::sign_image_origin`（`dto.rs:234-257`）。
+
 > 判断依据是**卡点**不是行数：`service-progress.md` 的「阻塞地图」已经写明，
 > `provider` 这条曾阻塞 24 个文件 / 8,885 行的依赖，**宿主侧早就不是瓶颈了**
 > —— 真正的缺口是「还没有真实 provider 插件被移植过来」。
@@ -2244,7 +2403,7 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 
 | # | 做什么 | 为什么先它 | 完成判据 |
 |---|---|---|---|
-| ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ⚠️ **本仓侧已做完**（`6020a8e`）：9 个文件同步进契约仓（**本地提交**）+ 两仓 `ABI_MAJOR` = 2 + tag `v0.2.0`（**本地未推**）+ 门禁 `parity/check_contract_sync.py`（已接进 verify，人为漂移验证过会红）。**剩下三步：推契约仓 → 两个插件改 tag → `plugin-ref-local` 补 `done` 帧** |
+| ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ✅ **已做完**（2026-10-08）。契约仓改放 GitHub [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)（public；`main` + `v0.1.0` + `v0.2.0`；本地 `cnb.cool` 远端**已删除**，发布源改指 GitHub）→ 两个插件改指 `v0.2.0` → `plugin-ref-local` 的 `done` 帧按**宿主内置副本**镜像过去（宿主侧早已实现，`GAP:` 注释删掉）。判据：两插件 `cargo test` 绿（`ref-local` 13 项 / `javbus` 33 项）、`parity/check_contract_sync.py` 报 9 个受管文件一致。详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md) §零 |
 | ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有两个 | 二进制 `<plugin_id>` 能被宿主拉起；扩展点被 `collect_extensions` 收下；`run_job` 有实现（不返回 `unimplemented`） |
 | ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | ⚠️ **第一段已通**（`aeff054`）：`import_by_number` + 窄接口补 `find_movie_id` / `import_plugin_movie` + 4 单测 + 3 个真库测试。**剩 `impl MovieMetadataImporter`** —— 卡在接口冲突（那个 trait 的方法签名**没有 config**，而 `fetch` / `fetch_plugin` 要看 `plugins.enabled` 的顺序），两条走法待拍板 |
 | ④ | **P1-2 决策**：`PlaybackPlan` 加 `local_path` delivery | 同域反证：`OpenCoverSourceResponse` 早有 `oneof { local_path, url }`，唯独播放计划没有。**必须在阶段 ⑤ 之前定**，否则 `local_provider` 要先按 `file://` 写一遍再改 | `PlaybackPlan.oneof delivery` 有 `LocalPathPlan local_path = 3`；`docs/plugin-abi.md` 写明三种 delivery 的适用场景 |

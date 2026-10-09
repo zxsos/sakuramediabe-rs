@@ -45,14 +45,18 @@
 //! 最坏的一种：库里干净、磁盘上全是孤儿。
 
 use chrono::NaiveDateTime;
+use sm_db::catalog::asset::Image;
+use sm_db::playback::media::{MediaPoint, MediaProgress};
 use sm_db::repo::{
-    MediaRepository, MediaThumbnailRepository, NewVideoItem, VideoItemFields, VideoItemRepository,
+    MediaPointRepository, MediaProgressRepository, MediaRepository, MediaThumbnailRepository,
+    NewVideoItem, VideoItemFields, VideoItemRepository,
 };
 use sm_db::videos::VideoItem;
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
 use crate::playback::media::MediaService;
+use crate::playback::media_summary::MediaSummary;
 use crate::videos::{Field, SortDirection, DEFAULT_ITEM_SORT, ITEM_SORT_KEYS};
 
 /// 条目归属合集的精简引用（上游 `VideoCollectionRef`）。
@@ -97,6 +101,40 @@ pub struct VideoListItem {
     pub media_count: i64,
     pub can_play: bool,
     pub collections: Vec<VideoCollectionRef>,
+}
+
+/// 详情里的一条媒体（上游 `MovieMediaResource` 的**服务层半边**）。
+///
+/// 上游那条资源 = `MediaSummaryResource` + `play_url` + `playback_deliveries` +
+/// `progress` + `points`。后两者是这里补齐的；前两者要**签名密钥**与**插件注册表**，
+/// 都在 API 层 —— 所以本结构只给原始数据，接口层再签地址、填交付方式。
+#[derive(Debug, Clone)]
+pub struct VideoMediaItem {
+    /// 媒体本体的展示摘要（含 `valid` —— 失效媒体也要出现在详情里）。
+    pub summary: MediaSummary,
+    /// 播放进度，未看过为 `None`。
+    pub progress: Option<MediaProgress>,
+    /// 时刻点，连同它引用的图片行（图片签名在接口层做）。
+    pub points: Vec<VideoMediaPoint>,
+}
+
+/// 详情里媒体上的一个时刻点 + 它引用的图片行。
+///
+/// 上游 `MovieMediaPointResource` 的 `image` 是**签名后的** `ImageResource`；
+/// 签名在接口层，所以这里给数据库行。
+#[derive(Debug, Clone)]
+pub struct VideoMediaPoint {
+    pub point: MediaPoint,
+    pub image: Image,
+}
+
+/// 视频详情（上游 `VideoItemDetailResource` = 列表项 + `media_items`）。
+#[derive(Debug, Clone)]
+pub struct VideoItemDetail {
+    /// 14 字段列表项，**带 `collections`**（上游 `get_video_detail` 传了它们）。
+    pub list: VideoListItem,
+    /// 该条目的**全部**媒体（含失效），按 `Media.id` 升序。
+    pub media_items: Vec<VideoMediaItem>,
 }
 
 /// 拆 `Media.resolution`（形如 `"1920x1080"`）为 `(宽, 高)`。
@@ -162,13 +200,15 @@ impl VideoItemUpdate {
 
 /// 视频条目 service。
 ///
-/// 持有四个仓储：条目本身、媒体、缩略图。**不持有连接池** —— 本 slice 的
-/// 写入都是单条 UPDATE，不需要事务。
+/// 持有六个仓储：条目本身、媒体、缩略图、图片、媒体进度、时刻点。
+/// **不持有连接池** —— 本 slice 的写入都是单条 UPDATE，不需要事务。
 pub struct VideoItemService {
     items: VideoItemRepository,
     media: MediaRepository,
     thumbnails: MediaThumbnailRepository,
     images: sm_db::repo::ImageRepository,
+    progress: MediaProgressRepository,
+    points: MediaPointRepository,
 }
 
 impl VideoItemService {
@@ -178,6 +218,8 @@ impl VideoItemService {
             media: MediaRepository::new(db.clone()),
             thumbnails: MediaThumbnailRepository::new(db.clone()),
             images: sm_db::repo::ImageRepository::new(db.clone()),
+            progress: MediaProgressRepository::new(db.clone()),
+            points: MediaPointRepository::new(db.clone()),
         }
     }
 
@@ -390,12 +432,91 @@ impl VideoItemService {
     /// 列出某个条目下的全部媒体，按 `Media.id` 升序。**刻意不分页** ——
     /// 「这个条目下有哪些文件」是详情页的需求，调用方几乎总是要全部。
     ///
-    /// 上游在这之上还会给每条媒体挂进度、时刻点与签名播放地址，后两者分别
-    /// 需要 `playback` 域的仓储与插件 registry，都不在本批。见
-    /// [`crate::videos`] 的「刻意不复刻」①。
+    /// ⚠️ 这**不是**详情页要的那个：这里只给裸 `media` 行，没有进度、时刻点与
+    /// 播放地址。详情走 [`Self::detail`]。
     pub async fn list_media(&self, video_id: i32) -> Result<Vec<sm_db::Media>, ServiceError> {
         self.require_video(video_id).await?;
         Ok(self.items.list_media(video_id).await?)
+    }
+
+    /// ★ 视频详情（上游 `VideoItemService.get_video_detail`，`:323-353`）。
+    ///
+    /// = 14 字段列表项（**带 `collections`**，与 `GET /videos` 同一套组装）+
+    /// `media_items`（全部媒体，含失效）。
+    ///
+    /// # 为什么不复用 [`Self::list_media`]
+    ///
+    /// `list_media` 只给 `media` 行；详情的每一条还要挂**进度**、**时刻点**
+    /// （连同图片行），两样都按 `media_ids` **批量**取 —— 逐条查就是 N+1。
+    /// 播放地址（`play_url`）与交付方式（`playback_deliveries`）分别要签名密钥与
+    /// 插件注册表，都在接口层，本方法**不给**。
+    pub async fn detail(&self, video_id: i32) -> Result<VideoItemDetail, ServiceError> {
+        let video = self.require_video(video_id).await?;
+        let mut lists = self.assemble(vec![video]).await?;
+        // `assemble` 对每个入参条目产出恰好一项，而这里只喂了一项。
+        let Some(list) = lists.pop() else {
+            return Err(ServiceError::from(sm_db::DbError::business(
+                "VideoItem",
+                "详情组装没有产出列表项",
+            )));
+        };
+        let media_items = self.media_items_of(video_id).await?;
+        Ok(VideoItemDetail { list, media_items })
+    }
+
+    /// 详情的 `media_items`：**全部**媒体（含失效）+ 进度 + 时刻点（连图片）。
+    ///
+    /// 与上游 `_media_items` 的三条批量查询一一对应：
+    /// `Media.select(..).where(video_item == video)`（走
+    /// [`crate::playback::media_summary::list_video_media_summaries`]）、
+    /// `MediaProgress.where(media.in_(ids))`、`MediaPoint.join(Image)`。
+    ///
+    /// ⚠️ 上游那句 `MediaPoint.join(Image)` 是**内连接** —— 图片行缺失（DDL 上
+    /// `RESTRICT`，理论上不该发生）的时刻点不会出现在结果里。这里同样跳过。
+    async fn media_items_of(&self, video_id: i32) -> Result<Vec<VideoMediaItem>, ServiceError> {
+        let grouped = crate::playback::media_summary::list_video_media_summaries(
+            self.media.pool(),
+            &[video_id],
+        )
+        .await?;
+        let summaries = grouped.get(&video_id).cloned().unwrap_or_default();
+        if summaries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let media_ids: Vec<i32> = summaries.iter().map(|summary| summary.media_id).collect();
+        let progress = self.progress.load_many(&media_ids).await?;
+        let points = self.points.list_all_by_media_ids(&media_ids).await?;
+        let image_ids: Vec<i32> = points.iter().map(|point| point.image_id).collect();
+        let images = self.images.find_by_ids(&image_ids).await?;
+
+        let mut points_by_media: std::collections::HashMap<i32, Vec<VideoMediaPoint>> =
+            std::collections::HashMap::new();
+        for point in points {
+            // `media_id` 可空（`SET NULL`）：源头媒体删了，时刻点还在。
+            // 详情是按媒体挂点的，所以没有 `media_id` 的点无处可挂 —— 跳过。
+            let Some(media_id) = point.media_id else {
+                continue;
+            };
+            let Some(image) = images.get(&point.image_id).cloned() else {
+                continue;
+            };
+            points_by_media
+                .entry(media_id)
+                .or_default()
+                .push(VideoMediaPoint { point, image });
+        }
+
+        Ok(summaries
+            .into_iter()
+            .map(|summary| {
+                let media_id = summary.media_id;
+                VideoMediaItem {
+                    summary,
+                    progress: progress.get(&media_id).cloned(),
+                    points: points_by_media.remove(&media_id).unwrap_or_default(),
+                }
+            })
+            .collect())
     }
 
     /// 分页列出条目。返回 `(本页列表项, 总数)`。
@@ -491,12 +612,12 @@ impl VideoItemService {
         Ok(videos
             .into_iter()
             .map(|video| {
-                // 第 1 位是 `media_id`：列表项用不着（成员端点的
-                // `first_media_id` 才要），所以这里丢掉。
-                let (_, duration_seconds, file_size_bytes, resolution) = first_media
+                // 第 1 位是 `media_id`、第 5 位是 `provider_key`：列表项用不着
+                // （成员端点的 `first_media_id` / `play_url` 才要），所以这里丢掉。
+                let (_, duration_seconds, file_size_bytes, resolution, _) = first_media
                     .get(&video.id)
                     .cloned()
-                    .unwrap_or((0, 0, 0, None));
+                    .unwrap_or((0, 0, 0, None, None));
                 let (cover_width, cover_height) = parse_resolution(resolution.as_deref());
                 let (media_count, valid_count) = stats.get(&video.id).copied().unwrap_or((0, 0));
                 let cover = video
