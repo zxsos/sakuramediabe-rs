@@ -316,7 +316,7 @@ initdb -D data -U sakuramedia --auth-local=trust --auth-host=trust -E UTF8
 python parity/gen_ddl.py --out docker/schema.sql
 psql -h localhost -p 5433 -U sakuramedia -d sakuramedia_test -v ON_ERROR_STOP=1 -f schema.sql
 
-$env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia@localhost:5433/sakuramedia_test"
+$env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia:sakuramedia@localhost:5433/sakuramedia_test"
 cargo test -p sm-db --test repo_integration --test gateway_integration
 ```
 

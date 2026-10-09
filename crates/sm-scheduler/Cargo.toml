@@ -2,12 +2,24 @@
 name = "sm-scheduler"
 version = "0.1.0"
 edition.workspace = true
-description = "后台任务调度，替代 APScheduler（14 个内建任务）"
+description = "后台任务调度，替代 APScheduler（cron 解析 + 到点幂等入队）"
 
 [dependencies]
 sm-core = { workspace = true }
 sm-service = { workspace = true }
+sm-db = { workspace = true }
+# cron 的 `Schedule::after` 接收/返回 `chrono::DateTime`，时区求值经它完成。
+chrono = { workspace = true }
 tokio = { workspace = true }
-tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+anyhow = { workspace = true }
+# 只解析表达式。刻意不用 `tokio-cron-scheduler`：它自带 job store 与执行器，
+# 会与 `background_task_run` 表形成两套状态源（ADR §2 / §3.1）。
+cron = { workspace = true }
+
+[dev-dependencies]
+# 集成测试要直接查 background_task_run 验证入队形状。
+sqlx = { workspace = true }
+tokio = { workspace = true }
+sm-db = { workspace = true }

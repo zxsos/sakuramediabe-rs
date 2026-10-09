@@ -51,6 +51,24 @@ impl MediaThumbnailRepository {
         &self.pool
     }
 
+    /// 按 id 查询一条缩略图。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 唯一索引是 `(media_id, offset)`，所以已有的查询入口全部是「按
+    /// `(media_id, offset)` 定位」或「按 media 列举」。而
+    /// `VideoItemService` 的封面规则拿到的是**缩略图 id**
+    /// （`VideoItemUpdateRequest.cover_thumbnail_id`），方向正好相反 ——
+    /// 没有这个方法，那条规则只能退回 service 层写 SQL。
+    pub async fn find_by_id(&self, id: i32) -> Result<Option<MediaThumbnail>, DbError> {
+        Ok(
+            sqlx::query_as::<_, MediaThumbnail>("SELECT * FROM media_thumbnail WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// 写入（或覆盖）某个时刻点的缩略图。
     ///
     /// 用 `ON CONFLICT (media_id, "offset") DO UPDATE` 而不是 `insert`：

@@ -1,8 +1,14 @@
 [package]
 name = "sm-api"
 version = "0.1.0"
+description = "axum 路由层 —— 错误信封、鉴权、CORS 与端点装配"
 edition.workspace = true
-description = "axum 路由层，126 个端点，契约逐字节不变"
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 sm-core = { workspace = true }
@@ -11,7 +17,18 @@ sm-db = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
+# SSE 的广播流：`BroadcastStream` 把 `broadcast::Receiver` 变成 `Stream`。
+# 只开 sync —— 其余 feature（fs、net、io-util）本模块一个都不用。
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# 集成测试用 oneshot 直接驱动 Router，不起端口、不依赖运行时
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+# 慢日志测试要把 warning 抓进内存断言字段，所以需要一个可写的 subscriber。
+tracing-subscriber = { workspace = true }

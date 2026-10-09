@@ -2,16 +2,38 @@
 name = "sm-server"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 description = "组合根：单进程同时承载 API(8000) 与调度器"
+
+[[bin]]
+name = "sm-server"
+path = "src/main.rs"
 
 [dependencies]
 sm-core = { workspace = true }
 sm-db = { workspace = true }
 sm-api = { workspace = true }
+sm-service = { workspace = true }
 sm-scheduler = { workspace = true }
-sm-plugins = { workspace = true }
+# 组合根要自己 serve：axum::serve + with_graceful_shutdown。
+axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# release 下滚动落盘（见 src/logging.rs：只在显式给了 log_dir 时启用）
+tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 config = { workspace = true }
+sqlx = { workspace = true }
+# 刻意**不**依赖 sm-plugins：插件 ABI（gRPC）还没落地，而一个不引用的依赖
+# 就是 ADR §6 说的幽灵配置 —— 它会让「插件已接上」看起来成立。
+# 阶段 4/5 落地时把这一行加回来。
+
+[dev-dependencies]
+sm-db = { workspace = true }
+# 冒烟测试要真的发 HTTP 请求（tests/server_smoke.rs）。
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }

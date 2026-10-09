@@ -1,6 +1,19 @@
 target/
-Cargo.lock
+
+# Cargo.lock 必须提交：这是产二进制的 workspace，lockfile 是供应链基线
+# （配合 cargo audit）。只有纯 library crate 才该忽略它。
 
 # Python bytecode from the parity tooling
 __pycache__/
 *.pyc
+
+upstream/
+
+# 并行开发的 git worktree（各自独立分支 + 独立 target 目录）
+.worktrees/
+
+# 跨 CodeBuddy 实例的协作通道（本地交换用，不入库）
+.bridge/
+
+# 编辑器产生的回收站目录
+.Trash-*/

@@ -62,6 +62,35 @@ impl NewVideoItem {
     }
 }
 
+/// `video_item` 的局部更新。**每个 `None` 都表示「不动这一列」。**
+///
+/// # 为什么 `release_date` 是两层 `Option`
+///
+/// ```text
+/// None      -> 不动（字段没给，或给了 null）
+/// Some(None) -> 清空为 NULL
+/// Some(Some(d)) -> 设为 d
+/// ```
+///
+/// 上游 `update_video` 对三个字段的**显式 null** 语义并不一致：
+///
+/// | 字段 | 给了 null 时 |
+/// |---|---|
+/// | `title` / `summary` | **忽略**（`if ... is not None` 才赋值） |
+/// | `release_date` | **清空**（`if "release_date" in update_data`） |
+///
+/// 两层 `Option` 就是这个差异的编码。合成一个 `Option<T>` 会让「清空」与
+/// 「不动」无法区分，而两者的最终行状态不同。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VideoItemFields<'a> {
+    /// 标题。空白由 service 层拦成 422，这里不做判断。
+    pub title: Option<&'a str>,
+    /// 简介。空串是合法值（清空简介）。
+    pub summary: Option<&'a str>,
+    /// 发布日期。见类型文档的两层 `Option` 说明。
+    pub release_date: Option<Option<chrono::NaiveDateTime>>,
+}
+
 /// `video_item` 表仓储。
 #[derive(Debug, Clone)]
 pub struct VideoItemRepository {
@@ -158,6 +187,42 @@ impl VideoItemRepository {
         .bind(release_date)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// 局部更新。一条 UPDATE，只推进一次 `updated_at`。
+    ///
+    /// 封面**不在**这个结构里：它由 [`Self::set_cover`] 单独写。原因是
+    /// 上游换封面会连带「旧封面图不再被引用 → 清理磁盘文件」，那一步需要
+    /// service 层知道旧值，混进这条 SQL 就看不见了。
+    ///
+    /// 返回 `None` 表示行不存在 —— 调用方已经做过 404 判定，这里是兜底。
+    pub async fn update_fields(
+        &self,
+        id: i32,
+        fields: &VideoItemFields<'_>,
+    ) -> Result<Option<VideoItem>, DbError> {
+        // `release_date` 用「标志位 + 值」两个参数表达「不动 / 清空 / 赋值」
+        // 三态：`COALESCE` 做不到，因为 NULL 本身就是一个合法的目标值。
+        let has_release_date = fields.release_date.is_some();
+        let release_date = fields.release_date.flatten();
+        sqlx::query_as::<_, VideoItem>(
+            "UPDATE video_item SET \
+                 title = COALESCE($2, title), \
+                 summary = COALESCE($3, summary), \
+                 release_date = CASE WHEN $4 THEN $5 ELSE release_date END, \
+                 updated_at = $6 \
+             WHERE id = $1 \
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(fields.title)
+        .bind(fields.summary)
+        .bind(has_release_date)
+        .bind(release_date)
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(VIDEO_ITEM_ENTITY))
     }
 
     /// 设置封面图。返回是否真的改了。

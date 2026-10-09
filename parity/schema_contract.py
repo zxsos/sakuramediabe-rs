@@ -27,9 +27,20 @@ import os
 import re
 import sys
 
+# 优先级：显式环境变量 > 工作区内 clone 的上游 > 作者本机的原始路径。
+# `upstream/sakuramediabe` 是 `git clone https://github.com/tinypinglite/sakuramediabe`
+# 的结果，CI 与换机器时不用再改这份脚本。
+_DEFAULT_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "upstream",
+    "sakuramediabe",
+    "src",
+    "model",
+)
 MODEL_ROOT = os.environ.get(
     "PEEWEE_ROOT",
-    r"C:\Users\29789\Desktop\sakuramedia\sakuramediabe\src\model",
+    _DEFAULT_ROOT if os.path.isdir(_DEFAULT_ROOT)
+    else r"C:\Users\29789\Desktop\sakuramedia\sakuramediabe\src\model",
 )
 
 # Peewee 字段类型 -> 规范化类型名。

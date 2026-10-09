@@ -1,0 +1,216 @@
+//! 请求体提取器包装。
+//!
+//! # 为什么不能直接 `axum::Json`
+//!
+//! axum 里提取器失败时，**rejection 直接变成响应**，不会经过 handler 的
+//! 错误类型。所以 `Json<PlaylistCreateRequest>` 解析失败时，客户端拿到的是
+//! axum 默认的 **400 + 纯文本**，而不是上游的
+//! `422 {"error":{"code":"validation_error",...}}`。
+//!
+//! 这是个静默的契约破坏：状态码和响应体形状都错了，而单测如果只断言
+//! "请求失败了"根本发现不了。
+//!
+//! 所以这里包一层，把 `JsonRejection` 转成 [`ErrorResponse`]。
+//!
+//! [`Multipart`] 是同一个理由的第二个例子：axum 的 `Multipart` 解析失败同样
+//! 直接变成响应（400 + 纯文本），而上游的 `RequestValidationError` 是
+//! 422 信封。
+
+use axum::extract::multipart::MultipartRejection;
+use axum::extract::{FromRequest, Json as AxumJson, Multipart as AxumMultipart, Request};
+use axum::http::StatusCode;
+use serde::de::DeserializeOwned;
+
+use crate::error::ErrorResponse;
+
+/// 请求体提取器：解析失败时产出上游形状的 422。
+pub struct Json<T>(pub T);
+
+impl<T, S> FromRequest<S> for Json<T>
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = ErrorResponse;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumJson::<T>::from_request(request, state).await {
+            Ok(AxumJson(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ErrorResponse::from(rejection)),
+        }
+    }
+}
+
+/// 单个上传文件。
+#[derive(Debug, Clone)]
+pub struct UploadedFile {
+    /// 表单字段名。
+    pub field: String,
+    /// 客户端给的文件名。可能为 `None`（未带 `filename=` 的字段）。
+    pub file_name: Option<String>,
+    /// 声明的 MIME 类型。**不校验** —— 上游也不校验，而这里校验会把
+    /// 「类型不认识的合法文件」变成 422。
+    pub content_type: Option<String>,
+    /// 文件内容。
+    pub bytes: Vec<u8>,
+}
+
+/// multipart 提取器，带**强制字节上限**。
+///
+/// # 上限为什么必须是强制的
+///
+/// 不设上限的话，一个 `Content-Length: 1 GB` 的上传会在内存里堆到 1 GB ——
+/// 鉴权中间件挡不住（body 在鉴权之后才读），axum 的默认 body 上限是 2 MB
+/// 但那也足够把一个 16 GB 的 NAS 机器的内存吃干。这里默认
+/// [`DEFAULT_MAX_BYTES`]，由调用方按端点调大或调小。
+///
+/// 超限 → **413** `http_error`（`Payload Too Large`）。不是 422：422 在
+/// 这个项目里表示「请求体格式/字段不对」，而文件太大是另一回事，客户端
+/// 据此该提示「换个文件」而不是「改改字段」。
+///
+/// # 为什么流式累积而不是 `bytes()` 一次性读
+///
+/// `Field::bytes()` 会把整个字段读进内存且**没有上限**。这里逐 chunk
+/// 累加并在超限时**立刻**返回：超限那一刻已经读进来的字节被丢弃，
+/// 不会继续读到请求结束。
+pub struct Multipart {
+    inner: AxumMultipart,
+    max_bytes: usize,
+}
+
+impl Multipart {
+    /// 单个文件的上限。默认 [`DEFAULT_MAX_BYTES`]。
+    pub fn new(inner: AxumMultipart) -> Self {
+        Self {
+            inner,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+
+    /// 覆盖上限。
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// 取下一个文件字段。流已结束 → `Ok(None)`。
+    ///
+    /// 解析失败 → 422 `validation_error`（与 JSON body 同类）；
+    /// 超限 → 413 `http_error`。
+    pub async fn next_file(&mut self) -> Result<Option<UploadedFile>, ErrorResponse> {
+        loop {
+            let mut field = match self.inner.next_field().await.map_err(ErrorResponse::from)? {
+                Some(field) => field,
+                None => return Ok(None),
+            };
+
+            let mut file = UploadedFile {
+                field: field.name().unwrap_or_default().to_owned(),
+                file_name: field.file_name().map(str::to_owned),
+                content_type: field.content_type().map(str::to_owned),
+                bytes: Vec::new(),
+            };
+
+            while let Some(chunk) = field.chunk().await.map_err(ErrorResponse::from)? {
+                // `len + chunk.len()` 而不是「先加再加判」：后者会先分配
+                // 出超限的整块内存再丢掉它，前者只多占一个 chunk 的量。
+                if file.bytes.len() + chunk.len() > self.max_bytes {
+                    return Err(ErrorResponse::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "http_error",
+                        "Uploaded file is too large",
+                    )
+                    .with_details(details_of_pair(
+                        "field",
+                        &file.field,
+                        "max_bytes",
+                        self.max_bytes as i64,
+                    )));
+                }
+                file.bytes.extend_from_slice(&chunk);
+            }
+
+            // 跳过非文件字段（表单里的普通文本输入）。
+            if file.file_name.is_none() && file.bytes.is_empty() {
+                continue;
+            }
+            return Ok(Some(file));
+        }
+    }
+}
+
+/// 默认单文件上限 8 MiB。
+///
+/// 取 8 MiB 的理由与 `media-file-hash` 的采样阈值同源：视频封面/插件 zip
+/// 都在这个量级以内，而超限的实际上传是**误选了一个视频文件**。
+pub const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn details_of_pair(
+    key_a: &str,
+    value_a: &str,
+    key_b: &str,
+    value_b: i64,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert(key_a.to_owned(), serde_json::Value::from(value_a));
+    map.insert(key_b.to_owned(), serde_json::Value::from(value_b));
+    map
+}
+
+impl<S> FromRequest<S> for Multipart
+where
+    S: Send + Sync,
+{
+    /// multipart 请求体本身不合法（缺 `Content-Type`、boundary 缺失、
+    /// chunked 体损坏）→ 422 `validation_error`。
+    type Rejection = ErrorResponse;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumMultipart::from_request(request, state).await {
+            Ok(inner) => Ok(Self::new(inner)),
+            Err(rejection) => Err(ErrorResponse::from(rejection)),
+        }
+    }
+}
+
+impl From<axum::extract::multipart::MultipartError> for ErrorResponse {
+    /// 读流失败（body 截断、chunk 编码错误）→ **422** `validation_error`。
+    ///
+    /// 与 [`MultipartRejection`] 同一个映射，但**理由不同**：rejection 发生在
+    /// 「还没开始读」—— `Content-Type` 不对或 boundary 缺失；`MultipartError`
+    /// 发生在「读到一半」—— 客户端断了。两者都不是文件本身的问题，所以都是
+    /// 422 而不是 4xx 里的其它码。
+    fn from(value: axum::extract::multipart::MultipartError) -> Self {
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "detail".to_owned(),
+            serde_json::Value::from(value.body_text()),
+        );
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "Request validation failed",
+        )
+        .with_details(details)
+    }
+}
+
+impl From<MultipartRejection> for ErrorResponse {
+    /// 400 → **422** `validation_error`，与上游 `RequestValidationError` 对齐。
+    ///
+    /// 这个映射不是「顺手」：客户端对 400 与 422 的处理不同（重试策略），
+    /// 而上游从来不会因为上传体损坏而回 400。
+    fn from(value: MultipartRejection) -> Self {
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "detail".to_owned(),
+            serde_json::Value::from(value.body_text()),
+        );
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "Request validation failed",
+        )
+        .with_details(details)
+    }
+}

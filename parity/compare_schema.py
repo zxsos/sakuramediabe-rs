@@ -40,9 +40,20 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from schema_contract import UNKNOWN_NULLABLE, collect  # noqa: E402
 
+# 优先级：显式环境变量 > 工作区内的 crate > 作者本机的原始路径。
+# 缺省路径指向 Windows 时，换机器跑会得到「40 处 MISSING_STRUCT」——
+# 那不是真的缺结构体，只是没找到源码。
+_DEFAULT_RUST_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "crates",
+    "sm-db",
+    "src",
+)
 RUST_ROOT = os.environ.get(
     "SM_DB_SRC",
-    r"C:\Users\29789\Desktop\sakuramedia\sakuramedia-rs\crates\sm-db\src",
+    _DEFAULT_RUST_ROOT
+    if os.path.isdir(_DEFAULT_RUST_ROOT)
+    else r"C:\Users\29789\Desktop\sakuramedia\sakuramedia-rs\crates\sm-db\src",
 )
 
 # Rust 类型 -> Peewee 规范化类型。Option<> 视为同类型（可空性另行比对）。

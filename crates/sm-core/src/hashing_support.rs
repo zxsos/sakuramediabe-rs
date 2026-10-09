@@ -37,9 +37,34 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.finalize()
 }
 
+/// 常数时间比较。
+///
+/// 比较 HMAC 时用 `==` 会按字节短路：第一次不相等就返回，泄露了「前几个
+/// 字节是对的」这个信息，攻击者可以逐字节爆破签名。
+///
+/// 长度不等时直接 false —— 长度本身不是秘密。
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_is_false_on_any_difference() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"), "长度不等直接 false");
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn matches_rfc4231_case_1() {

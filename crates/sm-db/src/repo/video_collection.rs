@@ -205,6 +205,83 @@ impl VideoCollectionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 一次性更新名称与/或简介。**一条 UPDATE，只推进一次 `updated_at`。**
+    ///
+    /// `name` / `description` 各自是「`None` = 不动这一列」：
+    ///
+    /// | 传入 | 结果 |
+    /// |---|---|
+    /// | `(None, None)` | 不发语句，返回 `Ok(false)` |
+    /// | `(Some("新名"), None)` | 只改名字 |
+    /// | `(Some("新名"), Some(""))` | 名字与简介都改（空串是合法的「清空简介」） |
+    ///
+    /// # 为什么不拆成 `rename` + `set_description` 两次调用
+    ///
+    /// 上游 `update_collection` 是「逐个字段赋值 → 一次 `save()`」，
+    /// `updated_at` 只被赋值一次。拆成两次 UPDATE 会写两个时间戳，而
+    /// `list_collections` 的默认排序正是 `updated_at DESC` —— 两次写入之间
+    /// 读到的列表顺序会与上游不同。
+    ///
+    /// 空白名按业务错误拒绝，与 [`Self::insert`] 同一把尺子。
+    pub async fn update(
+        &self,
+        id: i32,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<bool, DbError> {
+        if name.is_none() && description.is_none() {
+            return Ok(false);
+        }
+        if let Some(name) = name {
+            if VideoCollection::normalize_name(Some(name)).is_empty() {
+                return Err(DbError::business(VIDEO_COLLECTION_ENTITY, "name 不能为空"));
+            }
+        }
+        let result = sqlx::query(
+            "UPDATE video_collection SET \
+                 name = COALESCE($2, name), \
+                 description = COALESCE($3, description), \
+                 updated_at = $4 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(name.map(|n| VideoCollection::normalize_name(Some(n))))
+        .bind(description.map(str::trim))
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(VIDEO_COLLECTION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 只推进 `updated_at`，不动其它列。返回是否真的改了。
+    ///
+    /// 对应上游 `_touch_collection`：成员增删与重排都要让合集在
+    /// 「最近活跃」里上浮，而那些操作本身不碰父表的其它列。
+    pub async fn touch(&self, id: i32) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE video_collection SET updated_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(crate::common::time::now_utc())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(VIDEO_COLLECTION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`Self::touch`] 的事务内变体。
+    ///
+    /// 「改成员 + touch 父表」必须原子：否则中间那一瞬父表的 `updated_at`
+    /// 还是旧的，而成员已经变了 —— 合集列表的排序会与成员状态不一致。
+    pub async fn touch_in(&self, ctx: &mut crate::repo::Ctx<'_>, id: i32) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE video_collection SET updated_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(crate::common::time::now_utc())
+            .execute(ctx.conn().await?.as_conn())
+            .await
+            .map_err(|e| DbError::from(e).with_entity(VIDEO_COLLECTION_ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 删掉一个合集，返回是否真的删了。
     ///
     /// 成员行随外键 `CASCADE` 一并消失 —— 「保留合集、只清成员」用
@@ -226,3 +303,112 @@ crate::impl_ordered_member_repo!(
     "video_item_id",
     "VideoCollectionItem"
 );
+
+/// 只在 `video_collection_item` 上存在的三个成员操作。
+///
+/// # 为什么没有进 [`crate::impl_ordered_member_repo`]
+///
+/// 宏是给「moment / clip / video 三张同构表」共用的。逐条核对了上游：
+///
+/// | 操作 | moment | clip | video |
+/// |---|---|---|---|
+/// | 按**成员** id 移除（`unlink`） | ✅ `remove_point` | ✅ `remove_clip` | ✅ `remove_items_by_video_ids` |
+/// | 按**关联行** id 移除 | ❌ | ❌ | ✅ `remove_item` |
+/// | 批量按成员 id 移除 | ❌ | ❌ | ✅ `remove_items_by_video_ids` |
+/// | 重排（改 `position`） | ❌ | ❌ | ✅ `reorder_items` |
+///
+/// 也就是说后三个是 videos 独有。放进宏会给另外两张表留下**永不调用的
+/// 方法** —— 那正是本仓库文档里反复批评的「幽灵配置」，只是换成了方法。
+///
+/// # 「关联行 id」与「成员 id」是两个不同的东西
+///
+/// ```text
+/// video_collection_item:  id（关联行） │ collection_id │ video_item_id（成员） │ position
+///                                ▲                        ▲
+///                        API 的 item_id            API 的 video_item_id
+/// ```
+///
+/// 上游 `remove_item(collection_id, item_id)` 删的是**前者**。两者的取值
+/// 空间都从 1 开始、外观完全一样，所以混淆不会报错、只会删掉错的行 ——
+/// 这也是本文件要把两个方法命名成 `unlink_by_link_id` 与
+/// `unlink_by_member_ids` 而不是两个 `unlink` 的原因。
+impl VideoCollectionItemRepository {
+    /// 按**关联行 id** 移除一个成员。返回是否真的删掉了一行。
+    ///
+    /// `collection_id` 一并进 `WHERE`：URL 里的合集 id 与成员 id 必须属于
+    /// 同一个合集，否则「从 A 合集删 B 的成员」会静默成功。
+    pub async fn unlink_by_link_id(
+        &self,
+        collection_id: i32,
+        link_id: i32,
+    ) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("DELETE FROM video_collection_item WHERE collection_id = $1 AND id = $2")
+                .bind(collection_id)
+                .bind(link_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity("VideoCollectionItem"))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 事务内按**成员 id** 批量移除。返回删掉了几行。
+    ///
+    /// `member_ids` 允许含重复：`= ANY($2)` 对重复值不敏感，调用方不必
+    /// 先去重。上游用 `dict.fromkeys` 去重是为了让 IN 列表短一点，不是
+    /// 为了语义。
+    ///
+    /// 空数组直接返回 0 而不发语句 —— PostgreSQL 的 `= ANY('{}')` 恒为
+    /// false（不是 true），语义恰好也对，但发一条无意义的 DELETE 总归是
+    /// 浪费一次往返。
+    pub async fn unlink_by_member_ids_in(
+        &self,
+        ctx: &mut crate::repo::Ctx<'_>,
+        collection_id: i32,
+        member_ids: &[i32],
+    ) -> Result<u64, DbError> {
+        if member_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "DELETE FROM video_collection_item \
+             WHERE collection_id = $1 AND video_item_id = ANY($2)",
+        )
+        .bind(collection_id)
+        .bind(member_ids)
+        .execute(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity("VideoCollectionItem"))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 事务内改一个成员的 `position`。返回是否真的改了。
+    ///
+    /// `collection_id` 进 `WHERE` 是防御性的：调用方（重排）已经校验过
+    /// 「给出的 id 恰好覆盖本合集全部成员」，正常路径下这个条件恒真。
+    /// 留着它是为了让「行不存在」与「行属于别的合集」返回同一个 `false`，
+    /// 而不是把越权写当成成功。
+    ///
+    /// **不重排**其余成员的 `position` —— 重排是调用方一次性写全量的语义。
+    pub async fn set_position_in(
+        &self,
+        ctx: &mut crate::repo::Ctx<'_>,
+        collection_id: i32,
+        link_id: i32,
+        position: i32,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE video_collection_item \
+             SET position = $3, updated_at = $4 \
+             WHERE collection_id = $1 AND id = $2",
+        )
+        .bind(collection_id)
+        .bind(link_id)
+        .bind(position)
+        .bind(crate::common::time::now_utc())
+        .execute(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity("VideoCollectionItem"))?;
+        Ok(result.rows_affected() > 0)
+    }
+}

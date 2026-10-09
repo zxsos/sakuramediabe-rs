@@ -251,6 +251,27 @@ impl UserRefreshTokenRepository {
         .await?)
     }
 
+    /// 按 `token_hash` 查 **active** 记录。
+    ///
+    /// 上游 `refresh_token_pair` 就是这么定位记录的：
+    /// `UserRefreshToken.get_or_none(token_hash == hash & status == active)`。
+    /// 客户端刷新时只带明文，**没有** `token_id`，所以哈希必须是可查的键。
+    ///
+    /// 只过滤 `active`：被吊销或已过期的记录不该被这一步选中 —— 那正是
+    /// 轮换要防的重放。
+    pub async fn find_active_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<UserRefreshToken>, DbError> {
+        Ok(sqlx::query_as::<_, UserRefreshToken>(
+            "SELECT * FROM user_refresh_tokens WHERE token_hash = $1 AND status = $2",
+        )
+        .bind(token_hash.trim())
+        .bind(RefreshTokenStatus::Active.as_str())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// 插入一个令牌。
     ///
     /// `status` **显式写入** `"active"`，不依赖数据库 DEFAULT。

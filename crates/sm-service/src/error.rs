@@ -56,6 +56,34 @@ impl ServiceError {
         }
     }
 
+    /// 参数校验失败（422），**带 details**。
+    ///
+    /// 上游 `validate_page` 与 `resolve_sort_expression` 都把出错的字段值
+    /// 原样放进 `details`（`{"page": 0}` / `{"sort": "title:up"}`），客户端
+    /// 据此高亮对应控件。没有 details 的那个构造留给「消息本身就是全部信息」
+    /// 的场景（空更新、空名称）。
+    pub fn validation_with(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Map<String, Value>,
+    ) -> Self {
+        Self {
+            status: 422,
+            api: Box::new(ApiError::new(code, message).with_details(details)),
+        }
+    }
+
+    /// 认证失败（401）。
+    ///
+    /// 上游在鉴权路径上抛的三种码：`invalid_credentials`、
+    /// `invalid_refresh_token`、`unauthorized`。
+    pub fn unauthorized(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: 401,
+            api: Box::new(ApiError::new(code, message)),
+        }
+    }
+
     /// 资源冲突（409）：名称重复、系统保留、系统托管。
     ///
     /// `details` 可选 —— 上游在这些错误里都带上了上下文（哪个名字、

@@ -28,7 +28,7 @@ $parity = Join-Path $PSScriptRoot '..\parity'
 
 # Integration tests need a real database. Without this they skip rather
 # than fail, so a green run locally does not imply they executed.
-$env:SMDB_TEST_DATABASE_URL = 'postgres://sakuramedia@127.0.0.1:5433/sakuramedia_test'
+$env:SMDB_TEST_DATABASE_URL = 'postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test'
 
 $failed = New-Object System.Collections.ArrayList
 

@@ -22,9 +22,16 @@
 
 //! 因此实际需要迁移的账号极少。
 
-use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::Ident;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+// argon2 0.6 收窄了 `password_hash` 的再导出：只透出 `password_hash::{self,
+// PasswordHasher, PasswordVerifier, phc::PasswordHash}`。`SaltString`、`Ident`、
+// `rand_core` 要从 `password-hash` crate 直接取。
+//
+// 另一个行为变化：`PasswordHasher::hash_password` 在 0.6 里不再接收盐 ——
+// 改成开 `getrandom` 特性后由 trait 自动生成（见 Cargo.toml）。需要显式控盐时
+// 另有 `hash_password_with_salt(password, salt: &[u8])`，盐的类型也从
+// `&SaltString` 变成了 `&[u8]`。
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 
 /// 默认参数。
@@ -81,9 +88,10 @@ pub fn hash_password_with(
 ) -> Result<String, PasswordError> {
     let params = Params::new(m_cost, t_cost, p_cost, None).map_err(|_| PasswordError::Hashing)?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let salt = SaltString::generate(&mut OsRng);
+    // 盐由 `PasswordHasher::hash_password` 自动生成（需 `getrandom` 特性）。
+    // 每次调用都换新盐，对应 password.rs 里的 `salt_makes_each_hash_unique`。
     let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|_| PasswordError::Hashing)?;
     Ok(hash.to_string())
 }
@@ -113,7 +121,9 @@ pub fn needs_rehash(stored: &str) -> bool {
         // 无法解析的哈希（异常数据）也标记为需重算，交由登录流程暴露问题。
         return true;
     };
-    if parsed.algorithm != Ident::new_unwrap(ARGON2ID_ALGORITHM) {
+    // password-hash 0.6 里 `Ident` 藏在 `phc` 下且不再有 `new_unwrap`；
+    // 直接比字符串，语义相同且不锁死 `Ident` 的构造 API。
+    if parsed.algorithm.as_str() != ARGON2ID_ALGORITHM {
         return true;
     }
     // 其余情况：本实现生成的 Argon2id，默认参数下无需重算。

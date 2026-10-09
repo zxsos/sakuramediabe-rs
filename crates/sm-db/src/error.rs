@@ -18,6 +18,15 @@
 
 use std::fmt;
 
+/// PostgreSQL `unique_violation` 的 SQLSTATE。
+pub const UNIQUE_VIOLATION: &str = "23505";
+/// `foreign_key_violation`。
+pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+/// `check_violation`。
+pub const CHECK_VIOLATION: &str = "23514";
+/// `not_null_violation`。
+pub const NOT_NULL_VIOLATION: &str = "23502";
+
 /// 数据访问错误。
 #[derive(Debug)]
 pub enum DbError {
@@ -40,6 +49,18 @@ pub enum DbError {
     /// 归到 409 而非 500：这是**状态冲突**，重试或换输入可能成功。
     ConstraintViolation {
         entity: &'static str,
+        /// PostgreSQL **SQLSTATE**，如 `23505`（唯一违例）、`23503`（外键）、
+        /// `23514`（CHECK）、`23502`（NOT NULL）。
+        ///
+        /// # 为什么必须带上它
+        ///
+        /// 只有约束**名**时，「这是不是唯一违例」只能靠字符串猜 —— 而
+        /// `background_task_run_mutex_key_uniq` 这种名字既可能变，也可能与
+        /// 别的约束撞形状。业务上有一类逻辑**必须**区分它们：定时任务的
+        /// 「同 mutex_key 已在队列 → 按 coalesce 跳过」与视频合集的
+        /// 「重复加入 → 幂等返回」，都要求「唯一违例走跳过、其余照常报错」。
+        /// 猜错的后果是幂等路径静默失效，并发下表现为「同一个任务被入队两次」。
+        code: &'static str,
         /// 约束名。从 PostgreSQL 错误里提取，便于排查是哪个约束。
         constraint: String,
     },
@@ -61,7 +82,9 @@ impl fmt::Display for DbError {
         match self {
             Self::Db(err) => write!(f, "database error: {err}"),
             Self::NotFound { entity, key } => write!(f, "{entity} not found: {key}"),
-            Self::ConstraintViolation { entity, constraint } => {
+            Self::ConstraintViolation {
+                entity, constraint, ..
+            } => {
                 write!(f, "{entity} violates constraint: {constraint}")
             }
             Self::Business { entity, reason } => write!(f, "{entity} rejected: {reason}"),
@@ -89,11 +112,27 @@ impl From<sqlx::Error> for DbError {
             if code.starts_with("23") {
                 return Self::ConstraintViolation {
                     entity: "unknown",
+                    code: known_sqlstate(&code),
                     constraint: constraint_name_of(&code, db_err.constraint()),
                 };
             }
         }
         Self::Db(err)
+    }
+}
+
+/// 把 SQLSTATE 收敛成已知的四个常量之一。
+///
+/// `&'static str` 是为了让 [`DbError::ConstraintViolation::code`] 能按值比较 ——
+/// 「这是不是唯一违例」这个问题每轮调度与每次合集成员追加都要问一次，
+/// 不该让每个调用方各自写一遍字符串比较。
+fn known_sqlstate(code: &str) -> &'static str {
+    match code {
+        UNIQUE_VIOLATION => UNIQUE_VIOLATION,
+        FOREIGN_KEY_VIOLATION => FOREIGN_KEY_VIOLATION,
+        CHECK_VIOLATION => CHECK_VIOLATION,
+        NOT_NULL_VIOLATION => NOT_NULL_VIOLATION,
+        _ => "23000",
     }
 }
 
@@ -132,6 +171,19 @@ impl DbError {
         }
     }
 
+    /// 是不是**唯一**约束违例（`23505`）。
+    ///
+    /// 「唯一冲突」与「外键 / CHECK / NOT NULL 违例」在业务上后果完全不同：
+    /// 前者常常意味着「已经有人做过了，跳过即可」（定时任务的 coalesce、
+    /// 合集成员的幂等加入），后者是**真错误**，必须冒泡。把两者混为一谈的
+    /// 代价是掩盖真实缺陷 —— 所以这个判定只认 SQLSTATE，不看约束名。
+    pub fn is_unique_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::ConstraintViolation { code, .. } if *code == UNIQUE_VIOLATION
+        )
+    }
+
     /// 补上实体名。
     ///
     /// [`From<sqlx::Error>`] 不知道是哪个 Repository 出的错，只能填
@@ -161,6 +213,7 @@ mod tests {
 
         let cv = DbError::ConstraintViolation {
             entity: "Movie",
+            code: CHECK_VIOLATION,
             constraint: "movie_subscription_blacklist_exclusive".to_owned(),
         };
         assert!(cv
@@ -172,7 +225,8 @@ mod tests {
     fn with_entity_fills_only_the_unknown_placeholder() {
         let placeholder = DbError::ConstraintViolation {
             entity: "unknown",
-            constraint: "23505".to_owned(),
+            code: UNIQUE_VIOLATION,
+            constraint: "background_task_run_mutex_key_uniq".to_owned(),
         };
         match placeholder.with_entity("Movie") {
             DbError::ConstraintViolation { entity, .. } => assert_eq!(entity, "Movie"),
@@ -182,6 +236,7 @@ mod tests {
         // 已有实体名时不应被覆盖 —— Repository 可能已经填对了。
         let named = DbError::ConstraintViolation {
             entity: "Media",
+            code: UNIQUE_VIOLATION,
             constraint: "x".to_owned(),
         };
         match named.with_entity("Movie") {
@@ -191,8 +246,42 @@ mod tests {
     }
 
     #[test]
+    fn only_sqlstate_decides_whether_it_is_a_unique_violation() {
+        // 这条测试存在的理由：上一版按「约束名以 23505 开头」判定，而
+        // `From<sqlx::Error>` 存的是**约束名**（`background_task_run_mutex_key_uniq`）
+        // —— 于是判定在真实链路上恒为 false，定时任务的 coalesce 跳过与
+        // 合集成员的幂等加入都静默失效。约束名长得像 SQLSTATE 的那个 case
+        // （拿不到约束名时的回退值）恰好让人误以为它能用。
+        let unique_by_name_only = DbError::ConstraintViolation {
+            entity: "BackgroundTaskRun",
+            code: FOREIGN_KEY_VIOLATION,
+            constraint: "23505".to_owned(),
+        };
+        assert!(
+            !unique_by_name_only.is_unique_violation(),
+            "约束名像 23505 不等于唯一违例"
+        );
+
+        let real_unique = DbError::ConstraintViolation {
+            entity: "BackgroundTaskRun",
+            code: UNIQUE_VIOLATION,
+            constraint: "background_task_run_mutex_key_uniq".to_owned(),
+        };
+        assert!(real_unique.is_unique_violation());
+
+        for other in [FOREIGN_KEY_VIOLATION, CHECK_VIOLATION, NOT_NULL_VIOLATION] {
+            let err = DbError::ConstraintViolation {
+                entity: "X",
+                code: other,
+                constraint: "whatever".to_owned(),
+            };
+            assert!(!err.is_unique_violation(), "{other} 不是唯一违例");
+        }
+        assert!(!DbError::business("X", "y").is_unique_violation());
+    }
+
+    #[test]
     fn constraint_names_fall_back_to_sqlstate() {
-        // 拿不到约束名时至少要能分辨是哪一类违反。
         assert_eq!(constraint_name_of("23505", None), "unique_violation");
         assert_eq!(constraint_name_of("23503", None), "foreign_key_violation");
         assert_eq!(constraint_name_of("23514", None), "check_violation");

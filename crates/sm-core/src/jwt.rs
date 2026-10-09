@@ -19,7 +19,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::hashing_support::hmac_sha256;
+use crate::hashing_support::{constant_time_eq, hmac_sha256};
 
 /// JWT 解析或校验失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,16 +150,6 @@ pub fn base64url_decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 /// 常量时间比较，避免通过响应时间泄漏签名前缀。
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

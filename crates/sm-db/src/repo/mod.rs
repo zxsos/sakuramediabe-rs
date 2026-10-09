@@ -202,4 +202,4 @@ pub use user::{NewRefreshToken, NewUser, Rotation, UserRefreshTokenRepository, U
 pub use video_collection::{
     NewVideoCollection, VideoCollectionItemRepository, VideoCollectionRepository,
 };
-pub use video_item::{NewVideoItem, VideoItemRepository};
+pub use video_item::{NewVideoItem, VideoItemFields, VideoItemRepository};

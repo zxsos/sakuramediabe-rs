@@ -666,6 +666,65 @@ macro_rules! impl_ordered_member_repo {
                 .await
                 .map_err(|e| DbError::from(e).with_entity($entity))
             }
+            /// 查某个合集里是否已有这个成员。**至多一行。**
+            ///
+            /// 存在的唯一索引 `(collection_id, <成员外键>)` 就是这条查询的
+            /// 索引，所以它是 O(1) 的点查。
+            ///
+            /// # 为什么值得单独一个方法
+            ///
+            /// 「重复加入要幂等」这条规则要求**先查后插**，而
+            /// `list_by_collection` 是把整个合集读出来在内存里扫 —— 那个
+            /// 复杂度是 O(合集规模)，而万级成员合集在上游是真实存在的
+            /// （`list_collection_items` 的分页就是为它加的）。
+            pub async fn find_by_member(
+                &self,
+                collection_id: i32,
+                member_id: i32,
+            ) -> Result<Option<$model>, DbError> {
+                Ok(sqlx::query_as::<_, $model>(concat!(
+                    "SELECT * FROM ",
+                    $table,
+                    " WHERE collection_id = $1 AND ",
+                    $member,
+                    " = $2",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .fetch_optional(&self.pool)
+                .await?)
+            }
+            /// 追加到末尾的事务内变体，位置同样算 `max(position) + 1`。
+            ///
+            /// 与 [`Self::append`] 的差别是「算 MAX」与「插入」落在**同一个
+            /// 事务**里：并发追加时不会读到陈旧 MAX。
+            pub async fn append_in(
+                &self,
+                ctx: &mut Ctx<'_>,
+                collection_id: i32,
+                member_id: i32,
+            ) -> Result<$model, DbError> {
+                let now = $crate::common::time::now_utc();
+                sqlx::query_as::<_, $model>(concat!(
+                    "INSERT INTO ",
+                    $table,
+                    " (collection_id, ",
+                    $member,
+                    ", position, created_at, updated_at) ",
+                    "VALUES ($1, $2, ",
+                    "  COALESCE((SELECT max(position) FROM ",
+                    $table,
+                    "              WHERE collection_id = $1), -1) + 1, ",
+                    "  $3, $3) ",
+                    "RETURNING *",
+                ))
+                .bind(collection_id)
+                .bind(member_id)
+                .bind(now)
+                .fetch_one(ctx.conn().await?.as_conn())
+                .await
+                .map_err(|e| DbError::from(e).with_entity($entity))
+            }
             /// 插到指定位置。**不**检查该位置是否已被占用。
             ///
             /// 唯一索引不含 `position`，所以数据库不会拦重复位置 ——

@@ -19,7 +19,9 @@ pub mod jwt;
 pub mod pagination;
 pub mod password;
 pub mod refresh_token;
+pub mod signing;
 
 pub use auth::{AuthTokens, AuthUser, InvalidAuthResponse};
 pub use error::{ApiError, ErrorEnvelope};
 pub use pagination::Paginated;
+pub use signing::SignatureError;

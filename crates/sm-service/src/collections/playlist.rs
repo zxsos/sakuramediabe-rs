@@ -187,6 +187,12 @@ impl PlaylistService {
             .await?)
     }
 
+    /// 取一个列表。**含系统列表** —— 读取不做 `_require_custom_playlist`，
+    /// 上游 `get_playlist` 同样能取到「最近播放」。
+    pub async fn get(&self, playlist_id: i32) -> Result<Playlist, ServiceError> {
+        self.require_playlist(playlist_id).await
+    }
+
     /// 更新列表。**只能改自定义列表。**
     ///
     /// 名字未变时**跳过**唯一性检查 —— 否则「只改描述」会因为撞到自己

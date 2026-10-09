@@ -4,6 +4,7 @@ members = [
     "crates/hashing",
     "crates/media-file-hash",
     "crates/svc-hash",
+    "crates/svc-image",
     "crates/parity-cli",
     "crates/sm-core",
     "crates/sm-db",
@@ -52,9 +53,13 @@ futures = "0.3"
 async-trait = "0.1"
 
 # HTTP 服务（替代 FastAPI / starlette）
-axum = "0.8"
+# multipart：上传（插件 zip / 图片）。提取器在 sm-api::extract，
+# 对齐上游 FastAPI 的 `UploadFile = File(...)`。
+axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
+# 读取响应体（集成测试断言用）
+http-body-util = "0.1"
 
 # 数据库（替代 Peewee 4.5）：schema 完全保留，只做查询不引迁移框架
 sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "json", "chrono", "uuid"] }
@@ -73,13 +78,29 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # 认证（替代 python-jose + bcrypt）
-jsonwebtoken = "11"
+#
+# JWT 是 sm-core 自实现的 HS256（见 crates/sm-core/src/jwt.rs），
+# **不引入 jsonwebtoken**：上游 payload 只有 sub/type/exp 三个 claim，
+# 引入一个完整 JOSE 实现换不来对等的收益，反而多一份要审计的密码学代码。
 argon2 = "0.6"
-password-hash = { version = "0.5", features = ["rand_core"] }
+# `getrandom` 而非 `rand_core`：password-hash 0.6 的 `rand_core` 指向 rand_core 0.10，
+# 该版本不再提供 `OsRng`（已迁到 `rand` crate），手动造盐的那条路走不通。
+# 开 `getrandom` 后 `PasswordHasher::hash_password` 自带随机盐，语义等价且更短。
+password-hash = { version = "0.6", features = ["getrandom"] }
 rand = "0.8"
 
 # 调度（替代 APScheduler）
-tokio-cron-scheduler = "0.15"
+# ADR §2/§3.1：`tokio-cron-scheduler` 自带 job store 与执行器，会与 DB 持久
+# 队列形成两套状态源，已被 `cron` + 自研 tick 取代（见 crates/sm-scheduler）。
+# 这里只留表达式解析：到点判定在 tick，领取与租约在 worker。
+#
+# ADR §6 还列了 `tokio-util` 与 `tracing-appender`：前者**故意不加** ——
+# SSE 用 axum 自带的 `response::sse::{Event,Sse,KeepAlive}`，优雅关闭用
+# `axum::serve(...).with_graceful_shutdown(...)`，两处都不需要它，而不使用的
+# 依赖声明就是 ADR §6 所说的幽灵配置。
+cron = "0.17"
+# 日志落盘（替代 logging.handlers.RotatingFileHandler），仅 release 组合根启用
+tracing-appender = "0.2"
 
 # 配置（替代 pydantic-settings + toml）
 config = { version = "0.15", default-features = false, features = ["toml"] }
@@ -90,8 +111,21 @@ percent-encoding = "2"
 url = "2"
 regex = "1"
 
+# 图像（替代 Pillow + OpenCV）
+#
+# `default-features = false` 是硬要求：默认特性 = rayon + default-formats，
+# 而 default-formats 里的 avif 会拖进 ravif/rgb -> dav1d（AV1 解码的 C 绑定），
+# 与「纯 Rust、NAS 离线可编」冲突。只开实际用到的三种格式：
+#   jpeg -> zune-jpeg（纯 Rust）  png -> png（纯 Rust）  webp -> image-webp（纯 Rust）
+# 封面书脊检测的 Sobel 是自写的（crates/svc-image），不引 imageproc ——
+# 后者会拖进 nalgebra / rayon / rustdct，为 40 行卷积不值得。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+# 服务端二进制不需要 unwind：panic 即进程退出，由 supervisor 重启。
+# 只作用于 release，`cargo test`（dev profile）仍是 unwind，不受影响。
+panic = "abort"

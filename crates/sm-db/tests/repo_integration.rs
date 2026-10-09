@@ -23,7 +23,7 @@
 //! python parity/apply_ddl.py
 //!
 //! # 3) 跑测试
-//! $env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia@127.0.0.1:5433/sakuramedia_test"
+//! $env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test"
 //! cargo test -p sm-db --test repo_integration -- --nocapture
 //! ```
 //!
