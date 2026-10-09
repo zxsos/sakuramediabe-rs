@@ -114,9 +114,9 @@ impl<'a> LinkCollector<'a> {
             .find(|(k, _)| k.eq_ignore_ascii_case("class"))
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
-        let is_scope = self.ancestor_class.is_some_and(|needle| {
-            class_attr.split_whitespace().any(|item| item == needle)
-        });
+        let is_scope = self
+            .ancestor_class
+            .is_some_and(|needle| class_attr.split_whitespace().any(|item| item == needle));
         self.open_tags.push((name.to_owned(), is_scope));
         if is_scope {
             self.scope_depth += 1;

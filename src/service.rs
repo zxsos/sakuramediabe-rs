@@ -21,8 +21,8 @@
 use futures::stream::{self, BoxStream, StreamExt};
 use sm_plugin_api::v1::plugin_control_server::PluginControl;
 use sm_plugin_api::v1::{
-    Extension, JobDefinition, JobEvent, ProgressEvent, RegisterRequest,
-    RegisterResponse, RunJobRequest,
+    Extension, JobDefinition, JobEvent, ProgressEvent, RegisterRequest, RegisterResponse,
+    RunJobRequest,
 };
 use tonic::{Request, Response, Status};
 
@@ -142,13 +142,14 @@ impl PluginControl for Control {
 /// 从 `RunJobRequest` 里取 `movie_number` 参数。
 fn extract_movie_number(request: &RunJobRequest) -> Result<String, Status> {
     // 参数以 JSON Struct 形式传（与上游 `FetchSubtitleParams` 对齐）。
-    let params = request.params.as_ref().ok_or_else(|| {
-        Status::invalid_argument("缺少任务参数：需要 movie_number")
-    })?;
+    let params = request
+        .params
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("缺少任务参数：需要 movie_number"))?;
     let fields = &params.fields;
-    let value = fields.get("movie_number").ok_or_else(|| {
-        Status::invalid_argument("缺少任务参数：需要 movie_number")
-    })?;
+    let value = fields
+        .get("movie_number")
+        .ok_or_else(|| Status::invalid_argument("缺少任务参数：需要 movie_number"))?;
     let s = value
         .kind
         .as_ref()
@@ -172,7 +173,11 @@ async fn run_fetch(
     let mut events = Vec::new();
 
     // 先报进度：开始抓取。
-    events.push(Ok(progress_event(0, 0, format!("开始抓取 {movie_number} 的中文字幕"))));
+    events.push(Ok(progress_event(
+        0,
+        0,
+        format!("开始抓取 {movie_number} 的中文字幕"),
+    )));
 
     let subtitles = match client.fetch_chinese_subtitles(&movie_number).await {
         Ok(subtitles) => subtitles,
@@ -203,10 +208,7 @@ async fn run_fetch(
         },
     );
     // base64 编码的字幕列表。
-    let encoded: Vec<String> = subtitles
-        .iter()
-        .map(|b| base64_encode(b))
-        .collect();
+    let encoded: Vec<String> = subtitles.iter().map(|b| base64_encode(b)).collect();
     let list_values: Vec<prost_types::Value> = encoded
         .into_iter()
         .map(|s| prost_types::Value {
@@ -216,9 +218,11 @@ async fn run_fetch(
     result.fields.insert(
         "subtitles_base64".to_owned(),
         prost_types::Value {
-            kind: Some(prost_types::value::Kind::ListValue(prost_types::ListValue {
-                values: list_values,
-            })),
+            kind: Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue {
+                    values: list_values,
+                },
+            )),
         },
     );
 
@@ -253,8 +257,7 @@ fn status_of(err: &SubtitleCatError) -> Status {
 
 /// 简单的 base64 编码（不引入新依赖）。
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;

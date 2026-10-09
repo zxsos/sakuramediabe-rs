@@ -95,7 +95,8 @@ impl Settings {
     pub fn from_json(value: &Value) -> Self {
         let mut settings = Self::default();
         if let Some(seconds) = value.get("request_timeout_seconds").and_then(Value::as_f64) {
-            settings.request_timeout_seconds = seconds.clamp(TIMEOUT_MIN_SECONDS, TIMEOUT_MAX_SECONDS);
+            settings.request_timeout_seconds =
+                seconds.clamp(TIMEOUT_MIN_SECONDS, TIMEOUT_MAX_SECONDS);
             // gt=0：0 按下界处理，上游是 ValidationError，这里夹到最小正值。
             if settings.request_timeout_seconds <= 0.0 {
                 settings.request_timeout_seconds = f64::MIN_POSITIVE;

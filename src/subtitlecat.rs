@@ -35,8 +35,7 @@ const SEARCH_RESULT_CLASS: &str = "subtitles";
 /// 原版用了 look-around（`(?<!…)` / `(?!…)`），Rust 的 `regex` 不支持，改写为
 /// 无需 look-around 的版本：匹配核心部分，边界由调用方按需处理。
 /// `(?i)`：上游 `re.IGNORECASE`。
-const MOVIE_NUMBER_PATTERN: &str =
-    r"(?i)(?:FC2[-_ ]?PPV[-_ ]?|[A-Z]{2,6}[-_ ]?)\d{2,6}";
+const MOVIE_NUMBER_PATTERN: &str = r"(?i)(?:FC2[-_ ]?PPV[-_ ]?|[A-Z]{2,6}[-_ ]?)\d{2,6}";
 
 /// 抓取失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +52,9 @@ impl std::fmt::Display for SubtitleCatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Request(msg) => write!(f, "SubtitleCat 请求失败: {msg}"),
-            Self::InvalidSubtitle(msg) => write!(f, "SubtitleCat 返回内容不是有效的 SRT 字幕: {msg}"),
+            Self::InvalidSubtitle(msg) => {
+                write!(f, "SubtitleCat 返回内容不是有效的 SRT 字幕: {msg}")
+            }
             Self::ClientError(msg) => write!(f, "SubtitleCat 请求失败: {msg}"),
         }
     }
@@ -165,7 +166,11 @@ impl SubtitleCatClient {
     }
 
     /// GET 文本（带重试）。
-    async fn get_text(&self, url: Url, params: &[(&str, &str)]) -> Result<String, SubtitleCatError> {
+    async fn get_text(
+        &self,
+        url: Url,
+        params: &[(&str, &str)],
+    ) -> Result<String, SubtitleCatError> {
         let bytes = self.get(url, params).await?;
         String::from_utf8(bytes).map_err(|e| SubtitleCatError::Request(e.to_string()))
     }
@@ -237,9 +242,7 @@ impl SubtitleCatClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            SubtitleCatError::Request(format!("请求失败: {url}"))
-        }))
+        Err(last_error.unwrap_or_else(|| SubtitleCatError::Request(format!("请求失败: {url}"))))
     }
 
     /// 相对 URL 按基址解析（上游 `urljoin`）。
