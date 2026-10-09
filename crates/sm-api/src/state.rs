@@ -3,6 +3,7 @@
 use sm_db::Db;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
+use sm_service::system::JobCatalog;
 
 /// 所有路由共享的运行时状态。
 ///
@@ -28,13 +29,35 @@ pub struct AppState {
     ///
     /// `ConfigService` 的 `Clone` 只复制一个 `PathBuf`，很便宜。
     config: ConfigService,
+    /// 任务目录（内建 + 插件）。**快照**：插件表由组合根持有，而 API 层不能
+    /// 反向依赖组合根，所以只在插件加载/重建之后换一份新的。
+    ///
+    /// 缺省为空目录 —— 只有组合根会填它，而没填时「任务中心」应当什么都没有，
+    /// 而不是把内建任务凭空编出来。
+    jobs: JobCatalog,
 }
 
 impl AppState {
     /// 三个参数缺一不可：`config` 也要，因为 `PATCH /config` 没有它就没法
     /// 写回文件，而「写不进文件」的表现是「改了没反应」，最难排查。
     pub fn new(db: Db, auth: AuthConfig, config: ConfigService) -> Self {
-        Self { db, auth, config }
+        Self {
+            db,
+            auth,
+            config,
+            jobs: JobCatalog::default(),
+        }
+    }
+
+    /// 挂上任务目录。只有组合根会调 —— 它才知道有哪些插件任务。
+    pub fn with_jobs(mut self, jobs: JobCatalog) -> Self {
+        self.jobs = jobs;
+        self
+    }
+
+    /// 任务目录。
+    pub fn jobs(&self) -> &JobCatalog {
+        &self.jobs
     }
 
     pub fn db(&self) -> &Db {

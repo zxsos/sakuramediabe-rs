@@ -22,6 +22,7 @@ pub mod activity_cleanup;
 pub mod auth;
 pub mod config;
 pub mod indexer_settings;
+pub mod jobs;
 pub mod optional_services;
 pub mod status;
 pub mod task_queue;
@@ -29,6 +30,7 @@ pub mod task_queue;
 pub use account::AccountService;
 pub use activity_cleanup::{ActivityCleanupService, ActivityCleanupStats, RetentionPolicy};
 pub use config::ConfigService;
+pub use jobs::{JobCatalog, JobCatalogEntry};
 pub use optional_services::{
     capabilities, capabilities_of, image_search_enabled, job_disabled_reason,
     movie_similarity_enabled, require_image_search, require_job_enabled, Capabilities,

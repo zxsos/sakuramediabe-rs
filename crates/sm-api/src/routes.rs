@@ -10,6 +10,7 @@ pub mod clip_collections;
 pub mod config;
 pub mod downloads;
 pub mod indexer_settings;
+pub mod jobs;
 pub mod media_clips;
 pub mod movie_subscriptions;
 pub mod movies;

@@ -294,8 +294,10 @@ impl MoviePlotImageRepository {
 /// 新建一条通知。
 #[derive(Debug, Clone)]
 pub struct NewNotification {
-    /// 分类，有索引。**上游没给出枚举值**（`notification_category::ALL`
-    /// 是空数组），所以只校验非空。
+    /// 分类，有索引。取值必须是 [`notification_category`] 白名单之一。
+    ///
+    /// 此前这里是空的（上游枚举没被搬过来），所以只校验非空；白名单补全后
+    /// 校验也跟着收紧 —— 未知分类会让客户端的分类筛选渲染不出对应分支。
     pub category: String,
     pub title: String,
     pub content: String,
@@ -315,12 +317,36 @@ pub struct NewNotification {
 }
 
 impl NewNotification {
-    fn validate(&self) -> Result<(), DbError> {
-        if self.category.trim().is_empty() {
-            return Err(DbError::business(NOTIFICATION_ENTITY, "category 不能为空"));
+    /// 归一化后的分类。空白与非白名单值都回落 `info`。
+    ///
+    /// 与上游 `normalize_allowed_filter` 的差别：上游对非法值抛 422，而这里
+    /// 回落。理由是本方法是**仓储层**，它不知道调用方是 HTTP 层（该报 422）
+    /// 还是 worker 内部调用（只该记日志）。要区分请在 service 层用
+    /// `sm_service::system::activity::filters::normalize_allowed_filter`。
+    pub fn normalized_category(&self) -> &str {
+        let trimmed = self.category.trim();
+        if crate::system::activity::notification_category::is_valid(trimmed) {
+            trimmed
+        } else {
+            crate::system::activity::notification_category::DEFAULT
         }
+    }
+
+    /// 校验并归一化前置条件。**公开是为了让规则能被直接断言** ——
+    /// 它决定「什么会被写进库」，出错时用户看到的是通知丢失而不是报错。
+    pub fn validate(&self) -> Result<(), DbError> {
         if self.title.trim().is_empty() {
             return Err(DbError::business(NOTIFICATION_ENTITY, "title 不能为空"));
+        }
+        if !crate::system::activity::notification_category::is_valid(self.category.trim()) {
+            return Err(DbError::business(
+                NOTIFICATION_ENTITY,
+                format!(
+                    "category 非法：{:?}，允许值 {:?}",
+                    self.category.trim(),
+                    crate::system::activity::notification_category::ALL
+                ),
+            ));
         }
         // `resource_type` 与 `resource_id` 必须配对 —— 单有一个无法定位
         // 资源。数据库不校验这个（两列都是独立的可空列）。
@@ -427,6 +453,88 @@ impl SystemNotificationRepository {
         .bind(new.related_resource_id)
         .bind(now)
         .fetch_optional(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))
+    }
+
+    /// 按 `dedupe_key` 原子创建，**冲突时回读并返回既有行**。
+    ///
+    /// 与 [`Self::notify`] 的区别只在返回值：`notify` 用 `None` 表达
+    /// 「已被去重」，而本方法给出那条既有记录。上游 `create_once` 是后者
+    /// （`activity/notifications.py:112-140`）—— 调用方要拿它填资源字段，
+    /// 拿到 `None` 反而要再查一次。
+    ///
+    /// `dedupe_key` 为空是**调用错误**：上游直接
+    /// `raise ValueError("notification_dedupe_key_required")`。想要不带
+    /// 去重的普通通知请用 [`Self::notify`]（`NULL` 不参与唯一约束）。
+    pub async fn create_once(
+        &self,
+        new: &NewNotification,
+    ) -> Result<SystemNotification, DbError> {
+        new.validate()?;
+        let dedupe_key = new
+            .dedupe_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(dedupe_key) = dedupe_key else {
+            return Err(DbError::business(
+                NOTIFICATION_ENTITY,
+                "notification_dedupe_key_required：create_once 要求非空 dedupe_key",
+            ));
+        };
+
+        if let Some(row) = self.notify(new).await? {
+            return Ok(row);
+        }
+
+        // 冲突落败：回读既有行。唯一约束保证它此刻一定存在。
+        self.find_by_dedupe_key(dedupe_key)
+            .await?
+            .ok_or_else(|| {
+                DbError::business(
+                    NOTIFICATION_ENTITY,
+                    "create_once 冲突后回读不到既有行",
+                )
+            })
+    }
+
+    /// 按去重键取一行。
+    pub async fn find_by_dedupe_key(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<Option<SystemNotification>, DbError> {
+        sqlx::query_as::<_, SystemNotification>(
+            "SELECT * FROM system_notification WHERE dedupe_key = $1",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))
+    }
+
+    /// 释放已解决事件的幂等键，返回受影响的行数。
+    ///
+    /// 对应上游 `release_notification_dedupe_key`
+    /// （`activity/notifications.py:103`）。**保留通知历史**以便下次同类事件
+    /// 重新提醒 —— 置空键而不是删行正是这个用意。
+    pub async fn release_dedupe_key(&self, dedupe_key: &str) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE system_notification SET dedupe_key = NULL WHERE dedupe_key = $1",
+        )
+        .bind(dedupe_key)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 未读计数。
+    pub async fn count_unread(&self) -> Result<i64, DbError> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM system_notification WHERE is_read = false",
+        )
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))
     }

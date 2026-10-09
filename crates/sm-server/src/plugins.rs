@@ -37,6 +37,7 @@ use sm_plugins::loader::collect_providers;
 use sm_plugins::registry::ProviderRegistry;
 use sm_plugins::supervisor::{launch, restart_backoff, LaunchSpec, PluginProcess};
 use sm_scheduler::JobSpec;
+use sm_service::system::{JobCatalog, JobCatalogEntry};
 
 /// 等插件就绪的上限。
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -244,14 +245,69 @@ impl Plugins {
                     .unwrap_or_else(|| entry.default_cron.clone());
                 JobSpec {
                     task_key: entry.task_key.clone(),
+                    log_name: entry.log_name.clone(),
+                    cli_name: entry.cli_name.clone(),
                     display_name: entry.cli_help.clone(),
                     cron: Some(cron),
+                    manual_trigger_allowed: true,
                 }
             })
             .collect();
         // `schedulable()` 已经排掉了 `manual_only` —— 它们没有 cron，交给调度器
         // 也只会变成「永不触发」的条目。
         specs
+    }
+
+    /// 任务目录：内建任务 + 全部插件任务（**含 `manual_only`**）。
+    ///
+    /// 交给路由层的 `AppState`，供 `POST /system/jobs/{task_key}/run` 判断
+    /// 「这个 key 存不存在、能不能手动触发」。
+    pub fn catalog(&self) -> JobCatalog {
+        let mut entries: Vec<JobCatalogEntry> = sm_scheduler::builtin_jobs()
+            .into_iter()
+            .map(|spec| JobCatalogEntry {
+                task_key: spec.task_key,
+                log_name: spec.log_name,
+                cli_name: spec.cli_name,
+                cli_help: spec.display_name,
+                plugin_id: None,
+                // 内建任务的 `cron_setting`（`movie_heat_cron` 那一串）还没带进
+                // `JobSpec`，见 `sm_service::system::jobs` 的模块文档。
+                cron_setting: None,
+                cron_expr: spec.cron,
+                manual_trigger_allowed: spec.manual_trigger_allowed,
+                has_params_schema: false,
+            })
+            .collect();
+
+        for entry in self.jobs.entries() {
+            let cron = if entry.manual_only {
+                None
+            } else {
+                Some(
+                    self.config
+                        .cron_override(&entry.plugin_id, &entry.task_key)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| entry.default_cron.clone()),
+                )
+            };
+            entries.push(JobCatalogEntry {
+                task_key: entry.task_key.clone(),
+                log_name: entry.log_name.clone(),
+                cli_name: entry.cli_name.clone(),
+                cli_help: entry.cli_help.clone(),
+                plugin_id: Some(entry.plugin_id.clone()),
+                // 上游 `get_job_cron_setting`：插件任务的覆盖键长这个样子。
+                cron_setting: Some(format!(
+                    "plugins.job_crons.{}.{}",
+                    entry.plugin_id, entry.task_key
+                )),
+                cron_expr: cron,
+                manual_trigger_allowed: true,
+                has_params_schema: entry.has_params_schema,
+            });
+        }
+        JobCatalog::new(entries)
     }
 
     /// 从**全部**已加载插件的注册声明重建三张注册表。
@@ -432,6 +488,31 @@ mod tests {
             config.data_dir_for("local"),
             Path::new("/srv/plugins/local/data")
         );
+    }
+
+    #[tokio::test]
+    async fn the_catalog_holds_the_builtin_jobs_even_without_plugins() {
+        // 手动触发靠目录认任务：缺一个内建任务，它就变成 404「未知任务」。
+        let config = PluginConfig::from_snapshot(&Value::Object(Map::new()));
+        let plugins = Plugins::load(config).await;
+        let catalog = plugins.catalog();
+
+        assert_eq!(catalog.entries().len(), 19, "19 个内建任务");
+        let heat = catalog
+            .get("movie_heat_update")
+            .expect("内建任务要在目录里");
+        assert_eq!(heat.log_name, "movie-heat-update");
+        assert_eq!(heat.cli_name, "update-movie-heat");
+        assert_eq!(heat.cron_expr.as_deref(), Some("15 0 * * *"));
+        assert!(heat.plugin_id.is_none(), "内建任务没有来源插件");
+
+        // `manual_only` 的任务也要在目录里 —— 它没有 cron，手动触发是它唯一的
+        // 出路，而目录里没有它就会被判成「未知任务」。
+        let manual = catalog
+            .get("media_video_info_backfill")
+            .expect("manual_only 任务也要在");
+        assert_eq!(manual.cron_expr, None);
+        assert!(manual.manual_trigger_allowed);
     }
 
     #[tokio::test]

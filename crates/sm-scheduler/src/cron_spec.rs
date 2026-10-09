@@ -39,10 +39,17 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 ///
 /// 只描述「什么时候触发、叫什么」，**不含**执行逻辑 —— 执行在 worker 侧
 /// （本仓库还没有 worker，见 crate 文档）。
+///
+/// 字段与上游 `JobDefinition` 同名同义（它还有 `handler` / `lane` /
+/// `business_recovery` 等执行期字段，这里不做）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSpec {
     /// 处理器定位键，也是 `mutex_key` 的来源（`aps:` + 本值）。
     pub task_key: String,
+    /// 日志名。上游 `log_name`，任务中心与日志里都用它。
+    pub log_name: String,
+    /// CLI 子命令名。上游 `cli_name`。
+    pub cli_name: String,
     /// 展示名。上游是 `TASK_NAME_REGISTRY.get(task_key) or cli_help`，
     /// 这里直接落 `cli_help` 那一路的值。
     pub display_name: String,
@@ -52,6 +59,10 @@ pub struct JobSpec {
     /// **插件任务的键来自注册响应**（`JobDefinition.default_cron`），只有
     /// 运行期才知道。上游同理 —— `JOB_REGISTRY` 在 import 阶段才成型。
     pub cron: Option<String>,
+    /// 是否允许经 HTTP 手动触发。上游 `manual_trigger_allowed`，默认 `True`；
+    /// `_validate_cron_source` 还强制 `manual_only` 的任务必须允许 ——
+    /// 否则它既没有 cron 又不能手动触发，等于永远不会跑。
+    pub manual_trigger_allowed: bool,
 }
 
 impl JobSpec {
@@ -238,83 +249,125 @@ pub fn builtin_jobs() -> Vec<JobSpec> {
         // ---- catalog ----------------------------------------------------
         job(
             "movie_javdb_backfill",
+            "movie-javdb-backfill",
+            "backfill-movie-javdb",
             "尝试从 JavDB 补录插件影片",
             Some("30 5 * * *"),
         ),
         job(
             "actor_subscription_sync",
+            "actor-subscription-sync",
+            "sync-subscribed-actor-movies",
             "执行一次订阅女优影片抓取",
             Some("0 2 * * *"),
         ),
         job(
             "subscribed_movie_auto_download",
+            "subscribed-movie-auto-download",
+            "auto-download-subscribed-movies",
             "执行一次已订阅缺失影片自动下载",
             Some("30 2 * * *"),
         ),
         job(
             "movie_heat_update",
+            "movie-heat-update",
+            "update-movie-heat",
             "执行一次影片热度重算",
             Some("15 0 * * *"),
         ),
         job(
             "movie_interaction_sync",
+            "movie-interaction-sync",
+            "sync-movie-interactions",
             "执行一次影片互动数同步",
             Some("0 5 * * *"),
         ),
         job(
             "movie_similarity_recompute",
+            "movie-similarity-recompute",
+            "recompute-movie-similarities",
             "执行一次影片相似度全量重算",
             Some("30 3 * * *"),
         ),
         job(
             "movie_asset_pack_backfill",
+            "movie-asset-pack-backfill",
+            "backfill-movie-asset-packs",
             "影片图片打包回填（封面/薄封面/剧情图 → assets.zip）",
             None,
         ),
         // ---- playback ----------------------------------------------------
         job(
             "media_file_hash_backfill",
+            "media-file-hash-backfill",
+            "backfill-media-file-hashes",
             "执行一次空媒体文件哈希补算",
             Some("0 3 * * *"),
         ),
-        job("media_video_info_backfill", "媒体信息回填", None),
+        job(
+            "media_video_info_backfill",
+            "media-video-info-backfill",
+            "backfill-media-video-info",
+            "媒体信息回填",
+            None,
+        ),
         // 上游注释：115 用整库远端清单对账；每天一次且 provider 内部限速。
-        job("media_file_scan", "执行一次媒体文件巡检", Some("0 4 * * *")),
+        job(
+            "media_file_scan",
+            "media-file-scan",
+            "scan-media-files",
+            "执行一次媒体文件巡检",
+            Some("0 4 * * *"),
+        ),
         // 上游注释：空跑只查 DB 不读盘，30 分钟一次足够。
         job(
             "media_thumbnail_generation",
+            "media-thumbnail-generation",
+            "generate-media-thumbnails",
             "执行一次媒体缩略图生成",
             Some("*/30 * * * *"),
         ),
         job(
             "media_thumbnail_pack_backfill",
+            "media-thumbnail-pack-backfill",
+            "backfill-media-thumbnail-packs",
             "媒体缩略图打包回填（存量单文件 → thumbnails.zip）",
             None,
         ),
         // ---- transfers ---------------------------------------------------
         job(
             "download_task_sync",
+            "download-task-sync",
+            "sync-download-tasks",
             "执行一次下载任务状态同步",
             Some("* * * * *"),
         ),
         job(
             "download_task_auto_import",
+            "download-task-auto-import",
+            "auto-import-download-tasks",
             "执行一次已完成下载自动导入",
             Some("* * * * *"),
         ),
         // ---- discovery ---------------------------------------------------
         job(
             "image_search_index",
+            "image-search-index",
+            "index-image-search",
             "持续构建缩略图和剧情图的搜索向量索引，直到待处理队列为空",
             Some("*/5 * * * *"),
         ),
         job(
             "moment_recommendation_generate",
+            "moment-recommendation-generate",
+            "generate-moment-recommendations",
             "执行一次推荐时刻生成",
             Some("0 4 * * *"),
         ),
         job(
             "daily_recommendation_generate",
+            "daily-recommendation-generate",
+            "generate-daily-recommendations",
             "执行一次每日推荐快照生成",
             Some("0 5 * * *"),
         ),
@@ -323,22 +376,38 @@ pub fn builtin_jobs() -> Vec<JobSpec> {
         // cache 的 7 天 TTL。
         job(
             "gfriends_filetree_refresh",
+            "gfriends-filetree-refresh",
+            "refresh-gfriends-filetree",
             "拉取一次 GFriends Filetree 并写入本地缓存",
             Some("0 4 * * 1"),
         ),
         job(
             "activity_record_cleanup",
+            "activity-record-cleanup",
+            "cleanup-activity-records",
             "执行一次活动中心记录清理（任务运行 / 已读通知）",
             Some("30 5 * * *"),
         ),
     ]
 }
 
-fn job(task_key: &'static str, display_name: &'static str, cron: Option<&'static str>) -> JobSpec {
+#[allow(clippy::too_many_arguments)]
+fn job(
+    task_key: &'static str,
+    log_name: &'static str,
+    cli_name: &'static str,
+    display_name: &'static str,
+    cron: Option<&'static str>,
+) -> JobSpec {
     JobSpec {
         task_key: task_key.to_owned(),
+        log_name: log_name.to_owned(),
+        cli_name: cli_name.to_owned(),
         display_name: display_name.to_owned(),
         cron: cron.map(str::to_owned),
+        // 上游默认 `True`，且 `manual_only` 必须为 `True` —— 三项内建
+        // manual_only 任务也只能手动触发，没有第二条路。
+        manual_trigger_allowed: true,
     }
 }
 
@@ -361,8 +430,11 @@ mod tests {
     fn spec(task_key: &str, cron: Option<&str>) -> JobSpec {
         JobSpec {
             task_key: task_key.to_owned(),
+            log_name: task_key.to_owned(),
+            cli_name: task_key.to_owned(),
             display_name: task_key.to_owned(),
             cron: cron.map(str::to_owned),
+            manual_trigger_allowed: true,
         }
     }
 
@@ -393,11 +465,58 @@ mod tests {
     fn task_keys_are_unique() {
         // 唯一性是**互斥键**的前提：两个任务共用 `aps:<task_key>` 会让它们
         // 互相顶掉，而症状是「一个任务永远不跑」，极难定位。
-        let mut keys: Vec<String> = builtin_jobs().iter().map(|j| j.task_key.clone()).collect();
-        let before = keys.len();
-        keys.sort_unstable();
-        keys.dedup();
-        assert_eq!(keys.len(), before, "task_key 重复");
+        assert_unique(
+            builtin_jobs().iter().map(|j| j.task_key.clone()),
+            "task_key",
+        );
+    }
+
+    #[test]
+    fn log_names_and_cli_names_are_unique_too() {
+        // 上游 `_build_job_registry` 校验的是**三个**字段（task_key / cli_name /
+        // log_name），且插件与内建冲突时隔离插件。CLI 与日志靠后两个定位任务，
+        // 重复会让「跑的是哪个任务」变成猜谜。
+        assert_unique(
+            builtin_jobs().iter().map(|j| j.log_name.clone()),
+            "log_name",
+        );
+        assert_unique(
+            builtin_jobs().iter().map(|j| j.cli_name.clone()),
+            "cli_name",
+        );
+    }
+
+    fn assert_unique(values: impl Iterator<Item = String>, field: &str) {
+        let mut values: Vec<String> = values.collect();
+        let before = values.len();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values.len(), before, "{field} 重复");
+    }
+
+    #[test]
+    fn every_job_carries_its_three_names() {
+        // 任务中心（`GET /system/jobs`）要原样吐这三个字段，缺一个前端就显示空。
+        for spec in builtin_jobs() {
+            assert!(!spec.log_name.is_empty(), "{} 缺 log_name", spec.task_key);
+            assert!(!spec.cli_name.is_empty(), "{} 缺 cli_name", spec.task_key);
+            assert!(!spec.display_name.is_empty(), "{} 缺展示名", spec.task_key);
+        }
+    }
+
+    #[test]
+    fn a_manual_only_job_is_still_allowed_to_be_triggered_manually() {
+        // 上游 `_validate_cron_source`：`manual_only` 的任务**必须**允许手动触发
+        // —— 否则它既没有 cron 又不能手动触发，等于永远不会跑。
+        for spec in builtin_jobs() {
+            if spec.is_manual_only() {
+                assert!(
+                    spec.manual_trigger_allowed,
+                    "{} 是 manual_only 却不允许手动触发",
+                    spec.task_key
+                );
+            }
+        }
     }
 
     #[test]

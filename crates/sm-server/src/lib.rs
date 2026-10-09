@@ -6,11 +6,12 @@
 //! # 装配顺序是有意义的
 //!
 //! ```text
-//! 配置 → 日志 → 连接池 → 路由 → 插件 → 调度器 → HTTP → 等信号 → 逆序收尾
+//! 配置 → 日志 → 连接池 → 鉴权/配置服务 → 插件 → 路由 → 调度器 → HTTP →
+//! 等信号 → 逆序收尾
 //! ```
 //!
-//! 插件在路由之后：`plugins` 节要从配置服务的**磁盘快照**读，而配置服务是在
-//! 路由那一步建的。插件在调度器之前：插件任务的 cron 要并进调度表。
+//! 插件在**路由之前**：任务目录里有插件任务，而目录要在建 `AppState` 时给它。
+//! 插件在调度器之前：插件任务的 cron 要并进调度表。
 //!
 //! 日志在配置之后：配置阶段的错误也要能被打出来。连接池在路由之前：
 //! `AppState` 持有 `Db`，而 `Db` 就是池。调度器在 HTTP 之前：反过来的话，
@@ -72,26 +73,30 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         "数据库连接池就绪"
     );
 
-    // 3. 路由。鉴权配置里的密钥取自配置，不留硬编码默认值。
+    // 3. 鉴权与配置服务。密钥取自配置，不留硬编码默认值。
     let auth = AuthConfig::new(config.jwt_secret.clone());
     // 配置服务指向 `ServerConfig` 解析出的那个路径 —— 必须同一个，否则
     // `PATCH /config` 会写进另一个文件，表现为「改了没反应」。
     // 变量名不叫 `config`：那会遮蔽 `ServerConfig`，而下一行还要读它的
     // `slow_log` —— 遮蔽后那句会静默变成读 `ConfigService` 的不存在的字段。
     let config_service = sm_service::system::ConfigService::new(config.config_path.clone());
-    let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone());
-    let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
-    // 4. 插件。**在调度器之前** —— 插件任务的 cron 要并进调度表，反过来的话
-    //    调度器会漏掉它们，只能等下次启动才补上（而没有任何错误会提示）。
+    // 4. 插件。**在路由装配与调度器之前** —— 任务目录里有插件任务，反过来的话
+    //    手动触发会把它们判成「未知任务」；调度表也会漏掉它们的 cron
+    //    （而没有任何错误会提示）。
     //
     // 配置从**磁盘快照**读（`plugins` 是只读键，可能含插件凭据，不进 API 响应）。
     let plugin_config =
         plugins::PluginConfig::from_snapshot(&config_service.snapshot().unwrap_or_default());
     let loaded_plugins = plugins::Plugins::load(plugin_config).await;
     let plugin_specs = loaded_plugins.scheduler_specs();
+    let job_catalog = loaded_plugins.catalog();
 
-    // 5. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
+    // 5. 路由。
+    let state = sm_api::AppState::new(pool.clone(), auth, config_service).with_jobs(job_catalog);
+    let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
+
+    // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
     let scheduler = if config.scheduler_enabled {
         let repo = sm_db::repo::BackgroundTaskRunRepository::new(pool.clone());
         let mut specs = sm_scheduler::builtin_jobs();
@@ -126,14 +131,14 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         None
     };
 
-    // 6. HTTP。
+    // 7. HTTP。
     let addr = config.listen.bind_address();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|err| anyhow::anyhow!("绑定 {addr} 失败：{err}"))?;
     tracing::info!(address = %addr, "HTTP 服务已监听");
 
-    // 7. 等信号。Ctrl-C 与 SIGTERM 都要接：容器里发的是 SIGTERM，
+    // 8. 等信号。Ctrl-C 与 SIGTERM 都要接：容器里发的是 SIGTERM，
     //    只接 Ctrl-C 意味着 `docker stop` 每次都等超时才被杀。
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -141,7 +146,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("HTTP 服务异常退出：{err}"))?;
     tracing::info!("HTTP 服务已停止接受新请求");
 
-    // 8. 收尾：先停看门狗（否则它可能在关停过程中把刚杀掉的插件又拉起来），
+    // 9. 收尾：先停看门狗（否则它可能在关停过程中把刚杀掉的插件又拉起来），
     //    再停调度器（等当前 tick 结束）。
     if let Some(background) = scheduler {
         background

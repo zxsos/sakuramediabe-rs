@@ -31,8 +31,11 @@ const MINUTELY: &str = "tick_minutely";
 fn spec(task_key: &str, display_name: &str, cron: Option<&str>) -> JobSpec {
     JobSpec {
         task_key: task_key.to_owned(),
+        log_name: task_key.to_owned(),
+        cli_name: task_key.to_owned(),
         display_name: display_name.to_owned(),
         cron: cron.map(str::to_owned),
+        manual_trigger_allowed: true,
     }
 }
 

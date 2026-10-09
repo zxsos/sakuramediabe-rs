@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::config::routes())
         .merge(routes::downloads::routes())
         .merge(routes::indexer_settings::routes())
+        .merge(routes::jobs::routes())
         .merge(routes::media_clips::routes())
         .merge(routes::movie_subscriptions::routes())
         .merge(routes::movies::routes())

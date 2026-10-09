@@ -172,6 +172,17 @@ impl JobRegistry {
         self.by_key.is_empty()
     }
 
+    /// 全部任务，**按注册顺序**。
+    ///
+    /// 与 [`Self::schedulable`] 的区别是**含 `manual_only`**：任务中心要把它们
+    /// 列出来（否则手动触发会把它们判成「未知任务」），只是不给 cron。
+    pub fn entries(&self) -> Vec<&JobRegistration> {
+        self.order
+            .iter()
+            .filter_map(|key| self.by_key.get(key))
+            .collect()
+    }
+
     /// 可被定时调度的任务（交给 `sm-scheduler`），**按注册顺序**。
     pub fn schedulable(&self) -> Vec<&JobRegistration> {
         self.order

@@ -624,6 +624,263 @@ impl BackgroundTaskRunRepository {
         Ok(row)
     }
 
+    // ---------------------------------------------------------------- 终态 CAS
+    //
+    // 下面四个方法与上面 `finish` / `fail` / `report_progress` **语义不同**，
+    // 不是重复实现。区别有两条，都是上游 `activity/task_runs.py` 与
+    // `task_queue_service.py` 的真实差异：
+    //
+    // | | `finish` / `fail`（队列路径） | 本组（服务层终态） |
+    // |---|---|---|
+    // | 合法来源状态 | 仅 `running` | `pending` + `running`（`task_state::ACTIVE`） |
+    // | `result_summary` | **覆盖** | **合并**（`merge_summary`） |
+    // | `result_text` | 调用方给什么就写什么 | 缺省时由 summary 格式化兜底 |
+    // | 输掉竞争 | 报 `business` 错误 | 返回 `(当前行, false)` |
+    //
+    // 「输掉竞争」那条是 worker 正确性的前提：两个执行器可能同时收口同一行，
+    // 唯一赢家由行锁裁决，输的一方**必须读到持久终态并服从它**，而不是
+    // 抛错 —— 上游 `task_execution.py` 正是据此决定「本地成功也不能覆盖
+    // 已持久化的失败终态」。
+
+    /// 合并 `result_summary`。
+    ///
+    /// 对应上游 `activity/task_runs.py:43`：
+    ///
+    /// ```python
+    /// merged = dict(base_summary); merged.update(summary_patch)
+    /// ```
+    ///
+    /// `patch` 为空时原样返回 base。base 非法或缺失时按空对象处理 ——
+    /// 该列是 `JsonTextField NOT NULL DEFAULT '{}'`，真出现非法值只能是
+    /// 有人绕过本仓储直接写过，此时按空对象继续比整条失败更可用。
+    fn merge_summary_json(
+        base: Option<&str>,
+        patch: Option<&serde_json::Value>,
+    ) -> Result<String, DbError> {
+        let mut merged = match base {
+            Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        };
+        if !merged.is_object() {
+            // 列里存的是数组或标量时没有可合并的键位，退回空对象。
+            merged = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(patch) = patch {
+            if patch.is_object() {
+                if let (Some(target), Some(source)) = (
+                    merged.as_object_mut(),
+                    patch.as_object(),
+                ) {
+                    for (key, value) in source {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        Ok(merged.to_string())
+    }
+
+    /// 仅执行 `pending -> running`；其它状态**原样返回该行**且不产生任何写入。
+    ///
+    /// 对应上游 `TaskRunService.mark_task_run_running`
+    /// （`task_runs.py:166-177`）。`started_at` 仅在为空时补，重复调用不改写。
+    ///
+    /// 返回 `None` **只表示行不存在**。已是 `running` 或终态的行返回它自己 ——
+    /// 上游是先 `SELECT ... FOR UPDATE` 再判状态，非 pending 就原样返回。
+    /// 用 `WHERE state = 'pending'` 一把梭虽然少一次往返，却把「非 pending」
+    /// 折叠成 `None`，调用方分不清「行没了」和「行已是终态」，而这两种情况的
+    /// 处置完全不同。
+    pub async fn mark_running(&self, id: i32) -> Result<Option<BackgroundTaskRun>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if current.state != task_state::PENDING {
+            tx.rollback().await?;
+            return Ok(Some(current));
+        }
+
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, BackgroundTaskRun>(
+            "UPDATE background_task_run \
+             SET state = $2, started_at = COALESCE(started_at, $3), updated_at = $3 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(task_state::RUNNING)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    /// 收口为 `completed`。CAS 范围是 [`task_state::ACTIVE`]。
+    ///
+    /// `summary` 与行内已有摘要**合并**；`text` 为空时由合并后的摘要
+    /// 格式化兜底（上游 `format_result_text`）。**同时释放 `mutex_key` 与
+    /// 租约** —— 理由同 [`Self::finish`]。
+    ///
+    /// 返回 `None` 表示行不存在；`Some(row)` 的 `row.state` 是 `completed`
+    /// 表示本调用赢得了转移，否则是锁内读到的既有终态（调用方须服从它）。
+    pub async fn complete_active(
+        &self,
+        id: i32,
+        summary: Option<&serde_json::Value>,
+        text: Option<&str>,
+    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if !task_state::is_active(&current.state) {
+            tx.rollback().await?;
+            return Ok(Some(current));
+        }
+
+        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary)?;
+        // 上游是 `result_text or format_result_text(result_summary)`：两者都
+        // 没有值时写 NULL 而不是空串。`text` 列存不透明文本，空串与 NULL 在
+        // 客户端渲染上不等价（前者会渲染出一个空的文本节点）。
+        let text: Option<String> = text
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                crate::system::activity::result_summary::format_text(Some(merged.as_str()))
+            });
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, BackgroundTaskRun>(
+            "UPDATE background_task_run \
+             SET state = $2, result_summary = $3, result_text = $4, error_message = NULL, \
+                 finished_at = $5, lease_expires_at = NULL, mutex_key = NULL, updated_at = $5 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(task_state::COMPLETED)
+        .bind(merged)
+        .bind(text.as_deref())
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    /// 收口为 `failed`。CAS 范围与摘要合并规则同 [`Self::complete_active`]。
+    pub async fn fail_active(
+        &self,
+        id: i32,
+        error: &str,
+        summary: Option<&serde_json::Value>,
+    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if !task_state::is_active(&current.state) {
+            tx.rollback().await?;
+            return Ok(Some(current));
+        }
+
+        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary)?;
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, BackgroundTaskRun>(
+            "UPDATE background_task_run \
+             SET state = $2, error_message = $3, result_summary = $4, finished_at = $5, \
+                 lease_expires_at = NULL, mutex_key = NULL, updated_at = $5 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(task_state::FAILED)
+        .bind(error)
+        .bind(merged)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    /// 更新进行中任务的**显式**进度字段。终态行原样返回且零写入。
+    ///
+    /// 与 [`Self::report_progress`] 的区别是**逐字段可选**：这里只为传入的
+    /// 字段写值（`COALESCE` 保住未传入的），而 `report_progress` 的三件套
+    /// 要么全有效要么全清空。上游 `update_task_run_progress`
+    /// （`task_runs.py:180`）是前者。
+    ///
+    /// 摘要补丁在行锁内合并 —— 否则两个并发 reporter 会互相覆盖键位。
+    pub async fn report_progress_active(
+        &self,
+        id: i32,
+        progress: &TaskProgress,
+        summary_patch: Option<&serde_json::Value>,
+    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(current) = sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        if !task_state::is_active(&current.state) {
+            tx.rollback().await?;
+            return Ok(Some(current));
+        }
+
+        let merged = Self::merge_summary_json(current.result_summary.as_deref(), summary_patch)?;
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, BackgroundTaskRun>(
+            "UPDATE background_task_run \
+             SET progress_current = COALESCE($2, progress_current), \
+                 progress_total = COALESCE($3, progress_total), \
+                 progress_text = COALESCE($4, progress_text), \
+                 result_summary = $5, \
+                 updated_at = $6 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(progress.current)
+        .bind(progress.total)
+        .bind(progress.text.as_deref())
+        .bind(merged)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
     /// 列出**全部**租约过期的 `running` 行。**刻意不分页。**
     ///
     /// 与 [`Self::list_stale_leases`] 的区别是**必须一次拿全**：

@@ -82,6 +82,26 @@ pub mod task_state {
     /// 白名单里的全部状态。用于校验「这个字面量能不能写进库」。
     pub const ALL: [&str; 4] = [PENDING, RUNNING, COMPLETED, FAILED];
 
+    /// 「进行中」的两个状态。
+    ///
+    /// 对应上游 `ACTIVE_TASK_RUN_STATES = {"pending", "running"}`
+    /// （`activity/task_runs.py:22`）。**终态转移的合法来源集合** ——
+    /// 状态转移的 CAS 必须判在这两个值上，而不是只判 `running`。
+    ///
+    /// # 为什么不能只判 `running`
+    ///
+    /// worker 领取后本就是 `running`，所以队列路径上看不出差别。但收口
+    /// 转移的**合法来源**是两个状态：`pending` 行也可能被直接收口，例如
+    /// 尚未领取就被判定「功能停用」而跳过（`activity/worker` 的
+    /// `job_disabled_reason` 分支走的就是这条路）。只判 `running` 会让那条
+    /// 路径永远转移失败、任务卡在 `pending` 直到租约回收。
+    pub const ACTIVE: [&str; 2] = [PENDING, RUNNING];
+
+    /// 是否为进行中状态。
+    pub fn is_active(state: &str) -> bool {
+        ACTIVE.contains(&state)
+    }
+
     /// 是否为合法状态。
     pub fn is_valid(state: &str) -> bool {
         ALL.contains(&state)
@@ -181,8 +201,96 @@ impl BackgroundTaskRun {
 }
 
 /// 系统通知的分类。
+///
+/// 对应上游 `ALLOWED_NOTIFICATION_CATEGORIES`
+/// （`activity/notifications.py:18`）。白名单是**显式**的：写入前归一化并
+/// 校验，非法值报 422 `invalid_activity_filter` 而不是静默落到 `info`。
+///
+/// 那句「`normalized_category or "info"`」的兜底只在**上游已校验过**的前提下
+/// 才安全 —— `create` / `create_once` 都先过 [`crate::repo`] 侧的归一化。
+/// 直接往仓储塞一个未知分类不构成受支持的用法。
 pub mod notification_category {
-    pub const ALL: [&str; 0] = [];
+    /// 提醒。
+    pub const REMINDER: &str = "reminder";
+    /// 信息（默认分类）。
+    pub const INFO: &str = "info";
+    /// 警告。
+    pub const WARNING: &str = "warning";
+    /// 错误。
+    pub const ERROR: &str = "error";
+
+    /// 白名单里的全部分类。
+    pub const ALL: [&str; 4] = [REMINDER, INFO, WARNING, ERROR];
+
+    /// 是否为合法分类。
+    pub fn is_valid(category: &str) -> bool {
+        ALL.contains(&category)
+    }
+
+    /// 未指定分类时的兜底值。
+    pub const DEFAULT: &str = INFO;
+}
+
+/// `result_summary` 列（`JsonTextField`，TEXT 里的 JSON 文本）的展示规则。
+///
+/// 对应上游 `activity/task_runs.py:51-65`。
+pub mod result_summary {
+    use serde_json::Value;
+
+    /// 标量转字符串。**两处方言差异**。
+    ///
+    /// | 类型 | 本实现 | 上游 `str(value)` |
+    /// |---|---|---|
+    /// | 字符串 | `x`（裸内容） | `x` |
+    /// | 布尔 | `true` / `false` | 同 |
+    ///
+    /// 字符串这条容易踩：`Value::to_string()` 产出的是 **JSON 字面量**，
+    /// 会带上双引号（`"x"`）。直接用它会让 `result_text` 变成
+    /// `name="alice"`，而客户端与上游对拍期望的是 `name=alice`。
+    fn format_scalar(value: &Value) -> String {
+        match value {
+            Value::String(text) => text.clone(),
+            Value::Bool(flag) => {
+                if *flag {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                }
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// 把摘要格式化成一行人类可读文本。
+    ///
+    /// `key=value` 以空格连接，跳过容器（对象 / 数组）与 `null` —— 那些值
+    /// 塞进一行文本读不出来。空摘要或全是容器值时返回 `None`。
+    ///
+    /// # 键序即插入序
+    ///
+    /// 依赖工作区给 `serde_json` 开了 `preserve_order`（根 `Cargo.toml`），
+    /// 于是遍历序与上游 Python `dict` 的插入序一致 —— 输出文本因此可以
+    /// 逐字比对。换成 `BTreeMap` 排序会让这条性质消失。
+    pub fn format_text(summary_json: Option<&str>) -> Option<String> {
+        let raw = summary_json?;
+        if raw.trim().is_empty() {
+            return None;
+        }
+        let parsed: Value = serde_json::from_str(raw).ok()?;
+        let object = parsed.as_object()?;
+        let mut fragments = Vec::new();
+        for (key, value) in object {
+            match value {
+                Value::Object(_) | Value::Array(_) | Value::Null => continue,
+                other => fragments.push(format!("{key}={}", format_scalar(other))),
+            }
+        }
+        if fragments.is_empty() {
+            None
+        } else {
+            Some(fragments.join(" "))
+        }
+    }
 }
 
 /// `system_notification` 表：站内通知。

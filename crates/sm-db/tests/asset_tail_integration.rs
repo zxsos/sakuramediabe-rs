@@ -325,7 +325,7 @@ async fn the_same_event_notifies_once_but_plain_notifications_still_appear() {
     let db = TestDb::require().await;
     let repo = SystemNotificationRepository::new(db.pool().clone());
 
-    let mut deduped = notification("task", "任务失败");
+    let mut deduped = notification("error", "任务失败");
     deduped.dedupe_key = Some("task-run-42".to_owned());
 
     let first = repo
@@ -343,14 +343,14 @@ async fn the_same_event_notifies_once_but_plain_notifications_still_appear() {
     );
 
     // 没有去重键的通知 —— 每次都产生。
-    let plain = notification("task", "另一条");
+    let plain = notification("error", "另一条");
     repo.notify(&plain).await.unwrap().expect("");
     repo.notify(&plain)
         .await
         .unwrap()
         .expect("无去重键应每次都产生");
 
-    let listed = repo.list_by_category("task", page()).await.unwrap();
+    let listed = repo.list_by_category("error", page()).await.unwrap();
     assert_eq!(listed.total, 3, "1 条去重 + 2 条普通");
     assert_eq!(listed.total as usize, listed.items.len());
 }
@@ -366,7 +366,7 @@ async fn mark_read_writes_both_is_read_and_read_at() {
     let repo = SystemNotificationRepository::new(db.pool().clone());
 
     let row = repo
-        .notify(&notification("system", "系统消息"))
+        .notify(&notification("info", "系统消息"))
         .await
         .unwrap()
         .unwrap();
@@ -375,7 +375,7 @@ async fn mark_read_writes_both_is_read_and_read_at() {
 
     assert!(repo.mark_read(row.id).await.unwrap());
     let after = repo
-        .list_by_category("system", page())
+        .list_by_category("info", page())
         .await
         .unwrap()
         .items
@@ -389,7 +389,7 @@ async fn mark_read_writes_both_is_read_and_read_at() {
     // 重复标记：返回 false，且 read_at 不被改写。
     assert!(!repo.mark_read(row.id).await.unwrap());
     let again = repo
-        .list_by_category("system", page())
+        .list_by_category("info", page())
         .await
         .unwrap()
         .items
@@ -409,19 +409,19 @@ async fn resource_type_and_id_must_be_given_together() {
     let db = TestDb::require().await;
     let repo = SystemNotificationRepository::new(db.pool().clone());
 
-    let mut bad = notification("task", "半配置");
+    let mut bad = notification("info", "半配置");
     bad.resource_type = Some("movie".to_owned());
     bad.resource_id = None;
     let err = repo.notify(&bad).await.expect_err("resource_id 缺失");
     assert!(matches!(err, DbError::Business { .. }), "{err:?}");
 
-    let mut bad2 = notification("task", "半配置2");
+    let mut bad2 = notification("info", "半配置2");
     bad2.resource_id = Some(1);
     let err = repo.notify(&bad2).await.expect_err("resource_type 缺失");
     assert!(matches!(err, DbError::Business { .. }), "{err:?}");
 
     // 一起给出则可以。
-    let mut good = notification("task", "完整");
+    let mut good = notification("info", "完整");
     good.resource_type = Some("movie".to_owned());
     good.resource_id = Some(1);
     good.event_type = Some("movie.imported".to_owned());

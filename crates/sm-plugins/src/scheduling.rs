@@ -51,8 +51,15 @@ pub fn scheduler_specs(registry: &JobRegistry) -> Vec<JobSpec> {
         .into_iter()
         .map(|entry| JobSpec {
             task_key: entry.task_key.clone(),
+            // 这三个名字插件都声明了（`JobDefinition` 的必填字段），原样带上 ——
+            // 任务中心要靠它们显示与定位任务。
+            log_name: entry.log_name.clone(),
+            cli_name: entry.cli_name.clone(),
             display_name: entry.cli_help.clone(),
             cron: Some(entry.default_cron.clone()),
+            // proto 的 `JobDefinition` 没有「禁止手动触发」这一位，上游
+            // `manual_trigger_allowed` 也不是插件能声明的：一律允许。
+            manual_trigger_allowed: true,
         })
         .collect()
 }
@@ -95,6 +102,9 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].task_key, "local.cleanup");
         assert_eq!(specs[0].display_name, "清理本地缓存", "展示名是 cli_help");
+        // 三个名字原样带上：任务中心与 CLI 靠它们定位任务。
+        assert_eq!(specs[0].log_name, "local.cleanup");
+        assert_eq!(specs[0].cli_name, "local.cleanup");
         assert_eq!(specs[0].cron.as_deref(), Some("0 3 * * *"));
     }
 
