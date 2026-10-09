@@ -57,6 +57,56 @@ impl Default for InProcessRankingGateway {
     }
 }
 
+/// 复合排行网关：优先进程内，兜底 gRPC。
+///
+/// javdb 走进程内（已 vendoring），其他源走原有的 gRPC 路径。
+pub struct CompositeRankingGateway {
+    inprocess: InProcessRankingGateway,
+    grpc: crate::ranking_gateway::RankingPluginGateway,
+}
+
+impl CompositeRankingGateway {
+    pub fn new(
+        inprocess: InProcessRankingGateway,
+        grpc: crate::ranking_gateway::RankingPluginGateway,
+    ) -> Self {
+        Self { inprocess, grpc }
+    }
+}
+
+impl RankingGateway for CompositeRankingGateway {
+    fn fetch_ranking<'a>(
+        &'a self,
+        source_key: &'a str,
+        board_key: &'a str,
+        period: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, RankingCallError>> + Send + 'a>,
+    > {
+        // javdb 已 vendoring，走进程内；其他走 gRPC。
+        if source_key == "javdb" {
+            self.inprocess.fetch_ranking(source_key, board_key, period)
+        } else {
+            self.grpc.fetch_ranking(source_key, board_key, period)
+        }
+    }
+
+    fn resolve_periods<'a>(
+        &'a self,
+        source_key: &'a str,
+        board_key: &'a str,
+        periods_with_items: &'a [String],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, RankingCallError>> + Send + 'a>,
+    > {
+        if source_key == "javdb" {
+            self.inprocess.resolve_periods(source_key, board_key, periods_with_items)
+        } else {
+            self.grpc.resolve_periods(source_key, board_key, periods_with_items)
+        }
+    }
+}
+
 impl RankingGateway for InProcessRankingGateway {
     fn fetch_ranking<'a>(
         &'a self,

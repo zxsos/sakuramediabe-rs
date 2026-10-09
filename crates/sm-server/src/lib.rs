@@ -203,13 +203,19 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         provider_factory_source;
     // 排行同步（写侧）：目录（4b 才有的快照）+ 取数网关（每次现取插件的控制面
     // 端点，所以给的是**活的注册表句柄**）。填进 4a 建的那个槽。
+    //
+    // 进程内优先：javdb 已 vendoring，直接调进程内版本，不起进程、不走 gRPC；
+    // 其他源仍走 gRPC（CompositeRankingGateway 内部分流）。
     ranking_slot.fill(std::sync::Arc::new(
         sm_service::discovery::ranking::RankingSyncService::new(
             pool.clone(),
             loaded_plugins.ranking_sources(),
         )
         .with_gateway(std::sync::Arc::new(
-            ranking_gateway::RankingPluginGateway::new(loaded_plugins.extension_registry()),
+            inprocess_plugins::CompositeRankingGateway::new(
+                inprocess_plugins::InProcessRankingGateway::new(),
+                ranking_gateway::RankingPluginGateway::new(loaded_plugins.extension_registry()),
+            ),
         )),
     ));
 
