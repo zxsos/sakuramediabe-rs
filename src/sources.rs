@@ -386,7 +386,7 @@ impl Element {
             .join(" ")
     }
 
-    fn collect_text(&self, sep: &str, skip: Option<&str>, parts: &mut Vec<String>) {
+    fn collect_text(&self, _sep: &str, skip: Option<&str>, parts: &mut Vec<String>) {
         for child in &self.children {
             match child {
                 Child::Text(t) => {
@@ -399,7 +399,7 @@ impl Element {
                     if skip.is_some_and(|s| elem.name.eq_ignore_ascii_case(s)) {
                         continue;
                     }
-                    elem.collect_text(sep, skip, parts);
+                    elem.collect_text(_sep, skip, parts);
                 }
             }
         }
@@ -564,10 +564,9 @@ fn search_cup(size: &str) -> Option<&str> {
     // 半角或全角左括号。
     let (paren_end, after_paren) = if let Some(pos) = after_b.find('(') {
         (pos, &after_b[pos + 1..])
-    } else if let Some(pos) = after_b.find('（') {
-        (pos, &after_b[pos + '（'.len_utf8()..])
     } else {
-        return None;
+        let pos = after_b.find('（')?;
+        (pos, &after_b[pos + '（'.len_utf8()..])
     };
     let digits: String = after_b[..paren_end]
         .chars()

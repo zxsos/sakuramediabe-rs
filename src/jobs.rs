@@ -549,18 +549,18 @@ where
             .get_actor(snapshot.actor_id)
             .await
             .map_err(|e| JobError::Host(e.0))?;
-        let latest_javdb_id = latest
-            .as_ref()
-            .and_then(|a| a.values.get("javdb_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if latest.is_none() || latest_javdb_id != javdb_id {
+        if latest.as_ref().is_none_or(|a| {
+            a.values
+                .get("javdb_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                != javdb_id
+        }) {
             row.status = "stopped".to_owned();
             row.reason = "actor_changed_or_deleted".to_owned();
             row.next_attempt_at = None;
             stats.stopped += 1;
-        } else {
-            let latest = latest.unwrap();
+        } else if let Some(latest) = latest {
             let allowed = writable_fields(&latest, &missing_fields(&latest.values), owner);
             let patch: BTreeMap<String, FieldValue> = updates
                 .iter()
