@@ -61,7 +61,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
 
     // 3. 路由。鉴权配置里的密钥取自配置，不留硬编码默认值。
     let auth = AuthConfig::new(config.jwt_secret.clone());
-    let state = sm_api::AppState::new(pool.clone(), auth);
+    // 配置服务指向 `ServerConfig` 解析出的那个路径 —— 必须同一个，否则
+    // `PATCH /config` 会写进另一个文件，表现为「改了没反应」。
+    // 变量名不叫 `config`：那会遮蔽 `ServerConfig`，而下一行还要读它的
+    // `slow_log` —— 遮蔽后那句会静默变成读 `ConfigService` 的不存在的字段。
+    let config_service = sm_service::system::ConfigService::new(config.config_path.clone());
+    let state = sm_api::AppState::new(pool.clone(), auth, config_service);
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 4. 调度器。

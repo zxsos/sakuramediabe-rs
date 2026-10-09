@@ -2,6 +2,7 @@
 
 use sm_db::Db;
 use sm_service::system::auth::AuthConfig;
+use sm_service::system::config::ConfigService;
 
 /// 所有路由共享的运行时状态。
 ///
@@ -17,11 +18,23 @@ use sm_service::system::auth::AuthConfig;
 pub struct AppState {
     db: Db,
     auth: AuthConfig,
+    /// 配置服务。
+    ///
+    /// # 为什么状态里放服务而不是路径
+    ///
+    /// 因为路径是**服务的内部状态**：读盘、合并、原子写盘都围着它转。状态里
+    /// 只放路径的话，每个 handler 都要现造一个服务，而测试要指向临时目录 ——
+    /// 那就得把路径也做成参数，等于把同一件事拆成两处。
+    ///
+    /// `ConfigService` 的 `Clone` 只复制一个 `PathBuf`，很便宜。
+    config: ConfigService,
 }
 
 impl AppState {
-    pub fn new(db: Db, auth: AuthConfig) -> Self {
-        Self { db, auth }
+    /// 三个参数缺一不可：`config` 也要，因为 `PATCH /config` 没有它就没法
+    /// 写回文件，而「写不进文件」的表现是「改了没反应」，最难排查。
+    pub fn new(db: Db, auth: AuthConfig, config: ConfigService) -> Self {
+        Self { db, auth, config }
     }
 
     pub fn db(&self) -> &Db {
@@ -30,5 +43,10 @@ impl AppState {
 
     pub fn auth(&self) -> &AuthConfig {
         &self.auth
+    }
+
+    /// 配置服务。`PATCH /config` 通过它写盘。
+    pub fn config(&self) -> &ConfigService {
+        &self.config
     }
 }

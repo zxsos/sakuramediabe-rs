@@ -1,0 +1,22 @@
+[package]
+name = "plugin-ref-local"
+version = "0.1.0"
+description = "参考插件：以本地目录为后端的 StorageProvider gRPC 实现 —— 打通插件 ABI 数据面并量化开销"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sm-plugin-api = { workspace = true }
+async-trait = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+# net：一把 help 我们自己建起 server 用的 TcpListenerStream（起真实 server 需要内核分配的端口）。
+tokio-stream = { workspace = true, features = ["net"] }
+chrono = { workspace = true }
+percent-encoding = { workspace = true }

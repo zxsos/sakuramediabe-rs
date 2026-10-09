@@ -185,19 +185,19 @@ impl DownloadTaskRepository {
     /// 更新**宿主导入状态**。只碰 `import_status` / `import_task_run_id`。
     ///
     /// 刻意不接受 `state` —— 见模块文档。
+    ///
+    /// # 五个合法取值都放行，包括 `skipped`
+    ///
+    /// 此前这里只认四个（漏了 `skipped`），于是「这一趟没有可导入的媒体
+    /// 文件」这个**正常结果**写不进去 —— 只能记成 `failed`。客户端的六分类
+    /// 里 `skipped` 是独立一档，写不进去就意味着那一档永远是 0。
     pub async fn set_import_status(
         &self,
         id: i32,
         status: &str,
         import_task_run_id: Option<i64>,
     ) -> Result<DownloadTask, DbError> {
-        if !matches!(
-            status,
-            import_status::PENDING
-                | import_status::RUNNING
-                | import_status::DONE
-                | import_status::FAILED
-        ) {
+        if !import_status::is_valid(status) {
             return Err(DbError::business(
                 ENTITY,
                 format!("未知的导入状态 {status}"),
@@ -316,7 +316,11 @@ mod tests {
         // 就算将来有人想「统一」两个 setter，这些常量仍然是两套 ——
         // 合并它们会丢掉 state=completed & import_status=failed 这个组合。
         let download_terminal = [download_state::COMPLETED, download_state::FAILED];
-        let import_terminal = [import_status::DONE, import_status::FAILED];
+        let import_terminal = [
+            import_status::COMPLETED,
+            import_status::FAILED,
+            import_status::SKIPPED,
+        ];
 
         for state in download_terminal {
             assert!(download_state::is_terminal(state));

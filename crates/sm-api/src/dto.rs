@@ -10,15 +10,16 @@
 //! `is_system` / `is_mutable` / `is_deletable` 是**派生字段**：上游靠
 //! `from_playlist` 里的 `extra` 注入，Rust 侧在 `From<Playlist>` 里算。
 //!
-//! # 两处已知偏差（不要当成已对齐）
+//! # 一处已知偏差（不要当成已对齐）
 //!
-//! 1. **`movie_count` 恒为 0。** 上游的计数来自 `playlist_movie` 聚合查询，
-//!    本批 service 没有暴露该方法。字段必须存在（客户端读它），值待补。
-//! 2. **`created_at` / `updated_at` 的时间戳格式。** 上游 `SchemaModel` 有
+//! **`created_at` / `updated_at` 的时间戳格式。** 上游 `SchemaModel` 有
 //!    全局 `@field_serializer("*")` 按**运行时本地时区**序列化；这里按
 //!    naive UTC 输出 `YYYY-MM-DDTHH:MM:SS`。上游容器 `TZ=UTC`、
 //!    PG `timezone=UTC`，实际值应当一致，但**没有对拍过**。
 //!    另外 DB 两列可空而上游 DTO 非可空，这里 None 时输出空串。
+//!
+//! `movie_count` 曾恒为 0，现已由
+//! [`PlaylistResource::with_movie_count`] 从 service 的聚合计数填充。
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -39,8 +40,14 @@ pub struct PlaylistResource {
     pub updated_at: String,
 }
 
-impl From<Playlist> for PlaylistResource {
-    fn from(value: Playlist) -> Self {
+impl PlaylistResource {
+    /// 带成员计数构造。
+    ///
+    /// `From<Playlist>` 委托到这里并传 0 —— 那条路径只用于「刚写完、
+    /// 成员数必为 0」的场景（`POST /playlists`）。凡是**读**已有列表的
+    /// 地方都必须走这里并传真实计数，否则客户端读到的 `movie_count: 0`
+    /// 与「列表是空的」不可区分。
+    pub fn with_movie_count(value: Playlist, movie_count: i32) -> Self {
         let is_system = value.is_system();
         Self {
             id: value.id,
@@ -50,10 +57,63 @@ impl From<Playlist> for PlaylistResource {
             is_system,
             is_mutable: !is_system,
             is_deletable: !is_system,
-            // 见模块文档第 1 条：计数待补。
-            movie_count: 0,
+            movie_count,
             created_at: format_timestamp(value.created_at),
             updated_at: format_timestamp(value.updated_at),
+        }
+    }
+}
+
+impl From<Playlist> for PlaylistResource {
+    /// **计数恒为 0。** 见 [`PlaylistResource::with_movie_count`] 的说明 ——
+    /// 新建列表的成员数确实是 0，但这个 `From` 也会被误用到读路径上。
+    fn from(value: Playlist) -> Self {
+        Self::with_movie_count(value, 0)
+    }
+}
+
+impl From<&sm_service::collections::playlist::PlaylistWithCount> for PlaylistResource {
+    fn from(value: &sm_service::collections::playlist::PlaylistWithCount) -> Self {
+        Self::with_movie_count(value.playlist.clone(), value.movie_count)
+    }
+}
+
+/// `GET /playlists/{id}/resolutions` 的响应项（上游 `PlaylistResolutionOption`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistResolutionOption {
+    /// 档位标签（`8K` / `4K` / …）。已归一为大写形态。
+    pub resolution: String,
+    /// 列表内最高分辨率落在该档位的**影片**数。
+    pub count: i32,
+}
+
+/// `GET /status/capabilities` 的响应体。
+///
+/// 上游那个端点**没有 `response_model`**，直接返回 `capabilities()` 的
+/// `dict[str, bool]`。所以这里的字段集合就是全部 —— 多一个键客户端不会
+/// 报错，但少一个会。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilitiesResource {
+    /// 相似影片能力（依赖 `qdrant.enabled`）。
+    pub movie_similarity: bool,
+    /// 图搜能力（依赖 `qdrant.enabled` **且** `image_search.enabled`）。
+    pub image_search: bool,
+}
+
+impl From<sm_service::system::optional_services::Capabilities> for CapabilitiesResource {
+    fn from(value: sm_service::system::optional_services::Capabilities) -> Self {
+        Self {
+            movie_similarity: value.movie_similarity,
+            image_search: value.image_search,
+        }
+    }
+}
+
+impl From<&sm_service::collections::playlist::ResolutionOption> for PlaylistResolutionOption {
+    fn from(value: &sm_service::collections::playlist::ResolutionOption) -> Self {
+        Self {
+            resolution: value.resolution.clone(),
+            count: value.count,
         }
     }
 }
@@ -118,6 +178,41 @@ pub struct PlaylistCreateRequest {
 pub struct PlaylistUpdateRequest {
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+/// `GET /config` 的响应体（上游 `ConfigResource`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigResource {
+    /// 全部**可改**配置节的明文快照。只读键（`auth` / `enable_docs` /
+    /// `plugins`）已被剔除 —— 见 `routes/config.rs` 的模块文档。
+    pub values: serde_json::Value,
+}
+
+/// `PATCH /config` 的响应体（上游 `ConfigUpdateResource`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigUpdateResource {
+    /// 写盘**之后**的公开快照。注意它与运行中进程实际在用的值可能不同 ——
+    /// 那要等重启，见 `restart_required`。
+    pub values: serde_json::Value,
+    /// 必须重启的进程。**恒为** `["api", "aps"]`，永不为空。
+    ///
+    /// 上游的类型是 `list[Literal["api", "aps"]]`，字面量集合只有这两个，
+    /// 所以这个字段表达的不是「哪些进程受影响」，而是「本项目由这两个进程
+    /// 读配置」这一事实。客户端据此提示用户重启，而不需要判断非空。
+    pub restart_required: Vec<String>,
+}
+
+impl ConfigUpdateResource {
+    /// 用 service 给出的公开快照构造，`restart_required` 取常量。
+    pub fn new(values: serde_json::Value) -> Self {
+        Self {
+            values,
+            restart_required: sm_service::system::config::RESTART_REQUIRED
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]

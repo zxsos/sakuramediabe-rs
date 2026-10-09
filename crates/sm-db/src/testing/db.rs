@@ -145,6 +145,58 @@ impl TestDb {
         &self.pool
     }
 
+    /// 另建一个**多连接**的池，指向同一个测试 schema。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 本类型的池是 `max_connections(1)` —— 因为 `search_path` 是**会话级**
+    /// 设置，单一连接才能保证所有查询落在同一个测试 schema 里。
+    ///
+    /// 但有些语义**本质上跨会话**，单连接下**无法验证**：
+    ///
+    /// | 语义 | 为什么单连接不行 |
+    /// |---|---|
+    /// | advisory lock 互斥 | 同一会话重复 `pg_try_advisory_lock` 会**成功** |
+    /// | `FOR UPDATE SKIP LOCKED` | 同一会话里锁不住自己 |
+    /// | 会话级 GUC | 第二条连接看不到第一条的设置 |
+    ///
+    /// 那些测试在 `max_connections(1)` 下会拿到**误导性的通过** ——
+    /// 比如 advisory lock 的「第二个持有者被拒」根本走不到。
+    ///
+    /// # `search_path` 改成 `after_connect` 钩子
+    ///
+    /// 主池靠「借连接时刚好只有一条」来保证 schema 正确。多连接池做不到
+    /// 那样，所以每条**新**连接建立后立刻 `SET search_path`。用
+    /// `after_connect` 而不是建池后 `SET` 一次 —— 后者只影响当时那条连接，
+    /// 池里后来新建的连接会落回 `public` schema，于是测试在「表不存在」上
+    /// 失败而不是在断言上失败。
+    ///
+    /// 生产侧的池是 `max_connections = 20`（`sm_server::config`），够用。
+    pub async fn pool_with_max_connections(&self, max_connections: u32) -> PgPool {
+        let url = test_database_url().expect("TestDb 已建立，说明 URL 存在");
+        let schema = self.schema.clone();
+        let options = PgConnectOptions::from_str(&url).expect("连接串可解析");
+
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .after_connect(move |conn, _meta| {
+                let schema = schema.clone();
+                Box::pin(async move {
+                    // schema 名由 `unique_suffix` 生成（纳秒时间戳 + 计数器），
+                    // 不是外部输入，所以拼进 SQL 无注入面。
+                    let stmt = format!("SET search_path TO {schema}");
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+            .expect("建立多连接池失败")
+    }
+
     /// schema 名，用于断言信息。
     pub fn schema(&self) -> &str {
         &self.schema

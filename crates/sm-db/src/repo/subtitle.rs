@@ -500,6 +500,60 @@ impl SystemNotificationRepository {
             .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// 把指向一批任务台账的 `related_task_run_id` **置空**。返回改了几行。
+    ///
+    /// # 置空而不是让外键级联删通知
+    ///
+    /// 通知是**独立实体**，它自己的保留期由 [`Self::delete_read_before_in`]
+    /// 管。而 `related_task_run_id` 只是「这条通知与那次运行有关」的展示关联 ——
+    /// 台账记录被保留期清理掉后，通知（「某某任务失败了」）仍然是用户要看的
+    /// 事实，不该跟着消失。上游显式做了同一件事，注释写明「避免悬挂引用，
+    /// 不依赖数据库级联行为」。
+    ///
+    /// 事务内变体：必须与删台账放在同一个事务里。
+    pub async fn detach_task_runs_in(
+        &self,
+        ctx: &mut crate::repo::Ctx<'_>,
+        task_run_ids: &[i32],
+    ) -> Result<u64, DbError> {
+        if task_run_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE system_notification SET related_task_run_id = NULL, updated_at = $2 \
+             WHERE related_task_run_id = ANY($1)",
+        )
+        .bind(task_run_ids)
+        .bind(crate::common::time::now_utc())
+        .execute(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 删掉「已读且 `read_at` 早于 `cutoff`」的通知。返回删了几行。
+    ///
+    /// **未读通知一律保留** —— 用户还没看过的内容不该被清理掉。
+    ///
+    /// 用 `read_at` 而不是 `created_at` 作为窗口基准：一条 30 天前创建、
+    /// 昨天才读的通知，按 `read_at` 算还有保留期，按 `created_at` 算已经过期。
+    /// 上游用的是 `read_at`（`SystemNotification.read_at < cutoff`）。
+    ///
+    /// 事务内变体。
+    pub async fn delete_read_before_in(
+        &self,
+        ctx: &mut crate::repo::Ctx<'_>,
+        cutoff: chrono::NaiveDateTime,
+    ) -> Result<u64, DbError> {
+        let result =
+            sqlx::query("DELETE FROM system_notification WHERE is_read = true AND read_at < $1")
+                .bind(cutoff)
+                .execute(ctx.conn().await?.as_conn())
+                .await
+                .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
+        Ok(result.rows_affected())
+    }
 }
 // ================================================================ schema_migration
 

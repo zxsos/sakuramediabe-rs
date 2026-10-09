@@ -307,6 +307,33 @@ pub fn build_signed_media_url(
     ))
 }
 
+/// 构造签名片段串流 URL。
+///
+/// 对应上游 `build_signed_clip_url`（`src/common/file_signatures.py:241`）：
+///
+/// ```text
+/// /media-clips/{clip_id}/stream?expires={expires}&signature={signature}
+/// ```
+///
+/// 与其它资源共用固定有效期与窗口对齐策略（[`signature_expires`]）——
+/// 刻意不引入「片段有独立的有效期」这种差异。
+///
+/// # 没有 `path` 参数
+///
+/// 片段的产物路径由服务端从 `clip_id` 反查（`MediaClipService.stream_file_path`），
+/// 不从 URL 里取。所以这里**不**走 [`normalize_resource_path`] ——
+/// 那套 `.` / `..` / 绝对路径的拒绝逻辑在这里没有对应输入。
+///
+/// 顺带说明为什么这样更安全：URL 里带路径就意味着「路径来自客户端」，
+/// 而片段路径是服务端状态。
+pub fn build_signed_clip_url(secret: &str, clip_id: i32, now_seconds: i64) -> String {
+    let expires = signature_expires(now_seconds);
+    let signature = clip_signature(secret, clip_id, expires);
+    format!(
+        "{MEDIA_CLIP_STREAM_ROUTE_PREFIX}/{clip_id}/stream?expires={expires}&signature={signature}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,11 +8,13 @@
 //!
 //! # 与上游的两处**刻意**差异
 //!
-//! **① 密码算法是 Argon2id，不是 bcrypt。** 上游 `bcrypt.checkpw`。
-//! ⚠️ **存量 bcrypt 哈希目前无法校验** —— Rust 侧没有引入 bcrypt 实现，
-//! 既有部署升级后所有旧密码会登录失败。`sm_core::password::needs_rehash`
-//! 已经预留了迁移判定，补一个 bcrypt 校验器即可闭合，但那要新增依赖，
-//! 需要单独拍板。**在闭合前，这个端点是"新部署可用、存量数据不可用"。**
+//! **① 密码哈希是「Argon2id 写、bcrypt 也读」。** 上游 `bcrypt.checkpw`。
+//! 本实现**新密码一律写 Argon2id**（内存硬、抗 GPU/ASIC），但**必须能验
+//! 存量 bcrypt 哈希** —— 这个后端是原地替换上游，数据库里的哈希一行没动，
+//! 认不得就意味着切换当天所有人登不进来。所以 [`AuthService::login`]
+//! 在验证成功后按 [`sm_core::password::HashKind::should_upgrade`] 重哈希回写，
+//! **第一次登录即完成无感迁移**，不需要单独脚本或停机窗口。写侧永远不再
+//! 生成 bcrypt。
 //!
 //! **② 刷新时取用户用 `find_primary`。** 上游写的是
 //! `User.select().order_by(User.id).first()` —— 单用户部署下的固定写法。
@@ -30,7 +32,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use sm_core::jwt::encode_access_token;
-use sm_core::password::verify_password;
+use sm_core::password::{hash_password, verify_and_classify};
 use sm_core::refresh_token::{hash_token, RefreshRejection, RefreshTokenMaterial};
 use sm_db::common::time::now_utc;
 use sm_db::repo::{NewRefreshToken, UserRefreshTokenRepository, UserRepository};
@@ -88,6 +90,37 @@ impl AuthService {
         }
     }
 
+    /// 验证成功后把哈希升级为当前默认的 Argon2id。
+    ///
+    /// # 为什么失败只记日志不返回错误
+    ///
+    /// 密码**已经验证成功了** —— 此时把用户挡在门外，代价（用户登不进来）
+    /// 远大于收益（哈希晚一晚升级）。而升级失败只有两种可能：哈希算不出来
+    /// （几乎不可能）或数据库写不进去（该修的是数据库）。所以这里
+    /// best-effort + `warn`，与上面 [`Self::login`] 里 `touch_last_login`
+    /// 的处理是同一条原则。
+    ///
+    /// # 幂等性
+    ///
+    /// 重复执行是安全的：升级后 `needs_rehash` 为 false，不会再进这条路径。
+    /// 而中途失败时哈希保持原样，下次登录会**再试一次** —— 这正是想要的：
+    /// 迁移会随着登录自然推进，而不是需要单独的重试脚本。
+    async fn upgrade_password_hash(users: &UserRepository, user_id: i32, password: &str) {
+        let fresh = match hash_password(password) {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::warn!(user_id, error = %err, "生成 Argon2id 哈希失败，保留原哈希");
+                return;
+            }
+        };
+        match users.set_password_hash(user_id, &fresh).await {
+            Ok(_) => tracing::info!(user_id, "密码哈希已升级为 Argon2id"),
+            Err(err) => {
+                tracing::warn!(user_id, error = %err, "回写新哈希失败，保留原哈希（下次登录会重试）")
+            }
+        }
+    }
+
     /// 用户名 + 密码 → 令牌对。
     pub async fn login(
         &self,
@@ -104,7 +137,13 @@ impl AuthService {
             None => return Err(Self::invalid_credentials()),
         };
 
-        verify_password(password, &user.password_hash).map_err(|_| Self::invalid_credentials())?;
+        // 两种算法都收（存量 bcrypt + 本实现写的 Argon2id），并在验证成功后
+        // 按需升级哈希 —— 见 `sm_core::password` 的模块文档。
+        let hash_kind = verify_and_classify(password, &user.password_hash)
+            .map_err(|_| Self::invalid_credentials())?;
+        if hash_kind.should_upgrade() {
+            Self::upgrade_password_hash(&self.users, user.id, password).await;
+        }
 
         if let Err(err) = self.users.touch_last_login(user.id).await {
             // 登录时间写不进去不该让用户登不上 —— 但这必须**可见**，

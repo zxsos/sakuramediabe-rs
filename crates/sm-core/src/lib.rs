@@ -12,6 +12,8 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod config_schema;
+pub mod crontab;
 pub mod error;
 pub mod hashing_support;
 pub mod json;

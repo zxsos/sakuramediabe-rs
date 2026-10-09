@@ -9,9 +9,13 @@
 //!
 //! # 滚动参数抄上游
 //!
-//! `Logging.log_dir` 默认 `/data/logs`，`Logging.level` 默认 `INFO`。
-//! 轮转用 `tracing-appender` 的按天滚动，单文件 128 MiB —— 上游那是
-//! loguru 的 `rotation="128 MB"`。
+//! 上游的日志目录键是 `scheduler.log_dir`（默认 `/data/logs`），**不在
+//! `logging` 节里** —— `logging` 节只有 `level` 一个字段。轮转用
+//! `tracing-appender` 的按天滚动，单文件 128 MiB —— 上游那是 loguru 的
+//! `rotation="128 MB"`。
+//!
+//! （本模块的文档曾经把 `log_dir` 写成 `Logging.log_dir`，而 `config.rs`
+//! 也照着那个错名字去读，于是配置文件里的日志目录一直被静默忽略。）
 
 use std::path::Path;
 

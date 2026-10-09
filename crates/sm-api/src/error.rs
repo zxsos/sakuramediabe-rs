@@ -30,7 +30,7 @@
 //! 客户端才显形。所以 `tests/method_not_allowed_http.rs` 对**每一条**已注册
 //! 路由逐个发方法不匹配的请求并断言信封形状。
 
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -111,6 +111,32 @@ impl From<SignatureError> for ErrorResponse {
 impl From<JsonRejection> for ErrorResponse {
     /// 请求体解析失败 → 422 `validation_error`，与上游 `RequestValidationError` 对应。
     fn from(value: JsonRejection) -> Self {
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "detail".to_owned(),
+            serde_json::Value::from(value.body_text()),
+        );
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "Request validation failed",
+        )
+        .with_details(details)
+    }
+}
+
+impl From<QueryRejection> for ErrorResponse {
+    /// 查询串解析失败 → 422 `validation_error`。
+    ///
+    /// 与 [`JsonRejection`] 同一个理由：axum 的 `QueryRejection` 默认响应是
+    /// **400 + 纯文本**，不经过错误信封。上游 FastAPI 走
+    /// `RequestValidationError`，是 422 + 信封。两者状态码与响应体形状
+    /// 都不同，而客户端是按 `code` 分支的。
+    ///
+    /// `details.detail` 带 axum 的原始描述（哪个键、什么值、为什么不行），
+    /// 与 `JsonRejection` 的做法一致 —— 那是定位「客户端拼错了哪个参数」
+    /// 的唯一线索。
+    fn from(value: QueryRejection) -> Self {
         let mut details = serde_json::Map::new();
         details.insert(
             "detail".to_owned(),

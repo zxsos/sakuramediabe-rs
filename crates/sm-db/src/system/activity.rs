@@ -16,29 +16,83 @@
 use chrono::NaiveDateTime;
 use sqlx::FromRow;
 
+/// 任务队列互斥键的命名空间前缀。对应上游
+/// `src/service/system/task_queue_service.py:29` 的 `QUEUE_MUTEX_PREFIX`。
+///
+/// # 为什么住在 `sm-db` 而不是 service / scheduler
+///
+/// 三处都要它，而分属三个 crate：
+///
+/// - `sm_scheduler::tick` —— cron 触发时构造互斥键（coalesce 的防线）
+/// - `sm_service::system::task_queue` —— 队列本体的入队/冲突判定
+/// - `BackgroundTaskRunRepository` —— 唯一索引的语义解释
+///
+/// `sm-service` 与 `sm-scheduler` **互不依赖**（都只依赖 `sm-db`），所以放在
+/// 任何一个里都会让另一侧新增依赖边。而它确实是个**存储契约**：唯一索引
+/// `UNIQUE(mutex_key)` 圈定的就是这个命名空间，且存量库里已经有 `aps:`
+/// 开头的行 —— 换前缀会让在跑的任务与新调度的任务**互相不认**，且那种
+/// 不一致不报错，只表现为「同一个任务被并发跑了两份」。
+pub const QUEUE_MUTEX_PREFIX: &str = "aps:";
+
+/// 由 `task_key` 构造互斥键。
+///
+/// 与上游 `TaskQueueService.build_mutex_key` 逐字一致（`"aps:" + task_key`）。
+#[must_use]
+pub fn build_mutex_key(task_key: &str) -> String {
+    format!("{QUEUE_MUTEX_PREFIX}{task_key}")
+}
+
 /// `background_task_run.state` 取值。
 ///
-/// **注意来源差异**：`PENDING` 有源码证据（列默认值 `"pending"`，且队列
-/// 查询 `WHERE state='pending'`），`RUNNING` 由租约语义推导 —— 表头注释说
-/// 「lease_expires_at 过期即可回收」，隐含存在一个「已领取未回收」的中间态。
-/// 其余终态名在 `src/model/` 下没有常量定义，实际字面量由 service 层决定，
-/// 需要在迁移 service 时与上游对齐。
+/// 上游有**显式白名单**（`src/service/system/activity/task_runs.py:21`）：
+///
+/// ```python
+/// ALLOWED_TASK_STATES = {"pending", "running", "completed", "failed"}
+/// ```
+///
+/// 四个状态就是全部 —— 写进库里的任何其它字面量都是非法的。
+///
+/// # 「完成」叫 `completed` 而不是 `succeeded`
+///
+/// 这个字面量是**库契约**：任务中心（Flutter）按它渲染状态。
+/// 本仓库此前把成功态写成 `succeeded`，于是
+/// [`crate::repo::BackgroundTaskRunRepository::finish`] 写出的行落在白名单
+/// 之外，而上游按 `("completed", "failed")` 判终态 —— 结果是**已完成的任务
+/// 永远不会被保留期清理**，且客户端读不到「已完成」。
+///
+/// # 别和 `thumbnail_generation_state` 合并
+///
+/// [`crate::playback::media::thumbnail_state`] 里那个 `SUCCEEDED` 的字面量
+/// **确实是** `"succeeded"`（上游 `THUMBNAIL_STATE_SUCCEEDED`）。两个状态机
+/// 里有同名的常量、不同的字面量，看起来像笔误其实不是 —— 合并它们会让
+/// 两个表的状态判断同时失效。
 pub mod task_state {
-    /// 初始态，也是队列元素。**源码可证**。
+    /// 初始态，也是队列元素。
     pub const PENDING: &str = "pending";
 
-    /// 已领取、持有租约。由租约回收语义推导。
+    /// 已领取、持有租约。
     pub const RUNNING: &str = "running";
 
-    /// 正常结束。由 `finished_at` 的存在推导，具体字面量待与 service 对齐。
-    pub const SUCCEEDED: &str = "succeeded";
+    /// 正常结束。**注意字面量是 `completed`**，见模块文档。
+    pub const COMPLETED: &str = "completed";
 
-    /// 异常结束。由 `error_message` 的存在推导，具体字面量待与 service 对齐。
+    /// 异常结束。
     pub const FAILED: &str = "failed";
 
+    /// 白名单里的全部状态。用于校验「这个字面量能不能写进库」。
+    pub const ALL: [&str; 4] = [PENDING, RUNNING, COMPLETED, FAILED];
+
+    /// 是否为合法状态。
+    pub fn is_valid(state: &str) -> bool {
+        ALL.contains(&state)
+    }
+
     /// 是否为终态。
+    ///
+    /// 终态是**保留期清理的判据**（`activity_cleanup_service`）——
+    /// `pending` / `running` 无论多旧都不会被删。
     pub fn is_terminal(state: &str) -> bool {
-        state == SUCCEEDED || state == FAILED
+        state == COMPLETED || state == FAILED
     }
 }
 

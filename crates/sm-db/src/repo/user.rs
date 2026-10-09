@@ -200,6 +200,31 @@ impl UserRepository {
         .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
+    /// 改用户名。
+    ///
+    /// 与 [`Self::set_password_hash`] 一样**不**走通用 `update`：那条路径
+    /// 不校验非空，而空用户名会让 `find_by_username("")` 命中一条无法在
+    /// 登录界面复现的账号。
+    ///
+    /// 唯一约束 `users_username_uniq` 兜底并发：两个请求同时改成同一个
+    /// 新名字时，一个成功、另一个撞约束（`DbError::ConstraintViolation`），
+    /// 由 service 层映射成 409。
+    pub async fn set_username(&self, id: i32, username: &str) -> Result<Option<User>, DbError> {
+        let username = username.trim();
+        if username.is_empty() {
+            return Err(DbError::business(ENTITY, "username 不能为空"));
+        }
+        let now = crate::common::time::now_utc();
+        Ok(sqlx::query_as::<_, User>(
+            "UPDATE users SET username = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// 改密码。
     ///
     /// 密码哈希**不可经由通用 `update` 改** —— 那条路径不校验 PHC 格式，

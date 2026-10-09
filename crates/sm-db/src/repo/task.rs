@@ -46,6 +46,7 @@ use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
 use crate::paged_list;
+use crate::repo::Ctx;
 use crate::system::activity::{task_state, BackgroundTaskRun};
 
 /// 实体名，用于错误分类。
@@ -145,6 +146,43 @@ pub struct TaskOutcome {
     pub text: Option<String>,
 }
 
+/// 领取范围（上游的「并发道」lane）。
+///
+/// 把队列按 `task_key` 切开，让不同 worker 各领一条道。`include` 与
+/// `exclude` **同时**给出时以 `include` 为准 —— 上游也是先判
+/// `if include_task_keys:` 再判 `exclude`，两者都给等于「只领 include
+/// 里的、但排除 exclude 的」，那个组合没有实际意义。
+#[derive(Debug, Clone, Default)]
+pub struct TaskLanes {
+    /// 只领这些 `task_key`。**空 = 不限制**。
+    pub include: Vec<String>,
+    /// 不领这些 `task_key`。**空 = 不限制**。
+    pub exclude: Vec<String>,
+}
+
+impl TaskLanes {
+    /// 只领 `include` 里的。
+    pub fn including(keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            include: keys.into_iter().map(Into::into).collect(),
+            exclude: Vec::new(),
+        }
+    }
+
+    /// 领除 `exclude` 外的。
+    pub fn excluding(keys: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: keys.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// 两个集合都空 —— 等价于不限制，此时不该发条件。
+    pub fn is_unrestricted(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+}
+
 /// `background_task_run` 表仓储。
 #[derive(Debug, Clone)]
 pub struct BackgroundTaskRunRepository {
@@ -213,27 +251,107 @@ impl BackgroundTaskRunRepository {
         &self,
         lease_duration: chrono::Duration,
     ) -> Result<Option<ClaimedTask>, DbError> {
+        self.claim_in(lease_duration, None).await
+    }
+
+    /// 领取一个待执行任务，**限定在若干 `task_key` 内/外**。
+    ///
+    /// 对应上游 `claim_next(include_task_keys=..., exclude_task_keys=...)`。
+    /// 那个参数叫「并发道」（lane）：把队列按 `task_key` 切成互不干扰的
+    /// 若干条，让不同 worker 各领一条道上的任务。
+    ///
+    /// # 为什么用 `= ANY($n)` / `<> ALL($n)` 而不是拼 `IN (...)`
+    ///
+    /// 变长列表拼进 SQL 字面量需要在 `format!` 里生成占位符，那正是本仓库
+    /// 明确排除的做法。数组绑定让 SQL 保持字面量。
+    ///
+    /// # `exclude` 用 `<> ALL` 而不是 `NOT IN`
+    ///
+    /// `NOT IN` 遇到 NULL 会返回 NULL（既非真也非假），而 `task_key` 是
+    /// NOT NULL，所以这里其实等价 —— 但 `<> ALL` 的三值逻辑行为与
+    /// 「不在集合内」这个意图一致，不依赖列的可空性。
+    ///
+    /// # 空集合 = 不加限制
+    ///
+    /// `include` 给空集时**不**加条件（否则会领不到任何东西）；`exclude`
+    /// 给空集同理。这与上游 `if include_task_keys:` 的真值判断一致 ——
+    /// 上游传空 set 与传 None 行为相同。
+    pub async fn claim_in(
+        &self,
+        lease_duration: chrono::Duration,
+        lanes: Option<&TaskLanes>,
+    ) -> Result<Option<ClaimedTask>, DbError> {
         let now = crate::common::time::now_utc();
         let lease_expires_at = now + lease_duration;
 
-        let row = sqlx::query_as::<_, BackgroundTaskRun>(
-            "UPDATE background_task_run \
-             SET state = $1, started_at = $2, lease_expires_at = $3, updated_at = $2 \
-             WHERE id = ( \
-                 SELECT id FROM background_task_run \
-                 WHERE state = $4 \
-                   AND (scheduled_at IS NULL OR scheduled_at <= $2) \
-                 ORDER BY scheduled_at NULLS FIRST, id \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT 1 \
-             ) RETURNING *",
-        )
-        .bind(task_state::RUNNING)
-        .bind(now)
-        .bind(lease_expires_at)
-        .bind(task_state::PENDING)
-        .fetch_optional(&self.pool)
-        .await?;
+        let (include, exclude) = lanes
+            .map(|l| (l.include.clone(), l.exclude.clone()))
+            .unwrap_or_default();
+
+        // 三个分支各一条字面量 SQL，不做拼接 —— 占位符数量随条件变化，
+        // 拼出来的东西无法用 bind 表达。
+        let row = if !include.is_empty() {
+            sqlx::query_as::<_, BackgroundTaskRun>(
+                "UPDATE background_task_run \
+                 SET state = $1, started_at = $2, lease_expires_at = $3, updated_at = $2 \
+                 WHERE id = ( \
+                     SELECT id FROM background_task_run \
+                     WHERE state = $4 \
+                       AND (scheduled_at IS NULL OR scheduled_at <= $2) \
+                       AND task_key = ANY($5) \
+                     ORDER BY scheduled_at NULLS FIRST, id \
+                     FOR UPDATE SKIP LOCKED \
+                     LIMIT 1 \
+                 ) RETURNING *",
+            )
+            .bind(task_state::RUNNING)
+            .bind(now)
+            .bind(lease_expires_at)
+            .bind(task_state::PENDING)
+            .bind(&include)
+            .fetch_optional(&self.pool)
+            .await?
+        } else if !exclude.is_empty() {
+            sqlx::query_as::<_, BackgroundTaskRun>(
+                "UPDATE background_task_run \
+                 SET state = $1, started_at = $2, lease_expires_at = $3, updated_at = $2 \
+                 WHERE id = ( \
+                     SELECT id FROM background_task_run \
+                     WHERE state = $4 \
+                       AND (scheduled_at IS NULL OR scheduled_at <= $2) \
+                       AND task_key <> ALL($5) \
+                     ORDER BY scheduled_at NULLS FIRST, id \
+                     FOR UPDATE SKIP LOCKED \
+                     LIMIT 1 \
+                 ) RETURNING *",
+            )
+            .bind(task_state::RUNNING)
+            .bind(now)
+            .bind(lease_expires_at)
+            .bind(task_state::PENDING)
+            .bind(&exclude)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, BackgroundTaskRun>(
+                "UPDATE background_task_run \
+                 SET state = $1, started_at = $2, lease_expires_at = $3, updated_at = $2 \
+                 WHERE id = ( \
+                     SELECT id FROM background_task_run \
+                     WHERE state = $4 \
+                       AND (scheduled_at IS NULL OR scheduled_at <= $2) \
+                     ORDER BY scheduled_at NULLS FIRST, id \
+                     FOR UPDATE SKIP LOCKED \
+                     LIMIT 1 \
+                 ) RETURNING *",
+            )
+            .bind(task_state::RUNNING)
+            .bind(now)
+            .bind(lease_expires_at)
+            .bind(task_state::PENDING)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         // `lease_expires_at` 取**数据库读回的值**，而不是本地算出的那个。
         //
@@ -303,6 +421,66 @@ impl BackgroundTaskRunRepository {
         })
     }
 
+    /// **批量**延长租约，返回真正被续上的行数。
+    ///
+    /// 对应上游 `TaskQueueService.renew_leases`。与逐个调
+    /// [`Self::renew_lease`] 的区别有二，且都重要：
+    ///
+    /// 1. **不报错。** 单个版在任务已被回收时返回 `Err`，而批量版的语义是
+    ///    「有多少续上了」—— worker 一次心跳管一批任务，其中一个被回收不该
+    ///    让整批心跳失败。所以逐个调用的写法必须绕开单方法的错误路径。
+    /// 2. **一次往返。** worker 的心跳周期是秒级，批次可能有几十个 id。
+    ///
+    /// `state = 'running'` 条件在 SQL 里，所以已被回收（变回 pending）的行
+    /// 天然被排除 —— 这正是「续租不能复活别人的任务」那条规则。
+    pub async fn renew_leases(
+        &self,
+        ids: &[i32],
+        lease_duration: chrono::Duration,
+    ) -> Result<u64, DbError> {
+        // 与 `count_by_playlists` 同理：空输入直接返回，不发查询。
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = crate::common::time::now_utc();
+        let result = sqlx::query(
+            "UPDATE background_task_run \
+             SET lease_expires_at = $2, updated_at = $3 \
+             WHERE id = ANY($1) AND state = $4",
+        )
+        .bind(ids)
+        .bind(now + lease_duration)
+        .bind(now)
+        .bind(task_state::RUNNING)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 按 `mutex_key` 查当前持有者。**至多一行。**
+    ///
+    /// 存在的理由是 `conflict = "raise"` 那条路径要报出**是谁**挡住了：
+    /// 上游 `TaskQueueConflictError` 带 `blocking_task_run_id`，客户端据此
+    /// 提示「这个任务正在执行中」。
+    ///
+    /// # 为什么可能查不到
+    ///
+    /// 调用方是「INSERT 撞了唯一约束 → 再查一次」。这两步之间**没有**事务
+    /// 包裹，所以持有者可能刚好结束并释放了 `mutex_key`（`finish` / `fail`
+    /// 都会把它置空）。那时返回 `None` 是**正确**的，含义是「冲突已消失」，
+    /// 上游同样会传 `blocking=None`。
+    pub async fn find_by_mutex_key(
+        &self,
+        mutex_key: &str,
+    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run WHERE mutex_key = $1 LIMIT 1",
+        )
+        .bind(mutex_key.trim())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// 上报进度。
     ///
     /// 用通用 `update` 之外的专用方法：进度三件套**要么都不填，
@@ -369,7 +547,7 @@ impl BackgroundTaskRunRepository {
              WHERE id = $1 AND state = $6 RETURNING *",
         )
         .bind(id)
-        .bind(task_state::SUCCEEDED)
+        .bind(task_state::COMPLETED)
         .bind(summary)
         .bind(outcome.text.as_deref())
         .bind(now)
@@ -391,17 +569,51 @@ impl BackgroundTaskRunRepository {
     ///
     /// 失败也要释放 —— 保留一个失败的 key 会让重试永远撞唯一约束，
     /// 而重试正是失败后最该做的事。
+    ///
+    /// 不写 `result_summary`：需要带结构化失败原因时用
+    /// [`Self::fail_with_summary`]。
     pub async fn fail(&self, id: i32, error: &str) -> Result<BackgroundTaskRun, DbError> {
+        self.fail_with_summary(id, error, None).await
+    }
+
+    /// 标记失败，并写入 `result_summary`。
+    ///
+    /// # 为什么需要单独一个方法
+    ///
+    /// 上游把失败原因**分类**写进 `result_summary`，最常见的是租约回收：
+    ///
+    /// ```python
+    /// TaskRunService.fail_task_run(
+    ///     task_run.id,
+    ///     error_message=LEASE_EXPIRED_ERROR_MESSAGE,
+    ///     result_summary={INTERNAL_FAILURE_CODE_KEY: FAILURE_CODE_QUEUE_LEASE_EXPIRED},
+    /// )
+    /// ```
+    ///
+    /// 那个 `_failure_code` 是调用方**区分失败原因**的唯一依据 —— 用户手动
+    /// 取消、租约过期、执行进程重启，三者的 `error_message` 都是一句话，
+    /// 只有这个码能告诉客户端「要不要提示重试」。
+    ///
+    /// `summary` 为 `None` 时写 `'{}'`（该列的 DEFAULT），而不是写 NULL ——
+    /// 它是 `JsonTextField NOT NULL DEFAULT '{}}'`，写 NULL 会违反约束。
+    pub async fn fail_with_summary(
+        &self,
+        id: i32,
+        error: &str,
+        summary: Option<&serde_json::Value>,
+    ) -> Result<BackgroundTaskRun, DbError> {
         let now = crate::common::time::now_utc();
+        let summary = summary.map_or_else(|| "{}".to_owned(), ToString::to_string);
         let row = sqlx::query_as::<_, BackgroundTaskRun>(
             "UPDATE background_task_run \
-             SET state = $2, error_message = $3, finished_at = $4, \
-                 lease_expires_at = NULL, mutex_key = NULL, updated_at = $4 \
-             WHERE id = $1 AND state = $5 RETURNING *",
+             SET state = $2, error_message = $3, result_summary = $4, finished_at = $5, \
+                 lease_expires_at = NULL, mutex_key = NULL, updated_at = $5 \
+             WHERE id = $1 AND state = $6 RETURNING *",
         )
         .bind(id)
         .bind(task_state::FAILED)
         .bind(error)
+        .bind(summary)
         .bind(now)
         .bind(task_state::RUNNING)
         .fetch_optional(&self.pool)
@@ -410,6 +622,50 @@ impl BackgroundTaskRunRepository {
             DbError::business(ENTITY, format!("任务 {id} 不在 running 状态，不能置为失败"))
         })?;
         Ok(row)
+    }
+
+    /// 列出**全部**租约过期的 `running` 行。**刻意不分页。**
+    ///
+    /// 与 [`Self::list_stale_leases`] 的区别是**必须一次拿全**：
+    /// 后者是给「任务中心页面」看的（分页正确），而回收是 worker 的
+    /// housekeeper —— 只收第一页会让剩下的僵尸行永远留在队列里，而且
+    /// 每轮都重复收同样那批。
+    ///
+    /// `ORDER BY id` 让回收顺序确定，便于复现与测试。
+    pub async fn list_all_stale_leases(
+        &self,
+        now: NaiveDateTime,
+    ) -> Result<Vec<BackgroundTaskRun>, DbError> {
+        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run \
+             WHERE state = $1 AND lease_expires_at IS NOT NULL AND lease_expires_at < $2 \
+             ORDER BY id",
+        )
+        .bind(task_state::RUNNING)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 列出**全部**「曾经领取、`scheduled_at` 非空」的 `running` 行。
+    /// **刻意不分页**，理由同 [`Self::list_all_stale_leases`]。
+    ///
+    /// 这是「上一个进程遗留的任务」的判定 —— **不看租约**。进程刚启动时
+    /// 那一批行的租约还没到期，等它们到期要白等最多 300 秒
+    /// （`sm_service::system::task_queue::DEFAULT_LEASE_SECONDS`）。
+    ///
+    /// `scheduled_at IS NULL` 的行**不**返回：那类行不是队列元素
+    /// （`is_claimable` 虽把 NULL 当可领，但它们不由本队列写入），
+    /// 判失败会误伤别的写入方。上游同样带这个条件。
+    pub async fn list_interrupted(&self) -> Result<Vec<BackgroundTaskRun>, DbError> {
+        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run \
+             WHERE state = $1 AND scheduled_at IS NOT NULL \
+             ORDER BY id",
+        )
+        .bind(task_state::RUNNING)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// 列出可领取的任务（不改变状态）。用于诊断与「队列有多深」的回答。
@@ -478,6 +734,103 @@ impl BackgroundTaskRunRepository {
             items = "SELECT * FROM background_task_run \
                      WHERE task_key = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
         }
+    }
+
+    /// 库里出现过的全部 `task_key`。
+    ///
+    /// 保留期清理按 key 逐个处理，所以需要先枚举。顺序不保证 ——
+    /// 调用方不依赖顺序。
+    pub async fn distinct_task_keys(&self) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_key FROM background_task_run ORDER BY task_key",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 保留期分界：该 key 的第 `retention` 条**终态**记录（按 `id` 倒序）的 id。
+    ///
+    /// `None` 表示终态记录不足 `retention` 条，无需清理。
+    ///
+    /// # `retention` 为 0 的语义
+    ///
+    /// `OFFSET 0` 返回最新那条终态，于是分界就是它 —— 配合
+    /// [`Self::delete_terminal_through_in`] 就等于「终态记录一条不留」。
+    /// 上游 `activity_task_run_retention_per_key` 允许配 0，语义一致。
+    ///
+    /// # 为什么必须带 `state` 过滤
+    ///
+    /// 保留额只在**终态**记录里算。若不过滤，一条陈旧的 `pending` 会占掉
+    /// 保留额，把真正的历史挤掉；而更糟的是分界 id 之后所有 id 更小的行
+    /// 都会被删 —— 包括那条 `pending`。上游明确写了这条：
+    /// 「pending/running 无论 id 多旧都不能被清理」。
+    pub async fn retention_threshold_id(
+        &self,
+        task_key: &str,
+        retention: i64,
+    ) -> Result<Option<i32>, DbError> {
+        if retention < 0 {
+            return Err(DbError::business(ENTITY, "retention 不能为负"));
+        }
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM background_task_run \
+             WHERE task_key = $1 AND state IN ($2, $3) \
+             ORDER BY id DESC LIMIT 1 OFFSET $4",
+        )
+        .bind(task_key)
+        .bind(task_state::COMPLETED)
+        .bind(task_state::FAILED)
+        .bind(retention)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// 删掉该 key 下 `id <= threshold_id` 的全部终态记录。返回删了几行。
+    ///
+    /// 事务内变体：调用方需要与「把通知的 `related_task_run_id` 置空」放进
+    /// 同一个事务 —— 否则删完之后通知会指向不存在的行。
+    pub async fn delete_terminal_through_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        task_key: &str,
+        threshold_id: i32,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM background_task_run \
+             WHERE task_key = $1 AND state IN ($2, $3) AND id <= $4",
+        )
+        .bind(task_key)
+        .bind(task_state::COMPLETED)
+        .bind(task_state::FAILED)
+        .bind(threshold_id)
+        .execute(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 列出将被 [`Self::delete_terminal_through_in`] 删掉的那批 id。
+    ///
+    /// 单独一个方法是因为调用方需要**先**拿到 id 去解除通知的引用，而删除
+    /// 与解除引用必须在同一个事务里。两条语句各写一遍条件是「同一个 WHERE
+    /// 写两遍」的经典隐患 —— 改了一处忘了另一处，删掉的行与解除引用的行
+    /// 就会错位，而这种错不会报错，只留下悬挂引用。
+    pub async fn stale_terminal_ids_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        task_key: &str,
+        threshold_id: i32,
+    ) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM background_task_run \
+             WHERE task_key = $1 AND state IN ($2, $3) AND id <= $4",
+        )
+        .bind(task_key)
+        .bind(task_state::COMPLETED)
+        .bind(task_state::FAILED)
+        .bind(threshold_id)
+        .fetch_all(ctx.conn().await?.as_conn())
+        .await?)
     }
 
     /// 通用更新（改 `task_name` / `scheduled_at` 等非状态字段）。

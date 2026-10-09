@@ -39,11 +39,13 @@
 //! 删合集 → 成员行消失；删成员（影片/时刻/片段）→ 所属合集里的对应行消失。
 //! 两种方向都不会留下孤儿行，仓储层因此不需要「清理残留」的方法。
 
+use std::collections::HashMap;
+
 use sqlx::PgPool;
 
 use crate::collections::{
     ClipCollection, ClipCollectionItem, MomentCollection, MomentCollectionItem, Playlist,
-    PlaylistMovie, PluginOwned,
+    PlaylistMovie, PluginOwned, PLAYLIST_KIND_RECENTLY_PLAYED,
 };
 use crate::common::page::{Page, PageRequest};
 use crate::error::DbError;
@@ -909,6 +911,45 @@ pub struct PlaylistMovieRepository {
     pool: PgPool,
 }
 
+/// `moment_collection` / `clip_collection` 的合集计数。**给状态页用。**
+///
+/// 这两张表**没有 `kind` 列**，所以不需要 `include_system` 参数 ——
+/// 「系统托管的合集」这个概念只存在于 `playlist`。
+///
+/// 刻意不写进 `impl_collection_repo!` 宏：那个宏给三张父表生成方法，而
+/// `playlist` 那一侧已有自己的 `collection_counts(include_system)`（要排除
+/// 系统列表）。宏里再生成一个同义方法会让调用方有机会挑错。
+macro_rules! impl_collection_totals {
+    ($repo:ident, $table:literal, $item_table:literal) => {
+        impl $repo {
+            /// 合集计数：`(合集数, 成员行数)`。**给状态页用。**
+            pub async fn collection_counts(&self) -> Result<(i64, i64), DbError> {
+                let count = sqlx::query_scalar::<_, i64>(concat!("SELECT COUNT(*) FROM ", $table))
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+                let items =
+                    sqlx::query_scalar::<_, i64>(concat!("SELECT COUNT(*) FROM ", $item_table))
+                        .fetch_one(&self.pool)
+                        .await
+                        .map_err(|e| DbError::from(e).with_entity(COLLECTION_ENTITY))?;
+                Ok((count, items))
+            }
+        }
+    };
+}
+
+impl_collection_totals!(
+    MomentCollectionRepository,
+    "moment_collection",
+    "moment_collection_item"
+);
+impl_collection_totals!(
+    ClipCollectionRepository,
+    "clip_collection",
+    "clip_collection_item"
+);
+
 /// `Playlist` 专属的仓储方法。
 ///
 /// **不**放进 `impl_collection_repo!` —— 宏生成的三个父表里只有 `playlist`
@@ -927,6 +968,96 @@ impl PlaylistRepository {
                 .fetch_optional(&self.pool)
                 .await?,
         )
+    }
+
+    /// 列出播放列表，**系统列表固定在前**。**刻意不分页。**
+    ///
+    /// # 排序对齐上游 `_playlist_system_order`
+    ///
+    /// ```sql
+    /// ORDER BY CASE kind WHEN 'recently_played' THEN 0 ELSE 1 END ASC,
+    ///          updated_at DESC, id DESC
+    /// ```
+    ///
+    /// 上游是 `Case(Playlist.kind, _SYSTEM_KIND_ORDER, len(_SYSTEM_KIND_ORDER))`
+    /// —— 那个 `len(...)` 就是 `ELSE` 分支的值，即「不在系统 kind 集合里
+    /// 的一切」。写成常量 `1` 是因为 `SYSTEM_PLAYLIST_KINDS` 目前只有一项；
+    /// **加第二个系统 kind 时这里要改成 2**，否则两类系统列表之间没有稳定
+    /// 次序（并列后靠 `updated_at` 决定，而它们通常同时被写）。
+    ///
+    /// `updated_at DESC, id DESC` 两级排序是为了**稳定**：同一毫秒内被写过的
+    /// 两个列表（`add_movie` 会连带 touch 父列表）`updated_at` 会并列，
+    /// 只按它排会让列表页在两次刷新之间抖动。
+    ///
+    /// # `updated_at` 可空，而 DESC 在 PostgreSQL 里是 NULLS FIRST
+    ///
+    /// 所以从未被写过的列表（`updated_at IS NULL`）会排到最前面。这看着
+    /// 违反直觉，但**与上游一致** —— 上游 `Playlist.updated_at.desc()` 落到
+    /// PG 上是同一串 SQL。这里刻意不补 `NULLS LAST`：那会让新旧列表的
+    /// 相对顺序与上游不同，而列表顺序是客户端会缓存并做乐观更新的状态。
+    pub async fn list_ordered(&self, include_system: bool) -> Result<Vec<Playlist>, DbError> {
+        // `kind` 列是 NOT NULL（DDL 有默认值 custom，Rust 侧也是 `String`
+        // 而非 `Option<String>`），所以 `NOT IN` 不会因 NULL 产生三值逻辑。
+        let sql = if include_system {
+            "SELECT * FROM playlist \
+             ORDER BY CASE kind WHEN 'recently_played' THEN 0 ELSE 1 END ASC, \
+                      updated_at DESC, id DESC"
+        } else {
+            "SELECT * FROM playlist WHERE kind <> 'recently_played' \
+             ORDER BY CASE kind WHEN 'recently_played' THEN 0 ELSE 1 END ASC, \
+                      updated_at DESC, id DESC"
+        };
+        Ok(sqlx::query_as::<_, Playlist>(sql)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 合集计数：`(合集数, 成员行数)`。**给状态页用。**
+    ///
+    /// `include_system = false` 时只数自定义列表 —— 与 `list_ordered(false)`
+    /// 的口径一致，所以状态页显示的「N 个播放列表」与用户在
+    /// `GET /playlists?include_system=false` 里看到的条数相同。
+    ///
+    /// 成员数**必须跟着同一个过滤走**（子查询里也判 `kind`）：直接
+    /// `COUNT(*) FROM playlist_movie` 会把系统列表（最近播放）的成员算进去，
+    /// 于是「4 个列表 / 30 部电影」里那 30 部包含了系统列表的，而用户看到的
+    /// 只有 4 个自定义列表 —— 两个数字对不上，且没人知道该信哪个。
+    ///
+    /// 两个标量各一条查询（而不是 N+1 逐列表 `COUNT`）。
+    pub async fn collection_counts(&self, include_system: bool) -> Result<(i64, i64), DbError> {
+        let (count_sql, items_sql) = if include_system {
+            (
+                "SELECT COUNT(*) FROM playlist",
+                "SELECT COUNT(*) FROM playlist_movie",
+            )
+        } else {
+            (
+                "SELECT COUNT(*) FROM playlist WHERE kind <> $1",
+                "SELECT COUNT(*) FROM playlist_movie pm \
+                 JOIN playlist p ON p.id = pm.playlist_id WHERE p.kind <> $1",
+            )
+        };
+        let count = if include_system {
+            sqlx::query_scalar::<_, i64>(count_sql)
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, i64>(count_sql)
+                .bind(PLAYLIST_KIND_RECENTLY_PLAYED)
+                .fetch_one(&self.pool)
+                .await?
+        };
+        let items = if include_system {
+            sqlx::query_scalar::<_, i64>(items_sql)
+                .fetch_one(&self.pool)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, i64>(items_sql)
+                .bind(PLAYLIST_KIND_RECENTLY_PLAYED)
+                .fetch_one(&self.pool)
+                .await?
+        };
+        Ok((count, items))
     }
 }
 
@@ -1000,4 +1131,53 @@ impl PlaylistMovieRepository {
                      ORDER BY playlist_id LIMIT $2 OFFSET $3",
         }
     }
+
+    /// 批量统计各播放列表的成员数。
+    ///
+    /// 对应上游 `count_by_owner(PlaylistMovie, PlaylistMovie.playlist, ids)`。
+    /// **一次查询取回所有计数** —— 逐个列表 `COUNT(*)` 是 N+1，而列表页
+    /// 一次要渲染全部列表。
+    ///
+    /// # 空输入直接返回空 map，不发查询
+    ///
+    /// 上游 `count_by_owner` 开头就是 `if not owner_ids: return {}`，而
+    /// `WHERE playlist_id = ANY('{}')` 会返回零行而不是报错 —— 两者结果
+    /// 相同，但提前返回省掉一次往返，也让「无系统播放列表的新装实例」
+    /// 这个常见首屏不产生任何 DB 往返。
+    ///
+    /// # 用 `= ANY($1)` 而不是 `IN (...)`
+    ///
+    /// 变长列表拼进 SQL 字面量需要在 `format!` 里做占位符拼接，那正是
+    /// 本仓库明确排除的做法（注入面 + 破坏 `query_as` 的字面量约定）。
+    /// 数组绑定让 SQL 保持字面量。
+    pub async fn count_by_playlists(
+        &self,
+        playlist_ids: &[i32],
+    ) -> Result<HashMap<i32, i64>, DbError> {
+        if playlist_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, PlaylistMemberCount>(
+            "SELECT playlist_id, COUNT(*) AS member_count FROM playlist_movie \
+             WHERE playlist_id = ANY($1) GROUP BY playlist_id",
+        )
+        .bind(playlist_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.playlist_id, r.member_count))
+            .collect())
+    }
+}
+
+/// `count_by_playlists` 的一行。
+///
+/// 单独一个 `FromRow` 结构体而不是 `query!` 宏：宏需要编译期连接，
+/// CI 上没有（见 `movie.rs` 的模块文档）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PlaylistMemberCount {
+    playlist_id: i32,
+    member_count: i64,
 }

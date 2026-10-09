@@ -17,7 +17,9 @@
 //! 422 信封。
 
 use axum::extract::multipart::MultipartRejection;
-use axum::extract::{FromRequest, Json as AxumJson, Multipart as AxumMultipart, Request};
+use axum::extract::{
+    FromRequest, Json as AxumJson, Multipart as AxumMultipart, Query as AxumQuery, Request,
+};
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -36,6 +38,38 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
         match AxumJson::<T>::from_request(request, state).await {
             Ok(AxumJson(value)) => Ok(Self(value)),
+            Err(rejection) => Err(ErrorResponse::from(rejection)),
+        }
+    }
+}
+
+/// 查询参数提取器：解析失败时产出上游形状的 422。
+///
+/// # 为什么 `Query` 也要包 —— 它和 `Json` 是同一个漏洞
+///
+/// axum 的 `QueryRejection` 默认响应是 **400 + 纯文本**
+/// （`Failed to deserialize query string: ...`），既不经过错误信封，
+/// 状态码也与上游 FastAPI 的 422 不符。
+///
+/// 这个漏洞是**加查询参数时才暴露**的：本文件写下时项目里一个查询参数都
+/// 没有，所以只包了 `Json` 与 `Multipart`。第一个查询参数
+/// （`?include_system=`）立刻就撞上了 —— 由
+/// `crates/sm-api/tests/playlists_http.rs` 的
+/// `a_bad_query_value_returns_the_error_envelope` 钉住。
+///
+/// 用法与 `Json` 相同：写 `EnvelopeQuery(q): EnvelopeQuery<Q>`。
+pub struct Query<T>(pub T);
+
+impl<T, S> FromRequest<S> for Query<T>
+where
+    T: DeserializeOwned + Send + 'static,
+    S: Send + Sync,
+{
+    type Rejection = ErrorResponse;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match AxumQuery::<T>::from_request(request, state).await {
+            Ok(AxumQuery(value)) => Ok(Self(value)),
             Err(rejection) => Err(ErrorResponse::from(rejection)),
         }
     }

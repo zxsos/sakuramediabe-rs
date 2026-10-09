@@ -30,15 +30,19 @@
 | 域 | 模型数 | 已完成 | 状态 |
 |---|---|---|---|
 | `catalog` | 9 | 9 | **完成** |
-| `collections` | 6 | 0 | 待做 |
+| `collections` | 6 | 6 | **完成** |
 | `discovery` | 5 | 5 | **完成** |
 | `playback` | 6 | 6 | **完成** |
-| `videos` | 3 | 3 | **完成** |
-| `collections` | 6 | 6 | **完成** |
-| `system` | 5 | 5 | **完成** | 进行中（`User` / `UserRefreshToken` 已映射） |
+| `system` | 5 | 5 | **完成** |
 | `transfers` | 6 | 6 | **完成** |
-| `videos` | 3 | 0 | 待做 |
+| `videos` | 3 | 3 | **完成** |
 | **合计** | **40** | **40** | **100%** |
+
+> 这张表此前把 `collections` 与 `videos` 各列了**两行**（一行「0 / 待做」、
+> 一行「N / 完成」），`system` 那行的状态还串到了下一行，于是「合计 40/40」
+> 与逐行相加对不上。域清单以 `src/model/` 的实际目录为准：
+> `catalog` / `collections` / `discovery` / `playback` / `system` /
+> `transfers` / `videos`，共 7 个域 40 张表。
 
 ## 已映射
 

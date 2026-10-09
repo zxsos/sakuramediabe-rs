@@ -32,3 +32,6 @@ tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
 # 慢日志测试要把 warning 抓进内存断言字段，所以需要一个可写的 subscriber。
 tracing-subscriber = { workspace = true }
+# 造前置状态与回读期望值：把媒体判死、直接数一遍表以核对聚合口径。
+# 仓储层不提供「判死」这个业务动作（它由清理流程触发），所以只能写裸 SQL。
+sqlx = { workspace = true }

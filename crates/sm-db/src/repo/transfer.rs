@@ -40,6 +40,8 @@ use crate::error::DbError;
 use crate::paged_list;
 use crate::transfers::downloads::{DownloadClient, DownloadResourceBlacklist, Indexer};
 
+use sqlx::PgConnection;
+
 use super::ctx::Ctx;
 
 const CLIENT_ENTITY: &str = "DownloadClient";
@@ -300,6 +302,32 @@ pub struct IndexerRepository {
     pool: PgPool,
 }
 
+/// 在任意连接（池或事务）上插入一个索引器，返回新建的行。
+///
+/// # 为什么要抽出来
+///
+/// 三个调用点需要同一段 INSERT，连接来源却不同：`insert` 走池、`insert_in`
+/// 走调用方给的事务、`replace_all` 走自己开的事务（`Ctx::in_tx` 的入口
+/// `UnitOfWork::ctx()` 是私有的，所以那条路拿不到 `Ctx`）。
+///
+/// 抽出来后，「整表替换」与「单条插入」用的是**同一段 SQL 与同一套校验** ——
+/// 而整表替换**不能**有一套更宽松的规则（那会让它能写出 `insert` 拒绝的数据）。
+async fn insert_on(conn: &mut PgConnection, new: &NewIndexer) -> Result<Indexer, DbError> {
+    let (name, url, kind, api_key) = new.normalized()?;
+    let now = crate::common::time::now_utc();
+    sqlx::query_as::<_, Indexer>(
+        "INSERT INTO indexer (name, url, kind, api_key, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $5) RETURNING *",
+    )
+    .bind(name)
+    .bind(url)
+    .bind(kind)
+    .bind(api_key)
+    .bind(now)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))
+}
 impl IndexerRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -307,6 +335,102 @@ impl IndexerRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// 列出**全部**索引器，按 `id` 升序。**刻意不分页。**
+    ///
+    /// 配置页要的是整张表 —— 分页会让它只看到前 20 个，而
+    /// `PATCH /indexer-settings` 是**整表替换**语义：客户端基于这个列表
+    /// 提交全文，被截断的列表会导致保存一次就丢掉其余索引器。
+    ///
+    /// `ORDER BY id` 与上游 `Indexer.select().order_by(Indexer.id.asc())` 一致，
+    /// 所以「保存再读回」的顺序不变 —— 客户端的乐观更新（按位置比对）才成立。
+    pub async fn list_all(&self) -> Result<Vec<Indexer>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Indexer>("SELECT * FROM indexer ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 读出 `name → api_key` 的映射。**给「省略 api_key 时沿用旧值」用。**
+    ///
+    /// 一次查询而不是逐个 `find_by_name` —— 整表替换时每个索引器都要查一次，
+    /// 那是 N+1。
+    ///
+    /// 键是**原始 `name`**（未 casefold）：调用方按自己刚归一过的名字查，
+    /// 而写入时的 `name` 就是那个归一值。
+    pub async fn name_to_api_key(&self) -> Result<Vec<(String, Option<String>)>, DbError> {
+        Ok(sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT name, api_key FROM indexer ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// **原子地**把索引器整表替换为给定的一组（含绑定关系）。
+    ///
+    /// 语义就是上游 `_replace_indexers`：中间表与索引器全删，再逐条重建。
+    /// 这是配置页「保存」的动作 —— 页面上删掉一个索引器，保存后它就该消失。
+    ///
+    /// # 为什么整表替换而不是增量 diff
+    ///
+    /// 因为请求体是**整张表**（`indexers: [...]` 是完整列表）。做增量需要
+    /// 先在库里比对出「哪些是新增、哪些要改、哪些要删」，而那些判断依据
+    /// （name 是不是身份？id 变了算不算同一个？）上游并没有定义 ——
+    /// 它选的语义就是「你给什么就是什么」。跟着上游走，别自己发明 diff。
+    ///
+    /// # 一个事务，不是一串操作
+    ///
+    /// 全删再全插若不包在事务里，中途失败会留下**空表或半张表**，而用户
+    /// 只是点了一次保存。`indexer_download_client` 挂 CASCADE，所以删
+    /// indexer 会连带清空绑定 —— 上游因此显式先删中间表，这里照做：
+    /// 让「先删绑定」成为可读的一步，而不是依赖级联的副作用。
+    ///
+    /// 返回新建的索引器行（按 `items` 的顺序）。
+    pub async fn replace_all(
+        &self,
+        items: &[(NewIndexer, Vec<i32>)],
+    ) -> Result<Vec<Indexer>, DbError> {
+        // 自己开事务而不是走 `Ctx`：`Ctx::over_pool` 不开事务（语句自动提交），
+        // 而拿到事务内 `Ctx` 的入口 `UnitOfWork::ctx()` 是私有的。
+        // 整表替换必须是原子的，所以这里直接持有 `Transaction`。
+        let mut tx = self.pool.begin().await?;
+
+        // 先删中间表再删索引器：前者挂 CASCADE，后者会连带清空绑定。
+        // 显式先删是为了让这一步可读，而不是依赖级联的副作用。
+        sqlx::query("DELETE FROM indexer_download_client")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))?;
+        sqlx::query("DELETE FROM indexer")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))?;
+
+        let mut created = Vec::with_capacity(items.len());
+        for (new, client_ids) in items {
+            // 与 `insert` / `insert_in` 同一个归一与校验 —— 整表替换不该有
+            // 一套更宽松的规则。
+            let indexer = insert_on(&mut tx, new).await?;
+            for client_id in client_ids {
+                sqlx::query(
+                    "INSERT INTO indexer_download_client (indexer_id, download_client_id) \
+                     VALUES ($1, $2)",
+                )
+                .bind(indexer.id)
+                .bind(client_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))?;
+            }
+            created.push(indexer);
+        }
+
+        // 提交失败会在这里返回 Err，调用方拿不到半张表。事务在 `tx` 被 drop
+        // 时由 sqlx 自动回滚，所以中途任何 `?` 提前返回都是安全的。
+        tx.commit().await?;
+        Ok(created)
     }
 
     /// 按主键查询。
@@ -330,37 +454,13 @@ impl IndexerRepository {
     }
 
     pub async fn insert(&self, new: &NewIndexer) -> Result<Indexer, DbError> {
-        let (name, url, kind, api_key) = new.normalized()?;
-        let now = crate::common::time::now_utc();
-        sqlx::query_as::<_, Indexer>(
-            "INSERT INTO indexer (name, url, kind, api_key, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $5) RETURNING *",
-        )
-        .bind(name)
-        .bind(url)
-        .bind(kind)
-        .bind(api_key)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))
+        let mut conn = self.pool.acquire().await?;
+        insert_on(&mut conn, new).await
     }
 
     pub async fn insert_in(&self, ctx: &mut Ctx<'_>, new: &NewIndexer) -> Result<Indexer, DbError> {
-        let (name, url, kind, api_key) = new.normalized()?;
-        let now = crate::common::time::now_utc();
-        sqlx::query_as::<_, Indexer>(
-            "INSERT INTO indexer (name, url, kind, api_key, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $5) RETURNING *",
-        )
-        .bind(name)
-        .bind(url)
-        .bind(kind)
-        .bind(api_key)
-        .bind(now)
-        .fetch_one(ctx.conn().await?.as_conn())
-        .await
-        .map_err(|e| DbError::from(e).with_entity(INDEXER_ENTITY))
+        let mut conn = ctx.conn().await?;
+        insert_on(conn.as_conn(), new).await
     }
 
     /// 换接口地址。
@@ -436,6 +536,29 @@ impl IndexerDownloadClientRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// 一趟 JOIN 取回**全部**绑定关系：`(indexer_id, download_client_id, name)`。
+    ///
+    /// 按绑定行 `id` 升序 —— 与上游
+    /// `IndexerDownloadClient.select(...).order_by(IndexerDownloadClient.id.asc())`
+    /// 一致。顺序有实际意义：提交下载时「同 kind 内按绑定顺序挑选」，
+    /// 所以这个顺序是**行为**而不是排版。
+    ///
+    /// 返回三元组而不是 `DownloadClient`：配置页只需要 `id` 与 `name`，
+    /// 而 `provider_config`（可能含 cookie）不该为了取个名字被带出来。
+    ///
+    /// **刻意不分页**：调用方要按 `indexer_id` 分组后填进每一个索引器，
+    /// 分页会让某些索引器的绑定列表被截断。
+    pub async fn list_all_with_clients(&self) -> Result<Vec<(i32, i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, i32, String)>(
+            "SELECT b.indexer_id, b.download_client_id, c.name \
+             FROM indexer_download_client b \
+             JOIN download_client c ON c.id = b.download_client_id \
+             ORDER BY b.id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// 绑定索引器与下载器。**幂等。**

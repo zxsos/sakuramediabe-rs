@@ -33,10 +33,23 @@ const ROUTES: &[(&str, Method)] = &[
     // auth.rs
     ("/auth/tokens", Method::GET),
     ("/auth/token-refreshes", Method::GET),
+    // config.rs
+    ("/config", Method::POST),
+    ("/config", Method::DELETE),
+    // indexer_settings.rs
+    ("/indexer-settings", Method::POST),
     // playlists.rs
-    ("/playlists", Method::GET),
+    // GET /playlists 已注册（`list_playlists`），所以这里挑一个仍未注册的
+    // 方法。**改路由时记得同步这张表** —— 见文件头的说明。
+    ("/playlists", Method::PUT),
     ("/playlists/1", Method::POST),
     ("/playlists/1/movies/ABC-001", Method::POST),
+    ("/playlists/1/resolutions", Method::POST),
+    // status.rs
+    ("/status/capabilities", Method::POST),
+    ("/status", Method::POST),
+    ("/status/insights", Method::POST),
+    ("/status/watch-trend", Method::POST),
 ];
 
 /// 构造 router。405 与鉴权无关，所以不需要用户与令牌。
@@ -44,6 +57,7 @@ fn app(db: &TestDb) -> axum::Router {
     router(AppState::new(
         db.pool().clone(),
         AuthConfig::new("405-secret"),
+        sm_service::system::ConfigService::new(temp_config_path()),
     ))
 }
 
@@ -57,6 +71,18 @@ async fn body_of(response: axum::response::Response) -> (StatusCode, Value) {
         .to_bytes();
     let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, json)
+}
+
+/// 指向临时目录的配置路径。
+///
+/// 那些**不碰配置**的端点测试也需要一个 `ConfigService`，而它们绝不能写
+/// 到真实的 `config.toml` 上 —— 那是开发机/容器的配置。所以给一个每次调用
+/// 都不同的临时路径：即便某个用例意外触发了写盘，也只会留下空目录里的孤立
+/// 文件。
+fn temp_config_path() -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir().join(format!("sm-api-unused-{}-{n}.toml", std::process::id()))
 }
 
 #[tokio::test]
@@ -150,7 +176,13 @@ fn every_registered_route_appears_in_the_table() {
     // `include_str!` 只接受字面量，所以逐个列出而不是循环。
     for (name, text) in [
         ("auth", include_str!("../src/routes/auth.rs")),
+        ("config", include_str!("../src/routes/config.rs")),
+        (
+            "indexer_settings",
+            include_str!("../src/routes/indexer_settings.rs"),
+        ),
         ("playlists", include_str!("../src/routes/playlists.rs")),
+        ("status", include_str!("../src/routes/status.rs")),
     ] {
         assert!(
             text.contains(".fallback(method_not_allowed)"),

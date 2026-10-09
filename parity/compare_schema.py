@@ -99,7 +99,14 @@ STR_RE = re.compile(r'"([^"]+)"')
 # 名单之外的每个未检查 struct 都会让对拍失败。这是刻意的：新增一个
 # struct 却忘了给它 Python 对应物时，应该被问到，而不是安静地跳过。
 #
-# 下面 11 个都满足上述两条：它们是本仓库自己造的访问层与数据结构，
+# **条件 1 是硬门槛，投影行不在豁免范围内。** 一条聚合查询的返回行
+# （`SELECT id, MAX(level) ... GROUP BY id`）带 FromRow、被 query_as
+# 使用，却不是任何表的镜像 —— 它没有上游 Peewee 模型可以对照。给它豁免
+# 等于在这道门禁上开一个口子，而门禁的价值恰恰是抓住「新增结构体却忘了
+# 对拍」。那类结构体应当改用元组返回（见
+# `sm_db::repo::movie::MovieResolutionLevelRow`），具名类型放到 sm-service。
+#
+# 下面这些都满足上述两条：它们是本仓库自己造的访问层与数据结构，
 # 上游 Python 侧按定义就不存在对应模型。
 UNCHECKED_STRUCT_EXEMPT = frozenset(
     {
@@ -116,6 +123,14 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # 纯值对象：字段主权补丁与护栏，不落库
         "FieldPatch",
         "FieldGuard",
+        # 纯值对象：领取范围（并发道），只作为 bind 参数传给
+        # `claim_in`，没有 FromRow、不参与 query_as
+        "TaskLanes",
+        # 仓储与网关：持有 PgPool / 会话，不映射任何表
+        "StatsRepository",
+        # 纯值对象：会话级 advisory lock 守卫，持有 PoolConnection
+        # 而不映射任何表；无 FromRow、不参与 query_as
+        "AdvisoryLock",
         # 集成测试夹具
         "TestDb",
         # P0 批次的访问层与数据结构（user.rs / task.rs）

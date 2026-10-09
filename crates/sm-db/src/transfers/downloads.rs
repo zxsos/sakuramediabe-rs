@@ -127,18 +127,68 @@ pub mod download_state {
 }
 
 /// 导入状态（宿主自己的流程，与 provider 无关）。
+///
+/// # 五个字面量都是**库契约**，不是内部实现
+///
+/// 上游 `src/common/media_import_status.py:18-22` 显式列出五个值，而 DDL
+/// 里是**无 CHECK 约束**的 `varchar(32) NOT NULL DEFAULT 'pending'` ——
+/// 数据库不会拦住写错的字面量，所以它们的一致性全靠代码。
+///
+/// | 值 | 含义 |
+/// |---|---|
+/// | `pending` | 下载已完成，等待自动导入触发 |
+/// | `running` | 导入作业正在执行 |
+/// | `completed` | 符合条件的媒体文件已入库 |
+/// | `failed` | 存在未成功导入的文件 |
+/// | `skipped` | 没有符合条件的媒体文件 |
+///
+/// # `COMPLETED` 的字面量是 `completed` 而不是 `done`
+///
+/// 本仓库此前写的是 `DONE = "done"`。那不是命名风格问题，是**会让每一个
+/// 导入成功的下载被报成导入失败**：上游
+/// `StatusService._download_task_bucket`（`status_service.py:320`）按
+/// `import_status == "completed"` 判定 `imported` 桶，`"done"` 既不等于
+/// `completed` 也不等于 `skipped`、也不在 `UNFINISHED_IMPORT_STATUSES` 里，
+/// 于是落到 `else` 分支 —— `import_failed`。
+///
+/// 而 `/status/insights` 的六个桶是给用户看「有多少条导入失败了」的。
+/// 一个字面量的错字会让那个数字等于「导入成功数」，且**没有任何报错**。
+///
+/// 这与 `background_task_run.state` 的 `succeeded` → `completed` 是同一类
+/// 缺陷（同一个仓库犯过两次），所以这里把五个字面量连同来源一起写全。
 pub mod import_status {
     /// 初始态：尚未开始。
     pub const PENDING: &str = "pending";
     /// 导入中（stage / finalize）。
     pub const RUNNING: &str = "running";
     /// 导入成功，`completed_source_ref` 已写入。
-    pub const DONE: &str = "done";
+    pub const COMPLETED: &str = "completed";
     /// 终态：导入失败。
     pub const FAILED: &str = "failed";
+    /// 终态：没有符合条件的媒体文件，**不是失败**。
+    ///
+    /// 「这一趟下载里没有可导入的文件」是正常结果，不是错误 —— 用户看到它
+    /// 归在「导入失败」里会以为出了问题。客户端的六分类里它单独是
+    /// `skipped` 一档。
+    pub const SKIPPED: &str = "skipped";
 
+    /// 全部合法取值。`set_import_status` 按它校验。
+    pub const ALL: [&str; 5] = [PENDING, RUNNING, COMPLETED, FAILED, SKIPPED];
+
+    /// 导入「还在途」的两个取值。
+    ///
+    /// 上游 `UNFINISHED_IMPORT_STATUSES`（`media_import_status.py:33`）：
+    /// `pending`（等自动导入排队）与 `running`（作业正在跑）。其余三个都表示
+    /// 这一趟已经跑完、不会再自动推进。
+    pub const UNFINISHED: [&str; 2] = [PENDING, RUNNING];
+
+    pub fn is_valid(status: &str) -> bool {
+        ALL.contains(&status)
+    }
+
+    /// 是否已到终态。**包括 `skipped`** —— 它不会再自动推进。
     pub fn is_terminal(status: &str) -> bool {
-        status == DONE || status == FAILED
+        !UNFINISHED.contains(&status) && is_valid(status)
     }
 }
 
@@ -330,6 +380,60 @@ mod tests {
         assert!(!indexer_kind::is_valid("torznab"));
     }
 
+    /// 五个字面量逐条钉住 —— `import_status` 是无 CHECK 约束的
+    /// `varchar(32)`，字面量的一致性全靠代码。
+    ///
+    /// 这条测试存在的原因：本仓库犯过两次同类错误（`task_state` 的
+    /// `succeeded`→`completed`，`import_status` 的 `done`→`completed`），
+    /// 两次都是「改了常量名、没改字面量」或反过来。
+    #[test]
+    fn import_status_literals_match_upstream_verbatim() {
+        // 上游 src/common/media_import_status.py:18-22
+        assert_eq!(import_status::PENDING, "pending");
+        assert_eq!(import_status::RUNNING, "running");
+        assert_eq!(import_status::COMPLETED, "completed");
+        assert_eq!(import_status::FAILED, "failed");
+        assert_eq!(import_status::SKIPPED, "skipped");
+
+        // 本仓库曾写成 "done"，而上游按 "completed" 判桶
+        assert_ne!(
+            import_status::COMPLETED,
+            "done",
+            "字面量必须是 completed：上游 _download_task_bucket 按它判 imported 桶"
+        );
+        // 五个都在白名单里
+        for status in import_status::ALL {
+            assert!(import_status::is_valid(status));
+        }
+        // 且不多不少
+        assert_eq!(import_status::ALL.len(), 5);
+    }
+
+    /// `UNFINISHED` 恰好是「还在途」的两个 —— 上游用它决定要不要自动推进。
+    #[test]
+    fn unfinished_is_exactly_the_two_in_flight_values() {
+        assert_eq!(import_status::UNFINISHED, ["pending", "running"]);
+        for status in import_status::UNFINISHED {
+            assert!(!import_status::is_terminal(status), "{status} 在途");
+        }
+        for status in [
+            import_status::COMPLETED,
+            import_status::FAILED,
+            import_status::SKIPPED,
+        ] {
+            assert!(import_status::is_terminal(status), "{status} 是终态");
+        }
+    }
+
+    /// 未知字面量既不合法、也不算终态 —— 不能让它「看起来已完成」。
+    #[test]
+    fn an_unknown_status_is_neither_valid_nor_terminal() {
+        for bogus in ["done", "succeeded", "imported", "", "COMPLETED"] {
+            assert!(!import_status::is_valid(bogus), "{bogus:?} 不该合法");
+            assert!(!import_status::is_terminal(bogus), "{bogus:?} 不该算终态");
+        }
+    }
+
     #[test]
     fn two_state_machines_have_disjoint_terminal_sets() {
         // 这是不能把 state 与 import_status 合并成一个 status 列的原因。
@@ -337,8 +441,12 @@ mod tests {
         assert!(download_state::is_terminal(download_state::FAILED));
         assert!(!download_state::is_terminal(download_state::DOWNLOADING));
 
-        assert!(import_status::is_terminal(import_status::DONE));
+        assert!(import_status::is_terminal(import_status::COMPLETED));
         assert!(import_status::is_terminal(import_status::FAILED));
+        assert!(
+            import_status::is_terminal(import_status::SKIPPED),
+            "skipped 是终态 —— 这一趟不会再自动推进"
+        );
         assert!(!import_status::is_terminal(import_status::RUNNING));
     }
 
@@ -353,7 +461,9 @@ mod tests {
             "下载成功但导入失败是最常见的卡住形态，需要单独告警口径"
         );
 
-        assert!(!task(download_state::COMPLETED, import_status::DONE).is_stuck_after_download());
+        assert!(
+            !task(download_state::COMPLETED, import_status::COMPLETED).is_stuck_after_download()
+        );
         assert!(!task(download_state::DOWNLOADING, import_status::PENDING).fully_settled());
     }
 

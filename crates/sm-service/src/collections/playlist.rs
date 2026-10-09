@@ -17,6 +17,19 @@
 //! 系统列表不可改 | `_require_custom_playlist` | 409 `playlist_managed_by_system` |
 //! 空更新被拒 | `update_playlist` | 422 `validation_error` |
 //!
+//! # 查询编排：已落地一部分
+//!
+//! 上述五条规则之外，两个**不依赖影片卡片聚合**的查询也已落地：
+//!
+//! - [`PlaylistService::list`] —— 系统列表排序 + 批量成员计数。
+//! - [`PlaylistService::resolution_options`] —— 分辨率档位聚合。
+//!
+//! 剩下 `list_playlist_movies`（列表内影片分页）仍未落地：它要
+//! `with_movie_card_relations` 的封面/薄封面别名、`attach_movie_list_media`
+//! 的媒体挂载，以及 `PlaylistMovieListItemResource`（继承自
+//! `MovieListItemResource`）—— 后者属于影片卡片那一整套，与 `catalog` 域的
+//! 影片列表端点重合，等那一侧开工时一起做，避免两边各写一套聚合。
+//!
 //! # 两处容易搞反的地方
 //!
 //! **`update_playlist` 在名字未变时跳过唯一性检查。** 上游写的是
@@ -42,6 +55,7 @@ use sm_db::error::DbError;
 use sm_db::repo::{MovieRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository};
 use sm_db::Db;
 
+use crate::catalog::resolution::{self, RESOLUTION_LEVELS};
 use crate::error::{details_of, ServiceError};
 
 /// 更新播放列表的请求。**两个字段都可缺省** —— 缺省表示不改动。
@@ -56,6 +70,24 @@ impl PlaylistUpdate {
     pub fn is_empty(&self) -> bool {
         self.name.is_none() && self.description.is_none()
     }
+}
+
+/// 一个播放列表**连同它的成员数**。
+///
+/// 计数与本体合成一个结构体，而不是让调用方拿 `Vec<Playlist>` 再自己配
+/// `HashMap`：那会让「某个列表忘了查计数」变成一个静默的 0，而客户端读
+/// `movie_count` 决定要不要显示条目数 —— 0 与「真的没有影片」不可区分。
+#[derive(Debug, Clone)]
+pub struct PlaylistWithCount {
+    pub playlist: Playlist,
+    pub movie_count: i32,
+}
+
+/// 播放列表内覆盖到的分辨率档位，供前端渲染筛选下拉。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionOption {
+    pub resolution: String,
+    pub count: i32,
 }
 
 /// 播放列表 service。
@@ -160,6 +192,106 @@ impl PlaylistService {
             ));
         }
         Ok(playlist)
+    }
+
+    // ---------------------------------------------------------------- 列表
+
+    /// 列出播放列表，系统列表在前，每个列表带上成员数。
+    ///
+    /// 对应上游 `list_playlists(include_system=True)`。
+    ///
+    /// **两次查询而不是 N+1**：一次取列表、一次批量计数
+    /// （[`PlaylistMovieRepository::count_by_playlists`]）。
+    ///
+    /// # `include_system = false` 用 `kind <>` 而不是 `NOT IN (...)`
+    ///
+    /// 上游是 `Playlist.kind.not_in(cls.SYSTEM_KINDS)`。两者在 `kind` 非空时
+    /// 等价，而该列是 NOT NULL（DDL 默认 `custom`，Rust 侧是 `String`），
+    /// 所以改成 `<>` 只是为了少一次数组绑定。**若哪天 `kind` 变成可空，
+    /// 必须换回 `NOT IN`** —— `NULL NOT IN (...)` 是 NULL 而非 TRUE，
+    /// 那种行会被静默漏掉，而 `kind <> '...'` 同样把它漏掉（都不报错）。
+    pub async fn list(&self, include_system: bool) -> Result<Vec<PlaylistWithCount>, ServiceError> {
+        let playlists = self.playlists.list_ordered(include_system).await?;
+        let ids: Vec<i32> = playlists.iter().map(|p| p.id).collect();
+        let counts = self.members.count_by_playlists(&ids).await?;
+
+        Ok(playlists
+            .into_iter()
+            .map(|playlist| {
+                // 缺项按 0：列表存在但没有成员行，与「列表不存在」是不同的事。
+                // 截断不可能发生 —— 成员数上界是 `playlist_movie` 的行数，
+                // 而它的主键是 i32。
+                let movie_count = counts.get(&playlist.id).copied().unwrap_or(0) as i32;
+                PlaylistWithCount {
+                    playlist,
+                    movie_count,
+                }
+            })
+            .collect())
+    }
+
+    /// 某个播放列表的成员数。
+    ///
+    /// 对应上游 `get_playlist` / `update_playlist` 里的
+    /// `_playlist_counts([playlist.id]).get(playlist.id, 0)` —— 两次查询
+    /// （取列表 + 数成员），与上游一致。
+    ///
+    /// 供「已经拿到 `Playlist`、只缺计数」的调用方使用。整页列表走
+    /// [`PlaylistService::list`]，那里是一次批量查询而不是逐个。
+    pub async fn member_count(&self, playlist_id: i32) -> Result<i32, ServiceError> {
+        let counts = self.members.count_by_playlists(&[playlist_id]).await?;
+        Ok(counts.get(&playlist_id).copied().unwrap_or(0) as i32)
+    }
+
+    /// 播放列表内影片覆盖到的分辨率档位。
+    ///
+    /// 对应上游 `list_playlist_resolutions`。
+    ///
+    /// # 顺序 = 档位从高到低，且**过滤掉计数为 0 的档位**
+    ///
+    /// 上游最后一步是 `if count > 0`。前端直接把返回数组当筛选项渲染，
+    /// 留下 `count: 0` 的档位会让用户点进去得到空列表。
+    ///
+    /// # 分桶在 Rust 侧做，不在 SQL 里
+    ///
+    /// 上游注释写明了理由：`MAX(level)` 之后要按「序号落在哪个档位」归类，
+    /// 而这个映射不是线性的（`level=5 → 2K`）。写进 SQL 就得让档位标签
+    /// 进 `GROUP BY`，于是「按影片聚合」变成「按影片+标签聚合」，一部影片
+    /// 会被计入多个桶 —— 计数直接错。
+    pub async fn resolution_options(
+        &self,
+        playlist_id: i32,
+    ) -> Result<Vec<ResolutionOption>, ServiceError> {
+        // 列表不存在时 404，且**先于**聚合查询 —— 与上游
+        // `cls._require_playlist(playlist_id)` 的位置一致。
+        self.require_playlist(playlist_id).await?;
+
+        let levels = self
+            .movies
+            .max_resolution_levels_by_playlist(playlist_id)
+            .await?;
+
+        let mut counts: std::collections::HashMap<&'static str, i32> =
+            std::collections::HashMap::new();
+        for row in levels {
+            let level: resolution::MovieResolutionLevel = row.into();
+            // `bucket_for_level` 对 level <= 0 返回 None —— 不可解析的媒体
+            // 不计入任何档位，而不是被塞进最低档。
+            if let Some(label) = resolution::bucket_for_level(level.max_level) {
+                *counts.entry(label).or_insert(0) += 1;
+            }
+        }
+
+        Ok(RESOLUTION_LEVELS
+            .iter()
+            .filter_map(|(label, _)| {
+                let count = counts.get(label).copied().unwrap_or(0);
+                (count > 0).then(|| ResolutionOption {
+                    resolution: (*label).to_owned(),
+                    count,
+                })
+            })
+            .collect())
     }
 
     // ---------------------------------------------------------------- 写入

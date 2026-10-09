@@ -6,12 +6,15 @@ description = "业务逻辑层，对应 Python 的 114 个 service 文件"
 
 [dependencies]
 sm-core = { workspace = true }
+# 运行期读写配置文件（ConfigService 的原子写盘与重读磁盘快照）
+toml = { workspace = true }
 sm-db = { workspace = true }
 sm-plugins = { workspace = true }
 media-file-hash = { workspace = true }
 svc-hash = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -21,4 +24,7 @@ sqlx = { workspace = true }
 [dev-dependencies]
 sm-db = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+bcrypt = { workspace = true }
+sqlx = { workspace = true }

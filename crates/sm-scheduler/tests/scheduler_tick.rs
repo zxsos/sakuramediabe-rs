@@ -132,10 +132,21 @@ async fn a_due_job_is_enqueued_exactly_once_and_not_again() {
 #[tokio::test]
 async fn the_enqueued_row_carries_the_upstream_shape() {
     // 入队的那一行必须与上游逐字段一致：trigger_type=scheduled、
-    // mutex_key=aps:<task_key>、scheduled_at 为空（立即可领）。
+    // mutex_key=aps:<task_key>、scheduled_at = 入队时刻。
+    //
+    // `scheduled_at` 这一项此前断言的是 `None`，而那**恰好是上游的反面**：
+    // `src/service/system/activity/task_runs.py:161` 的
+    // `BackgroundTaskRun.create(..., scheduled_at=now())` 写的是当前时刻，
+    // 而 `task_queue_service` 的模块 docstring 也说「所有 task_run 都是队列
+    // 托管行；scheduled_at 记录进入队列的时间」。
+    //
+    // 它不是可有可无的字段：`recover_interrupted_runs` 判定「上一个进程遗留
+    // 的任务」靠的正是 `scheduled_at IS NOT NULL`。写 NULL 会让 cron 入队的
+    // 行**永远**不被中断回收 —— 崩溃后只能等租约到期（最多 300 秒）才动。
     let db = TestDb::require().await;
     let scheduler = scheduler_with(&db, vec![minutely(MINUTELY)]);
-    scheduler.tick_once(due_now(&scheduler, MINUTELY)).await;
+    let now = due_now(&scheduler, MINUTELY);
+    scheduler.tick_once(now).await;
 
     let row = sqlx::query_as::<
         _,
@@ -159,7 +170,11 @@ async fn the_enqueued_row_carries_the_upstream_shape() {
     assert_eq!(row.1, "每分钟任务");
     assert_eq!(row.2, "scheduled", "上游 cron 触发的 trigger_type");
     assert_eq!(row.3.as_deref(), Some("aps:tick_minutely"));
-    assert_eq!(row.4, None, "scheduled_at 为空 = 立即可领");
+    let scheduled_at = row.4.expect("scheduled_at 记录入队时间，不该是 NULL");
+    assert!(
+        scheduled_at <= sm_db::common::time::now_utc(),
+        "scheduled_at 是入队时刻，不该在未来：{scheduled_at:?}"
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ members = [
     "crates/svc-hash",
     "crates/svc-image",
     "crates/parity-cli",
+    "crates/plugin-ref-local",
     "crates/sm-core",
     "crates/sm-db",
     "crates/sm-plugin-api",
@@ -29,6 +30,7 @@ unsafe_code = "forbid"
 hashing = { path = "crates/hashing" }
 media-file-hash = { path = "crates/media-file-hash" }
 svc-hash = { path = "crates/svc-hash" }
+plugin-ref-local = { path = "crates/plugin-ref-local" }
 sm-core = { path = "crates/sm-core" }
 sm-db = { path = "crates/sm-db" }
 sm-plugin-api = { path = "crates/sm-plugin-api" }
@@ -83,6 +85,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # **不引入 jsonwebtoken**：上游 payload 只有 sub/type/exp 三个 claim，
 # 引入一个完整 JOSE 实现换不来对等的收益，反而多一份要审计的密码学代码。
 argon2 = "0.6"
+# 只用于**验证**存量 bcrypt 哈希（迁移路径），写侧仍是 Argon2id。
+# 纯 Rust：blowfish 由 cipher 实现，交叉编译与离线 NAS 构建不受影响。
+bcrypt = "0.19"
 # `getrandom` 而非 `rand_core`：password-hash 0.6 的 `rand_core` 指向 rand_core 0.10，
 # 该版本不再提供 `OsRng`（已迁到 `rand` crate），手动造盐的那条路走不通。
 # 开 `getrandom` 后 `PasswordHasher::hash_password` 自带随机盐，语义等价且更短。
@@ -103,7 +108,20 @@ cron = "0.17"
 tracing-appender = "0.2"
 
 # 配置（替代 pydantic-settings + toml）
-config = { version = "0.15", default-features = false, features = ["toml"] }
+#
+# 刻意**不**用 `config` crate：它给的是「扁平键 + 环境变量覆盖」，而本仓库要的
+# 恰恰是「按 sm_core::config_schema 的 `节.字段` 结构读」，默认值的唯一来源是
+# 那张模式表。环境变量那层由 sm-server::config 自己处理（键名是既有部署契约，
+# 不能动）。曾用过它，代价是 `database.url` 的默认值出现了第二份字面量，且已经
+# 与上游漂移（`/sakuramedia` vs `/sakuramediabe`）。
+# toml：与上面那个**不是**重复依赖，分工不同。
+#   - `config` 在**进程启动**时读配置，要支持环境变量覆盖（上游
+#     pydantic-settings 的 env 优先级），只有它做得到；
+#   - `toml` 在**运行期**读写配置文件（`ConfigService::update` 的原子写盘
+#     与「每次 PATCH 重读磁盘快照」），这里要的是精确控制序列化形状 ——
+#     `config` 是只读库，且 `to_string_pretty` 的输出会被运维直接阅读。
+# 要合并成一个的话，得给 `config` 加写回能力，那是它刻意不提供的方向。
+toml = "0.9"
 
 # 编码与解析（替代 Python 内建）
 base64 = "0.23"

@@ -164,6 +164,19 @@ impl VideoCollectionRepository {
         }
     }
 
+    /// 合集计数：`(合集数, 成员行数)`。**给状态页用。**
+    ///
+    /// 两条标量查询而不是走 `Page` —— 状态页只要总数，不要内容。
+    pub async fn collection_counts(&self) -> Result<(i64, i64), DbError> {
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM video_collection")
+            .fetch_one(&self.pool)
+            .await?;
+        let items = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM video_collection_item")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((count, items))
+    }
+
     paged_list! {
         /// 按名字搜索（子串）。**分页。**
         ///

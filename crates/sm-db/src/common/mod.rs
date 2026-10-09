@@ -11,13 +11,16 @@
 //! | [`json_text`] | `JsonTextField`：TEXT 列装 JSON 文本，空串 == NULL |
 //! | [`update`] | 把 `SET updated_at = now()` 固化进 API 形状 |
 //! | [`guard`] | 字段护栏：受保护字段与插件白名单 |
+//! | [`advisory_lock`] | 会话级 advisory lock：媒体 I/O 的短时独占 |
 
+pub mod advisory_lock;
 pub mod guard;
 pub mod json_text;
 pub mod page;
 pub mod time;
 pub mod update;
 
+pub use advisory_lock::{AdvisoryLock, LockUnavailable};
 pub use guard::{FieldGuard, WriteSource};
 pub use json_text::{decode as decode_json_text, encode as encode_json_text};
 pub use page::{Page, PageRequest};

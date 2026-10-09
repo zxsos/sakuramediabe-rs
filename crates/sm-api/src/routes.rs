@@ -5,7 +5,10 @@ use axum::http::StatusCode;
 use crate::error::ErrorResponse;
 
 pub mod auth;
+pub mod config;
+pub mod indexer_settings;
 pub mod playlists;
+pub mod status;
 
 /// 路径命中但方法不匹配 → 405 `http_error`。
 ///

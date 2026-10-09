@@ -33,6 +33,82 @@ fn guard() -> FieldGuard {
     )
 }
 
+/// 媒体分辨率 → 档位序号的 `CASE` 表达式。
+///
+/// 对应上游 `src/service/catalog/movie_resolution_service.py` 的
+/// `resolution_level_expression()`。**列名硬编码为 `md.resolution`** ——
+/// 每条用到它的查询都必须把 `media` 别名成 `md`。这是刻意的：表达式要能被
+/// 拼进别的 SQL 字面量，所以它不能是带占位符的格式串。
+///
+/// # 为什么压成整数而不是直接比字符串
+///
+/// 档位筛选的语义是「影片的**最高**媒体落在 `[threshold, upper)` 区间」。
+/// 要对一组媒体取最高再比阈值，必须有一个全序的比较键 —— 字符串
+/// `"1080P"` / `"4K"` 做不到（字典序下 `"720P" > "1080P"`）。序号是
+/// 唯一能让 `MAX()` 之后直接比较的形态。
+///
+/// # 分支顺序是契约本身，不能重排
+///
+/// `CASE` 从上往下第一个命中就返回，所以：
+///
+/// 1. `width <= 0 OR height <= 0 → 0` 必须在**所有**比较之前。否则
+///    `0x0`（合法匹配那个正则！）会掉到 `ELSE 0`，而 `0x9999` 会命中
+///    档位 5 —— 一个宽 0 的影片被判成 2K。
+/// 2. 宽度分支（7680 / 3840）必须在高度分支之前。`7680x4320` 的高度
+///    4320 ≥ 1440，若先判高度会落进档位 5（2K）而不是 7（8K）。
+///
+/// # `split_part` 按**第一个** `x` 切
+///
+/// `1920x1080` → `("1920", "1080")`。第二个参数写 2 时 PG 返回剩余部分，
+/// 所以值里若还有 `x`（`1920x1080x60`）会被整体 cast 失败 —— 正则
+/// `^\d+x\d+$` 已经把它排除了。
+///
+/// # 阈值与上游逐条一致
+///
+/// `8K=7680宽` / `4K=3840宽` / `2K=1440高` / `1080P=1080高` /
+/// `720P=720高` / `480P=480高` / `360P=360高`。改任何一个数字都会让
+/// 已入库媒体的档位归属变化，进而改变筛选结果。
+const RESOLUTION_LEVEL_CASE: &str = "CASE \
+     WHEN split_part(md.resolution, 'x', 1)::int <= 0 \
+       OR split_part(md.resolution, 'x', 2)::int <= 0 THEN 0 \
+     WHEN split_part(md.resolution, 'x', 1)::int >= 7680 THEN 7 \
+     WHEN split_part(md.resolution, 'x', 1)::int >= 3840 THEN 6 \
+     WHEN split_part(md.resolution, 'x', 2)::int >= 1440 THEN 5 \
+     WHEN split_part(md.resolution, 'x', 2)::int >= 1080 THEN 4 \
+     WHEN split_part(md.resolution, 'x', 2)::int >= 720 THEN 3 \
+     WHEN split_part(md.resolution, 'x', 2)::int >= 480 THEN 2 \
+     WHEN split_part(md.resolution, 'x', 2)::int >= 360 THEN 1 \
+     ELSE 0 END";
+
+/// 一部影片的聚合结果：**`(movie_id, max_level)`**。
+///
+/// # 为什么是元组而不是 `pub struct`
+///
+/// 这个行**不是任何表的镜像** —— 它是一次 `GROUP BY m.id` 聚合的投影。
+/// 而 `pub struct` + `#[derive(FromRow)]` 在 `sm-db` 里的含义是
+/// 「我映射一张表」，`parity/compare_schema.py` 也正是这么理解的：它把
+/// 每一个这样的结构体都当成待验证的表模型，于是要求存在对应的 Peewee
+/// 模型，找不到就报 `UNCHECKED_STRUCT` 并让门禁变红。
+///
+/// 投影行没有上游模型（上游用 Peewee 表达式树，那个「行」只是元组），
+/// 所以两条路：
+///
+/// 1. 给对拍脚本加豁免 + 放宽它的判定条件 —— 那是**削弱门禁**，
+///    而这道门禁存在的意义就是抓住「新增结构体却忘了对拍」。
+/// 2. 让 `sm-db` 返回元组，把具名类型放到 `sm-service`（它不在对拍
+///    扫描范围内，且那里才是消费方）。
+///
+/// 选 2。代价是这一层的可读性靠文档，收益是门禁一点没松。
+/// `sm-service::catalog::resolution::MovieResolutionLevel` 是对应的具名类型。
+///
+/// # `max_level` 恒非空
+///
+/// `CASE` 的 `ELSE 0` 覆盖全部剩余情况，而内连接 + `WHERE` 保证每个分组
+/// 至少一行，所以 `MAX(...)` 恒非空。解码成 `i32` 而不是 `Option<i32>`：
+/// 若哪天这个前提破了，解码会**报 ColumnDecode**（可定位），而不是静默
+/// 变成「无法解析」而少算一档。
+pub type MovieResolutionLevelRow = (i32, i32);
+
 /// 插入一条影片。
 ///
 /// 只暴露**有业务含义**的列；`heat` / `watched_count` / `comment_count`
@@ -113,6 +189,72 @@ impl MovieRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    /// 播放列表内每部影片的**最高分辨率档位序号**。
+    ///
+    /// 对应上游 `PlaylistService.list_playlist_resolutions` 里那段
+    /// `MAX(resolution_level_expression()) ... GROUP BY Movie.id`。
+    /// 返回 `Vec<(movie_id, max_level)>` —— **每部影片一行**。
+    ///
+    /// # 档位序号：把 `WxH` 压成一个可比较的整数
+    ///
+    /// 核心是 **4K/8K 看宽度、其余看高度**（见文件里的
+    /// `RESOLUTION_LEVEL_CASE`），分支顺序与上游 `Case` 逐条一致。
+    ///
+    /// # 只统计 `valid` 且形如 `WxH` 的媒体
+    ///
+    /// - `md.valid = TRUE`：判死的媒体不参与，与上游一致。
+    /// - `md.resolution ~ '^\d+x\d+$'`：**只有 probe 写入的值**是这个形态。
+    ///   脏值（空串、`1920*1080`、`HD`）一律排除，而不是让
+    ///   `split_part(...)::int` 抛「invalid input syntax for type integer」。
+    ///
+    ///   这条正则是必需的，不是保险：没有它，一个脏值就会让整个查询
+    ///   **报错**（而不是少算一部影片）—— 那是 500 级的故障。
+    ///
+    /// # 没有媒体的影片**不出现在结果里**
+    ///
+    /// `JOIN media` 是内连接，所以一部影片若没有任何合法媒体，整个分组
+    /// 不存在。上游同样如此（`base.join(Media, ...)` + `where`），所以
+    /// 「列表里有 3 部影片但只有 2 部计入档位」是**契约的一部分**，
+    /// 不是缺陷。
+    ///
+    /// # 三个外键列名都**不是**上游 Peewee 的属性名
+    ///
+    /// 照抄上游表达式树会连撞三次，且每次都只在**运行时**才炸 ——
+    /// `cargo check` / `clippy` / `cargo test --lib` 全绿，因为这条 SQL
+    /// 从没被执行过：
+    ///
+    /// | 上游 Peewee | 真实 DDL 列 |
+    /// |---|---|
+    /// | `PlaylistMovie.playlist` | `playlist_movie.playlist_id` |
+    /// | `PlaylistMovie.movie` | `playlist_movie.movie_id` |
+    /// | `Media.movie` | `media.movie_number` |
+    ///
+    /// 外键列一律带 `_id` 后缀（`media` 那个例外：它指向
+    /// `movie.movie_number` 这个**字符串**业务主键，所以列名也就叫
+    /// `movie_number`）。
+    ///
+    /// 写错的后果都是 `column ... does not exist` 的 500，而不是静默少算 ——
+    /// 这点是好事。集成测试见
+    /// `crates/sm-service/tests/playlist_listing.rs`。
+    pub async fn max_resolution_levels_by_playlist(
+        &self,
+        playlist_id: i32,
+    ) -> Result<Vec<MovieResolutionLevelRow>, DbError> {
+        let sql = format!(
+            "SELECT m.id AS movie_id, MAX({RESOLUTION_LEVEL_CASE}) AS max_level \
+             FROM movie m \
+             JOIN playlist_movie pm ON pm.movie_id = m.id \
+             JOIN media md ON md.movie_number = m.movie_number \
+             WHERE pm.playlist_id = $1 AND md.valid = TRUE \
+               AND md.resolution ~ '^\\d+x\\d+$' \
+             GROUP BY m.id"
+        );
+        Ok(sqlx::query_as::<_, MovieResolutionLevelRow>(safe_sql(sql))
+            .bind(playlist_id)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// 插入。

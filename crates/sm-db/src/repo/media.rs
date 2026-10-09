@@ -93,6 +93,28 @@ pub struct MediaRepository {
     pool: PgPool,
 }
 
+/// 一行媒体摘要的列。十一个，顺序见 [`MediaRepository::summaries_for_movies`]。
+///
+/// # 为什么是元组而不是具名 `pub struct`
+///
+/// schema 对拍把 `sm-db` 里每个 `pub struct` 都当成**表镜像**要求验证，
+/// 而这是聚合投影，没有对应的 Peewee 模型。声明成 `pub struct` 就要么被门禁
+/// 拦下，要么给门禁开口子 —— 两者都比元组更糟。具名类型在
+/// `sm_service::playback::media_summary::MediaSummary`。
+pub type MediaSummaryRow = (
+    String,         // movie_number
+    i32,            // media_id
+    Option<i32>,    // library_id
+    Option<String>, // library_name
+    Option<String>, // provider_key
+    String,         // file_name
+    Option<String>, // resolution
+    i64,            // file_size_bytes
+    i32,            // duration_seconds
+    Option<String>, // video_info（JsonText：可能是脏文本，不解析）
+    bool,           // valid
+);
+
 impl MediaRepository {
     /// 构造仓储。
     pub fn new(pool: PgPool) -> Self {
@@ -310,6 +332,69 @@ impl MediaRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// 批量取回若干影片的媒体摘要。
+    ///
+    /// # 列是**显式列出**的，不是 `SELECT *`
+    ///
+    /// 上游的 `Media.select(...)` 逐个列了字段，这里跟着。理由：摘要用于列表
+    /// 渲染，而 `storage_ref`（可能含凭据）不该因为「顺手」被带出来。
+    ///
+    /// # `LEFT JOIN` 而不是 `JOIN` —— **跟着上游，不是为了孤儿媒体**
+    ///
+    /// 上游写的是 `JOIN.LEFT_OUTER`，这里照抄。要注意**理由不是**
+    /// 「孤儿媒体可能存在」：`media_library_id_fk` 是 `ON DELETE CASCADE`
+    /// （`docker/schema.sql:512`），所以删库会把它的媒体一起删掉 ——
+    /// **孤儿媒体在当前 DDL 下不可能出现**。集成测试
+    /// `deleting_a_library_cascades_to_its_media` 钉住了这个事实。
+    ///
+    /// 保留左连接有两个实际理由：
+    ///
+    /// 1. 与上游逐条一致（这是本仓库的第一原则）。
+    /// 2. DTO 里 `library_id` / `library_name` / `provider_key` 都声明为
+    ///    **可空**，左连接是这个声明成立的前提。改成内连接后，那三个
+    ///    `Option` 就永远不会是 `None`，而类型仍在说「可能没有」——
+    ///    于是某天有人给 `media_library_id_fk` 放宽成 `SET NULL`，
+    ///    解码会突然开始报错。
+    ///
+    /// # `ORDER BY movie_number, media.id`
+    ///
+    /// 与上游一致。`media.id` 是次级排序键 —— 同一影片的媒体按入库顺序稳定
+    /// 返回，否则两次查询可能给出不同顺序，客户端的乐观更新会闪。
+    ///
+    /// # 为什么容忍 `type_complexity`
+    ///
+    /// 三个替代方案都更差：
+    ///
+    /// 1. `pub struct` + `#[derive(FromRow)]` → 被 schema 对拍当成表镜像拦下，
+    ///    或被迫给门禁加豁免（削弱那道门禁正是它存在的反面）。
+    /// 2. 拆成两次查询（`media` + `media_library`）→ 得把 `Media` 整个读出来，
+    ///    而它含 `storage_ref`（**可能含凭据**）。把凭据读进一个「只用于渲染
+    ///    列表」的数据结构是个陷阱 —— 上游显式列字段正是为了避开它。
+    /// 3. 建中间视图 → 要改 DDL，而 DDL 必须与上游逐字节一致。
+    #[allow(clippy::type_complexity)]
+    pub async fn summaries_for_movies(
+        &self,
+        movie_numbers: &[String],
+    ) -> Result<Vec<MediaSummaryRow>, DbError> {
+        if movie_numbers.is_empty() {
+            // 空数组绑定会得到 `IN ()` 那种非法/无意义 SQL。
+            // 上游是 `if not movie_numbers: return {}`，语义一致。
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, MediaSummaryRow>(
+            "SELECT m.movie_number, m.id, m.library_id, l.name, l.provider_key, \
+                    m.file_name, m.resolution, m.file_size_bytes, \
+                    m.duration_seconds, m.video_info, m.valid \
+             FROM media m \
+             LEFT JOIN media_library l ON l.id = m.library_id \
+             WHERE m.movie_number = ANY($1) \
+             ORDER BY m.movie_number, m.id",
+        )
+        .bind(movie_numbers)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// 记录一次缩略图生成失败。

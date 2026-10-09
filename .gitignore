@@ -17,3 +17,6 @@ upstream/
 
 # 编辑器产生的回收站目录
 .Trash-*/
+
+# CodeBuddy 的项目数据目录（IDE 生成，不入库）
+.codebuddy/

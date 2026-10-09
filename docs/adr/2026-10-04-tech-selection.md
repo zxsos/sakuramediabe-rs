@@ -132,6 +132,14 @@ upsert / search / alias 切换，接口面小且稳定，用 `reqwest` 足够。
 | `[profile.release] panic = "abort"` | `Cargo.toml` |
 | **`Cargo.lock` 纳入版本控制**（原被 `.gitignore` 忽略） | `.gitignore` |
 | `parity/compare_schema.py` 的 `RUST_ROOT` 硬编码 Windows 路径 → 工作区相对路径回退 | `parity/compare_schema.py:43-57` |
+| `tokio-cron-scheduler` → **`cron` + 自研 tick**（ADR §2/§3.1 的决策此前只写在文档里） | `Cargo.toml`、`crates/sm-scheduler/` |
+| axum 开 `multipart` feature；新增 `extract::Multipart`（强制 8 MiB 上限） | `crates/sm-api/src/extract.rs` |
+| SSE 传输骨架 + **10 个**事件名常量（此前文档写「13 事件」，实为 `completed` 的 yield 次数） | `crates/sm-api/src/sse.rs` |
+| 慢请求日志中间件（`SAKURAMEDIA_SLOW_LOG` 白名单 + `SAKURAMEDIA_SLOW_REQUEST_MS`） | `crates/sm-api/src/middleware/slow_log.rs` |
+| 405 走错误信封 + 逐路由回归测试（此前每条 `MethodRouter` 已挂 fallback，缺的是测试） | `crates/sm-api/src/routes.rs`、`tests/method_not_allowed_http.rs` |
+| 组合根 `sm-server`：配置 / 池 / 日志 / 路由 / 调度器 / SIGTERM 优雅关闭 | `crates/sm-server/` |
+| `DbError::ConstraintViolation` 带上 **SQLSTATE**，新增 `is_unique_violation()` | `crates/sm-db/src/error.rs` |
+| Linux 门禁脚本（本仓库原先只有 PowerShell 版） | `scripts/verify.sh` |
 
 ### `argon2` 升级的 API 变化（值得记一笔）
 
@@ -157,7 +165,31 @@ password-hash 0.6 里：
 | WebP 无损与 Pillow 产物可互解 | 同上（无 Pillow） | Rust 编码 → Pillow 解码双向 |
 | `image-webp` 无损编码质量 | 未实测 | 已自证往返逐像素一致（`lossless_round_trip_preserves_every_pixel`） |
 | gRPC 插件 ABI 往返开销 | 未做参考插件 | 先做 1 个 local 存储插件打穿流式 RPC |
-| `cron` 的 DST/时区边界 | 未写边界测试 | 全 UTC 解析 + 单测 |
+| ~~`cron` 的 DST/时区边界~~ | **已闭环，但结论与原假设不同** | 见下 |
+| 慢 SQL 归因（`db_ms` / `db_queries`） | sqlx 无 peewee 式全局查询钩子 | `sm-db` 发 `tracing` span 后由中间件汇总 |
+| 存量 bcrypt 密码哈希 | Rust 侧无 bcrypt 实现 | 引入 bcrypt 校验器（**需拍板新增依赖**） |
+| 启动引导任务（`trigger_type = "startup"`） | 就绪判定依赖 `catalog` 域状态 | 该域落地后补 |
+
+### `cron` 的时区：原假设错了，已按上游改正
+
+ADR §3.1 原写「全 UTC 解析 + 单测」。读上游后发现
+`src/start/aps.py:361` 是 `CronTrigger.from_crontab(expr, timezone=get_runtime_timezone())`，
+而 `get_runtime_timezone()` 取 `TZ` 环境变量 → 系统时区 → 兜底
+`Asia/Shanghai`（`src/common/runtime_time.py:16-44`）。所以「每天凌晨 2 点」
+是**本地** 2 点，不是 UTC。
+
+`sm_scheduler::RuntimeTimezone` 因此按上游顺序解析，且**不引 `chrono-tz`**：
+IANA 时区名交给 `chrono::Local`（Linux 上系统时区就是它），`UTC` 与
+`±HH:MM` 单独处理。DST 由系统时区承担；`FixedUtcOffset` **不**跟随 DST
+切换，文档里写明了。
+
+同时暴露两处会**静默**出错的方言差异（`crates/sm-scheduler/src/cron_spec.rs`
+有逐条测试）：
+
+| 项 | 上游 `from_crontab` | `cron` crate | 不转的后果 |
+|---|---|---|---|
+| 字段顺序 | 分 时 日 月 周（5 段） | **秒** 分 时 日 月 周（6/7 段） | 16 个任务**全部**编译失败 |
+| 星期编号 | 0/7=周日，1=周一 | 1=周日，2=周一（Quartz） | `0 4 * * 1` 从「周一」变「**周日**」——不报错，只错一天 |
 
 > 注：列梯度的最后一步是**除以最大值归一化**，因此 Sobel 核的整体缩放（OpenCV
 > 是否除以 8）不影响结果，只有核内权重比例 1:2:1 与灰度系数会影响。

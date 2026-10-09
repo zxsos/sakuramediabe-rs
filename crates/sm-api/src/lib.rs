@@ -46,6 +46,7 @@ pub mod dto;
 pub mod error;
 pub mod extract;
 pub mod middleware;
+pub mod query;
 pub mod routes;
 pub mod sse;
 pub mod state;
@@ -64,7 +65,10 @@ use tower_http::cors::CorsLayer;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::auth::routes())
+        .merge(routes::config::routes())
+        .merge(routes::indexer_settings::routes())
         .merge(routes::playlists::routes())
+        .merge(routes::status::routes())
         .fallback(error::not_found)
         .layer(CorsLayer::permissive())
         .with_state(state)

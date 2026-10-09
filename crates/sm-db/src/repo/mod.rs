@@ -155,6 +155,7 @@ pub mod media;
 pub mod movie;
 pub mod playback;
 pub mod recommendation;
+pub mod stats;
 pub mod submission;
 pub mod subtitle;
 pub mod task;
@@ -188,12 +189,15 @@ pub use recommendation::{
     DailyRecommendationItemRepository, MomentRecommendationRepository, NewDailyRecommendation,
     NewMomentRecommendation,
 };
+pub use stats::StatsRepository;
 pub use submission::{DownloadSubmissionRepository, NewSubmissionRecord};
 pub use subtitle::{
     MoviePlotImageRepository, NewNotification, NewSubtitle, SchemaMigrationRepository,
     SubtitleRepository, SystemNotificationRepository,
 };
-pub use task::{BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskOutcome, TaskProgress};
+pub use task::{
+    BackgroundTaskRunRepository, ClaimedTask, NewTaskRun, TaskLanes, TaskOutcome, TaskProgress,
+};
 pub use transfer::{
     DownloadClientRepository, DownloadResourceBlacklistRepository, IndexerDownloadClientRepository,
     IndexerRepository, NewDownloadClient, NewIndexer,

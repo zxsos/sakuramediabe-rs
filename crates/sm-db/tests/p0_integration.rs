@@ -796,7 +796,15 @@ async fn mutex_key_blocks_concurrent_enqueue_and_is_released_on_finish() {
         .finish(claimed.run.id, &TaskOutcome::default())
         .await
         .unwrap();
-    assert_eq!(finished.state, "succeeded");
+    // 上游白名单 ALLOWED_TASK_STATES = {pending, running, completed, failed}。
+    // 此前这里断言的是 "succeeded"，而 finish() 也写 "succeeded" —— 一致的错。
+    // 它之所以没被发现，是因为**没有任何一处在比对上游**：断言跟着实现写，
+    // 两边一起漂移。
+    assert_eq!(finished.state, "completed");
+    assert!(
+        sm_db::system::activity::task_state::is_valid(&finished.state),
+        "写进库的状态必须在上游白名单内"
+    );
     assert!(
         !finished.is_mutex_guarded(),
         "完成后必须释放互斥键，否则同键任务永久无法创建"

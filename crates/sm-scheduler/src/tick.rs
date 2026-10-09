@@ -41,10 +41,12 @@ use sm_db::repo::{BackgroundTaskRunRepository, NewTaskRun};
 
 use crate::cron_spec::{RuntimeTimezone, ScheduledJob};
 
-/// 互斥键前缀。上游 `QUEUE_MUTEX_PREFIX`，注释写明「与 APS 现有互斥命名空间
-/// 保持一致」—— 存量库里已经有 `aps:` 开头的行，换前缀会让在跑的任务
-/// 与新调度的任务**互相不认**。
-pub const QUEUE_MUTEX_PREFIX: &str = "aps:";
+/// 互斥键前缀。**唯一真相源在 [`sm_db::system::activity::QUEUE_MUTEX_PREFIX`]** ——
+/// `sm_service::system::task_queue` 也用它，而两个 crate 互不依赖。
+///
+/// 这里保留这个 `pub use` 是为了不破坏本 crate 既有的引用点（`lib.rs` 的
+/// 重导出与 tick 的测试都按这个名字取）。
+pub use sm_db::system::activity::QUEUE_MUTEX_PREFIX;
 
 /// cron 触发的 `trigger_type`。
 pub const TRIGGER_SCHEDULED: &str = "scheduled";
@@ -231,6 +233,8 @@ impl Scheduler {
     /// 入队一次。`Ok(false)` 表示因互斥键被占用而跳过。
     async fn enqueue_scheduled(&self, job: &ScheduledJob) -> Result<bool, sm_db::DbError> {
         let spec = job.spec();
+        // 入队时刻。`scheduled_at` 记的是它，见下面那个字段的注释。
+        let now = sm_db::common::time::now_utc();
         let new = NewTaskRun {
             task_key: spec.task_key.to_owned(),
             task_name: spec.display_name.to_owned(),
@@ -239,9 +243,14 @@ impl Scheduler {
             // 每分钟的两个下载任务会把队列塞满同 key 的 pending 行。
             mutex_key: Some(format!("{QUEUE_MUTEX_PREFIX}{}", spec.task_key)),
             params: None,
-            // 立刻可领。`scheduled_at` 记录的是入队时间，上游也是如此
-            // （「所有 task_run 都是队列托管行；scheduled_at 记录进入队列的时间」）。
-            scheduled_at: None,
+            // 入队时间，**不是** None。上游的模块 docstring 写明「所有
+            // task_run 都是队列托管行；scheduled_at 记录进入队列的时间」。
+            //
+            // 写 None 会让这些行被 `recover_interrupted_runs` 的
+            // `scheduled_at IS NOT NULL` 过滤排除 —— 崩溃后 cron 入队的任务
+            // 不会被中断回收，只能等租约到期。`claim` 两种都当可领，所以
+            // 填 now 不影响领取（`scheduled_at <= now` 同一刻成立）。
+            scheduled_at: Some(now),
         };
         match self.repo.enqueue(&new).await {
             Ok(_) => Ok(true),

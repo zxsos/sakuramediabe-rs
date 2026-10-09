@@ -120,6 +120,19 @@ fn parse_ms(raw: Option<&str>) -> Option<u64> {
 ///
 /// 目的是把「一条慢请求日志」与「同一请求里的其它日志」串起来，所以只需要
 /// 短且唯一 —— 不需要 uuid 本身。
+///
+/// # 格式固定 12 位，别用 `{:x}`
+///
+/// 写成 `format!("{:x}{:x}", nanos, seq)` 的话，`{:x}` **会丢掉前导零** ——
+/// 低 32 位纳秒时间戳的十六进制长度在 1..8 之间浮动，于是 id 长度不定。
+/// 依赖固定宽度的下游（日志 grep、仪表盘按 id 聚合）会随机失效，而这种失效
+/// 只在低 32 位恰好有小值时才显形。
+///
+/// 所以两个字段都写死宽度：8 位时间戳 + 4 位进程内序号。
+///
+/// 序号取 `& 0xffff` 是有意的：同一纳秒内最多 65536 个请求，而纳秒分辨率下
+/// 一个进程要在同一纳秒里处理 6.5 万个请求才会撞 —— 那时日志本身也已经
+/// 淹没了。序号超过 4 位就回绕，不影响正确性。
 fn request_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -128,7 +141,7 @@ fn request_id() -> String {
     // 进程内自增，避免同一纳秒内的并发请求撞 id。
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{:x}{:x}", nanos as u32, seq)
+    format!("{:08x}{:04x}", nanos as u32, seq & 0xffff)
 }
 
 /// 慢请求日志中间件体。
@@ -233,8 +246,16 @@ mod tests {
     }
 
     #[test]
-    fn request_ids_differ_between_calls() {
+    fn request_ids_differ_between_calls_and_have_a_fixed_width() {
         assert_ne!(request_id(), request_id());
-        assert_eq!(request_id().len(), 8 + 1, "8 位十六进制 + 1 位计数十六进制");
+        // 宽度是**约定**（见 `request_id` 的文档），不是巧合。多采样几次，
+        // 因为 `{:x}` 丢前导零这件事只在低 32 位有小值时才显形。
+        for _ in 0..64 {
+            assert_eq!(
+                request_id().len(),
+                12,
+                "8 位时间戳 + 4 位序号，长度必须恒定"
+            );
+        }
     }
 }

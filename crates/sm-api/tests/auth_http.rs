@@ -51,7 +51,11 @@ async fn seed_user(db: &Db) -> String {
 }
 
 fn app(db: &TestDb) -> axum::Router {
-    router(AppState::new(db.pool().clone(), AuthConfig::new(SECRET)))
+    router(AppState::new(
+        db.pool().clone(),
+        AuthConfig::new(SECRET),
+        sm_service::system::ConfigService::new(temp_config_path()),
+    ))
 }
 
 async fn post(
@@ -92,6 +96,18 @@ fn code_of(body: &Value) -> &str {
 }
 
 // ---------------------------------------------------------------- 登录
+
+/// 指向临时目录的配置路径。
+///
+/// 那些**不碰配置**的端点测试也需要一个 `ConfigService`，而它们绝不能写
+/// 到真实的 `config.toml` 上 —— 那是开发机/容器的配置。所以给一个每次调用
+/// 都不同的临时路径：即便某个用例意外触发了写盘，也只会留下空目录里的孤立
+/// 文件。
+fn temp_config_path() -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir().join(format!("sm-api-unused-{}-{n}.toml", std::process::id()))
+}
 
 #[tokio::test]
 async fn login_returns_a_full_token_resource() {

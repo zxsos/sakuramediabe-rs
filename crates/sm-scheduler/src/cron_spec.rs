@@ -340,87 +340,10 @@ fn job(task_key: &'static str, display_name: &'static str, cron: Option<&'static
     }
 }
 
-/// 把上游的 5 段 crontab 表达式转成 `cron` crate 能吃的形式。
-///
-/// 这里有**两个**必须转换的地方，少做一个就是一次静默的错误调度。
-///
-/// # ① 字段顺序：段数与首段
-///
-/// | | 字段顺序 | 段数 |
-/// |---|---|---|
-/// | 上游 `CronTrigger.from_crontab` | 分 时 日 月 周 | 5 |
-/// | `cron` crate `Schedule` | **秒** 分 时 日 月 周 [年] | 6 或 7 |
-///
-/// 直接把 `"15 0 * * *"` 交给 `cron` 会被当成 6 段（首段缺失）而报
-/// `Hours must be less than 23. ('15' specified.)` 之类的错 —— 症状是
-/// **每个**任务都编译失败，而错误信息里的插入符指向一个看不出原因的位置。
-/// 秒段补 0（cron 精度到秒，秒固定 0 = 每分钟一次，与上游语义一致）。
-///
-/// # ② 星期编号：两套约定不同（这个更危险）
-///
-/// | 编号 | 上游 crontab | `cron` crate（Quartz） |
-/// |---|---|---|
-/// | 周日 | `0` 或 `7` | `1` |
-/// | 周一 | `1` | `2` |
-/// | … | … | … |
-/// | 周六 | `6` | `7` |
-///
-/// 透传的后果是**静默错一天**：上游 `gfriends_filetree_refresh` 的
-/// `0 4 * * 1`（每周一 04:00）会变成每周**日** 04:00 —— 不报错、不崩，
-/// 只是每周提前一天刷新缓存。写测试时才发现的，所以这里逐段映射
-/// `n → n % 7 + 1`。
-///
-/// 名字（`MON`/`FRI`）两套约定一致，原样保留；`*/n` 的步长锚在字段起点，
-/// 而 0-6 映射到 1-7 是等长平移，所以步长不用动（`*/2` 两边都是
-/// 周日/周二/周四/周六）。
-fn to_cron_crate_expr(expr: &str) -> String {
-    let mut fields: Vec<String> = expr.split_whitespace().map(str::to_owned).collect();
-    if fields.len() == 5 {
-        // 秒段补 0 —— 分钟在前的 5 段变 6 段。
-        fields.insert(0, "0".to_owned());
-    }
-    // 星期字段在两种布局里都是索引 5。
-    if let Some(day_of_week) = fields.get_mut(5) {
-        *day_of_week = remap_day_of_week(day_of_week);
-    }
-    fields.join(" ")
-}
-
-/// 星期字段：把 crontab 编号改成 Quartz 编号。
-fn remap_day_of_week(field: &str) -> String {
-    field
-        .split(',')
-        .map(remap_day_of_week_part)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn remap_day_of_week_part(part: &str) -> String {
-    // 步长跟在 `/` 之后，且**不该**被映射（`*/2` 的 2 是步长不是星期）。
-    let (range, step) = part
-        .split_once('/')
-        .map_or((part, None), |(range, step)| (range, Some(step)));
-    let mapped = if range == "*" {
-        "*".to_owned()
-    } else if let Some((from, to)) = range.split_once('-') {
-        format!("{}-{}", map_day_number(from), map_day_number(to))
-    } else {
-        map_day_number(range)
-    };
-    match step {
-        Some(step) => format!("{mapped}/{step}"),
-        None => mapped,
-    }
-}
-
-/// `n → n % 7 + 1`。名字与越界值原样返回（后者留给 `cron` crate 报错）。
-fn map_day_number(raw: &str) -> String {
-    match raw.parse::<u32>() {
-        Ok(0) => "1".to_owned(),
-        Ok(n) if n <= 7 => (n % 7 + 1).to_string(),
-        _ => raw.to_owned(),
-    }
-}
+// cron 方言转换住在 `sm_core::crontab` —— 配置校验（`config_schema` 验
+// `scheduler.*_cron` 字段）与本模块的运行期求值必须用**同一套**规则，否则
+// 会出现「配置校验通过但调度时解析失败」或「星期编号没映射而错一天」。
+use sm_core::crontab::to_cron_crate_expr;
 
 #[cfg(test)]
 mod tests {
@@ -493,45 +416,6 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("bad"), "{text}");
         assert!(text.contains("not a cron"), "{text}");
-    }
-
-    #[test]
-    fn five_field_expressions_gain_a_zero_seconds_field() {
-        // 5 段 = 分钟在前（上游 from_crontab）；`cron` crate 要 6 段秒在前。
-        assert_eq!(to_cron_crate_expr("15 0 * * *"), "0 15 0 * * *");
-        assert_eq!(to_cron_crate_expr("*/5 * * * *"), "0 */5 * * * *");
-        // 带秒的 6 段与 7 段原样透传（插件任务可以自己写）。
-        assert_eq!(to_cron_crate_expr("30 15 0 * * *"), "30 15 0 * * *");
-        assert_eq!(to_cron_crate_expr("0 0 12 * * ? 2030"), "0 0 12 * * ? 2030");
-    }
-
-    #[test]
-    fn day_of_week_is_remapped_from_crontab_to_quartz_numbering() {
-        // crontab 0/7=周日、1=周一…6=周六；Quartz 1=周日、2=周一…7=周六。
-        assert_eq!(map_day_number("0"), "1", "周日");
-        assert_eq!(map_day_number("7"), "1", "7 也是周日");
-        assert_eq!(map_day_number("1"), "2", "周一");
-        assert_eq!(map_day_number("6"), "7", "周六");
-        // 名字两套约定一致，原样保留。
-        assert_eq!(map_day_number("MON"), "MON");
-        // 越界值不猜，交给 cron crate 报错。
-        assert_eq!(map_day_number("9"), "9");
-    }
-
-    #[test]
-    fn a_weekday_range_shifts_by_one_in_quartz_numbering() {
-        // `1-5` = 周一到周五（crontab）→ Quartz 的 2-6。
-        assert_eq!(remap_day_of_week("1-5"), "2-6");
-        // 全周区间仍是全周。
-        assert_eq!(remap_day_of_week("0-6"), "1-7");
-        // 列表逐项映射。
-        assert_eq!(remap_day_of_week("1,3,5"), "2,4,6");
-        // 步长不动。
-        assert_eq!(remap_day_of_week("*/2"), "*/2");
-        assert_eq!(remap_day_of_week("1-5/2"), "2-6/2");
-        // `*` 与名字。
-        assert_eq!(remap_day_of_week("*"), "*");
-        assert_eq!(remap_day_of_week("MON-FRI"), "MON-FRI");
     }
 
     #[test]

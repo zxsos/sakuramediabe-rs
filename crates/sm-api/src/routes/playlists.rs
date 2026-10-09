@@ -3,9 +3,22 @@
 //!
 //! # 与上游 `src/api/routers/collections/playlists.py` 的对应
 //!
-//! 上游 9 个端点里，本批落了 5 个。没落的 4 个都依赖 service 尚未实现的
-//! 查询编排（`list_playlists` / `list_playlist_movies` / `list_playlist_resolutions`
-//! 需要 `movie_resolution_service` 的聚合），**不是**路由层写不出来。
+//! 上游 9 个端点里，本批落了 **7** 个。剩下 1 个读端点
+//! （`GET /playlists/{id}/movies`）依赖尚未实现的影片卡片聚合
+//! （`with_movie_card_relations` / `attach_movie_list_media` /
+//! `MovieListItemResource`）—— **不是**路由层写不出来。
+//!
+//! | 上游 | 本文件 | 状态 |
+//! |---|---|---|
+//! | `GET ""` | `list_playlists` | 已落（系统列表排序 + 批量计数） |
+//! | `POST ""` | `create_playlist` | 已落 |
+//! | `GET /{id}` | `get_playlist` | 已落（**含真实 `movie_count`**） |
+//! | `PATCH /{id}` | `update_playlist` | 已落（**含真实 `movie_count`**） |
+//! | `DELETE /{id}` | `delete_playlist` | 已落 |
+//! | `GET /{id}/resolutions` | `list_playlist_resolutions` | 已落（分辨率档位聚合） |
+//! | `PUT /{id}/movies/{n}` | `add_movie` | 已落 |
+//! | `DELETE /{id}/movies/{n}` | `remove_movie` | 已落 |
+//! | `GET /{id}/movies` | —— | **待做**：影片卡片聚合 |
 //!
 //! # 鉴权挂在 handler 上而不是 router 上
 //!
@@ -23,8 +36,10 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-// `patch` / `delete` 是 MethodRouter 上的方法而非自由函数，只需要 `get/post/put`。
-use axum::routing::{get, post, put};
+// 这里只导入 `get` / `put` 两个**自由函数**：`patch` / `post` / `delete`
+// 都以 `MethodRouter` 的方法形式出现（`.post(...)` / `.patch(...)`），
+// 那不是自由函数，导入 `axum::routing::post` 反而是未使用的导入。
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use sm_service::collections::playlist::{PlaylistService, PlaylistUpdate};
@@ -32,9 +47,13 @@ use sm_service::collections::playlist::{PlaylistService, PlaylistUpdate};
 use crate::auth::CurrentUser;
 // 注意是 crate 自己的 Json —— axum 的那个会让解析失败绕过错误信封，
 // 见 extract.rs 的文档。
-use crate::dto::{PlaylistCreateRequest, PlaylistResource, PlaylistUpdateRequest};
+use crate::dto::{
+    PlaylistCreateRequest, PlaylistResolutionOption, PlaylistResource, PlaylistUpdateRequest,
+};
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
+use crate::extract::Query as EnvelopeQuery;
+use crate::query::{default_true, deser_bool};
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
@@ -42,7 +61,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/playlists",
-            post(create_playlist).fallback(method_not_allowed),
+            get(list_playlists)
+                .post(create_playlist)
+                .fallback(method_not_allowed),
         )
         .route(
             "/playlists/{id}",
@@ -50,6 +71,10 @@ pub fn routes() -> Router<AppState> {
                 .patch(update_playlist)
                 .delete(delete_playlist)
                 .fallback(method_not_allowed),
+        )
+        .route(
+            "/playlists/{id}/resolutions",
+            get(list_playlist_resolutions).fallback(method_not_allowed),
         )
         .route(
             "/playlists/{id}/movies/{movie_number}",
@@ -71,6 +96,39 @@ struct PlaylistMoviePath {
     movie_number: String,
 }
 
+/// `GET /playlists` 的查询参数。
+///
+/// `include_system` **默认为真**，且布尔值按 pydantic 的 lax 规则解析 ——
+/// 见 [`crate::query`] 的模块文档，那 12 个字面量（`1` / `yes` / `on` …）
+/// 与 serde 默认的 `true/false` 不是一回事。
+#[derive(Debug, Deserialize)]
+struct ListPlaylistsQuery {
+    #[serde(default = "default_true", deserialize_with = "deser_bool")]
+    include_system: bool,
+}
+
+async fn list_playlists(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    EnvelopeQuery(query): EnvelopeQuery<ListPlaylistsQuery>,
+) -> Result<Json<Vec<PlaylistResource>>, ErrorResponse> {
+    let service = PlaylistService::new(state.db());
+    let rows = service.list(query.include_system).await?;
+    Ok(Json(rows.iter().map(PlaylistResource::from).collect()))
+}
+
+async fn list_playlist_resolutions(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(path): Path<PlaylistPath>,
+) -> Result<Json<Vec<PlaylistResolutionOption>>, ErrorResponse> {
+    let service = PlaylistService::new(state.db());
+    let options = service.resolution_options(path.id).await?;
+    Ok(Json(
+        options.iter().map(PlaylistResolutionOption::from).collect(),
+    ))
+}
+
 async fn create_playlist(
     _user: CurrentUser,
     State(state): State<AppState>,
@@ -89,7 +147,13 @@ async fn get_playlist(
     Path(path): Path<PlaylistPath>,
 ) -> Result<Json<PlaylistResource>, ErrorResponse> {
     let service = PlaylistService::new(state.db());
-    Ok(Json(PlaylistResource::from(service.get(path.id).await?)))
+    let playlist = service.get(path.id).await?;
+    // 上游 `get_playlist` 返回真实计数，不是 0。
+    let movie_count = service.member_count(path.id).await?;
+    Ok(Json(PlaylistResource::with_movie_count(
+        playlist,
+        movie_count,
+    )))
 }
 
 async fn update_playlist(
@@ -108,7 +172,13 @@ async fn update_playlist(
             },
         )
         .await?;
-    Ok(Json(PlaylistResource::from(playlist)))
+    // 计数在更新**之后**取：改名不改变成员数，但更新会推进 `updated_at`，
+    // 两次查询之间若有人加片，上游同样会读到那个时刻的值。
+    let movie_count = service.member_count(path.id).await?;
+    Ok(Json(PlaylistResource::with_movie_count(
+        playlist,
+        movie_count,
+    )))
 }
 
 /// 上游对删除返回 `Response(status_code=204)` —— **空响应体**。
