@@ -128,6 +128,17 @@ impl ProviderRegistry {
         }
     }
 
+    /// 全部条目，**按 `plugins.enabled` 顺序**。
+    ///
+    /// 组合根用它把「一个插件自己的 provider 表」合进宿主那张总表 ——
+    /// 上游是 `refresh_media_provider_registry(_ACTIVE_PLUGINS)` 一次刷全量。
+    pub fn entries(&self) -> Vec<&ProviderRegistration> {
+        self.order
+            .iter()
+            .filter_map(|key| self.by_key.get(key))
+            .collect()
+    }
+
     /// 所有声明了该能力的 provider，**按 `plugins.enabled` 顺序**。
     ///
     /// 上游的兜底链路（如 JavDB 未收录时的 metadata_source）就是按这个顺序

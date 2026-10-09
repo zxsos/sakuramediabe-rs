@@ -97,7 +97,7 @@ impl SchedulerHandle {
     }
 
     /// 已注册的任务键。
-    pub fn task_keys(&self) -> Vec<&'static str> {
+    pub fn task_keys(&self) -> Vec<String> {
         self.scheduler.task_keys()
     }
 
@@ -107,7 +107,7 @@ impl SchedulerHandle {
     }
 
     /// 启动日志用的「任务 = cron」摘要，格式对齐上游 `cron_info`。
-    pub fn cron_summary(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn cron_summary(&self) -> Vec<(&str, &str)> {
         self.scheduler.cron_summary()
     }
 

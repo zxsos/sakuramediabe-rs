@@ -22,3 +22,15 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 chrono = { workspace = true }
 percent-encoding = { workspace = true }
+# 读宿主写好的配置文件（`SAKURAMEDIA_PLUGIN_SETTINGS_FILE`）。
+serde_json = { workspace = true }
+
+# 参考插件的**可执行文件**：宿主按生命周期协议拉起的那个进程
+# （见 docs/adr/2026-10-05-plugin-lifecycle.md）。
+[[bin]]
+name = "plugin-ref-local"
+path = "src/bin/plugin-ref-local.rs"
+
+[dev-dependencies]
+# 生命周期用例要用宿主的 supervisor 拉起上面那个可执行文件。
+sm-plugins = { workspace = true }

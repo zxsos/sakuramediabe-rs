@@ -42,16 +42,16 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSpec {
     /// 处理器定位键，也是 `mutex_key` 的来源（`aps:` + 本值）。
-    pub task_key: &'static str,
+    pub task_key: String,
     /// 展示名。上游是 `TASK_NAME_REGISTRY.get(task_key) or cli_help`，
     /// 这里直接落 `cli_help` 那一路的值。
-    pub display_name: &'static str,
+    pub display_name: String,
     /// 5 段 cron 表达式。`None` 表示 `manual_only`（只能手动触发）。
     ///
-    /// 字面量而非 `String`：注册表是编译期常量，不接受运行期注入 ——
-    /// 运行期可改的只有 `settings.scheduler.*`，那是**覆盖**机制
-    /// （`get_job_cron_expr`：先读 settings，缺省回退这里）。
-    pub cron: Option<&'static str>,
+    /// 持有 `String` 而不是 `&'static str`：内建任务的键是编译期常量，但
+    /// **插件任务的键来自注册响应**（`JobDefinition.default_cron`），只有
+    /// 运行期才知道。上游同理 —— `JOB_REGISTRY` 在 import 阶段才成型。
+    pub cron: Option<String>,
 }
 
 impl JobSpec {
@@ -67,8 +67,8 @@ impl JobSpec {
 /// 带着一个每分钟 panic 的后台任务跑起来。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleError {
-    pub task_key: &'static str,
-    pub cron: &'static str,
+    pub task_key: String,
+    pub cron: String,
     pub reason: String,
 }
 
@@ -94,13 +94,15 @@ pub struct ScheduledJob {
 impl ScheduledJob {
     /// 解析并编译。`spec.cron` 为 `None` 时返回 `Ok(None)`。
     pub fn compile(spec: JobSpec) -> Result<Option<Self>, ScheduleError> {
-        let Some(expr) = spec.cron else {
+        // 借而不取：解析失败时要带着 `task_key` 与**原始**表达式报错，
+        // 而成功后还要把整个 `spec` 搬进 `Self`。
+        let Some(expr) = spec.cron.as_ref() else {
             return Ok(None);
         };
         let normalized = to_cron_crate_expr(expr);
         let schedule = cron::Schedule::from_str(&normalized).map_err(|err| ScheduleError {
-            task_key: spec.task_key,
-            cron: expr,
+            task_key: spec.task_key.clone(),
+            cron: expr.clone(),
             reason: err.to_string(),
         })?;
         Ok(Some(Self { spec, schedule }))
@@ -334,9 +336,9 @@ pub fn builtin_jobs() -> Vec<JobSpec> {
 
 fn job(task_key: &'static str, display_name: &'static str, cron: Option<&'static str>) -> JobSpec {
     JobSpec {
-        task_key,
-        display_name,
-        cron,
+        task_key: task_key.to_owned(),
+        display_name: display_name.to_owned(),
+        cron: cron.map(str::to_owned),
     }
 }
 
@@ -356,6 +358,14 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn spec(task_key: &str, cron: Option<&str>) -> JobSpec {
+        JobSpec {
+            task_key: task_key.to_owned(),
+            display_name: task_key.to_owned(),
+            cron: cron.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn the_registry_has_nineteen_jobs_sixteen_with_cron() {
         let jobs = builtin_jobs();
@@ -364,10 +374,10 @@ mod tests {
         assert_eq!(with_cron, 16, "其中 16 项带 cron");
         // 三个 manual_only 的 task_key 逐条对上 —— 它们在 HTTP 侧是
         // 「可手动触发但无 cron」，少了 cron 就变成永不入队。
-        let manual: Vec<&str> = jobs
+        let manual: Vec<String> = jobs
             .iter()
             .filter(|j| j.is_manual_only())
-            .map(|j| j.task_key)
+            .map(|j| j.task_key.clone())
             .collect();
         assert_eq!(
             manual,
@@ -383,7 +393,7 @@ mod tests {
     fn task_keys_are_unique() {
         // 唯一性是**互斥键**的前提：两个任务共用 `aps:<task_key>` 会让它们
         // 互相顶掉，而症状是「一个任务永远不跑」，极难定位。
-        let mut keys: Vec<&str> = builtin_jobs().iter().map(|j| j.task_key).collect();
+        let mut keys: Vec<String> = builtin_jobs().iter().map(|j| j.task_key.clone()).collect();
         let before = keys.len();
         keys.sort_unstable();
         keys.dedup();
@@ -404,11 +414,7 @@ mod tests {
 
     #[test]
     fn an_invalid_cron_is_rejected_at_compile_time() {
-        let spec = JobSpec {
-            task_key: "bad",
-            display_name: "坏表达式",
-            cron: Some("not a cron"),
-        };
+        let spec = spec("bad", Some("not a cron"));
         let err = ScheduledJob::compile(spec).expect_err("非法表达式应在编译期失败");
         assert_eq!(err.task_key, "bad");
         // 错误信息要同时带上 task_key 与**原始**表达式（不是转换后的 6 段
@@ -438,11 +444,7 @@ mod tests {
     #[test]
     fn a_sunday_expression_lands_on_sunday() {
         // crontab 的 `0` 也是周日，映射后不能跑到周六去。
-        let spec = JobSpec {
-            task_key: "weekly_sunday",
-            display_name: "每周日",
-            cron: Some("0 5 * * 0"),
-        };
+        let spec = spec("weekly_sunday", Some("0 5 * * 0"));
         let job = ScheduledJob::compile(spec).unwrap().unwrap();
         let fire = job
             .next_fire_after(at("2026-10-04T10:00:00Z"), &RuntimeTimezone::Utc)
@@ -559,11 +561,7 @@ mod tests {
     #[test]
     fn an_impossible_date_yields_none_instead_of_looping() {
         // 「2 月 30 日」永不发生。必须返回 None，不能死循环。
-        let spec = JobSpec {
-            task_key: "impossible",
-            display_name: "2 月 30 日",
-            cron: Some("0 0 30 2 *"),
-        };
+        let spec = spec("impossible", Some("0 0 30 2 *"));
         let job = ScheduledJob::compile(spec).unwrap().unwrap();
         assert_eq!(
             job.next_fire_after(at("2026-01-01T00:00:00Z"), &RuntimeTimezone::Utc),

@@ -1692,7 +1692,9 @@ dependencies = [
  "futures",
  "percent-encoding",
  "prost-types",
+ "serde_json",
  "sm-plugin-api",
+ "sm-plugins",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2544,11 +2546,14 @@ dependencies = [
 name = "sm-plugins"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde_json",
  "sm-core",
  "sm-db",
  "sm-plugin-api",
+ "sm-scheduler",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
 ]
@@ -2580,6 +2585,8 @@ dependencies = [
  "sm-api",
  "sm-core",
  "sm-db",
+ "sm-plugin-api",
+ "sm-plugins",
  "sm-scheduler",
  "sm-service",
  "sqlx",
@@ -2604,7 +2611,6 @@ dependencies = [
  "serde_json",
  "sm-core",
  "sm-db",
- "sm-plugins",
  "sqlx",
  "svc-hash",
  "tokio",

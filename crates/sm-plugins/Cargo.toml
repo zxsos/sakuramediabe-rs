@@ -8,7 +8,17 @@ description = "插件宿主：进程管理、gRPC 客户端、能力注册表"
 sm-core = { workspace = true }
 sm-plugin-api = { workspace = true }
 sm-db = { workspace = true }
+# 只为了把插件声明的任务转成 `JobSpec` 交给 cron 调度（`src/scheduling.rs`）。
+# 依赖方向是「声明方 → 调度方」：调度器不认识插件，插件知道自己的 cron 该
+# 交给谁。反向（调度器依赖插件）会让执行期与调度期缠在一起。
+sm-scheduler = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+# 交付校验要判 `release_date` 是不是严格的 YYYY-MM-DD（proto 写在字段上的原话）。
+chrono = { workspace = true }
+
+[dev-dependencies]
+# 调用面的集成测试要起真实的扩展点 server（端口交给内核分配）。
+tokio-stream = { workspace = true, features = ["net"] }

@@ -54,14 +54,17 @@ pub const TRIGGER_SCHEDULED: &str = "scheduled";
 pub const TRIGGER_STARTUP: &str = "startup";
 
 /// 一次 tick 的结果，供测试与诊断断言。
+///
+/// 键是 `String` 而不是 `&'static str`：插件任务的 `task_key` 来自注册响应，
+/// 只有运行期才知道（见 [`crate::JobSpec`]）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
     /// 本次真正入队的任务键。
-    pub enqueued: Vec<&'static str>,
+    pub enqueued: Vec<String>,
     /// 到点但因互斥键被占用而跳过的任务键。
-    pub skipped: Vec<&'static str>,
+    pub skipped: Vec<String>,
     /// 本次触发时 `enqueue` 失败（不是约束冲突）的任务键。
-    pub failed: Vec<&'static str>,
+    pub failed: Vec<String>,
     /// 回收的僵尸任务行数。
     pub reclaimed: u64,
 }
@@ -85,7 +88,7 @@ pub struct Scheduler {
     timezone: RuntimeTimezone,
     /// 每个任务的下一次触发时刻（UTC）。`Mutex` 而不是 `RwLock`：tick 是
     /// 单线程循环，读写都在同一个任务里，锁只用于让 `shutdown` 能读到。
-    next_fire: Mutex<HashMap<&'static str, DateTime<Utc>>>,
+    next_fire: Mutex<HashMap<String, DateTime<Utc>>>,
     /// 每轮的间隔。1 秒是上游 APS 的粒度 —— `download_task_sync` 是
     /// `* * * * *`，粒度粗了会系统性迟到。
     interval: Duration,
@@ -120,7 +123,7 @@ impl Scheduler {
             // 比启动失败更难查。
             if let Some(job) = ScheduledJob::compile(spec)? {
                 if let Some(fire) = job.next_fire_after(now, &timezone) {
-                    next_fire.insert(job.spec().task_key, fire);
+                    next_fire.insert(job.spec().task_key.clone(), fire);
                 }
                 // `next_fire_after` 返回 None 的任务（如「2 月 30 日」）不登记，
                 // 于是它永远不到点、也永远不会入队 —— 而不是每 tick 空转。
@@ -147,8 +150,11 @@ impl Scheduler {
     }
 
     /// 已注册的任务键。
-    pub fn task_keys(&self) -> Vec<&'static str> {
-        self.jobs.iter().map(|j| j.spec().task_key).collect()
+    pub fn task_keys(&self) -> Vec<String> {
+        self.jobs
+            .iter()
+            .map(|j| j.spec().task_key.clone())
+            .collect()
     }
 
     /// 某个任务的下一次触发时刻（UTC）。
@@ -161,10 +167,15 @@ impl Scheduler {
     }
 
     /// 启动日志用的「任务 = cron」摘要，格式对齐上游 `cron_info`。
-    pub fn cron_summary(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn cron_summary(&self) -> Vec<(&str, &str)> {
         self.jobs
             .iter()
-            .filter_map(|j| j.spec().cron.map(|cron| (j.spec().task_key, cron)))
+            .filter_map(|j| {
+                j.spec()
+                    .cron
+                    .as_deref()
+                    .map(|cron| (j.spec().task_key.as_str(), cron))
+            })
             .collect()
     }
 
@@ -190,7 +201,7 @@ impl Scheduler {
                 Ok(true) => report.enqueued.push(task_key),
                 Ok(false) => report.skipped.push(task_key),
                 Err(err) => {
-                    tracing::error!(task_key, error = %err, "定时任务入队失败");
+                    tracing::error!(task_key = task_key.as_str(), error = %err, "定时任务入队失败");
                     report.failed.push(task_key);
                 }
             }
@@ -199,7 +210,7 @@ impl Scheduler {
     }
 
     /// 到点的任务，并把它们的下一次触发时刻推进到 `now` 之后。
-    fn take_due(&self, now: DateTime<Utc>) -> Vec<(&'static str, ScheduledJob)> {
+    fn take_due(&self, now: DateTime<Utc>) -> Vec<(String, ScheduledJob)> {
         let Ok(mut next_fire) = self.next_fire.lock() else {
             // 上一轮 panic 时 mutex 被毒化。这里返回「没有到点任务」而不是
             // 传播 panic：调度循环不该被一次 panic 带走。
@@ -208,22 +219,27 @@ impl Scheduler {
         };
         let mut due = Vec::new();
         for job in &self.jobs {
-            let key = job.spec().task_key;
-            let Some(fire) = next_fire.get(key).copied() else {
+            // 先按 `&str` 查（`String: Borrow<str>`），到点之后才 clone ——
+            // 每个 tick 都给全部任务克隆一份键是白花钱，而这里 1 秒一轮。
+            let Some(fire) = next_fire.get(job.spec().task_key.as_str()).copied() else {
                 continue;
             };
             if fire > now {
                 continue;
             }
+            let key = job.spec().task_key.clone();
             // 推进到「now 之后的下一次」而不是「上次 fire 之后的下一次」——
             // 后者会让停机 1 小时的任务每分钟入队一次（coalesce 的语义是
             // 积压即丢弃，不是补跑）。
             if let Some(next) = job.next_fire_after(now, &self.timezone) {
-                next_fire.insert(key, next);
+                next_fire.insert(key.clone(), next);
             } else {
                 // 「2 月 30 日」这种永不匹配的任务：摘掉登记，不再检查。
-                next_fire.remove(key);
-                tracing::warn!(task_key = key, "该任务没有下一次触发时间，已停止调度");
+                next_fire.remove(&key);
+                tracing::warn!(
+                    task_key = key.as_str(),
+                    "该任务没有下一次触发时间，已停止调度"
+                );
             }
             due.push((key, job.clone()));
         }
@@ -256,7 +272,7 @@ impl Scheduler {
             Ok(_) => Ok(true),
             Err(err) if is_mutex_conflict(&err) => {
                 tracing::info!(
-                    task_key = spec.task_key,
+                    task_key = spec.task_key.as_str(),
                     "定时任务已在队列或执行中，本次触发按 coalesce 丢弃"
                 );
                 Ok(false)

@@ -9,7 +9,10 @@ sm-core = { workspace = true }
 # 运行期读写配置文件（ConfigService 的原子写盘与重读磁盘快照）
 toml = { workspace = true }
 sm-db = { workspace = true }
-sm-plugins = { workspace = true }
+# 刻意**不**依赖 sm-plugins：源码里没有任何 `sm_plugins::` 引用，而这一行
+# 会把依赖方向锁死 —— 插件任务要接 cron 触发，需要 `sm-plugins → sm-scheduler
+# → sm-service → sm-plugins` 不成环。等 service 层真要调插件时再按那时的
+# 分层加回来（ADR §6：不使用的依赖声明就是幽灵配置）。
 media-file-hash = { workspace = true }
 svc-hash = { workspace = true }
 chrono = { workspace = true }

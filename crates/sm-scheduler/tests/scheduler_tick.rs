@@ -18,7 +18,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use sm_db::repo::{BackgroundTaskRunRepository, NewTaskRun, TaskOutcome};
 use sm_db::system::activity::task_state;
 use sm_db::testing::TestDb;
@@ -27,19 +27,18 @@ use sm_scheduler::tick::Scheduler;
 
 const MINUTELY: &str = "tick_minutely";
 
-fn at(text: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(text)
-        .expect("时间戳")
-        .with_timezone(&Utc)
+/// 声明一个任务。键是运行期字符串（插件任务的键就是），所以统一走 `String`。
+fn spec(task_key: &str, display_name: &str, cron: Option<&str>) -> JobSpec {
+    JobSpec {
+        task_key: task_key.to_owned(),
+        display_name: display_name.to_owned(),
+        cron: cron.map(str::to_owned),
+    }
 }
 
 /// 每分钟触发的任务，便于把「下一次」算到可控的点。
-fn minutely(task_key: &'static str) -> JobSpec {
-    JobSpec {
-        task_key,
-        display_name: "每分钟任务",
-        cron: Some("* * * * *"),
-    }
+fn minutely(task_key: &str) -> JobSpec {
+    spec(task_key, "每分钟任务", Some("* * * * *"))
 }
 
 fn scheduler_with(db: &TestDb, jobs: Vec<JobSpec>) -> Scheduler {
@@ -276,14 +275,7 @@ async fn stale_leases_are_reclaimed_before_enqueueing() {
 #[tokio::test]
 async fn a_manual_only_job_never_enqueues() {
     let db = TestDb::require().await;
-    let scheduler = scheduler_with(
-        &db,
-        vec![JobSpec {
-            task_key: MINUTELY,
-            display_name: "只能手动触发",
-            cron: None,
-        }],
-    );
+    let scheduler = scheduler_with(&db, vec![spec(MINUTELY, "只能手动触发", None)]);
     // 手动任务根本不进调度表，于是 task_keys 里没有它。
     assert!(scheduler.task_keys().is_empty());
     for _ in 0..3 {
@@ -301,11 +293,7 @@ async fn an_invalid_cron_fails_at_construction_not_at_tick() {
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let err = Scheduler::with_timezone(
         repo,
-        vec![JobSpec {
-            task_key: "broken",
-            display_name: "坏 cron",
-            cron: Some("99 99 99"),
-        }],
+        vec![spec("broken", "坏 cron", Some("99 99 99"))],
         RuntimeTimezone::Utc,
         Duration::from_secs(1),
     )
@@ -369,23 +357,39 @@ async fn the_fire_time_is_utc_based_even_for_a_daily_job() {
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let scheduler = Scheduler::with_timezone(
         repo,
-        vec![JobSpec {
-            task_key: "daily_heat",
-            display_name: "每日热度",
-            cron: Some("15 0 * * *"),
-        }],
+        vec![spec("daily_heat", "每日热度", Some("15 0 * * *"))],
         RuntimeTimezone::FixedUtcOffset(8 * 3600),
         Duration::from_secs(1),
     )
     .unwrap();
     assert_eq!(scheduler.timezone_name(), "fixed-offset");
 
-    // UTC 2026-10-04T00:00 时，东八区是本地 08:00，所以下一次本地
-    // 00:15 是 UTC 2026-10-04T16:15。
-    let now = at("2026-10-04T00:00:00Z");
-    let report = scheduler.tick_once(now).await;
-    assert!(report.is_noop(), "本地 08:00 不是 00:15：{report:?}");
+    // 触发时刻读调度器自己的 `next_fire`，**不按日历推日期**。构造时那一次
+    // 是按真实 `Utc::now()` 算的，而「现在落在 UTC 的哪一段」决定它算出来的
+    // 那一刻在 UTC 的哪一天：本地 00:15 之前的半天里，下一次是**今天**
+    // 16:15Z；之后才是明天。写死日期会在那天过后变红，按日历推则会在每天
+    // UTC 00:00–16:00 之间变红 —— 症状都像调度算错了，原因却在用例自己。
+    //
+    // （也不要为此去放宽调度器的「陈旧触发」判定：忽略过于陈旧的触发本身
+    // 就是它该有的行为。）
+    let fire = scheduler
+        .next_fire_at("daily_heat")
+        .expect("已注册的任务必然有下一次触发时刻");
+    // 换算的两侧都锁住：东八区墙钟是本地 00:15，同一瞬间在 UTC 是前一天 16:15。
+    assert_eq!(
+        fire.with_timezone(&FixedOffset::east_opt(8 * 3600).expect("东八区"))
+            .time()
+            .to_string(),
+        "00:15:00",
+        "本地（UTC+8）00:15"
+    );
+    assert_eq!(fire.time().to_string(), "16:15:00", "UTC 侧是前一天 16:15");
 
-    let report = scheduler.tick_once(at("2026-10-04T16:15:00Z")).await;
+    let report = scheduler
+        .tick_once(fire - chrono::Duration::seconds(1))
+        .await;
+    assert!(report.is_noop(), "差 1 秒还没到点：{report:?}");
+
+    let report = scheduler.tick_once(fire).await;
     assert_eq!(report.enqueued, vec!["daily_heat"], "{report:?}");
 }

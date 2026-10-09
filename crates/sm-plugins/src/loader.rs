@@ -110,8 +110,8 @@ pub async fn register(
 /// # 只收 `media_provider` 这一个扩展点
 ///
 /// `Extension` 是 oneof（`media_provider` / metadata_source / ranking_source）。
-/// 注册表目前只表达「媒体 provider」，其余两个扩展点有各自的调用面，等用到时
-/// 再决定怎么存 —— 这里**显式忽略**而不是硬塞进同一个表。
+/// 另两个扩展点有自己的声明与校验（[`crate::extensions::collect_extensions`]），
+/// 这里**显式忽略**而不是硬塞进 provider 这张表。
 pub fn collect_providers(response: &RegisterResponse) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     for extension in &response.extensions {
