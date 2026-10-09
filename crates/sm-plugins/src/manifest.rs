@@ -117,6 +117,9 @@ pub struct PluginManifest {
     pub author: Option<String>,
     /// 上游字段，只供详情接口回显。
     pub homepage: Option<String>,
+    /// 插件入口文件名（不含扩展名）。如 `plugin-115`。
+    /// 为空时用 plugin_id。
+    pub entry: Option<String>,
     /// 清单的**原始 JSON 对象**。
     ///
     /// 详情接口（`GET /system/plugins/{id}`）的 `manifest` 字段是
@@ -172,6 +175,8 @@ impl PluginManifest {
                 field: "plugin_id",
                 reason: "缺少字段 plugin_id（或别名 id）".to_owned(),
             })?;
+        // 兼容连字符：插件包可能用 `plugin-ref-local`，统一转成下划线
+        let plugin_id = plugin_id.replace('-', "_");
         if !is_valid_plugin_id(&plugin_id) {
             return Err(ManifestProblem::InvalidField {
                 field: "plugin_id",
@@ -199,6 +204,7 @@ impl PluginManifest {
             requires_python: optional_text(object, "requires_python"),
             author: optional_text(object, "author"),
             homepage: optional_text(object, "homepage"),
+            entry: optional_text(object, "entry"),
             raw: value.clone(),
         })
     }

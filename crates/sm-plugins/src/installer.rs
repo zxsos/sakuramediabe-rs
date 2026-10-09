@@ -199,14 +199,16 @@ pub fn unpack_with_limits(
     }
 
     // 入口文件：上游查的是 `__init__.py`，Rust 插件查可执行文件。
-    if entry_point_of(&staging, &manifest.plugin_id).is_none() {
+    // 优先用 manifest 的 `entry` 字段（如 `plugin-115`），没有才用 plugin_id。
+    let entry_name = manifest.entry.as_deref().unwrap_or(&manifest.plugin_id);
+    if entry_point_of(&staging, entry_name).is_none() {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(InstallError::new(
             &manifest.plugin_id,
             InstallStage::Package,
             format!(
                 "包根缺少入口文件：既没有 `{}` 也没有 `{}.exe`",
-                manifest.plugin_id, manifest.plugin_id
+                entry_name, entry_name
             ),
         ));
     }
