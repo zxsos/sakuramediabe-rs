@@ -632,7 +632,7 @@ pub const FEMALE_GENDER: i32 = 1;
 /// 历史窗口里「只有一位女优」的影片，以及它们的女优与热度。
 ///
 /// 一行 = 一部影片 × 它的**那位**女优（因为筛选过了，每部只有一行）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct HistoryActorRow {
     pub movie_id: i32,
     pub actor_id: i32,
@@ -645,7 +645,7 @@ pub struct HistoryActorRow {
 /// 候选窗口里带女优的影片。
 ///
 /// 一行 = 一部影片 × 它的**每一位**女优（候选窗口不做「只有一位」筛选）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct CandidateRow {
     pub movie_id: i32,
     pub actor_id: i32,
@@ -723,6 +723,8 @@ impl HotActressReleaseRepository {
                     .bind(history_end)
                     .fetch_all(&mut *conn)
                     .await
+                    // 闭包签名要求 `DbError`，而 `fetch_all` 给的是 `sqlx::Error`。
+                    .map_err(DbError::from)
             })
         })
         .await?;
@@ -759,6 +761,7 @@ impl HotActressReleaseRepository {
                     .bind(candidate_end)
                     .fetch_all(&mut *conn)
                     .await
+                    .map_err(DbError::from)
             })
         })
         .await?;
@@ -847,7 +850,7 @@ impl ImageSearchSessionRepository {
 }
 
 /// 待索引的缩略图。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PendingThumbnail {
     pub thumbnail_id: i32,
     pub media_id: i32,
@@ -860,7 +863,7 @@ pub struct PendingThumbnail {
 }
 
 /// 待索引的剧情图。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PendingPlotImage {
     pub plot_image_id: i32,
     pub movie_id: Option<i32>,

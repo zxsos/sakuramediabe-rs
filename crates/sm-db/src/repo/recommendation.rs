@@ -25,6 +25,7 @@
 //! 被推荐一次），`movie_id` 不唯一 —— 因为同一部影片的不同时刻是不同的推荐。
 
 use sqlx::PgPool;
+use sqlx::AssertSqlSafe;
 
 use crate::common::page::{Page, PageRequest};
 use crate::discovery::rankings::{DailyRecommendationItem, MomentRecommendation};
@@ -32,8 +33,17 @@ use crate::error::DbError;
 use crate::paged_list;
 use crate::repo::Ctx;
 
+use std::collections::HashMap;
+
+use crate::repo::discovery::PendingImageRepository;
+
 const DAILY_ENTITY: &str = "DailyRecommendationItem";
 const MOMENT_ENTITY: &str = "MomentRecommendation";
+/// 稀疏索引的**特征来源**表（`movie` / `movie_actor` / `movie_tag`）。
+///
+/// 刻意与 `DAILY_ENTITY` / `MOMENT_ENTITY` 分开：那两个是**结果表**，这个是
+/// **源数据表**。混用会让错误日志指错表。
+const MOVIE_FEATURE_ENTITY: &str = "MovieFeature";
 
 // ================================================================ daily_recommendation_item
 
@@ -563,15 +573,29 @@ impl MovieFeatureRepository {
 
     /// 通用 DF 查询。`link_table` / `feature_column` 是**受控常量**，
     /// 不是用户输入 —— 用 `format!` 拼在这里而不是绑参数，因为标识符不能绑。
+    ///
+    /// # ★ 白名单是**运行时**校验，不是 `debug_assert`
+    ///
+    /// 标识符无法绑参数，只能拼进 SQL，所以这里天然是注入面。白名单从
+    /// `debug_assert!` 改成运行时 `Err`：**`debug_assert!` 在 release 下被
+    /// 编译掉**，那时白名单形同不存在，任何新增调用点传进来的字符串都会
+    /// 直接拼进 SQL。
+    // allow 理由：白名单就在下一行，且**运行时生效**（见函数体）。
+    #[allow(clippy::unnecessary_literal_unwrap)]
     async fn document_frequencies(
         &self,
         link_table: &str,
         feature_column: &str,
     ) -> Result<HashMap<i32, i64>, DbError> {
-        debug_assert!(
-            matches!((link_table, feature_column), ("movie_actor", "actor") | ("movie_tag", "tag")),
-            "只允许两张已知的关联表"
-        );
+        if !matches!(
+            (link_table, feature_column),
+            ("movie_actor", "actor") | ("movie_tag", "tag")
+        ) {
+            return Err(DbError::business(
+                MOVIE_FEATURE_ENTITY,
+                format!("未知的关联表/特征列组合：{link_table}.{feature_column}"),
+            ));
+        }
         let sql = format!(
             "SELECT l.{feature_column} AS feature_id, COUNT(l.movie) AS df \
              FROM {link_table} l \
@@ -579,7 +603,13 @@ impl MovieFeatureRepository {
              WHERE m.is_collection = false \
              GROUP BY l.{feature_column}"
         );
-        let rows: Vec<(i32, i64)> = sqlx::query_as(&sql)
+        // ★ `AssertSqlSafe`：sqlx 0.9 要求动态 SQL 显式声明「已审计」。
+        //
+        // 审计结论：唯一的动态部分是 `link_table` 与 `feature_column` 两个
+        // **标识符**，它们在函数开头被运行时白名单挡过（release 下同样生效，
+        // 不是 `debug_assert!`）。标识符无法绑参数，只能拼 —— 这是白名单
+        // 存在的全部理由。
+        let rows: Vec<(i32, i64)> = sqlx::query_as(AssertSqlSafe(sql))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
@@ -663,7 +693,7 @@ impl MovieFeatureRepository {
 ///
 /// 向量库里只有 `plot_image_id` 与 `movie_id`，**没有番号**（`movie_number`）。
 /// 而响应要带番号 —— 所以必须回表。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct PlotImageLink {
     pub plot_image_id: i32,
     pub movie_id: Option<i32>,
@@ -714,7 +744,7 @@ impl PendingImageRepository {
         "#;
         let rows: Vec<PlotImageLink> = sqlx::query_as(sql)
             .bind(plot_image_ids)
-            .fetch_all(&self.pool)
+            .fetch_all(self.pool())
             .await
             .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
         Ok(rows.into_iter().map(|link| (link.plot_image_id, link)).collect())

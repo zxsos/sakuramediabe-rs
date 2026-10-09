@@ -104,6 +104,12 @@ pub fn routes() -> Router<AppState> {
             "/actors/{actor_id}/years",
             get(get_actor_years).fallback(method_not_allowed),
         )
+        // ★ `search` 是**字面段**，不是 `{actor_id}`。所以它与
+        // `/actors/{actor_id}` 不会冲突（matchit 静态优先，且段数不同）。
+        .route(
+            "/actors/search/javdb/stream",
+            post(search_javdb_actor_stream).fallback(method_not_allowed),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,4 +441,15 @@ async fn get_actor_years(
 ) -> Result<Json<Vec<YearResource>>, ErrorResponse> {
     let years = ActorService::new(state.db()).years(path.actor_id).await?;
     Ok(Json(years.into_iter().map(YearResource::from).collect()))
+}
+
+/// `POST /actors/search/javdb/stream` —— **SSE 流**：搜 JavDB 并入库。
+///
+/// 流式而非一次性返回，因为一个演员可能有几百部作品，逐部入库要几十秒。
+async fn search_javdb_actor_stream(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    EnvelopeJson(_payload): EnvelopeJson<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    todo!("骨架：SSE —— 接 ActorService::stream_search_and_upsert_actor_from_javdb")
 }

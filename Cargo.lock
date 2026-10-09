@@ -2673,6 +2673,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cron",
+ "qdrant-client",
  "serde_json",
  "sm-core",
  "sm-db",

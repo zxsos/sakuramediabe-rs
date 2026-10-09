@@ -93,6 +93,57 @@ pub fn routes() -> Router<AppState> {
             "/movies/{movie_number}/collection-status",
             get(get_collection_status).fallback(method_not_allowed),
         )
+        // ★ 单片端点全部在 `/movies/{movie_number}` 这**一段**上。
+        //
+        // ⚠️ 注册顺序**不**决定匹配优先级（axum 的路径匹配器按段数与字面量
+        // 优先），所以 `"/movies/{movie_number}"` 不会吃掉
+        // `"/movies/{movie_number}/subtitles"` —— 段数不同。
+        //
+        // 但**别**把 `"/movies/{movie_number}"` 写成 `"/movies/{*rest}"`：
+        // 那样它会匹配任意深度，`/movies/latest` 这类静态路径就再也匹配不到了。
+        .route("/movies/{movie_number}", get(get_movie_detail).fallback(method_not_allowed))
+        .route(
+            "/movies/{movie_number}/reviews",
+            get(get_movie_reviews).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/{movie_number}/subtitles",
+            get(get_movie_subtitles).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/{movie_number}/similar",
+            get(list_similar_movies).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/{movie_number}/merged-playback",
+            get(get_merged_playback).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/{movie_number}/metadata-refresh",
+            post(refresh_movie_metadata).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/{movie_number}/heat-recompute",
+            // ★ 202 而非 200 —— 重算要扫全表，是长任务。
+            post(recompute_movie_heat).fallback(method_not_allowed),
+        )
+        // ★ PUT / DELETE，不是 POST。上游用 RESTful 动词表达订阅开关。
+        .route(
+            "/movies/{movie_number}/subscription",
+            // 204 且**无 body**：见两个 handler 的文档。
+            put(subscribe_movie)
+                .delete(unsubscribe_movie)
+                .fallback(method_not_allowed),
+        )
+        // 两条 SSE 流。`include_in_schema` 由 axum 侧不管，路径照铺。
+        .route(
+            "/movies/search/javdb/stream",
+            post(search_javdb_movies_stream).fallback(method_not_allowed),
+        )
+        .route(
+            "/movies/series/{series_id}/javdb/import/stream",
+            post(import_series_movies_stream).fallback(method_not_allowed),
+        )
 }
 
 // ================================================================ 番号解析
@@ -700,4 +751,190 @@ async fn unblacklist_movies(
         .set_blacklisted(&payload.movie_numbers, false)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ================================================================ 单片端点（11 个）
+
+/// `GET /movies/{movie_number}` —— 影片详情。
+///
+/// # 它是**三个域的汇合点**，这也是它曾被列为「卡死」的原因
+///
+/// 响应含：影片基本信息（`catalog`）+ 媒体与进度（`playback`）+ 打点
+/// （`playback`）+ 榜单名次（`discovery::ranking`）。三域都铺完后才铺它。
+async fn get_movie_detail(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieService::get_movie_detail（catalog + playback 进度/打点 + ranking 名次）")
+}
+
+/// `GET /movies/{movie_number}/reviews` 的查询参数。
+///
+/// # `page_size` **只有下界没有上界**
+///
+/// 上游 `Query(default=20, ge=1)` —— **无 `le`**。所以 `page_size=10000` 合法。
+/// 与 daily/hot-actress 的 `ge=1, le=100` 不同，**别**复用那个有上界的结构。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct MovieReviewQuery {
+    #[serde(default = "one")]
+    page: i64,
+    #[serde(default = "twenty")]
+    page_size: i64,
+    /// 排序。默认 `recently`。
+    #[serde(default)]
+    sort: Option<String>,
+}
+
+/// `GET /movies/{movie_number}/reviews`
+///
+/// ⚠️ 响应是 **list 而非分页对象**（`list[JavdbMovieReviewResource]`）——
+/// 上游给了分页参数却返回裸列表。**照抄**，别「修正」成 `PageResponse`。
+async fn get_movie_reviews(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+    EnvelopeQuery(query): EnvelopeQuery<MovieReviewQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ErrorResponse> {
+    let _ = (movie_number, query);
+    todo!("骨架：接 MovieService::get_movie_reviews；响应是裸 list 不是分页对象")
+}
+
+/// `GET /movies/{movie_number}/subtitles`
+///
+/// 服务层见 [`sm_service::catalog::movie_subtitle`]。两处不变量在那边：
+/// 10 MiB 上限先 stat 再读、路径逃逸校验在 canonicalize 之后。
+async fn get_movie_subtitles(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieSubtitleService::get_movie_subtitles；影片不存在 -> 404 movie_not_found")
+}
+
+/// `limit` 的边界是 `0..=100`（**下界 0**，见 handler 文档）。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SimilarMoviesQuery {
+    #[serde(default = "twenty")]
+    limit: i64,
+}
+
+/// `GET /movies/{movie_number}/similar` —— 相似影片。
+///
+/// # ★ `limit` 的下界是 **0**，不是 1
+///
+/// 上游 `Query(default=20, ge=0, le=100)`。`ge=0` 意味着 **`limit=0` 合法**
+/// 且返回**空列表**（不是 422）。
+///
+/// ⚠️ 这一点很容易写反。若照别处惯例写成 `ge=1`，客户端传 `limit=0`
+/// （「不要相似影片」）时会收到 422 —— 那是**改变契约**。
+///
+/// 相似影片依赖 Qdrant 稀疏索引；索引未就绪时返回**空列表**而不是报错
+/// （见 `discovery::recommendation` 的降级语义）。
+async fn list_similar_movies(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+    EnvelopeQuery(query): EnvelopeQuery<SimilarMoviesQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, ErrorResponse> {
+    let _ = (movie_number, query);
+    todo!("骨架：接 MovieRecommendationService::list_similar_resources；索引不可用 -> 空列表")
+}
+
+/// `GET /movies/{movie_number}/merged-playback` 的查询参数。
+///
+/// # ★ `library_id` **必填**且 `ge=1`
+///
+/// 上游 `library_id: int = Query(..., ge=1)` —— **无默认值**，缺参即 **422**。
+/// 所以下面**没有** `#[serde(default)]`：缺了它会把「缺参」变成「library_id=0」。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct MergedPlaybackQuery {
+    library_id: i64,
+}
+
+/// `GET /movies/{movie_number}/merged-playback` —— 合并播放。
+async fn get_merged_playback(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+    EnvelopeQuery(query): EnvelopeQuery<MergedPlaybackQuery>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let _ = (movie_number, query);
+    todo!("骨架：接 MovieService::get_merged_playback；library_id 缺参应在 extractor 层 422")
+}
+
+/// `POST /movies/{movie_number}/metadata-refresh` —— **200**（不是 202）。
+///
+/// 覆盖式刷新（见 `catalog::catalog_import::refresh_movie_metadata_strict`）。
+/// 番号冲突是 **409**（`movie_metadata_number_conflict`），调 JavDB 失败是 **502**。
+async fn refresh_movie_metadata(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieMetadataRefreshService::refresh_movie_metadata；409 番号冲突 / 502 调用失败")
+}
+
+/// `POST /movies/{movie_number}/heat-recompute` —— ★ **202 Accepted**。
+///
+/// 走调度器（`catalog::movie_task::MovieTaskService`），因为全表重算很慢。
+/// 错误码：影片不存在 → 404；**已有同名任务在跑 → 409**
+/// `movie_heat_recompute_conflict`（不排队）。
+async fn recompute_movie_heat(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieTaskService::recompute_movie_heat；202 + task_run_id；已在跑 -> 409")
+}
+
+/// `PUT /movies/{movie_number}/subscription` —— ★ **204，无 body**。
+///
+/// 成功时**不返回资源**。别返回 `Json<...>` —— 那会让 204 带 body，
+/// 而多数 HTTP 客户端会忽略它，白白序列化一遍。
+async fn subscribe_movie(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<StatusCode, ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieService::set_subscription(true)；成功 204 不带 body")
+}
+
+/// `DELETE /movies/{movie_number}/subscription` —— ★ **204，无 body**。
+async fn unsubscribe_movie(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(movie_number): Path<String>,
+) -> Result<StatusCode, ErrorResponse> {
+    let _ = movie_number;
+    todo!("骨架：接 MovieService::unsubscribe_movie；成功 204 不带 body")
+}
+
+/// `POST /movies/search/javdb/stream` —— **SSE 流**。
+///
+/// ⚠️ 路径里 `search` 是**字面段**，不是 `{movie_number}`，所以与
+/// `/movies/{movie_number}` 不冲突（段数不同）。
+async fn search_javdb_movies_stream(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    EnvelopeJson(_payload): EnvelopeJson<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    todo!("骨架：SSE —— MovieMetadataRefreshService::stream_search_and_upsert_movie_from_javdb")
+}
+
+/// `POST /movies/series/{series_id}/javdb/import/stream` —— **SSE 流**。
+///
+/// 导入一个系列的全部影片。**单部失败不中断整批**（事件里带 error）。
+async fn import_series_movies_stream(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(series_id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let _ = series_id;
+    todo!("骨架：SSE —— MovieMetadataRefreshService::stream_import_series_movies_from_javdb")
 }

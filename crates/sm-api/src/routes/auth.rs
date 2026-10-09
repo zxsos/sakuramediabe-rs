@@ -66,6 +66,15 @@ pub fn routes() -> Router<AppState> {
             "/auth/token-refreshes",
             post(refresh_token_pair).fallback(method_not_allowed),
         )
+        // ★ 形同 `/auth/tokens` 的**表单**登录，但**故意不写进 OpenAPI 文档**。
+        //
+        // 上游标了 `include_in_schema=False` —— 它是给 Swagger UI 用的后门，
+        // 不该出现在面向客户端的 API 文档里。照抄这个意图：本仓不加任何
+        // 「文档可见性」配置，由部署方决定是否暴露。
+        .route(
+            "/auth/docs-token",
+            post(docs_login).fallback(method_not_allowed),
+        )
 }
 
 /// 登录。**不带鉴权** —— 这是拿 token 的地方。
@@ -130,4 +139,29 @@ impl From<TokenPair> for TokenResource {
             },
         }
     }
+}
+
+/// `POST /auth/docs-token` —— 文档登录。**不带鉴权**。
+///
+/// # ★ 请求体是 **form-urlencoded**，不是 JSON
+///
+/// 上游签名是 `form_data: OAuth2PasswordRequestForm = Depends()`，即
+/// `application/x-www-form-urlencoded` 的 `username` / `password` 字段。
+///
+/// ⚠️ 别写成 `Json<...>`：Swagger UI 的 `authorize` 按钮发的是表单，
+/// 改成 JSON 会让文档里的「Try it out」**永远 422**。
+///
+/// 与 `POST /auth/tokens` 的差别只有「是否进文档」—— 认证逻辑完全相同。
+async fn docs_login(
+    State(_state): State<AppState>,
+    axum::extract::Form(_form): axum::extract::Form<DocsLoginForm>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    todo!("骨架：同 create_token_pair，但收 form-urlencoded；不进 OpenAPI 文档")
+}
+
+/// `OAuth2PasswordRequestForm` 的字段。`scope` 上游有但**不用**，故不取。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DocsLoginForm {
+    pub username: String,
+    pub password: String,
 }

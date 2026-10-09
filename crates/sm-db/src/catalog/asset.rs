@@ -69,6 +69,26 @@ pub mod image_search_index_status {
     /// 成功。
     pub const SUCCESS: i32 = 2;
 
+    /// 本表的**全部**合法值。
+    ///
+    /// ★ 与 `playback::media::image_search_index_status` 的 `ALL` **不同**：
+    /// 那套有 `SKIPPED = 3`（非 JAV 媒体的缩略图不参与检索），本套**没有**。
+    ///
+    /// 两处各有一份 `ALL` 是刻意的 —— 用错会让「跳过」被写进剧情图，
+    /// 而 `movie_plot_image.image_search_index_status` 的语义里没有这个状态。
+    pub const ALL: [i32; 3] = [PENDING, FAILED, SUCCESS];
+
+    /// 该值是否合法。写入前用它挡住脏状态。
+    ///
+    /// 与 `playback::media` 那套的 `is_valid` 同名同义，**签名刻意一致** ——
+    /// 调用方（`repo::discovery::PendingImageRepository`）两处都调它。
+    ///
+    /// ⚠️ **不是 `const fn`**：`<[T]>::contains` 不是 const（要与
+    /// `playback::media` 那版逐字一致，后者也是普通 `fn`）。
+    pub fn is_valid(status: i32) -> bool {
+        ALL.contains(&status)
+    }
+
     /// 是否为终态（无需再处理）。
     pub const fn is_terminal(status: i32) -> bool {
         status == SUCCESS

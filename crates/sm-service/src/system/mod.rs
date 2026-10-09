@@ -25,8 +25,10 @@ pub mod config;
 pub mod indexer_settings;
 pub mod jobs;
 pub mod optional_services;
+pub mod plugin_removal;
 pub mod status;
 pub mod task_queue;
+pub mod telemetry;
 
 pub use account::AccountService;
 pub use activity::{

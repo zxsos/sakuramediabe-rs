@@ -21,10 +21,20 @@
 //! - `provider_helpers` / `thumbnails/contracts` 依赖插件 ABI，阻塞。
 
 pub mod clip_artifact;
+pub mod media;
 pub mod media_clip;
+pub mod media_file_hash_backfill;
+pub mod media_library;
+pub mod media_metadata_probe;
 pub mod media_summary;
+pub mod media_thumbnail;
+pub mod media_thumbnail_pack_backfill;
+pub mod media_validity_scan;
+pub mod media_video_info_backfill;
 pub mod operation_locks;
+pub mod provider_helpers;
 pub mod search_filters;
+pub mod thumbnails;
 
 pub use media_summary::{
     attach_movie_list_media, list_movie_media_summaries, MediaSummary, MovieMediaAttachment,

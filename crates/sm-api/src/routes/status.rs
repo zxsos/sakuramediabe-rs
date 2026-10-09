@@ -56,6 +56,16 @@ pub fn routes() -> Router<AppState> {
             "/status/capabilities",
             get(get_capabilities).fallback(method_not_allowed),
         )
+        // ★ 路径是 `/status/...`（三段）而不是 `/{provider}`（两段）——
+        // 上游的 router prefix 就是 `/status`，容易误以为末段是变量。
+        .route(
+            "/status/image-search",
+            get(get_image_search_status).fallback(method_not_allowed),
+        )
+        .route(
+            "/status/metadata-providers/{provider}/test",
+            get(test_metadata_provider).fallback(method_not_allowed),
+        )
 }
 
 // ================================================================ /status
@@ -362,4 +372,47 @@ async fn get_capabilities(
 ) -> Result<Json<CapabilitiesResource>, ErrorResponse> {
     let capabilities = sm_service::system::optional_services::capabilities_of(state.config())?;
     Ok(Json(CapabilitiesResource::from(capabilities)))
+}
+
+/// `GET /status/image-search` —— 图搜索引状态。
+///
+/// # 读**数据库单例表**，不是问 Qdrant
+///
+/// 理由与 `discovery::image_search_space` 相同：`/status/*` 是高频轮询接口，
+/// 每次问 Qdrant 是一次网络往返。状态是「索引记录在哪个嵌入空间」这件事，
+/// 由 `image_search_index_state`（id 恒为 1）持有。
+async fn get_image_search_status(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    todo!("骨架：接 StatusService::get_image_search_status（读单例表，不问 Qdrant）")
+}
+
+/// `GET /status/metadata-providers/{provider}/test` —— 探测元数据源。
+///
+/// # ★ 只接受 `javdb` 一个值，其它一律 **422 `invalid_metadata_provider`**
+///
+/// 上游是 `if normalized_provider not in {"javdb"}: raise ApiError(422, ...)`。
+///
+/// ⚠️ 归一化在**比较之前**：`provider.strip().lower()`。所以 `/test/JAVDB`
+/// 合法、`/test/javdb%20` 也合法（strip 掉空白）。
+///
+/// 别把它做成「枚举所有已装 provider」—— 那会让「探测一个不存在的源」变成
+/// 404，而客户端需要区分「源名写错了」（422，改请求）与「源不可用」（5xx）。
+async fn test_metadata_provider(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(provider): Path<String>,
+) -> Result<Json<serde_json::Value>, ErrorResponse> {
+    let normalized = provider.trim().to_lowercase();
+    if normalized != "javdb" {
+        // 显式给 422：`ErrorResponse` 没有 `validation` 便捷构造（那是
+        // service 层 `ServiceError::validation` 的事），端点层一律用 `new`。
+        return Err(ErrorResponse::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_metadata_provider",
+            format!("未知的元数据来源：{provider}"),
+        ));
+    }
+    todo!("骨架：调 JavDB 探测；不可用时返回诊断结果而非 5xx（同 download-clients/test 的取舍）")
 }
