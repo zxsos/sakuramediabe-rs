@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --bin plugin-115
+
+      - name: Create manifest
+        run: |
+          cat > manifest.json << 'MANIFEST'
+          {
+            "id": "sakuramedia_115_provider",
+            "version": "${{ github.ref_name }}",
+            "entry": "plugin-115",
+            "display_name": "115 Provider"
+          }
+          MANIFEST
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/plugin-115 dist/
+          cp manifest.json dist/
+          cd dist && zip -r ../sakuramedia_115_provider-${{ github.ref_name }}.zip manifest.json plugin-115
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sakuramedia_115_provider-${{ github.ref_name }}.zip
