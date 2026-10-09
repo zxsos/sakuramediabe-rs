@@ -128,6 +128,8 @@ pub type ImportProgressCallback<'a> =
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// 导入服务。
+// 两个依赖尚未被方法体引用（导入编排还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MediaImportService {
     provider: Option<Box<dyn StorageProvider>>,
     catalog_import: Option<Box<dyn CatalogImport>>,
@@ -141,7 +143,8 @@ pub trait StorageProvider {
         parent_ref: &serde_json::Value,
     ) -> Result<Vec<ScannedEntry>, ServiceError>;
     /// 暂存一个文件。
-    fn stage_import_file(&self, source_ref: &serde_json::Value) -> Result<StagedFile, ServiceError>;
+    fn stage_import_file(&self, source_ref: &serde_json::Value)
+        -> Result<StagedFile, ServiceError>;
     /// 定稿（把暂存变成最终记录）。
     fn finalize(&self, staged: &StagedFile) -> Result<FinalizedFile, ServiceError>;
     /// 清理暂存。**失败路径必调。**
@@ -242,7 +245,14 @@ impl MediaImportService {
         collection_id: Option<i64>,
         mut progress: Option<ImportProgressCallback<'_>>,
     ) -> Result<ImportResult, ServiceError> {
-        let _ = (source_ref, library_id, media_kind, source_disposition, collection_id, &mut progress);
+        let _ = (
+            source_ref,
+            library_id,
+            media_kind,
+            source_disposition,
+            collection_id,
+            &mut progress,
+        );
         todo!("骨架：scan -> 逐条 stage -> 宿主写入 -> finalize；stage 之后必 abort 兜底")
     }
 

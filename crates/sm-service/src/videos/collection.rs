@@ -35,15 +35,21 @@
 //! 两者都传错都不会报错（id 空间相同、外观相同），所以名字与文档是唯一的
 //! 防线。
 
+use sm_db::common::page::PageRequest;
 use sm_db::repo::{
     commit_or_rollback, Ctx, NewVideoCollection, VideoCollectionItemRepository,
     VideoCollectionRepository, VideoItemRepository,
 };
-use sm_db::videos::{VideoCollection, VideoCollectionItem};
+use sm_db::videos::{VideoCollection, VideoCollectionItem, VideoItem};
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
-use crate::videos::Field;
+use crate::videos::{
+    parse_sort, validate_page, Field, SortDirection, COLLECTION_ITEM_SORT_KEYS,
+    DEFAULT_COLLECTION_ITEM_SORT,
+};
+
+use super::item::{VideoItemService, VideoListItem};
 
 /// 更新合集。两个字段各自独立，缺省表示不改动。
 #[derive(Debug, Clone, Default)]
@@ -68,6 +74,45 @@ pub enum Added {
     Added { id: i32, position: i32 },
     /// 此前已是成员，什么都没做。
     AlreadyPresent,
+}
+
+/// 视频合集连同它的成员数与封面。
+#[derive(Debug, Clone)]
+pub struct VideoCollectionWithCount {
+    pub collection: VideoCollection,
+    /// 成员数。**数的是全部成员**（含指向已失效视频的那些）——
+    /// 上游 `count_by_owner` 就是 `COUNT(*)`，没有有效性过滤。
+    pub item_count: i32,
+    /// 封面：按 `(position, id)` 排最前那个成员的**条目封面**。
+    ///
+    /// 三处为空都会得到 `None`：没有成员、首个成员无 `cover_image_id`、
+    /// 或那张图片行已被删。上游 `_collection_cover` 同样是三步都可能落空。
+    pub cover: Option<sm_db::catalog::asset::Image>,
+}
+
+/// 一个合集成员，连同它的内嵌条目。
+///
+/// # `play_url` **不在这里**
+///
+/// 它要插件 ABI（上游 `MEDIA_PROVIDER_REGISTRY.require(provider_key)` 拿
+/// `playback_deliveries[0]`），所以由 API 层在 `include_play_url=true` 时补。
+/// **本层拿不到它** —— 别在这里塞一个空串占位。
+#[derive(Debug, Clone)]
+pub struct VideoCollectionItemRow {
+    pub item: VideoCollectionItem,
+    /// 内嵌的条目列表项。
+    ///
+    /// ⚠️ **`collections` 是空的**：上游 `_query_item_resources` 没给
+    /// `_to_list_item` 传 `collections`，默认空列表。本仓对应的是
+    /// `VideoItemService` 的 `assemble_without_collections`（`pub(crate)`，
+    /// 所以这里不写成文档链接）。
+    pub video: VideoListItem,
+    /// 「首个有效媒体」的 id（`Media.id` 升序）。
+    ///
+    /// **恒返回**，与 `include_play_url` 无关 —— 连播页右侧的关键帧面板靠它
+    /// 调 `GET /media/{id}/thumbnails`。没有有效媒体时为 `None`
+    /// （上游那个 `COALESCE(first_media.id, 0) or None` 的 0 哨兵）。
+    pub first_media_id: Option<i32>,
 }
 
 /// 视频合集 service。
@@ -362,25 +407,216 @@ impl VideoCollectionService {
 
     // ---------------------------------------------------------- 读
 
-    /// 取合集。不存在则 404。
+    fn images(&self) -> sm_db::repo::ImageRepository {
+        sm_db::repo::ImageRepository::new(self.pool.clone())
+    }
+
+    /// 一批合集的**成员数**与**封面**。
     ///
-    /// 上游 `get_collection` 还要回填 `item_count` 与 `cover_image`，那两个
-    /// 需要跨表聚合（`count_by_owner` + 按 position 取首位成员的封面），
-    /// 随列表端点一起做，见 [`crate::videos`]。
-    pub async fn get(&self, collection_id: i32) -> Result<VideoCollection, ServiceError> {
-        self.require_collection(collection_id).await
+    /// 四次查询而不是「每个合集四次」：成员行一次（`list_by_collections`）、
+    /// 条目一次（去重后的 `video_item_id`）、图片一次（去重后的
+    /// `cover_image_id`）。**封面只看每个合集的首个成员**，所以条目与图片都
+    /// 只按「首成员」集合去查 —— 一个合集可能有上千成员。
+    async fn counts_and_covers(
+        &self,
+        collection_ids: &[i32],
+    ) -> Result<
+        std::collections::HashMap<i32, (i32, Option<sm_db::catalog::asset::Image>)>,
+        ServiceError,
+    > {
+        use std::collections::HashMap;
+
+        if collection_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let items = self.members.list_by_collections(collection_ids).await?;
+
+        // `list_by_collections` 只保证 `collection_id` 有序，**组内不排序**。
+        // 封面判据是组内 `(position, id)` 最小者，所以这里自己扫一遍取最小；
+        // 顺手把成员数也数出来。
+        let mut best: HashMap<i32, (i32, i32, i32)> = HashMap::new();
+        let mut counts: HashMap<i32, i32> = HashMap::new();
+        for item in &items {
+            let (position, id) = item.playback_order_key();
+            *counts.entry(item.collection_id).or_insert(0) += 1;
+            best.entry(item.collection_id)
+                .and_modify(|slot| {
+                    if (position, id) < (slot.1, slot.2) {
+                        *slot = (item.video_item_id, position, id);
+                    }
+                })
+                .or_insert((item.video_item_id, position, id));
+        }
+
+        let mut video_ids: Vec<i32> = best.values().map(|slot| slot.0).collect();
+        video_ids.sort_unstable();
+        video_ids.dedup();
+        let videos = self.videos.find_by_ids(&video_ids).await?;
+
+        let mut image_ids: Vec<i32> = video_ids
+            .iter()
+            .filter_map(|id| videos.get(id).and_then(|video| video.cover_image_id))
+            .collect();
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        let images = self.images().find_by_ids(&image_ids).await?;
+
+        Ok(collection_ids
+            .iter()
+            .map(|id| {
+                let cover = best
+                    .get(id)
+                    .and_then(|slot| videos.get(&slot.0))
+                    .and_then(|video| video.cover_image_id)
+                    .and_then(|image_id| images.get(&image_id))
+                    .cloned();
+                (*id, (counts.get(id).copied().unwrap_or(0), cover))
+            })
+            .collect())
+    }
+
+    /// 取合集 + 成员数 + 封面。不存在则 404。
+    ///
+    /// 上游 `get_collection` 返回的就是这个形状
+    /// （`VideoCollectionResource.from_collection(..., item_count, cover_image)`）。
+    pub async fn get_with_count(
+        &self,
+        collection_id: i32,
+    ) -> Result<VideoCollectionWithCount, ServiceError> {
+        let collection = self.require_collection(collection_id).await?;
+        let mut stats = self.counts_and_covers(&[collection_id]).await?;
+        let (item_count, cover) = stats.remove(&collection_id).unwrap_or((0, None));
+        Ok(VideoCollectionWithCount {
+            collection,
+            item_count,
+            cover,
+        })
+    }
+
+    /// 全部合集 + 成员数 + 封面，按 `updated_at DESC, id DESC`。
+    pub async fn list_collections(&self) -> Result<Vec<VideoCollectionWithCount>, ServiceError> {
+        let collections = self.collections.list_ordered_by_recency().await?;
+        let ids: Vec<i32> = collections.iter().map(|row| row.id).collect();
+        let mut stats = self.counts_and_covers(&ids).await?;
+        Ok(collections
+            .into_iter()
+            .map(|collection| {
+                let (item_count, cover) = stats.remove(&collection.id).unwrap_or((0, None));
+                VideoCollectionWithCount {
+                    collection,
+                    item_count,
+                    cover,
+                }
+            })
+            .collect())
     }
 
     /// 按播放顺序列出全部成员。**刻意不分页** —— 拖拽编辑页要的是全量顺序。
-    ///
-    /// 面向连播页的分页版本（`list_collection_items`，上游为了万级成员合集
-    /// 专门加的）随列表端点一起做，见 [`crate::videos`] 的「不落查询编排」。
     pub async fn list_items(
         &self,
         collection_id: i32,
     ) -> Result<Vec<VideoCollectionItem>, ServiceError> {
         self.require_collection(collection_id).await?;
         Ok(self.members.list_by_collection(collection_id).await?)
+    }
+
+    // ---------------------------------------------------------- 成员资源
+
+    /// 成员分页。返回 `(本页成员, 总数)`。
+    ///
+    /// # 校验顺序照上游
+    ///
+    /// `_require_collection` 在 `validate_page` **之前** —— 所以「合集不存在」
+    /// 不能被报成分页错误。
+    pub async fn list_items_paged(
+        &self,
+        collection_id: i32,
+        sort: Option<&str>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<VideoCollectionItemRow>, i64), ServiceError> {
+        self.require_collection(collection_id).await?;
+        validate_page(page, page_size)?;
+        let spec = parse_sort(
+            sort,
+            COLLECTION_ITEM_SORT_KEYS,
+            DEFAULT_COLLECTION_ITEM_SORT,
+        )?;
+        let request = PageRequest::new(page, page_size)?;
+        let (items, total) = self
+            .members
+            .list_page_with_video(
+                collection_id,
+                spec.key.as_str(),
+                spec.direction == SortDirection::Desc,
+                &request,
+            )
+            .await?;
+        Ok((self.item_rows(items).await?, total))
+    }
+
+    /// 全部成员（**不分页**），带内嵌条目。`reorder` 的响应与拖拽编辑页用。
+    pub async fn list_item_rows(
+        &self,
+        collection_id: i32,
+    ) -> Result<Vec<VideoCollectionItemRow>, ServiceError> {
+        let items = self.list_items(collection_id).await?;
+        self.item_rows(items).await
+    }
+
+    /// 把成员行补齐成「成员 + 内嵌条目」。
+    ///
+    /// 三次批量查询：条目本体（`find_by_ids`）、条目列表项的其余字段
+    /// （`VideoItemService::assemble_without_collections` 内部再发几条）、
+    /// 以及首个有效媒体 id（`first_valid_media`）。
+    ///
+    /// **`assemble` 走的是 `without_collections`** —— 见那个方法的文档。
+    async fn item_rows(
+        &self,
+        items: Vec<VideoCollectionItem>,
+    ) -> Result<Vec<VideoCollectionItemRow>, ServiceError> {
+        use std::collections::HashMap;
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut video_ids: Vec<i32> = items.iter().map(|item| item.video_item_id).collect();
+        video_ids.sort_unstable();
+        video_ids.dedup();
+
+        let found = self.videos.find_by_ids(&video_ids).await?;
+        // `find_by_ids` 给的是 `HashMap`，这里按去重后的 id 顺序重建一遍再交给
+        // `assemble` —— 它保序，而我们要靠 id 回查，顺序本身不重要，但传一份
+        // 确定顺序的输入更省心。
+        let ordered: Vec<VideoItem> = video_ids
+            .iter()
+            .filter_map(|id| found.get(id).cloned())
+            .collect();
+        let assembled = VideoItemService::new(&self.pool)
+            .assemble_without_collections(ordered)
+            .await?;
+        let by_id: HashMap<i32, VideoListItem> = assembled
+            .into_iter()
+            .map(|row| (row.video.id, row))
+            .collect();
+
+        let first_media = self.videos.first_valid_media(&video_ids).await?;
+
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(video) = by_id.get(&item.video_item_id) else {
+                // 外键保证条目存在；真丢了（并发删）就跳过这一行。
+                continue;
+            };
+            out.push(VideoCollectionItemRow {
+                first_media_id: first_media
+                    .get(&item.video_item_id)
+                    .map(|(media_id, _, _, _)| *media_id),
+                video: video.clone(),
+                item,
+            });
+        }
+        Ok(out)
     }
 
     /// 批量清空成员。**保留合集本身** —— 编辑页「全选取消」的操作。

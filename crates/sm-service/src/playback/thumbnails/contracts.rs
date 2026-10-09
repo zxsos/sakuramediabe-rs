@@ -120,4 +120,3 @@ mod tests {
         assert_eq!(deferred.error_code, "thumbnail_source_deferred");
     }
 }
-

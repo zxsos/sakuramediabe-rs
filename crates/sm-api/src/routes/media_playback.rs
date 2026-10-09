@@ -126,7 +126,7 @@ async fn get_playback_attempt_mode(
 async fn play_media(
     State(_state): State<AppState>,
     _user: CurrentUser,
-    Path((media_id, resource_path)): Path<(i64, String)>,
+    Path((_media_id, _resource_path)): Path<(i64, String)>,
     Query(_query): Query<PlayQuery>,
 ) -> Result<Response, ErrorResponse> {
     todo!("骨架：需先接 provider 插件拿 library_handle；照上游 play_media 实现（签名 -> 404 两级 -> proxy/redirect）")

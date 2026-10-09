@@ -46,7 +46,9 @@ impl MovieMetadataRefreshService {
     ///
     /// 流程：按番号查 JavDB -> 校验番号一致(409) -> 严格覆盖写库
     /// -> 重建 `assets.zip`。
-    pub async fn refresh_movie_metadata(movie_number: &str) -> Result<serde_json::Value, ServiceError> {
+    pub async fn refresh_movie_metadata(
+        movie_number: &str,
+    ) -> Result<serde_json::Value, ServiceError> {
         let _ = movie_number;
         todo!("骨架：查 JavDB -> 校验番号一致(409) -> 严格覆盖写 -> 重建 assets.zip")
     }
@@ -97,7 +99,10 @@ mod tests {
     /// 番号冲突是**永久性**失败 —— 归成 5xx 会让客户端无限重试。
     #[test]
     fn conflicts_are_not_retryable_5xx() {
-        for code in ["movie_metadata_number_conflict", "movie_metadata_javdb_id_conflict"] {
+        for code in [
+            "movie_metadata_number_conflict",
+            "movie_metadata_javdb_id_conflict",
+        ] {
             assert!(!code.contains("failed"), "{code} 不该被当成可重试的失败");
         }
     }
@@ -105,7 +110,7 @@ mod tests {
     /// 流式事件**必须**能表达「某部失败但整体继续」。
     #[test]
     fn an_error_event_does_not_abort_the_stream() {
-        let events = vec![
+        let events = [
             MetadataStreamEvent {
                 event: "movie".to_owned(),
                 movie_number: "A-001".to_owned(),

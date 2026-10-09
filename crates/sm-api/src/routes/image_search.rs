@@ -46,11 +46,12 @@
 //!    重复字段名在客户端实现上不统一。
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_service::discovery::image_search::ImageSearchPage;
-use sm_service::discovery::image_search_reset::{ImageSearchResetResult, ImageSearchResetService};
+use sm_service::discovery::image_search_reset::ImageSearchResetResult;
 use sm_service::discovery::plot_image_search::PlotImageSearchPage;
 
 use crate::auth::CurrentUser;
@@ -69,7 +70,10 @@ pub fn routes() -> Router<AppState> {
             "/image-search/text-sessions",
             post(create_text_image_search_session),
         )
-        .route("/image-search/plot-sessions", post(create_plot_image_search_session))
+        .route(
+            "/image-search/plot-sessions",
+            post(create_plot_image_search_session),
+        )
         .route(
             "/image-search/reset",
             post(reset_image_search).fallback(method_not_allowed),
@@ -186,7 +190,10 @@ async fn create_plot_text_search_session(
 ///
 /// **空串返回 `Some(vec![])` 而不是 `None`** —— 调用方据此区分「显式给了空
 /// 列表」与「没给这个过滤条件」。合并两者会让「排除全部」变成「不过滤」。
-pub fn parse_csv_positive_ints(raw: Option<&str>, field: &str) -> Result<Option<Vec<i64>>, ErrorResponse> {
+pub fn parse_csv_positive_ints(
+    raw: Option<&str>,
+    field: &str,
+) -> Result<Option<Vec<i64>>, ErrorResponse> {
     let Some(raw) = raw else { return Ok(None) };
     if raw.is_empty() {
         return Ok(Some(Vec::new()));

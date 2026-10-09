@@ -88,10 +88,7 @@ mod tests {
             failed: 1,
         };
         assert_eq!(
-            stats.packed
-                + stats.skipped_existing_pack
-                + stats.skipped_missing_files
-                + stats.failed,
+            stats.packed + stats.skipped_existing_pack + stats.skipped_missing_files + stats.failed,
             stats.examined
         );
     }

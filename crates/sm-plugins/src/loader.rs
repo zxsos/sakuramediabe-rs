@@ -112,7 +112,14 @@ pub async fn register(
 /// `Extension` 是 oneof（`media_provider` / metadata_source / ranking_source）。
 /// 另两个扩展点有自己的声明与校验（[`crate::extensions::collect_extensions`]），
 /// 这里**显式忽略**而不是硬塞进 provider 这张表。
-pub fn collect_providers(response: &RegisterResponse) -> ProviderRegistry {
+///
+/// # `plugin_endpoint` 是**调用方告诉它的**，不在 `RegisterResponse` 里
+///
+/// proto 的注册响应没有「我监听的地址」这个字段（插件是被宿主拉起来的，地址
+/// 由宿主分配）。所以往下发的每个 provider 条目都要带上宿主手里那个端点 ——
+/// 否则查表只能查到声明，**打不出去**（见
+/// [`ProviderRegistration::plugin_endpoint`]）。
+pub fn collect_providers(response: &RegisterResponse, plugin_endpoint: &str) -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     for extension in &response.extensions {
         // oneof 的变体名取**字段名**（prost 的规则），不是消息类型名。
@@ -129,6 +136,7 @@ pub fn collect_providers(response: &RegisterResponse) -> ProviderRegistry {
                 .data_plane_endpoint
                 .clone()
                 .or_else(|| response.data_plane_endpoint.clone()),
+            plugin_endpoint: plugin_endpoint.to_owned(),
         });
     }
     registry
@@ -164,19 +172,23 @@ mod tests {
             ..Default::default()
         };
 
-        let registry = collect_providers(&response);
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
         assert_eq!(registry.len(), 1);
 
         let entry = registry.require("local_storage").expect("应当收进去");
         assert_eq!(entry.plugin_id, "local", "要记得来自哪个插件");
         assert!(entry.is_download());
+        assert_eq!(
+            entry.plugin_endpoint, "http://127.0.0.1:60001",
+            "控制面端点由宿主下发 —— 没有它查表只能查到声明、打不出去"
+        );
 
         // 插件级的数据面端点要继承下来。
         let with_endpoint = RegisterResponse {
             data_plane_endpoint: Some("http://127.0.0.1:50051".to_owned()),
             ..response
         };
-        let registry = collect_providers(&with_endpoint);
+        let registry = collect_providers(&with_endpoint, "http://127.0.0.1:60001");
         assert_eq!(
             registry
                 .require("local_storage")
@@ -206,7 +218,7 @@ mod tests {
             ..Default::default()
         };
 
-        let registry = collect_providers(&response);
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
         assert!(registry.is_empty(), "只收 media_provider：{registry:?}");
     }
 

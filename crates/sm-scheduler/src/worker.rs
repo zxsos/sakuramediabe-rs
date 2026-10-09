@@ -93,11 +93,6 @@ const CLAIM_ERROR_BACKOFF: u32 = 5;
 /// housekeeper 的间隔下限（秒）。上游 `max(lease_seconds // 3, 5)` 的那个 5。
 const HOUSEKEEPING_FLOOR_SECONDS: u64 = 5;
 
-/// 构建某个任务的执行体。
-///
-/// 收 `&Value` 形参（持久化的 `params`）是因为**带参任务**要从这里读
-/// `params`（上游 `JobDefinition.build_executor`）。无参任务的实现忽略它。
-
 /// handler 需要的**进程级依赖**。
 ///
 /// # 为什么是这个形状
@@ -161,6 +156,10 @@ impl QdrantEndpoint {
         !self.url.trim().is_empty()
     }
 }
+/// 构建某个任务的执行体。
+///
+/// 收 `&Value` 形参（持久化的 `params`）是因为**带参任务**要从这里读
+/// `params`（上游 `JobDefinition.build_executor`）。无参任务的实现忽略它。
 pub type HandlerFactory =
     Box<dyn Fn(&Db, &Value) -> Result<TaskHandler, WorkerError> + Send + Sync>;
 
@@ -353,21 +352,35 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
     //
     // 这个 `reset` 键是 `discovery::image_search_reset::reset_params()` 定的
     // **契约** —— 那边改名这里就静默失效（变成单阶段，`reset: true` 被忽略）。
+    // 每个工厂各持一份 `Arc` —— `move` 闭包会把捕获的变量**整个搬走**，
+    // 第二个工厂拿不到同一个 `Arc`。这是三个 handler 共用一份依赖的写法。
+    let image_search_deps = Arc::clone(&deps);
     registry.register(
         "image_search_index",
         Box::new(move |db: &Db, params: &Value| {
-            let deps = Arc::clone(&deps);
+            // 工厂是 `Fn`（每个任务运行调一次），所以每次 **clone**，不能把
+            // 捕获的那个 move 进 handler。
+            let deps = Arc::clone(&image_search_deps);
+            // handler future 要求 `'static`：`db` / `params` 都是工厂的
+            // **借用参数**，必须克隆成自有值才能进 async block。
+            let db = Db::clone(db);
+            let params = params.clone();
             let handler: TaskHandler = Box::new(move |reporter| {
                 Box::pin(async move {
                     // `reset` 决定单阶段还是双阶段（见上面的表格）。
-                    let reset = params.get("reset").and_then(Value::as_bool).unwrap_or(false);
-                    let batch_size = image_search_batch_size(&deps.config, "index_upsert_batch_size");
-                    let inference_batch = image_search_batch_size(&deps.config, "inference_batch_size");
+                    let reset = params
+                        .get("reset")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let batch_size =
+                        image_search_batch_size(&deps.config, "index_upsert_batch_size");
+                    let inference_batch =
+                        image_search_batch_size(&deps.config, "inference_batch_size");
 
                     // 图搜未启用时**正常返回 None**（不干活），不是 Err ——
                     // `optional_services::job_disabled_reason` 已经把这类任务
                     // 在任务中心置灰，这里再报错会让「未启用」看起来像「坏了」。
-                    let Some(service) = build_image_search_service(db, &deps)? else {
+                    let Some(mut service) = build_image_search_service(&db, &deps)? else {
                         // **不能返回 `Ok(None)`** —— `TaskHandlerResult = Result<Value, String>`，
                         // `None` 编不过。用一个显式的 `skipped` 摘要。
                         //
@@ -378,12 +391,9 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
                             "reason": "image_search 未启用",
                         }));
                     };
-                    let mut sink: ProgressSink<'_> =
-                        Box::new(move |current, total, text, patch| {
-                            Box::pin(async move { reporter.emit(current, total, Some(text), patch).await })
-                        });
+                    let sink = progress_sink_for(&reporter);
                     let summary = service
-                        .index_pending_images(batch_size, inference_batch, reset, Some(&mut sink))
+                        .index_pending_images(batch_size, inference_batch, reset, Some(sink))
                         .await
                         .map_err(|error| format!("图搜索索引失败：{}", error.code()))?;
                     // `summary` 的键与上游**逐字一致** —— 它会进 `signal_scores`
@@ -410,27 +420,30 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
     // 糟**，不能像图搜那样「未启用就跳过」——
     // `job_disabled_reason("movie_similarity_recompute", …)` 已经在领取前
     // 拦住了未启用的情况，走到工厂里就说明**该跑**。
+    let similarity_deps = Arc::clone(&deps);
     registry.register(
         "movie_similarity_recompute",
         Box::new(move |db: &Db, _params: &Value| {
-            let deps = Arc::clone(&deps);
+            let deps = Arc::clone(&similarity_deps);
+            // 同上：handler future 要 `'static`，`db` 必须克隆成自有值。
+            let db = Db::clone(db);
             let handler: TaskHandler = Box::new(move |reporter| {
                 Box::pin(async move {
                     // Qdrant 没配端点 = 配置自相矛盾（`qdrant.enabled` 为真
                     // 却没 url），**报错**而不是跳过 —— 见
                     // `build_image_search_service` 里同一条的说明。
-                    let service = build_movie_similarity_service(db, &deps)?;
-                    let mut sink: sm_service::discovery::recommendation::ProgressSink<'_> =
-                        Box::new(move |current, total, text, patch| {
-                            Box::pin(async move { reporter.emit(current, total, Some(text), patch).await })
-                        });
+                    // 走到这里必然已启用（领取前 `job_disabled_reason` 已拦过），
+                    // 所以 `None` 是「不该发生」。但 `Option` 必须拆开才能调方法 ——
+                    // 用 `Err` 而不是 `unwrap()`：panic 会让整个 worker 进程退出。
+                    let service = build_movie_similarity_service(&db, &deps)?
+                        .ok_or_else(|| "movie_similarity 未启用，却仍被领取".to_owned())?;
+                    let sink = progress_sink_for(&reporter);
                     let stats = service
-                        .recompute_all(Some(&mut sink))
+                        .recompute_all(Some(sink))
                         .await
                         .map_err(|error| format!("影片相似度重算失败：{}", error.code()))?;
                     // 键名与上游逐字一致 —— 会进 `signal_scores` 一类的列。
-                    serde_json::to_value(stats)
-                        .map_err(|error| format!("摘要序列化失败：{error}"))
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
                 })
             });
             Ok(handler)
@@ -440,13 +453,62 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
     registry
 }
 
+/// 进度 sink 的具体类型。
+///
+/// `image_search_index::ProgressSink` 与 `recommendation::ProgressSink` 是
+/// **两个同形的类型别名**（`handoff.md` 纪律第 7 条意义上又一处重复，但拆
+/// 它们要动两个模块的公开签名，这轮不做）。别名是透明的，所以这**一个**
+/// 具体类型同时满足两处。
+///
+/// # 为什么必须 `'static` + 参数要拷进 future
+///
+/// sink 被 move 进 worker 的 handler future，而 `TaskHandler` 要求
+/// `Pin<Box<dyn Future + Send>>` —— 隐含 `'static`。所以：
+///
+/// - 闭包**拥有** reporter 的一个 `Clone`（`TaskRunReporter` 是 `Clone`），
+///   不能借用外层的那个；
+/// - `text: &str` 与 `patch: Option<&Value>` 是**调用时**的借用，返回的
+///   future 活得更久 —— 先把它们拷成 `String` / `Value` 再 `async move`。
+type SharedProgressSink = Box<
+    dyn FnMut(
+            Option<i32>,
+            Option<i32>,
+            &str,
+            Option<&Value>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send,
+>;
+
+/// 把一个 reporter 包成进度 sink。
+fn progress_sink_for(
+    reporter: &sm_service::system::activity::TaskRunReporter,
+) -> SharedProgressSink {
+    let reporter = reporter.clone();
+    Box::new(move |current, total, text, patch| {
+        let reporter = reporter.clone();
+        let text = text.to_owned();
+        let patch = patch.cloned();
+        Box::pin(async move {
+            reporter
+                .emit(current, total, Some(&text), patch.as_ref())
+                .await
+                // `emit` 返回 `ServiceError`，而 sink 契约要 `String`。
+                .map_err(|error| format!("进度上报失败：{}", error.code()))
+        })
+    })
+}
+
 /// 读 `image_search.<key>` 的批量大小，缺省 16。
 ///
 /// 上游 `settings.image_search.index_upsert_batch_size` 与
 /// `inference_batch_size` 都有默认值，且 `max(1, ...)` —— **0 或负数会被抬到 1**
 /// 而不是报错（`image_search_index_service.py:72-73`）。照抄。
 fn image_search_batch_size(config: &sm_service::system::config::ConfigService, key: &str) -> i64 {
-    let snapshot = config.snapshot();
+    // `snapshot()` 返回 `Result`。读不到就**回落默认值**而不是传播错误 ——
+    // 批量大小不是「能不能干活」的判据，读失败按上游的缺省 16 走。
+    let Ok(snapshot) = config.snapshot() else {
+        return 16;
+    };
     snapshot
         .get("image_search")
         .and_then(|section| section.get(key))
@@ -460,12 +522,17 @@ fn build_image_search_service(
     db: &Db,
     deps: &HandlerDeps,
 ) -> Result<Option<sm_service::discovery::image_search_index::ImageSearchIndexService>, String> {
+    use sm_service::discovery::embedding::EmbeddingClient;
     use sm_service::discovery::image_search_index::ImageSearchIndexService;
+    // 服务要的是**两个具体集合的 store**（`ThumbnailVectorStore` /
+    // `PlotImageVectorStore`），不是裸 `DenseStore`：写侧的 `upsert_records`
+    // 在这两个类型上，记录 → point 的映射也在它们各自的文件里。
     use sm_service::discovery::qdrant::dense::{
-        DenseStore, PLOT_IMAGE_COLLECTION, PLOT_IMAGE_PAYLOAD_INDEX, THUMBNAIL_COLLECTION,
+        PLOT_IMAGE_COLLECTION, PLOT_IMAGE_PAYLOAD_INDEX, THUMBNAIL_COLLECTION,
         THUMBNAIL_PAYLOAD_INDEX,
     };
-    use sm_service::discovery::embedding::EmbeddingClient;
+    use sm_service::discovery::qdrant::plot_image::PlotImageVectorStore;
+    use sm_service::discovery::qdrant::thumbnail::ThumbnailVectorStore;
 
     // `snapshot()` 返回 `Result`。**这里不 `?`** —— 读不到配置时按「未启用」
     // 处理（返回 `None`）。理由：调用点在 worker 的领取循环里，让它因为配置
@@ -486,14 +553,6 @@ fn build_image_search_service(
         return Err("image_search 已启用但 qdrant.url 为空：配置不一致".to_owned());
     }
     let base = deps.qdrant.url.trim_end_matches('/');
-    let client = || -> Result<Qdrant, String> {
-        qdrant_client::config::QdrantConfig::from_url(base.to_owned())
-            .map_err(|error| format!("向量库地址无法解析：{error}"))
-            .and_then(|mut config| {
-                config.api_key = deps.qdrant.api_key.clone();
-                config.build().map_err(|error| error.to_string())
-            })
-    };
     let embedding = || -> Result<EmbeddingClient, String> {
         let base_url = snapshot
             .get("image_search")
@@ -503,7 +562,9 @@ fn build_image_search_service(
         let api_key = snapshot
             .get("image_search")
             .and_then(|section| section.get("inference_api_key"))
-            .and_then(serde_json::Value::as_str);
+            .and_then(serde_json::Value::as_str)
+            // `EmbeddingClient::new` 收 `Option<String>`，不是 `Option<&str>`。
+            .map(str::to_owned);
         Ok(EmbeddingClient::new(
             base_url,
             api_key,
@@ -516,19 +577,28 @@ fn build_image_search_service(
     // `payload_index_fields` 传各自那份常量：缩略图按 `movie_id` + `media_id`
     // 过滤，剧情图**只有** `movie_id`（见 dense.rs 的两个常量）。
     let api_key = deps.qdrant.api_key.as_deref();
-    Ok(Some(ImageSearchIndexService::new(
-        Arc::new(DenseStore::connect(
+    // `DenseStore::connect` 返回 `ServiceError`，而本函数的错误是 `String` ——
+    // 显式转（worker 的错误就是字符串，没有 `From<ServiceError>`）。
+    let connect = |collection: &str,
+                   payload_index_fields: &'static [&'static str]|
+     -> Result<sm_service::discovery::qdrant::dense::DenseStore, String> {
+        sm_service::discovery::qdrant::dense::DenseStore::connect(
             base,
             api_key,
+            collection,
+            payload_index_fields,
+        )
+        .map_err(|error| format!("向量库连接失败：{}", error.code()))
+    };
+    Ok(Some(ImageSearchIndexService::new(
+        Arc::new(ThumbnailVectorStore::with_store(connect(
             THUMBNAIL_COLLECTION,
             THUMBNAIL_PAYLOAD_INDEX,
-        )?),
-        Arc::new(DenseStore::connect(
-            base,
-            api_key,
+        )?)),
+        Arc::new(PlotImageVectorStore::with_store(connect(
             PLOT_IMAGE_COLLECTION,
             PLOT_IMAGE_PAYLOAD_INDEX,
-        )?),
+        )?)),
         Arc::new(embedding()?),
         sm_db::repo::discovery::PendingImageRepository::new(db.clone()),
         sm_db::repo::discovery::ImageSearchIndexStateRepository::new(db.clone()),

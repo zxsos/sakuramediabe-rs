@@ -145,6 +145,30 @@ impl MediaThumbnailRepository {
         }
     }
 
+    /// 某条 Media 的**全部**缩略图，按 `(offset, id)` 升序。**刻意不分页。**
+    ///
+    /// # 为什么与下面分页的 `list_by_media` 是两个方法
+    ///
+    /// 上游是**两个用途**，排序也不同：
+    ///
+    /// | 用途 | 排序 |
+    /// |---|---|
+    /// | `GET /media/{id}/thumbnails`（本方法） | `offset ASC, id ASC` |
+    /// | 运维/巡检翻页看缩略图台账 | `offset` 单键 |
+    ///
+    /// `id` 这个**次级键不能省**：同一秒上可能有两条（重新生成过就撞上
+    /// `(media_id, offset)` 唯一约束之外的脏数据），只按 `offset` 排的话
+    /// PostgreSQL 不保证稳定顺序，于是「同一媒体两次请求拿到不同次序」——
+    /// 而选图逻辑（`discovery::moment_recommendation` 取中位数）依赖位置语义。
+    pub async fn list_all_by_media(&self, media_id: i32) -> Result<Vec<MediaThumbnail>, DbError> {
+        Ok(sqlx::query_as::<_, MediaThumbnail>(
+            "SELECT * FROM media_thumbnail WHERE media_id = $1 ORDER BY \"offset\", id",
+        )
+        .bind(media_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 批量取「若干条 Media 在若干个时刻」的缩略图。
     ///
     /// 对应上游 `MediaClipService.load_cover_map` 的两次 `in_` 查询。片段封面
@@ -408,31 +432,64 @@ impl MediaPointRepository {
         )
     }
 
-    /// 插入时刻点。
+    /// 按 id 批量取，返回 `{id: MediaPoint}`。
+    ///
+    /// 时刻合集点位列表要按成员行批量回填点位本体 —— 逐个合集/逐个成员
+    /// 调 [`Self::find_by_id`] 就是 N+1。
+    ///
+    /// **空列表直接返回空**：`= ANY('{}')` 本身合法，但空入参不该产生一次
+    /// 数据库往返。
+    ///
+    /// 走主键索引。
+    pub async fn find_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, MediaPoint>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, MediaPoint>("SELECT * FROM media_point WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+    }
+
+    /// 插入时刻点。参数顺序与上游 `MediaPoint.create(...)` 的关键字一一对应。
     ///
     /// `movie_number` / `video_item_id` 是**快照**（不建外键），所以
     /// `media_id` 可空 —— 来源 Media 被删后时刻点仍然存在并保留展示，
     /// 这是 `on_delete = SET NULL` 的设计意图。
     ///
+    /// # ⚠️ 这里此前漏了 `thumbnail_id`（本轮补上）
+    ///
+    /// DDL 有 `thumbnail_id integer NULL`，模型也声明了该字段，但 INSERT 的列
+    /// 清单里**没有它** —— 于是每个时刻点的 `thumbnail_id` 恒为 NULL。
+    /// 后果不止「少一列」：上游 `create_point` 的**幂等判据**正是
+    /// `WHERE media = ? AND thumbnail = ?`（见 [`Self::find_by_media_and_thumbnail`]），
+    /// `thumbnail_id` 恒 NULL 会让那条查询永远命中不了，重复建点变成必然。
+    ///
     /// 不提供 upsert：`media_point` 上**没有**唯一索引，同一时刻点可以
-    /// 有多行（来源不同就是不同记录）。
+    /// 有多行（来源不同就是不同记录）。幂等由 service 层「先查后插」保证。
     #[allow(clippy::too_many_arguments)]
     pub async fn insert(
         &self,
-        image_id: i32,
-        offset_seconds: i32,
         media_id: Option<i32>,
+        thumbnail_id: Option<i32>,
+        image_id: i32,
         movie_number: Option<&str>,
         video_item_id: Option<i32>,
+        offset_seconds: i32,
     ) -> Result<MediaPoint, DbError> {
         let now = crate::common::time::now_utc();
         sqlx::query_as::<_, MediaPoint>(
             "INSERT INTO media_point ( \
-                 media_id, image_id, movie_number, video_item_id, offset_seconds, \
-                 created_at, updated_at \
-             ) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING *",
+                 media_id, thumbnail_id, image_id, movie_number, video_item_id, \
+                 offset_seconds, created_at, updated_at \
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7) RETURNING *",
         )
         .bind(media_id)
+        .bind(thumbnail_id)
         .bind(image_id)
         .bind(movie_number.map(str::trim).filter(|s| !s.is_empty()))
         .bind(video_item_id)
@@ -441,6 +498,51 @@ impl MediaPointRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| DbError::from(e).with_entity(POINT_ENTITY))
+    }
+
+    /// 某条 Media 上「指向某个缩略图」的时刻点。**幂等判据。**
+    ///
+    /// 上游 `create_point` 的第一件事就是这条查询：命中说明同一个
+    /// `(media, thumbnail)` 已经建过点，直接返回它并告诉调用方「没新建」。
+    ///
+    /// `ORDER BY id LIMIT 1`：表上没有唯一索引，理论上可能有多行（历史数据
+    /// 或被别处写坏），取最早的一条，与上游 `.order_by(MediaPoint.id).first()`
+    /// 一致。
+    pub async fn find_by_media_and_thumbnail(
+        &self,
+        media_id: i32,
+        thumbnail_id: i32,
+    ) -> Result<Option<MediaPoint>, DbError> {
+        Ok(sqlx::query_as::<_, MediaPoint>(
+            "SELECT * FROM media_point \
+             WHERE media_id = $1 AND thumbnail_id = $2 ORDER BY id LIMIT 1",
+        )
+        .bind(media_id)
+        .bind(thumbnail_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// 某条 Media 的**全部**时刻点，按 `id` 升序。**刻意不分页。**
+    ///
+    /// # 为什么与下面分页的 `list_by_media` 排序不同
+    ///
+    /// 上游这是**两个端点各自的排序**，不是随手写的：
+    ///
+    /// | 端点 | 排序 |
+    /// |---|---|
+    /// | `GET /media/{id}/points`（本方法） | `MediaPoint.id` |
+    /// | `GET /media-points`（全局列表） | `created_at` 降序（可传 sort 覆盖）|
+    ///
+    /// 本方法服务前者。**不要**为了「统一」把它改成按 `offset_seconds` ——
+    /// 那会让客户端的点位顺序与上游不一致（骨架文档里就写错过这一条）。
+    pub async fn list_all_by_media(&self, media_id: i32) -> Result<Vec<MediaPoint>, DbError> {
+        Ok(sqlx::query_as::<_, MediaPoint>(
+            "SELECT * FROM media_point WHERE media_id = $1 ORDER BY id",
+        )
+        .bind(media_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     paged_list! {

@@ -171,6 +171,29 @@ async fn seed_image(pool: &sqlx::PgPool, origin: &str) -> i32 {
     row.0
 }
 
+/// 建一条 `media_thumbnail` 行。
+///
+/// 裸 SQL，理由同 [`seed_image`]（`MediaThumbnailRepository` 没有 insert 方法，
+/// 产物是由 worker 的 `record_thumbnail_success` 落地的，测试要提前造一行）。
+///
+/// `image_search_index_status` 是 `NOT NULL` 且**没有默认值**，所以必须显式给
+/// —— 传 0（`thumbnail_status::PENDING` 的口径）。
+async fn seed_thumbnail(pool: &sqlx::PgPool, media_id: i32, image_id: i32, offset: i32) -> i32 {
+    let row = sqlx::query_as::<_, (i32,)>(
+        "INSERT INTO media_thumbnail \
+             (media_id, image_id, \"offset\", image_search_index_status, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, $4, $4) RETURNING id",
+    )
+    .bind(media_id)
+    .bind(image_id)
+    .bind(offset)
+    .bind(now_utc())
+    .fetch_one(pool)
+    .await
+    .expect("插入 media_thumbnail 失败");
+    row.0
+}
+
 // ================================================================ 缩略图：接上断裂的闭环
 
 #[tokio::test]
@@ -535,11 +558,11 @@ async fn point_insert_and_list_by_media() {
     let img2 = seed_image(db.pool(), "p2").await;
 
     points
-        .insert(img2, 200, Some(media_id), Some("ABC-001"), None)
+        .insert(None, None, img2, Some("ABC-001"), None, 200)
         .await
         .unwrap();
     points
-        .insert(img1, 100, Some(media_id), Some("ABC-001"), None)
+        .insert(None, None, img1, Some("ABC-001"), None, 100)
         .await
         .unwrap();
 
@@ -554,6 +577,86 @@ async fn point_insert_and_list_by_media() {
 }
 
 #[tokio::test]
+async fn point_insert_round_trips_the_thumbnail_id() {
+    // 锁的是一个**曾经静默丢失**的列：`media_point.thumbnail_id` 在 DDL 与模型
+    // 里都有，但 `insert` 的列清单里漏了它，于是恒为 NULL。
+    //
+    // 后果不止「少一列」：service 层的**幂等判据**正是
+    // `WHERE media_id = ? AND thumbnail_id = ?`（上游 `create_point` 第一件事），
+    // 恒 NULL 会让那条查询永远命中不了 —— 重复建点变成必然，且没有任何报错。
+    let db = TestDb::require().await;
+    let points = MediaPointRepository::new(db.pool().clone());
+
+    let media_id = seed_media(&db, "ABC-001").await;
+    let image_id = seed_image(db.pool(), "p-thumb").await;
+    let thumbnail_id = seed_thumbnail(db.pool(), media_id, image_id, 300).await;
+
+    let point = points
+        .insert(
+            Some(media_id),
+            Some(thumbnail_id),
+            image_id,
+            Some("ABC-001"),
+            None,
+            300,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        point.thumbnail_id,
+        Some(thumbnail_id),
+        "thumbnail_id 必须原样落库 —— 幂等判据依赖它"
+    );
+
+    // 幂等判据本身能命中。
+    let found = points
+        .find_by_media_and_thumbnail(media_id, thumbnail_id)
+        .await
+        .unwrap()
+        .expect("同一 (media, thumbnail) 应能查到");
+    assert_eq!(found.id, point.id);
+
+    // 换一个缩略图查不到 —— 否则那条查询是恒真的，等于没有判据。
+    let other_image = seed_image(db.pool(), "p-thumb-2").await;
+    let other_thumbnail = seed_thumbnail(db.pool(), media_id, other_image, 600).await;
+    assert!(points
+        .find_by_media_and_thumbnail(media_id, other_thumbnail)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn point_list_all_by_media_orders_by_id_not_by_offset() {
+    // 上游 `GET /media/{id}/points` 是 `ORDER BY MediaPoint.id`，**不是**按时刻。
+    // 分页的 `list_by_media` 才是 `OFFSET` 序 —— 两个端点两种排序，别统一。
+    let db = TestDb::require().await;
+    let points = MediaPointRepository::new(db.pool().clone());
+
+    let media_id = seed_media(&db, "ABC-001").await;
+    let late = seed_image(db.pool(), "p-late").await;
+    let early = seed_image(db.pool(), "p-early").await;
+
+    // 先插 300 秒、后插 100 秒：按 id 序应是 [300, 100]，按时刻序会是 [100, 300]。
+    let first = points
+        .insert(Some(media_id), None, late, Some("ABC-001"), None, 300)
+        .await
+        .unwrap();
+    let second = points
+        .insert(Some(media_id), None, early, Some("ABC-001"), None, 100)
+        .await
+        .unwrap();
+
+    let by_id = points.list_all_by_media(media_id).await.unwrap();
+    assert_eq!(
+        by_id.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![first.id, second.id],
+        "list_all_by_media 必须按 id 升序"
+    );
+    assert_eq!(by_id[0].offset_seconds, 300, "第一行是后插的那个");
+}
+
+#[tokio::test]
 async fn point_survives_its_source_media_being_deleted() {
     // on_delete = SET NULL：来源删后时刻点仍在，快照列仍能归属与展示。
     let db = TestDb::require().await;
@@ -562,7 +665,7 @@ async fn point_survives_its_source_media_being_deleted() {
     let media_id = seed_media(&db, "ABC-001").await;
     let image_id = seed_image(db.pool(), "p1").await;
     let point = points
-        .insert(image_id, 100, Some(media_id), Some("ABC-001"), None)
+        .insert(Some(media_id), None, image_id, Some("ABC-001"), None, 100)
         .await
         .unwrap();
 
@@ -595,7 +698,7 @@ async fn point_delete_removes_the_row() {
     let image_id = seed_image(db.pool(), "p1").await;
 
     let point = points
-        .insert(image_id, 100, None, Some("ABC-001"), None)
+        .insert(None, None, image_id, Some("ABC-001"), None, 100)
         .await
         .unwrap();
     assert!(points.delete(point.id).await.unwrap());

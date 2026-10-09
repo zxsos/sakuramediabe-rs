@@ -617,6 +617,247 @@ impl ClipCollectionService {
     }
 }
 
+/// 时刻合集所有 422 的错误码。与上游
+/// `validate_page(..., error_code="invalid_moment_collection_filter")` 一致。
+///
+/// 与 [`INVALID_CLIP_COLLECTION_FILTER`] 是**两个**码：客户端按 `code` 分支，
+/// 合并会让「哪个域的筛选条件有问题」这条信息丢失。
+pub const INVALID_MOMENT_COLLECTION_FILTER: &str = "invalid_moment_collection_filter";
+
+/// 时刻合集连同它的成员数与封面。
+///
+/// # `point_count` 的口径与 [`CollectionWithCount::clip_count`] **不同**
+///
+/// 片段有产物文件、可能失效，所以 `clip_count` 只数**有效**成员；时刻点没有
+/// 产物，`point_count` 就是全部成员。照抄 clip 侧的 `valid_members` 会把
+/// 成员数算成 0（时刻点根本没有 `retain_valid` 这条路径）。
+#[derive(Debug, Clone)]
+pub struct MomentCollectionWithCount {
+    pub collection: MomentCollection,
+    /// 成员数（**全部**成员，不过滤有效性）。
+    pub point_count: i32,
+    /// 封面：按 `(position, id)` 排最前那个成员的点位图。空合集为 `None`。
+    pub cover: Option<sm_db::catalog::asset::Image>,
+}
+
+/// 一个时刻合集成员，连同它的点位与图片。
+///
+/// 三张表（`moment_collection_item` / `media_point` / `image`）在 **Rust 侧
+/// 拼**，不是一次三表 JOIN —— `sqlx` 的元组 `FromRow` 按位置解码、要求每个
+/// 元素是 `Decode`，而这里三个都是具名模型（实现的是 `FromRow`）。
+/// 分三次 `= ANY($1)` 批量查既避开重复列名，也避开 N+1。
+#[derive(Debug, Clone)]
+pub struct MomentPointWithImage {
+    pub item: sm_db::collections::MomentCollectionItem,
+    pub point: sm_db::playback::media::MediaPoint,
+    pub image: sm_db::catalog::asset::Image,
+}
+
+/// 分页校验。违规 → 422 [`INVALID_MOMENT_COLLECTION_FILTER`]。
+///
+/// 与 [`validate_page`]（videos 域）的区别**只有错误码** —— 上游时刻合集
+/// 那一处传的是 `error_code="invalid_moment_collection_filter"`。
+fn validate_moment_page(page: i64, page_size: i64) -> Result<(), ServiceError> {
+    sm_core::pagination::validate_page(page, page_size).map_err(|err| {
+        let details = match err.details() {
+            serde_json::Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("page".to_owned(), other);
+                map
+            }
+        };
+        ServiceError::validation_with(INVALID_MOMENT_COLLECTION_FILTER, err.message(), details)
+    })
+}
+
+/// 时刻合集专属的读路径。
+///
+/// # 为什么不放进 `impl_ordered_collection_service!`
+///
+/// 宏的 `list_members` 只返回成员行，而列表与详情还要**成员数**与**封面**
+/// —— 封面要 `media_point.image_id`，所以那两件事都要点位本体。宏是
+/// moment 与 clip 共用的，而 clip 的有效性判定只有 clip 有（见上）。
+impl MomentCollectionService {
+    /// 确认合集存在，否则 404 `moment_collection`。
+    ///
+    /// 宏里的 `require_collection` 是私有的，而点位列表端点要先做存在性校验
+    /// —— 上游 `_require_collection` 在 `validate_page` **之前**，所以
+    /// 「合集不存在」不能被报成分页错误。
+    pub async fn require(&self, collection_id: i32) -> Result<MomentCollection, ServiceError> {
+        self.require_collection(collection_id).await
+    }
+
+    fn images(&self) -> sm_db::repo::ImageRepository {
+        sm_db::repo::ImageRepository::new(self.pool.clone())
+    }
+
+    /// 一批合集的**成员数**与**封面**。
+    ///
+    /// 三次查询而不是「每个合集三次」：成员行一次（`list_by_collections`）、
+    /// 点位一次（去重后的 `point_id`）、图片一次（去重后的 `image_id`）。
+    ///
+    /// **只取每个合集的首个成员**作为封面判据，而不是把整批成员的点位都拉
+    /// 回来 —— 一个合集可能有上千成员，而封面只看第一个。
+    async fn counts_and_covers(
+        &self,
+        collection_ids: &[i32],
+    ) -> Result<
+        std::collections::HashMap<i32, (i32, Option<sm_db::catalog::asset::Image>)>,
+        ServiceError,
+    > {
+        use std::collections::HashMap;
+
+        if collection_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let items = self.members.list_by_collections(collection_ids).await?;
+
+        // `list_by_collections` 只保证 `collection_id` 有序，**组内不排序**
+        // （跨合集时 `position` 没有可比性，仓储层注释写明了）。而封面的判据
+        // 就是组内的 `(position, id)` 最小者，所以这里自己扫一遍取最小。
+        //
+        // 顺手把成员数也数出来 —— 同一圈里两件事，不再多遍历一次。
+        let mut best: HashMap<i32, (i32, i32, i32)> = HashMap::new();
+        let mut counts: HashMap<i32, i32> = HashMap::new();
+        for item in &items {
+            let (position, id) = item.playback_order_key();
+            *counts.entry(item.collection_id).or_insert(0) += 1;
+            best.entry(item.collection_id)
+                .and_modify(|slot| {
+                    if (position, id) < (slot.1, slot.2) {
+                        *slot = (item.point_id, position, id);
+                    }
+                })
+                .or_insert((item.point_id, position, id));
+        }
+
+        let mut point_ids: Vec<i32> = best.values().map(|slot| slot.0).collect();
+        point_ids.sort_unstable();
+        point_ids.dedup();
+        let points = self.origin.find_by_ids(&point_ids).await?;
+
+        let mut image_ids: Vec<i32> = point_ids
+            .iter()
+            .filter_map(|id| points.get(id).map(|point| point.image_id))
+            .collect();
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        let images = self.images().find_by_ids(&image_ids).await?;
+
+        Ok(collection_ids
+            .iter()
+            .map(|id| {
+                let cover = best
+                    .get(id)
+                    .and_then(|slot| points.get(&slot.0))
+                    .and_then(|point| images.get(&point.image_id))
+                    .cloned();
+                (*id, (counts.get(id).copied().unwrap_or(0), cover))
+            })
+            .collect())
+    }
+
+    /// 一个合集 + 成员数 + 封面。
+    ///
+    /// 刻意只查这一个合集，不借用 [`Self::list_collections`] 再筛 ——
+    /// 那会把**所有**合集的成员都拉出来。
+    pub async fn get_with_count(
+        &self,
+        collection_id: i32,
+    ) -> Result<MomentCollectionWithCount, ServiceError> {
+        let collection = self.require_collection(collection_id).await?;
+        let mut stats = self.counts_and_covers(&[collection_id]).await?;
+        let (point_count, cover) = stats.remove(&collection_id).unwrap_or((0, None));
+        Ok(MomentCollectionWithCount {
+            collection,
+            point_count,
+            cover,
+        })
+    }
+
+    /// 全部合集 + 成员数 + 封面，按 `updated_at DESC, id DESC`。
+    pub async fn list_collections(&self) -> Result<Vec<MomentCollectionWithCount>, ServiceError> {
+        let collections = self.parent.list_ordered_by_recency().await?;
+        let ids: Vec<i32> = collections.iter().map(|row| row.id).collect();
+        let mut stats = self.counts_and_covers(&ids).await?;
+        Ok(collections
+            .into_iter()
+            .map(|collection| {
+                let (point_count, cover) = stats.remove(&collection.id).unwrap_or((0, None));
+                MomentCollectionWithCount {
+                    collection,
+                    point_count,
+                    cover,
+                }
+            })
+            .collect())
+    }
+
+    /// 成员分页。返回 `(本页成员连同点位与图片, 总数)`。
+    ///
+    /// # 排序与切片
+    ///
+    /// `list_by_collection` 已经是 `ORDER BY position, id`，与上游
+    /// `.order_by(position, id)` 同序。切片在**内存**里做，而上游用 SQL 的
+    /// `OFFSET/LIMIT` —— 两者结果一致（时刻点没有有效性过滤，`total` 就是
+    /// 行数），差别只在超大合集上多读了几行。合集是用户手建的，长度有界。
+    ///
+    /// # 点位或图片查不到的行会被跳过
+    ///
+    /// 外键保证它们存在；真丢了（并发删）就当这行不存在。上游那条
+    /// `JOIN MediaPoint JOIN Image` 同样会把它漏掉，而 `total` 仍然按
+    /// 成员行数算 —— 两边一致。
+    pub async fn list_points_paged(
+        &self,
+        collection_id: i32,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<MomentPointWithImage>, i64), ServiceError> {
+        self.require_collection(collection_id).await?;
+        validate_moment_page(page, page_size)?;
+
+        let items = self.members.list_by_collection(collection_id).await?;
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let start = usize::try_from(sm_core::pagination::page_offset(page, page_size))
+            .unwrap_or(usize::MAX)
+            .min(items.len());
+        let end = start
+            .saturating_add(usize::try_from(page_size).unwrap_or(usize::MAX))
+            .min(items.len());
+        let page_items = &items[start..end];
+
+        let mut point_ids: Vec<i32> = page_items.iter().map(|item| item.point_id).collect();
+        point_ids.sort_unstable();
+        point_ids.dedup();
+        let points = self.origin.find_by_ids(&point_ids).await?;
+
+        let mut image_ids: Vec<i32> = point_ids
+            .iter()
+            .filter_map(|id| points.get(id).map(|point| point.image_id))
+            .collect();
+        image_ids.sort_unstable();
+        image_ids.dedup();
+        let images = self.images().find_by_ids(&image_ids).await?;
+
+        let mut out = Vec::with_capacity(page_items.len());
+        for item in page_items {
+            let Some(point) = points.get(&item.point_id) else {
+                continue;
+            };
+            let Some(image) = images.get(&point.image_id) else {
+                continue;
+            };
+            out.push(MomentPointWithImage {
+                item: item.clone(),
+                point: point.clone(),
+                image: image.clone(),
+            });
+        }
+        Ok((out, total))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::dedup_preserving_order;

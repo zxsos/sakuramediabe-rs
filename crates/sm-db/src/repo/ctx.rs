@@ -45,6 +45,7 @@ use crate::error::DbError;
 use crate::playback::media::image_search_index_status;
 
 use super::asset::{MovieActorRepository, MovieTagRepository, TagRepository};
+use super::image::{ImageRepository, NewImage};
 use super::media::MediaRepository;
 use super::movie::{MovieRepository, NewMovie};
 use super::playback::MediaThumbnailRepository;
@@ -300,6 +301,71 @@ impl<'a> UnitOfWork<'a> {
 
         Ok(GeneratedThumbnail { thumb, media })
     }
+
+    /// 登记一批缩略图产物：逐条 upsert `Image`（同 `origin` 复用行）再 upsert
+    /// `MediaThumbnail`。**整体原子。**
+    ///
+    /// # 为什么必须原子
+    ///
+    /// 一媒体有十几张缩略图。逐条提交时中途失败会留下「`thumbnails.zip` 里有 12
+    /// 条、数据库只有 3 条」—— 那 9 条成了**幽灵**：包分发出去客户端看得到，
+    /// 而任何按数据库算的列表与清理都看不见它们。
+    ///
+    /// # 与 [`Self::generate_thumbnail`] 的区别
+    ///
+    /// 那个是**任务路径**：产物落地即把 `media` 的状态机推进到 `succeeded`。
+    /// 这个只登记产物，**不碰 `media`** —— `media` 的状态由调用方决定
+    /// （上游 `ThumbnailArtifactService.persist` 同样不碰它）。
+    ///
+    /// # 用 upsert 而不是 insert
+    ///
+    /// 上游这里是 `Image.create` + `MediaThumbnail.create`（裸插入）。同一媒体
+    /// **重新生成**缩略图时会撞 `(media_id, offset)` 唯一索引与 `origin` 唯一
+    /// 索引 —— 上游靠调用方先清干净来回避。这里用 upsert：表的约束本来就是
+    /// 这么设计的（两个仓储各自的 `upsert` 文档都写了理由）。
+    pub async fn record_thumbnail_artifacts(
+        &mut self,
+        media_id: i32,
+        artifacts: &[ThumbnailArtifactRecord],
+        index_status: i32,
+    ) -> Result<usize, DbError> {
+        let thumbs = self.thumbnails();
+        let images = ImageRepository::new(self.pool.clone());
+
+        let mut ctx = self.ctx();
+        for artifact in artifacts {
+            let (image_id, _created) = images
+                .upsert_in(
+                    &mut ctx,
+                    &NewImage {
+                        origin: artifact.origin.clone(),
+                    },
+                )
+                .await?;
+            thumbs
+                .upsert_in(
+                    &mut ctx,
+                    media_id,
+                    artifact.offset_seconds,
+                    image_id,
+                    index_status,
+                )
+                .await?;
+        }
+        Ok(artifacts.len())
+    }
+}
+
+/// 一件待登记的缩略图产物。
+///
+/// 只带**登记需要**的两样：`image.origin`（库内相对路径）与偏移。产物字节不进
+/// 数据库 —— 它们已经落进 `thumbnails.zip` 了。
+#[derive(Debug, Clone)]
+pub struct ThumbnailArtifactRecord {
+    /// 图片的库内相对路径（`image.origin`，POSIX 分隔符）。
+    pub origin: String,
+    /// 在媒体里的偏移（秒）。
+    pub offset_seconds: i32,
 }
 
 /// 一次缩略图生成的结果。

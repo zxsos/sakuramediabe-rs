@@ -59,7 +59,10 @@ fn magnet_hash(source_uri: &str) -> Option<String> {
 }
 
 /// 从 `.torrent` URL 算 info-hash。**需要出网 + libtorrent**。
-fn torrent_hash(source_uri: &str) -> Result<String, ServiceError> {
+///
+/// 是 `async` 的：**实现时要出网**（流式 GET + 限 10 MiB + 5 次重定向）。
+/// 骨架期 `todo!()` 不返回，签名先按终态写，免得实现时改调用点。
+async fn torrent_hash(source_uri: &str) -> Result<String, ServiceError> {
     let _ = source_uri;
     todo!("骨架：流式 GET（限 10MiB / 5 次重定向）+ libtorrent 解析 infohash")
 }
@@ -115,9 +118,14 @@ mod tests {
     }
 
     /// 非 magnet / 非 http 的输入 → 422 `invalid_download_source`。
-    #[test]
-    fn an_unsupported_scheme_is_rejected_with_the_dedicated_code() {
+    ///
+    /// `#[tokio::test]`：`resolve_resource_hash` 是 async（`torrent_hash`
+    /// 那一路要出网）。这条用例走不到那一路，但 future 仍必须 await 才有
+    /// `Result`。
+    #[tokio::test]
+    async fn an_unsupported_scheme_is_rejected_with_the_dedicated_code() {
         let error = resolve_resource_hash("ftp://example.com/x.torrent")
+            .await
             .expect_err("非 http(s) 应被拒");
         assert_eq!(error.code(), "invalid_download_source");
     }

@@ -29,6 +29,13 @@ use crate::error::DbError;
 use crate::paged_list;
 use crate::playback::media::{thumbnail_state, Media};
 
+/// 缩略图生成候选行：**`(media_id, library_id, provider_key)`**。
+///
+/// 元组而不是结构体，理由同 `movie::MovieResolutionLevelRow`：它跨
+/// `media` + `media_library` 两张表、不是任何一张表的镜像，对拍脚本认不出它的
+/// 上游模型 —— 具名类型放 `sm-service` 那边更合适（那里才需要字段含义）。
+pub type ThumbnailCandidateRow = (i32, i32, String);
+
 use super::ctx::Ctx;
 use super::movie::{bind_value_exec, safe_sql};
 
@@ -366,6 +373,231 @@ impl MediaRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// 缩略图生成的**候选数**。上游 `MediaThumbnailTaskService.count_pending_media`。
+    ///
+    /// # 它不是「状态为 `pending` 的数量」——骨架把它写成那样是错的
+    ///
+    /// 上游 `_candidate_query` 的条件是三条的**并**：
+    ///
+    /// ```text
+    ///   1. 状态 ∈ {pending, succeeded}          <- 含 succeeded！
+    ///   2. 或 状态 = retry_wait 且已到期
+    ///   3. 且 该媒体**一张缩略图都没有**
+    ///   4. 且 media.valid = true
+    /// ```
+    ///
+    /// 第 1 条里的 `succeeded` 是关键：状态机说「做完了」但**产物不在**（包被删、
+    /// 磁盘换了、上一次写库成功而落盘失败）时，这个媒体必须被重新扫到 ——
+    /// 否则它会永久停在 `succeeded` 而永远没有图。`list_pending_thumbnails`
+    /// （只扫 `retry_wait`）盖不到这一类。
+    ///
+    /// 第 3 条让「已成功产出」的媒体不会再进候选：即使状态是 `succeeded`。
+    ///
+    /// `JOIN media_library` 与上游一致。注意它在语义上是**恒等**的
+    /// （`media_library_id_fk` 是 `ON DELETE CASCADE` 且 `library_id` 非空，
+    /// 不可能有挂不上库的媒体）——保留它是为了与上游逐条对应。
+    pub async fn count_thumbnail_candidates(&self) -> Result<i64, DbError> {
+        let now = crate::common::time::now_utc();
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM media m \
+             JOIN media_library l ON l.id = m.library_id \
+             WHERE m.valid = true \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id) \
+               AND ( \
+                     m.thumbnail_generation_state = ANY($2) \
+                  OR ( m.thumbnail_generation_state = $3 \
+                       AND (m.thumbnail_next_retry_at IS NULL \
+                            OR m.thumbnail_next_retry_at <= $1) ) \
+               )",
+        )
+        .bind(now)
+        .bind([thumbnail_state::PENDING, thumbnail_state::SUCCEEDED])
+        .bind(thumbnail_state::RETRY_WAIT)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// 候选列表。`WHERE` 与 [`Self::count_thumbnail_candidates`] **逐字相同**
+    /// （含那三条并集与 `NOT EXISTS`），`ORDER BY id` + `LIMIT`。
+    ///
+    /// 上游 `_candidate_entries`。带 `provider_key` / `library_id` 是因为下一步
+    /// 就是「按 provider_key 找到那个插件去调」—— 只给 `media_id` 不够。
+    pub async fn list_thumbnail_candidates(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ThumbnailCandidateRow>, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query_as::<_, ThumbnailCandidateRow>(
+            "SELECT m.id, l.id, l.provider_key FROM media m \
+             JOIN media_library l ON l.id = m.library_id \
+             WHERE m.valid = true \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id) \
+               AND ( \
+                     m.thumbnail_generation_state = ANY($2) \
+                  OR ( m.thumbnail_generation_state = $3 \
+                       AND (m.thumbnail_next_retry_at IS NULL \
+                            OR m.thumbnail_next_retry_at <= $1) ) \
+               ) \
+             ORDER BY m.id LIMIT $4",
+        )
+        .bind(now)
+        .bind([thumbnail_state::PENDING, thumbnail_state::SUCCEEDED])
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// ★ 延迟一次：源还没就绪，但**不该**算失败。
+    ///
+    /// 上游 `_mark_deferred`。与 [`Self::record_thumbnail_failure`] 的关键差别是
+    /// 它加的是 `thumbnail_deferred_count`，**不是** `thumbnail_attempt_count`
+    /// —— 两个计数是两条独立的轨道（见 `sm-service` 侧
+    /// `thumbnails::task_service` 的模块文档）。
+    ///
+    /// # 为什么不能就复用 `record_thumbnail_failure`
+    ///
+    /// 那会让「盘还没挂载」消耗**失败预算**：延迟 2 次之后，一次真正的失败就
+    /// 直接进终态 —— 而用户把盘挂上之后，它本该成功的。
+    pub async fn record_thumbnail_deferred(
+        &self,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_deferred_count = thumbnail_deferred_count + 1, \
+                thumbnail_last_error_code = $3, \
+                thumbnail_last_error = $3, \
+                thumbnail_next_retry_at = $4, \
+                updated_at = $5 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(error_code)
+        .bind(next_retry_at)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+        Ok(row)
+    }
+
+    /// ★ 把媒体推进**终态**（自动重试到此为止）。
+    ///
+    /// 上游 `_write_state(state=TERMINAL, ...)`。与
+    /// [`Self::record_thumbnail_failure`] 的差别是后者**固定**写 `RETRY_WAIT`，
+    /// 而终态是另一条路：清掉 `next_retry_at`、记 `terminal_at`。
+    ///
+    /// # 为什么必须单独一个方法
+    ///
+    /// 让调用方「传个状态字符串进去」看起来更省事，但三种终态的语义各不相同：
+    /// `succeeded` 要**清零**两个计数，`retry_wait` 要**排下一次时间**，
+    /// `terminal` 要**记下放弃的时刻**。合成一个 `set_state(state, ...)` 会让
+    /// 调用方忘掉「终态要清 next_retry_at」这类细节 —— 而忘了它，那条媒体会
+    /// 带着一个过期的时间点永远卡在队列里。
+    pub async fn record_thumbnail_terminal(
+        &self,
+        id: i32,
+        error_code: &str,
+    ) -> Result<Media, DbError> {
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_attempt_count = thumbnail_attempt_count + 1, \
+                thumbnail_last_error_code = $3, \
+                thumbnail_last_error = $3, \
+                thumbnail_next_retry_at = NULL, \
+                thumbnail_terminal_at = $4, \
+                updated_at = $4 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::TERMINAL)
+        .bind(error_code)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+        Ok(row)
+    }
+
+    /// 某个缩略图状态下的媒体数，**且这些媒体一张缩略图都没有**。
+    ///
+    /// 上游 `_count_state`。用于给运维显示「还有 N 部在退避 / N 部已放弃」。
+    ///
+    /// # 与 [`Self::count_thumbnail_candidates`] 的两处差别
+    ///
+    /// | | 候选数 | 本方法 |
+    /// |---|---|---|
+    /// | `valid` 过滤 | 有 | **没有**（上游也没有）|
+    /// | 状态 | 三条并集 | 单个 |
+    ///
+    /// 不加 `valid` 过滤是刻意的：这个数是给运维看的**队列深度**，无效媒体
+    /// 卡在退避里同样是问题，藏起来反而看不见。
+    pub async fn count_thumbnail_state(&self, state: &str) -> Result<i64, DbError> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM media m \
+             WHERE m.thumbnail_generation_state = $1 \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id)",
+        )
+        .bind(state)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// 把指定媒体从**终态**放回 `pending`，返回受影响行数。
+    ///
+    /// 上游 `reset_terminal_media`。供「人工重试」用：终态意味着自动重试已放弃，
+    /// 而用户换了网络环境/挂回了盘之后就想重试了。
+    ///
+    /// # 三个 WHERE 条件都不能少
+    ///
+    /// | 条件 | 漏了会怎样 |
+    /// |---|---|
+    /// | `state = terminal` | 把正在退避的媒体也「重置」，等于**白送一次重试额度** |
+    /// | `valid = true` | 对一条坏媒体重置，它下一轮照样失败，只是多烧一次 |
+    /// | **无缩略图** | 把已经有产物的媒体重置成 `pending`，下一轮**重新生成一遍** |
+    ///
+    /// 计数一并清零：不清的话它下次失败时直接从「已用掉 2 次」开始，立刻又进终态 ——
+    /// 用户点了重试却什么都发生不了。
+    pub async fn reset_terminal_thumbnails(&self, media_ids: &[i32]) -> Result<u64, DbError> {
+        if media_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = crate::common::time::now_utc();
+        let result = sqlx::query(
+            "UPDATE media SET \
+                 thumbnail_generation_state = $1, \
+                 thumbnail_attempt_count = 0, \
+                 thumbnail_deferred_count = 0, \
+                 thumbnail_next_retry_at = NULL, \
+                 thumbnail_last_error_code = NULL, \
+                 thumbnail_last_error = NULL, \
+                 thumbnail_terminal_at = NULL, \
+                 updated_at = $2 \
+             WHERE id = ANY($3) \
+               AND valid = true \
+               AND thumbnail_generation_state = $4 \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = media.id)",
+        )
+        .bind(thumbnail_state::PENDING)
+        .bind(now)
+        .bind(media_ids)
+        .bind(thumbnail_state::TERMINAL)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// 批量取回若干影片的媒体摘要。

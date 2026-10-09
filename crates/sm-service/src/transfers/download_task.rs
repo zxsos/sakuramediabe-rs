@@ -123,8 +123,11 @@ pub struct DownloadTaskService;
 
 impl DownloadTaskService {
     /// **可触发导入的状态白名单**（三态，见模块文档）。
-    pub const DEFAULT_IMPORTABLE_STATUSES: [&'static str; 3] =
-        [IMPORT_STATUS_PENDING, IMPORT_STATUS_FAILED, IMPORT_STATUS_SKIPPED];
+    pub const DEFAULT_IMPORTABLE_STATUSES: [&'static str; 3] = [
+        IMPORT_STATUS_PENDING,
+        IMPORT_STATUS_FAILED,
+        IMPORT_STATUS_SKIPPED,
+    ];
 
     /// `GET /download-tasks` —— **200**，泛型分页。
     ///
@@ -231,10 +234,19 @@ mod tests {
     /// 已有**未成功**的导入在跑时不可再导 —— 否则会起两个导入抢同一个文件。
     #[test]
     fn a_running_import_blocks_another_one() {
-        assert!(!DownloadTaskService::importable(&task("pending"), Some("running")));
-        assert!(!DownloadTaskService::importable(&task("pending"), Some("failed")));
+        assert!(!DownloadTaskService::importable(
+            &task("pending"),
+            Some("running")
+        ));
+        assert!(!DownloadTaskService::importable(
+            &task("pending"),
+            Some("failed")
+        ));
         // 已成功的不阻塞（可重新导入）。
-        assert!(DownloadTaskService::importable(&task("pending"), Some("succeeded")));
+        assert!(DownloadTaskService::importable(
+            &task("pending"),
+            Some("succeeded")
+        ));
     }
 
     /// `None` 与空列表在 `state` 上**语义不同**，这里锁住归一结果。

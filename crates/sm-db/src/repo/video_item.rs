@@ -164,6 +164,26 @@ impl VideoItemRepository {
         )
     }
 
+    /// 按 id 批量取，返回 `{id: VideoItem}`。
+    ///
+    /// 合集列表要按成员行批量回填成员本体（封面取首个成员的条目封面）
+    /// —— 逐个成员调 [`Self::find_by_id`] 就是 N+1。
+    ///
+    /// **空列表直接返回空**：空入参不该产生一次数据库往返。
+    pub async fn find_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, VideoItem>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, VideoItem>("SELECT * FROM video_item WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+    }
+
     /// 按标题与发布日期查一个条目。**这是本表的「幂等键」。**
     ///
     /// 表上**没有**唯一约束，所以「同一个非 JAV 影片被登记两次」数据库拦不住
@@ -310,5 +330,210 @@ impl VideoItemRepository {
             .await
             .map_err(|e| DbError::from(e).with_entity(VIDEO_ITEM_ENTITY))?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+// ================================================================ 列表项组装
+
+/// 「首条有效媒体的时长」的 `ORDER BY` 片段。
+///
+/// **抽成常量是因为合集成员端点要一模一样的片段** —— 那边多联结了一张
+/// `video_collection_item`（别名 `vci`），但这一条只看 `v.id` 与 `media`，
+/// 所以可以逐字复用。抄两遍就会在某个时刻分叉。
+pub(crate) const VIDEO_FIRST_MEDIA_DURATION_COLUMN: &str = "COALESCE((SELECT m.duration_seconds \
+     FROM media m WHERE m.video_item_id = v.id AND m.valid ORDER BY m.id LIMIT 1), 0)";
+
+/// 「首条有效媒体的文件大小」的 `ORDER BY` 片段。见上。
+pub(crate) const VIDEO_FIRST_MEDIA_FILE_SIZE_COLUMN: &str = "COALESCE((SELECT m.file_size_bytes \
+     FROM media m WHERE m.video_item_id = v.id AND m.valid ORDER BY m.id LIMIT 1), 0)";
+
+/// 条目列表的排序键 → `ORDER BY` 片段。**白名单。**
+///
+/// 键与 `sm_service::videos::VideoSort::as_str()` **逐字对应** ——
+/// 那边负责「用户给的 `field:direction` 合不合法」（含 `position` 这种只有
+/// 合集成员才允许的键），这里负责「合法的键落成哪个 SQL 片段」。
+/// 自由字符串会被拼进 SQL，所以片段只能从这张表里取。
+///
+/// # `duration` / `file_size` 排的不是本表列
+///
+/// 它们排的是**「首条有效媒体」**的两列（`Media.id` 最小且 `valid`）。
+/// 上游写成 `MIN(Media.id)` 分组子查询 + 两次 `LEFT JOIN` +
+/// `COALESCE(..., 0)`；这里用相关子查询表达**同一语义**：
+///
+/// - 取的是同一个值（`ORDER BY m.id LIMIT 1` 即 `MIN(id)`，且都限定 `valid`）；
+/// - `COALESCE(..., 0)` 让「没有有效媒体」按 **0** 参与排序。少了它，`DESC`
+///   会把 NULL 排到最前（PostgreSQL 的 `DESC` 是 NULLS FIRST），与上游不符。
+pub const VIDEO_LIST_SORT_FIELD_MAP: [(&str, &str); 4] = [
+    ("created_at", "v.created_at"),
+    ("title", "v.title"),
+    ("duration", VIDEO_FIRST_MEDIA_DURATION_COLUMN),
+    ("file_size", VIDEO_FIRST_MEDIA_FILE_SIZE_COLUMN),
+];
+
+/// 取排序片段。不在白名单 → `None`（调用方应报 422，而不是拼一条可疑 SQL）。
+pub fn video_list_sort_column(key: &str) -> Option<&'static str> {
+    VIDEO_LIST_SORT_FIELD_MAP
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, column)| *column)
+}
+
+/// 每个条目的媒体统计：`(video_item_id, media_count, valid_count)`。
+///
+/// **投影行**（两列都是聚合值），不是任何单表的镜像 —— 所以是元组别名而不是
+/// `pub struct`。取舍记录见 `repo/movie.rs::MovieResolutionLevelRow`。
+pub type VideoMediaStats = (i32, i64, i64);
+
+/// 每个条目的**首条有效媒体**：`(video_item_id, media_id, duration_seconds,
+/// file_size_bytes, resolution)`。**投影行**，同上。
+///
+/// `media_id` 在里面是因为合集成员端点的 `first_media_id` 要它
+/// （上游 `COALESCE(first_media.id, 0)` 那个哨兵值，归一为 `None`）。
+pub type VideoFirstMedia = (i32, i32, i32, i64, Option<String>);
+
+/// 条目归属的合集：`(video_item_id, collection_id, name)`。
+///
+/// **`video_collection_item ⋈ video_collection` 的 JOIN 投影**，同上。
+pub type VideoCollectionRefRow = (i32, i32, String);
+
+impl VideoItemRepository {
+    /// 分页列出条目，可选标题子串过滤与排序。返回 `(本页, 总数)`。
+    ///
+    /// # 排序键必须来自 [`VIDEO_LIST_SORT_FIELD_MAP`]
+    ///
+    /// 不在白名单 → **运行时** `Err`，不是 `debug_assert!`：后者在 release 下
+    /// 被编译掉，那这份白名单就等于不存在，而它挡的是 SQL 注入。
+    ///
+    /// # 过滤用 `LIKE`，与同文件的 `search_by_title` 的 `ILIKE` 不同
+    ///
+    /// 上游 `_filtered_query` 是 `VideoItem.title.contains(...)`，落到
+    /// PostgreSQL 上是 **`LIKE`（区分大小写）**。这里照上游；`search_by_title`
+    /// 的 `ILIKE` 是另一处（**它目前没有任何调用方**，所以两者暂时不会互相
+    /// 矛盾）。按当前仓库口径若要统一，改这里一个词即可 —— 但那会偏离上游。
+    pub async fn list_page(
+        &self,
+        query: Option<&str>,
+        sort_key: &str,
+        descending: bool,
+        request: &PageRequest,
+    ) -> Result<(Vec<VideoItem>, i64), DbError> {
+        let column = video_list_sort_column(sort_key).ok_or_else(|| {
+            DbError::business(VIDEO_ITEM_ENTITY, format!("未知的排序键：{sort_key:?}"))
+        })?;
+        // 方向只可能是这两个字面量之一，所以拼进去没有注入面。
+        let direction = if descending { "DESC" } else { "ASC" };
+        let pattern = query.map(|raw| format!("%{raw}%"));
+        let filter = "WHERE ($1::text IS NULL OR v.title LIKE $1)";
+
+        let total: i64 = sqlx::query_scalar(super::movie::safe_sql(format!(
+            "SELECT COUNT(*) FROM video_item v {filter}"
+        )))
+        .bind(pattern.as_deref())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(VIDEO_ITEM_ENTITY))?;
+
+        let sql = format!(
+            "SELECT v.* FROM video_item v {filter} \
+             ORDER BY {column} {direction}, v.id {direction} LIMIT $2 OFFSET $3"
+        );
+        let rows = sqlx::query_as::<_, VideoItem>(super::movie::safe_sql(sql))
+            .bind(pattern.as_deref())
+            .bind(request.limit())
+            .bind(request.offset())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(VIDEO_ITEM_ENTITY))?;
+        Ok((rows, total))
+    }
+
+    /// 一批条目的媒体统计。返回 `{video_item_id: (media_count, valid_count)}`。
+    ///
+    /// `can_play` 的判据就是 `valid_count > 0`（上游 `bool(row.valid_count)`）。
+    ///
+    /// 用 `SUM(CASE WHEN valid THEN 1 ELSE 0 END)` 而不是 `SUM(valid)` ——
+    /// PostgreSQL **不支持对 `boolean` 求和**（上游注释也是这么写的）。
+    /// 没有媒体的条目不会出现在结果里，调用方按 `(0, false)` 兜底。
+    pub async fn media_stats(
+        &self,
+        video_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, (i64, i64)>, DbError> {
+        if video_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, VideoMediaStats>(
+            "SELECT video_item_id, COUNT(*) AS media_count, \
+                    SUM(CASE WHEN valid THEN 1 ELSE 0 END) AS valid_count \
+             FROM media WHERE video_item_id = ANY($1) GROUP BY video_item_id",
+        )
+        .bind(video_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, count, valid)| (id, (count, valid)))
+            .collect())
+    }
+
+    /// 一批条目的**首条有效媒体**。返回
+    /// `{video_item_id: (media_id, duration_seconds, file_size_bytes, resolution)}`。
+    ///
+    /// `DISTINCT ON (video_item_id) … ORDER BY video_item_id, id` —— 每个条目
+    /// 取 `Media.id` 最小的那条**有效**媒体，与上游那个
+    /// `MIN(Media.id) WHERE valid GROUP BY video_item` 子查询同值。
+    ///
+    /// 没有有效媒体的条目**不出现在结果里**，调用方按
+    /// `(0, 0, 0, None)` 兜底（上游 `COALESCE(..., 0)` 是同一件事）。
+    pub async fn first_valid_media(
+        &self,
+        video_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, (i32, i32, i64, Option<String>)>, DbError> {
+        if video_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, VideoFirstMedia>(
+            "SELECT DISTINCT ON (video_item_id) video_item_id, id, duration_seconds, \
+                    file_size_bytes, resolution \
+             FROM media WHERE video_item_id = ANY($1) AND valid \
+             ORDER BY video_item_id, id",
+        )
+        .bind(video_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, media_id, duration, size, resolution)| {
+                (id, (media_id, duration, size, resolution))
+            })
+            .collect())
+    }
+
+    /// 一批条目归属的合集。返回 `{video_item_id: [(collection_id, name), …]}`。
+    ///
+    /// 按 `(name, id)` 升序 —— 上游 `_collections_map` 就是这么排的，客户端
+    /// 按它渲染「所属合集」标签，**顺序是可见的**。
+    pub async fn collections_map(
+        &self,
+        video_ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Vec<(i32, String)>>, DbError> {
+        if video_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, VideoCollectionRefRow>(
+            "SELECT vci.video_item_id, vc.id, vc.name \
+             FROM video_collection_item vci \
+             JOIN video_collection vc ON vc.id = vci.collection_id \
+             WHERE vci.video_item_id = ANY($1) \
+             ORDER BY vc.name, vc.id",
+        )
+        .bind(video_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: std::collections::HashMap<i32, Vec<(i32, String)>> =
+            std::collections::HashMap::new();
+        for (video_id, collection_id, name) in rows {
+            out.entry(video_id).or_default().push((collection_id, name));
+        }
+        Ok(out)
     }
 }

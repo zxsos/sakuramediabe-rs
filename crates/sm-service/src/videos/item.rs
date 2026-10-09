@@ -50,7 +50,76 @@ use sm_db::videos::VideoItem;
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
-use crate::videos::Field;
+use crate::videos::{Field, SortDirection, DEFAULT_ITEM_SORT, ITEM_SORT_KEYS};
+
+/// 条目归属合集的精简引用（上游 `VideoCollectionRef`）。
+///
+/// 只有 `id` 与 `name` —— **刻意不带** `item_count` / `cover_image`：那是
+/// `VideoCollectionResource` 的事，而列表/详情里的「所属合集」标签只用得上
+/// 这两个。上游注释写明了这是为了避免循环导入。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoCollectionRef {
+    pub id: i32,
+    pub name: String,
+}
+
+/// 视频条目列表项的全部数据（上游 `VideoItemListItemResource`）。
+///
+/// **封面未签名** —— 签名要密钥，在 API 层做。
+///
+/// # 14 个字段分别从哪来
+///
+/// | 字段 | 来源 |
+/// |---|---|
+/// | `video.id` / `title` / `summary` / `release_date` / `created_at` / `updated_at` | `video_item` 行 |
+/// | `cover` | `cover_image_id` 指向的 `image` 行（**可能为 `None`**）|
+/// | `duration_seconds` / `file_size_bytes` / `cover_width` / `cover_height` | **首条有效媒体** |
+/// | `media_count` | 全部媒体数（**含失效的**）|
+/// | `can_play` | 是否存在**有效**媒体 |
+/// | `collections` | 归属合集，按 `(name, id)` 升序 |
+///
+/// # 为什么不是「取第一条媒体」而是「第一条**有效**媒体」
+///
+/// 上游 `_first_media_alias` 的子查询带 `Media.valid == True`。一条指向已失效
+/// 文件的媒体不该决定条目的时长与封面比例，也不该让 `can_play` 为真。
+/// 全部失效时那个 `LEFT JOIN` 落空 —— 与 `can_play = false` 是同一件事。
+#[derive(Debug, Clone)]
+pub struct VideoListItem {
+    pub video: VideoItem,
+    pub cover: Option<sm_db::catalog::asset::Image>,
+    pub duration_seconds: i32,
+    pub file_size_bytes: i64,
+    pub cover_width: Option<i32>,
+    pub cover_height: Option<i32>,
+    pub media_count: i64,
+    pub can_play: bool,
+    pub collections: Vec<VideoCollectionRef>,
+}
+
+/// 拆 `Media.resolution`（形如 `"1920x1080"`）为 `(宽, 高)`。
+///
+/// 空 / 缺 `x` / 非数字 / 非正值一律 `(None, None)`，由调用方决定回退
+/// （前端瀑布流回退 16:9）。上游是同名静态方法 `_parse_resolution`。
+///
+/// 归一化本身在 `sm_core::media_formats::normalize_media_resolution` ——
+/// 那是上游 `src/common/media_formats.py` 的位置，别把这层搬到 service。
+fn parse_resolution(value: Option<&str>) -> (Option<i32>, Option<i32>) {
+    let Some(normalized) = value.and_then(sm_core::media_formats::normalize_media_resolution)
+    else {
+        return (None, None);
+    };
+    let mut parts = normalized.split('x');
+    let (Some(width), Some(height), None) = (parts.next(), parts.next(), parts.next()) else {
+        return (None, None);
+    };
+    // 归一化已经保证是 ASCII 数字且不超过 `i32::MAX`，所以这两次解析必然成功；
+    // 仍然用 `match` 而不是 `expect` —— 一旦上游放宽维度上限，这里会**静默**
+    // 变成「分辨率未知」，而不是 panic。
+    match (width.parse::<i32>(), height.parse::<i32>()) {
+        (Ok(width), Ok(height)) => (Some(width), Some(height)),
+        _ => (None, None),
+    }
+}
 
 /// 新建条目。
 #[derive(Debug, Clone, Default)]
@@ -96,6 +165,7 @@ pub struct VideoItemService {
     items: VideoItemRepository,
     media: MediaRepository,
     thumbnails: MediaThumbnailRepository,
+    images: sm_db::repo::ImageRepository,
 }
 
 impl VideoItemService {
@@ -104,6 +174,7 @@ impl VideoItemService {
             items: VideoItemRepository::new(db.clone()),
             media: MediaRepository::new(db.clone()),
             thumbnails: MediaThumbnailRepository::new(db.clone()),
+            images: sm_db::repo::ImageRepository::new(db.clone()),
         }
     }
 
@@ -283,6 +354,137 @@ impl VideoItemService {
     pub async fn list_media(&self, video_id: i32) -> Result<Vec<sm_db::Media>, ServiceError> {
         self.require_video(video_id).await?;
         Ok(self.items.list_media(video_id).await?)
+    }
+
+    /// 分页列出条目。返回 `(本页列表项, 总数)`。
+    ///
+    /// # 校验顺序照上游
+    ///
+    /// 上游 `list_videos` 第一句就是 `validate_page`，之后才碰过滤与排序 ——
+    /// 所以「分页非法」与「搜索词归一后为空」同时成立时，报的是**分页**那条。
+    pub async fn list(
+        &self,
+        query: Option<&str>,
+        sort: Option<&str>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<VideoListItem>, i64), ServiceError> {
+        crate::videos::validate_page(page, page_size)?;
+        let query = crate::videos::normalize_query(query)?;
+        let spec = crate::videos::parse_sort(sort, ITEM_SORT_KEYS, DEFAULT_ITEM_SORT)?;
+        // `PageRequest` 再校验一次（同一个 `sm_core` 口径），换来 `offset`/`limit`
+        // 与「负数换成 0」这类边界处理，不必在这层重写。
+        let request = sm_db::common::page::PageRequest::new(page, page_size)?;
+        let (videos, total) = self
+            .items
+            .list_page(
+                query.as_deref(),
+                spec.key.as_str(),
+                spec.direction == SortDirection::Desc,
+                &request,
+            )
+            .await?;
+        let items = self.assemble(videos).await?;
+        Ok((items, total))
+    }
+
+    /// 把一批条目补齐成列表项。**四条批量查询**，不是逐条:
+    ///
+    /// 1. 封面图（按去重后的 `cover_image_id`）
+    /// 2. 每条目的首条有效媒体（时长 / 大小 / 分辨率）
+    /// 3. 每条目的媒体统计（总数与有效数）
+    /// 4. 每条目的归属合集
+    ///
+    /// 上游是一次带 `LEFT JOIN` 大查询 + 两次批量回填；这里拆成四次批量查询 ——
+    /// 少了那两次 `LEFT JOIN` 与 `COALESCE`，但**结果集与上游逐字段相同**。
+    /// 复用面：`GET /videos` 与合集成员端点（后者的 `video` 内嵌项）
+    /// 走的是同一个函数。
+    pub(crate) async fn assemble(
+        &self,
+        videos: Vec<VideoItem>,
+    ) -> Result<Vec<VideoListItem>, ServiceError> {
+        self.assemble_inner(videos, true).await
+    }
+
+    /// 与 [`Self::assemble`] 相同，但**不填 `collections`**。
+    ///
+    /// 合集成员端点用这个：上游 `_query_item_resources` 调 `_to_list_item` 时
+    /// **没有传 `collections`**，默认就是空列表。别「顺手补全」—— 那会改变
+    /// 响应（嵌套条目多出一个字段），而且合集成员页里再列一遍「所属合集」
+    /// 本来也没有意义。
+    pub(crate) async fn assemble_without_collections(
+        &self,
+        videos: Vec<VideoItem>,
+    ) -> Result<Vec<VideoListItem>, ServiceError> {
+        self.assemble_inner(videos, false).await
+    }
+
+    async fn assemble_inner(
+        &self,
+        videos: Vec<VideoItem>,
+        with_collections: bool,
+    ) -> Result<Vec<VideoListItem>, ServiceError> {
+        if videos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i32> = videos.iter().map(|video| video.id).collect();
+
+        let mut cover_ids: Vec<i32> = videos
+            .iter()
+            .filter_map(|video| video.cover_image_id)
+            .collect();
+        cover_ids.sort_unstable();
+        cover_ids.dedup();
+        let covers = self.images.find_by_ids(&cover_ids).await?;
+
+        let first_media = self.items.first_valid_media(&ids).await?;
+        let stats = self.items.media_stats(&ids).await?;
+        // 只有列表项才要合集引用 —— 成员端点因此省掉一整次查询。
+        let collections = if with_collections {
+            self.items.collections_map(&ids).await?
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        Ok(videos
+            .into_iter()
+            .map(|video| {
+                // 第 1 位是 `media_id`：列表项用不着（成员端点的
+                // `first_media_id` 才要），所以这里丢掉。
+                let (_, duration_seconds, file_size_bytes, resolution) = first_media
+                    .get(&video.id)
+                    .cloned()
+                    .unwrap_or((0, 0, 0, None));
+                let (cover_width, cover_height) = parse_resolution(resolution.as_deref());
+                let (media_count, valid_count) = stats.get(&video.id).copied().unwrap_or((0, 0));
+                let cover = video
+                    .cover_image_id
+                    .and_then(|image_id| covers.get(&image_id).cloned());
+                let collections = collections
+                    .get(&video.id)
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|(id, name)| VideoCollectionRef {
+                                id: *id,
+                                name: name.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                VideoListItem {
+                    video,
+                    cover,
+                    duration_seconds,
+                    file_size_bytes,
+                    cover_width,
+                    cover_height,
+                    media_count,
+                    // 上游 `bool(row.valid_count)`。
+                    can_play: valid_count > 0,
+                    collections,
+                }
+            })
+            .collect())
     }
 }
 

@@ -621,6 +621,30 @@ impl ClipCollectionRepository {
     }
 }
 
+impl MomentCollectionRepository {
+    /// 列出全部时刻合集，按 `updated_at DESC, id DESC`。**刻意不分页。**
+    ///
+    /// 与 [`ClipCollectionRepository::list_ordered_by_recency`] 逐条同理，
+    /// 包括 `updated_at` 可空导致「从未 touch 过的排最前」这个与上游一致的
+    /// 行为。
+    ///
+    /// # 更正一处此前的判断
+    ///
+    /// 上面 clip 那份的文档写着「`MomentCollectionRepository` 不需要它
+    /// （时刻点合集没有列表端点）」。**那是错的** —— 上游
+    /// `moment_collections.py:21` 有 `GET ""` → `list[MomentCollectionResource]`，
+    /// 且 `moment_collection_service.py:146-150` 的排序与 clip 完全相同
+    /// （`updated_at.desc(), id.desc()`）。它此前缺，是因为时刻合集那 9 个
+    /// 端点还停在 `todo!()`。
+    pub async fn list_ordered_by_recency(&self) -> Result<Vec<MomentCollection>, DbError> {
+        Ok(sqlx::query_as::<_, MomentCollection>(
+            "SELECT * FROM moment_collection ORDER BY updated_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+}
+
 // ================================================================ 成员表
 
 /// 生成两张「有序合集成员表」的仓储。
@@ -660,7 +684,11 @@ impl ClipCollectionRepository {
 #[macro_export]
 macro_rules! impl_ordered_member_repo {
     (
-        $repo:ident, $model:ty, $table:literal, $member:literal, $entity:literal
+        // `$entity` 收 `expr` 而不是 `literal`：宏体里只把它当表达式用
+        // （`with_entity($entity)`，没有 `concat!`），所以允许调用方传一个
+        // `const` —— 否则「`VideoCollectionItem`」这个实体名会在调用点再抄
+        // 一遍字面量，与文件里的常量分叉。
+        $repo:ident, $model:ty, $table:literal, $member:literal, $entity:expr
     ) => {
         #[doc = concat!("`", $table, "` 表仓储：有序合集成员。")]
         #[derive(Debug, Clone)]

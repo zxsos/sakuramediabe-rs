@@ -169,7 +169,11 @@ mod tests {
     /// ★ 评论数是**主导项**（17/34，占一半）。
     ///
     /// 搞反权重会完全改变热度排序，而排序直接决定所有列表的呈现。
+    ///
+    /// `assertions_on_constants` 在这里是**误报**：两侧都是 `const`，编译期
+    /// 就能定值 —— 而这正是本条用例的目的（把权重比例钉死，谁改动谁红）。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn comments_dominate() {
         use weights::*;
         assert!((COMMENT - 0.5).abs() < 1e-9, "评论权重就是 0.5");
@@ -177,7 +181,10 @@ mod tests {
     }
 
     /// 观看数权重最低 —— 权重顺序照抄 7 < 5 < 17 < 5 里的相对关系。
+    ///
+    /// 理由同 [`comments_dominate`]：断言常量是刻意的。
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn watched_count_has_the_smallest_weight() {
         use weights::*;
         assert!(WATCHED < WANT_WATCH);

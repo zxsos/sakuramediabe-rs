@@ -89,7 +89,7 @@ async fn seed_point(db: &TestDb) -> i32 {
         .expect("upsert image")
         .0;
     MediaPointRepository::new(db.pool().clone())
-        .insert(image, 0, Some(media), None, None)
+        .insert(Some(media), None, image, None, None, 0)
         .await
         .expect("insert media_point")
         .id

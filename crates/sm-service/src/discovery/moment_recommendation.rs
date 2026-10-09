@@ -31,7 +31,7 @@
 //!
 //! # 一处贯穿全文的概念：`target_ratio`
 //!
-//! [`safe_ratio`] 算的是**场景在影片里的时间比例**
+//! [`MomentRecommendationService::safe_ratio`] 算的是**场景在影片里的时间比例**
 //! （`offset_seconds / duration_seconds`），返回 `Option<f64>` —— 时长未知的
 //! 媒体返回 `None`。
 //!
@@ -212,6 +212,8 @@ pub trait PageContext {
 }
 
 /// 瞬时推荐服务。
+// 两个依赖尚未被方法体引用（`generate_recommendations` 还是 `todo!()`）。
+#[allow(dead_code)]
 pub struct MomentRecommendationService {
     store: Arc<DenseStore>,
     embedding: Arc<EmbeddingClient>,
@@ -309,10 +311,11 @@ impl MomentRecommendationService {
                 true
             }
             Some(existing) => {
-                let existing_key =
-                    (existing.score, -strategy_priority(existing.strategy) as f64);
-                let candidate_key =
-                    (candidate.score, -strategy_priority(candidate.strategy) as f64);
+                let existing_key = (existing.score, -strategy_priority(existing.strategy) as f64);
+                let candidate_key = (
+                    candidate.score,
+                    -strategy_priority(candidate.strategy) as f64,
+                );
                 if candidate_key > existing_key {
                     pool.insert(candidate.thumbnail_id, candidate);
                 }
@@ -337,7 +340,10 @@ impl MomentRecommendationService {
     /// 再叠一条**每片最多 [`MAX_RECOMMENDATIONS_PER_MOVIE`] 条**：避免一部
     /// 热门影片刷满整个推荐池。上游 `:403-410` 是 `continue`（跳过），
     /// **不补位** —— 所以返回值可能比 `limit` 短。
-    pub fn rank_candidates(candidates: &mut Vec<MomentCandidate>, limit: usize) -> Vec<MomentCandidate> {
+    pub fn rank_candidates(
+        candidates: &mut [MomentCandidate],
+        limit: usize,
+    ) -> Vec<MomentCandidate> {
         candidates.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -370,7 +376,10 @@ impl MomentRecommendationService {
     /// **读种子图字节** —— 上游 `_read_seed_image_bytes`（`:165-173`）读
     /// `image.origin` 指向的磁盘文件，而 `image` 表只有路径列
     /// （`schema.sql:144-149`），本仓库还没有 image store 模块。
-    pub async fn generate_recommendations(&self, limit: usize) -> Result<GenerateStats, ServiceError> {
+    pub async fn generate_recommendations(
+        &self,
+        limit: usize,
+    ) -> Result<GenerateStats, ServiceError> {
         let _ = limit;
         todo!("骨架：编排已就位，只差 image store 的读图字节（种子/选图/热门/落库/打分的仓储都已在 sm_db::repo::moment）")
     }

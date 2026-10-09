@@ -39,8 +39,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ServiceError;
-
 /// 相似度权重（`REGULAR_WEIGHTS`）。
 pub const W_SIMILARITY: f64 = 8.0 / 19.0;
 /// 订阅演员权重。
@@ -93,7 +91,11 @@ pub fn reason_text(code: &str) -> Option<&'static str> {
 
 /// 理由码列表 → 文案列表。**丢弃表外的码**。
 pub fn reason_texts(codes: &[String]) -> Vec<String> {
-    codes.iter().filter_map(|code| reason_text(code)).map(str::to_owned).collect()
+    codes
+        .iter()
+        .filter_map(|code| reason_text(code))
+        .map(str::to_owned)
+        .collect()
 }
 
 /// 候选影片的轻量投影。**只 5 个字段**（见模块文档）。
@@ -205,7 +207,11 @@ pub fn seed_weight(index: usize, total: usize) -> f64 {
 ///
 /// `normalize(0 / heat_ref)` = 0。不排除它们 —— 它们仍在候选里，只是没热度分。
 pub fn heat_scores(movies: &[CandidateMovie]) -> HashMap<i64, f64> {
-    let mut positive: Vec<i64> = movies.iter().filter_map(|m| m.heat).filter(|h| *h > 0).collect();
+    let mut positive: Vec<i64> = movies
+        .iter()
+        .filter_map(|m| m.heat)
+        .filter(|h| *h > 0)
+        .collect();
     if positive.is_empty() {
         return HashMap::new();
     }
@@ -215,7 +221,12 @@ pub fn heat_scores(movies: &[CandidateMovie]) -> HashMap<i64, f64> {
     let reference = (positive[rank.min(positive.len() - 1)] as f64).max(1.0);
     movies
         .iter()
-        .map(|movie| (movie.id, normalize(movie.heat.unwrap_or(0) as f64 / reference)))
+        .map(|movie| {
+            (
+                movie.id,
+                normalize(movie.heat.unwrap_or(0) as f64 / reference),
+            )
+        })
         .collect()
 }
 
@@ -275,13 +286,15 @@ pub fn ranking_scores(rows: &[(i64, i64, String)]) -> HashMap<i64, f64> {
 ///
 /// 所以**新用户与索引未建好的用户看到的推荐是一样的**（都是冷启动推荐）。
 pub fn similarity_scores(
-    hits_by_seed: &HashMap<i64, Vec<super::recommendation::MovieSimilarityHit>>,
+    hits_by_seed: &HashMap<i64, Vec<super::MovieSimilarityHit>>,
     seed_weights: &HashMap<i64, f64>,
     candidate_ids: &HashSet<i64>,
 ) -> HashMap<i64, f64> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for (seed_id, hits) in hits_by_seed {
-        let Some(&seed_weight) = seed_weights.get(seed_id) else { continue };
+        let Some(&seed_weight) = seed_weights.get(seed_id) else {
+            continue;
+        };
         for hit in hits {
             if !candidate_ids.contains(&hit.movie_id) {
                 continue;
@@ -299,7 +312,8 @@ pub fn similarity_scores(
 ///
 /// 上游 `:280`：`bool(recent_seed_ids or subscribed_actor_movie_ids or
 /// subscribed_movie_ids)`。
-#[derive(Debug, Clone, Copy, Default)]
+// ⚠️ **不能** derive `Copy`：`Vec` / `HashSet` 都带堆分配。
+#[derive(Debug, Clone, Default)]
 pub struct InterestSignals {
     pub recent_seed_ids: Vec<i64>,
     pub subscribed_actor_movie_ids: HashSet<i64>,
@@ -437,7 +451,12 @@ pub fn sort_scored(scored: &mut [ScoredRecommendation]) {
 }
 /// 进度上报（签名与 `image_search` 那套一致）。
 pub type ProgressSink<'a> = Box<
-    dyn FnMut(Option<i32>, Option<i32>, &str, Option<&serde_json::Value>) -> BoxFuture<'a, Result<(), String>>
+    dyn FnMut(
+            Option<i32>,
+            Option<i32>,
+            &str,
+            Option<&serde_json::Value>,
+        ) -> BoxFuture<'a, Result<(), String>>
         + 'a,
 >;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -481,8 +500,18 @@ pub struct ScoreInputs {
     /// 每部候选的榜单行 `(movie_id, rank, period)`。
     pub ranking_rows: Vec<(i64, i64, String)>,
     /// 每个种子的相似影片命中。**空表 = 相似度信号缺失**（Qdrant 故障已降级）。
-    pub hits_by_seed: HashMap<i64, Vec<super::recommendation::MovieSimilarityHit>>,
+    pub hits_by_seed: HashMap<i64, Vec<super::MovieSimilarityHit>>,
 }
+
+/// 每日推荐服务。
+///
+/// 打分主体 [`Self::score_movies`] 刻意是**关联函数而非方法**：它不碰
+/// `self`，输入全部由调用方取好。这样评分逻辑（六路信号 × 三种制度）能被
+/// 完整单测，不需要 mock 数据库。
+///
+/// 骨架期这里 `impl` 了一个并不存在的 `DailyRecommendationService` ——
+/// 结构体忘了写。
+pub struct DailyRecommendationService;
 
 impl DailyRecommendationService {
     /// ★ 打分主体。**纯函数**（输入已由调用方取好，无 IO）。
@@ -497,8 +526,8 @@ impl DailyRecommendationService {
         let freshness = freshness_scores(&inputs.movies);
 
         // 公共信号 = 热度或榜单里**有任何一个 > 0**（上游 `:281-284`）。
-        let has_public_signal = heat.values().any(|score| *score > 0.0)
-            || ranking.values().any(|score| *score > 0.0);
+        let has_public_signal =
+            heat.values().any(|score| *score > 0.0) || ranking.values().any(|score| *score > 0.0);
         let has_interest_signal = inputs.interest.any();
         let regime = select_regime(&inputs.interest, has_public_signal);
 
@@ -523,7 +552,10 @@ impl DailyRecommendationService {
             let signals = SignalScores {
                 similarity: normalize(similarity.get(&movie.id).copied().unwrap_or(0.0)),
                 subscribed_actor: f64::from(
-                    inputs.interest.subscribed_actor_movie_ids.contains(&movie.id),
+                    inputs
+                        .interest
+                        .subscribed_actor_movie_ids
+                        .contains(&movie.id),
                 ),
                 subscribed_movie: f64::from(movie.is_subscribed),
                 heat: normalize(heat.get(&movie.id).copied().unwrap_or(0.0)),

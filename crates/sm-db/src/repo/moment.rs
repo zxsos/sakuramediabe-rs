@@ -49,50 +49,69 @@ const RECOMMENDATION_ENTITY: &str = "MomentRecommendation";
 
 /// 种子投影：一条待取向量的打点。
 ///
+/// 位置依次是 **`(point_id, media_id, thumbnail_id, movie_id, offset_seconds,
+/// duration_seconds)`** —— 六个都是 `i32`。
+///
 /// 对应上游 `_MomentSeed`（`:66-73`）里用到的字段。`recency_score` **不在
 /// 这里** —— 它由位置算出，放在 service 层（`recency_score(index, total)`）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct MomentSeedRow {
-    pub point_id: i32,
-    pub media_id: i32,
-    pub thumbnail_id: i32,
-    /// 该媒体所属影片。**经 `movie_number` 关联**，不是直连外键。
-    pub movie_id: i32,
-    pub offset_seconds: i32,
-    /// 该媒体时长。
-    ///
-    /// **DDL 是 `integer NOT NULL DEFAULT 0`**，不是可空 —— 「时长未知」在
-    /// 库里表现为 **0**。所以调用方要按「`<= 0` 即未知」处理，而不是靠
-    /// `Option` 判断。上游 `media.duration_seconds or 0` 兜的是同一件事。
-    pub duration_seconds: i32,
-}
+///
+/// # 为什么是元组而不是结构体
+///
+/// 它是**四表 JOIN 的投影**（`media_point` × `media` × `movie` ×
+/// `media_thumbnail`），不是任何一张表的镜像，上游没有可对拍的 Peewee 模型。
+/// 在 `sm-db` 里写成 `pub struct` 会让 `parity/compare_schema.py` 报
+/// `UNCHECKED_STRUCT`，而给门禁加豁免正是那道门禁要防的事 ——
+/// 取舍记录见 `repo/movie.rs::MovieResolutionLevelRow`。
+///
+/// ⚠️ **六个字段同类型，位置写错是静默的**：`(point_id, media_id,
+/// thumbnail_id, …)` 与 `(media_id, thumbnail_id, point_id, …)` 都能编译。
+/// 改 SQL 的 `SELECT` 必须同步改这里的位置说明。
+///
+/// 各位置的语义：
+///
+/// 1. `point_id` —— `media_point.id`
+/// 2. `media_id` —— `media_point.media_id`
+/// 3. `thumbnail_id` —— `media_point.thumbnail_id`
+/// 4. `movie_id` —— 该媒体所属影片，**经 `movie_number` 关联**，不是直连外键
+/// 5. `offset_seconds`
+/// 6. `duration_seconds` —— 该媒体时长。**DDL 是 `integer NOT NULL DEFAULT 0`**，
+///    不是可空：「时长未知」在库里表现为 **0**，所以调用方按「`<= 0` 即未知」
+///    处理，而不是靠 `Option` 判断。上游 `media.duration_seconds or 0` 兜的
+///    是同一件事。
+pub type MomentSeedRow = (i32, i32, i32, i32, i32, i32);
 
 /// 缩略图投影：选图与打分需要的全部列。
 ///
+/// 位置依次是 **`(thumbnail_id, media_id, movie_id, offset, image_origin,
+/// duration_seconds, movie_heat, movie_is_collection)`**。
+///
 /// `is_collection` 带上是因为三个采集源都要跳过合集条目
 /// （`:232` / `:333`）—— 那是「推荐时刻」不面向合集的理由。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct MediaThumbnailRow {
-    pub thumbnail_id: i32,
-    pub media_id: i32,
-    pub movie_id: i32,
-    /// 该缩略图在影片里的偏移（秒）。列名是 `"offset"`。
-    pub offset: i32,
-    /// 图片相对路径。**未签名** —— 签名在 API 层做（要密钥）。
-    pub image_origin: String,
-    pub duration_seconds: i32,
-    /// `movie.heat` 是 `NOT NULL DEFAULT 0` —— 「没热度」是 0，不是 `NULL`。
-    pub movie_heat: i32,
-    pub movie_is_collection: bool,
-}
+///
+/// # 为什么是元组而不是结构体
+///
+/// 它是 `media_thumbnail` × `image` × `media` × `movie` **四表 JOIN 的投影**，
+/// 不是任何一张表的镜像 —— 上游没有可对拍的 Peewee 模型。理由与取舍详见
+/// [`MomentSeedRow`]。
+///
+/// ⚠️ 前四个位置都是 `i32`，位置写错是静默的。各位置语义：
+///
+/// 1. `thumbnail_id` 2. `media_id` 3. `movie_id`
+/// 4. `offset` —— 该缩略图在影片里的偏移（秒）。列名是 `"offset"`，**不是
+///    `offset_seconds`**（与 [`MomentSeedRow`] 的第 5 位不同名）
+/// 5. `image_origin` —— 图片相对路径。**未签名**，签名在 API 层做（要密钥）
+/// 6. `duration_seconds` 7. `movie_heat` —— `movie.heat` 是
+///    `NOT NULL DEFAULT 0`，「没热度」是 0 不是 `NULL`
+/// 8. `movie_is_collection`
+pub type MediaThumbnailRow = (i32, i32, i32, i32, String, i32, i32, bool);
 
 /// 热门候选投影（源 C）。对应上游 `:362-367`。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct PopularMovieRow {
-    pub movie_id: i32,
-    /// `NOT NULL DEFAULT 0`。
-    pub heat: i32,
-}
+///
+/// 位置是 **`(movie_id, heat)`**，取自 `movie` 的两列 —— 不是整表镜像，
+/// 所以同样是元组（理由见 [`MomentSeedRow`]）。
+///
+/// 第 2 位 `heat` 是 `NOT NULL DEFAULT 0`。
+pub type PopularMovieRow = (i32, i32);
 
 /// 落库的一行时刻推荐。对应上游 `:473-493` 的 `rows` 字典。
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -115,18 +134,26 @@ pub struct NewMomentRecommendation {
 }
 
 /// 读侧的一行。对应上游 `MomentRecommendation` 模型 + 两次 JOIN。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct MomentRecommendationRow {
-    pub recommendation_id: i32,
-    pub rank: i32,
-    pub score: f64,
-    pub strategy: String,
-    pub reason: String,
-    pub media_id: i32,
-    pub thumbnail_id: i32,
-    pub offset_seconds: i32,
-    pub movie_id: i32,
-}
+///
+/// 位置依次是 **`(recommendation_id, rank, score, strategy, reason, media_id,
+/// thumbnail_id, offset_seconds, movie_id)`**。
+///
+/// # 为什么是元组而不是结构体
+///
+/// 它是 `moment_recommendation` 的**列子集 + JOIN**（只取 9 列，还有两次
+/// 关联），不是整表镜像 —— 写成 `pub struct` 会因「列不全」被门禁判成
+/// `EXTRA_FIELD`/`MISSING_FIELD` 或被报 `UNCHECKED_STRUCT`。用元组的取舍
+/// 见 [`MomentSeedRow`]。
+///
+/// **具名版本在 `sm-service`**：`discovery::moment_recommendation::MomentRecommendationRow`
+/// （那份不在对拍扫描范围内，也是真正的消费方）。改动这里要同步改它。
+///
+/// ⚠️ 各位置语义：
+///
+/// 1. `recommendation_id`（`moment_recommendation.id`） 2. `rank` 3. `score`
+/// 4. `strategy` 5. `reason` 6. `media_id` 7. `thumbnail_id`
+/// 8. `offset_seconds` 9. `movie_id`
+pub type MomentRecommendationRow = (i32, i32, f64, String, String, i32, i32, i32, i32);
 
 /// 取种子打点。
 #[derive(Debug, Clone)]
@@ -239,7 +266,9 @@ impl MediaThumbnailRepository {
             .bind(thumbnail_ids)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| DbError::business(THUMBNAIL_ENTITY, format!("取缩略图失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(THUMBNAIL_ENTITY, format!("取缩略图失败：{error}"))
+            })?;
         Ok(rows)
     }
 
@@ -271,7 +300,9 @@ impl MediaThumbnailRepository {
             .bind(movie_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| DbError::business(THUMBNAIL_ENTITY, format!("取缩略图失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(THUMBNAIL_ENTITY, format!("取缩略图失败：{error}"))
+            })?;
         Ok(rows)
     }
 
@@ -289,9 +320,12 @@ impl MediaThumbnailRepository {
         thumbnails: &[MediaThumbnailRow],
         desired_offset: i64,
     ) -> Option<&MediaThumbnailRow> {
+        // `.3` = `offset`、`.0` = `thumbnail_id`（见 [`MediaThumbnailRow`] 的
+        // 位置说明）。**两者都不是 `offset_seconds`** —— 别按
+        // [`MomentSeedRow`] 的第 5 位去推。
         thumbnails
             .iter()
-            .min_by_key(|item| ((item.offset as i64 - desired_offset).abs(), item.thumbnail_id))
+            .min_by_key(|item| ((item.3 as i64 - desired_offset).abs(), item.0))
     }
 }
 
@@ -339,7 +373,12 @@ impl MomentRecommendationRepository {
             .bind((limit * 5).max(limit).max(1))
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(
+                    RECOMMENDATION_ENTITY,
+                    format!("时刻推荐表操作失败：{error}"),
+                )
+            })?;
         Ok(rows)
     }
 
@@ -358,15 +397,21 @@ impl MomentRecommendationRepository {
         rows: &[NewMomentRecommendation],
         generated_at: chrono::NaiveDateTime,
     ) -> Result<u64, DbError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            DbError::business(
+                RECOMMENDATION_ENTITY,
+                format!("时刻推荐表操作失败：{error}"),
+            )
+        })?;
         sqlx::query("DELETE FROM moment_recommendation")
             .execute(&mut *tx)
             .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(
+                    RECOMMENDATION_ENTITY,
+                    format!("时刻推荐表操作失败：{error}"),
+                )
+            })?;
         let mut inserted = 0u64;
         for row in rows {
             let sql = r#"
@@ -395,12 +440,20 @@ impl MomentRecommendationRepository {
                 .bind(generated_at)
                 .execute(&mut *tx)
                 .await
-                .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+                .map_err(|error| {
+                    DbError::business(
+                        RECOMMENDATION_ENTITY,
+                        format!("时刻推荐表操作失败：{error}"),
+                    )
+                })?;
             inserted += result.rows_affected();
         }
-        tx.commit()
-            .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+        tx.commit().await.map_err(|error| {
+            DbError::business(
+                RECOMMENDATION_ENTITY,
+                format!("时刻推荐表操作失败：{error}"),
+            )
+        })?;
         Ok(inserted)
     }
 
@@ -436,7 +489,12 @@ impl MomentRecommendationRepository {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(
+                    RECOMMENDATION_ENTITY,
+                    format!("时刻推荐表操作失败：{error}"),
+                )
+            })?;
         Ok(rows)
     }
 
@@ -453,7 +511,12 @@ impl MomentRecommendationRepository {
         let total: (i64,) = sqlx::query_as(sql)
             .fetch_one(&self.pool)
             .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(
+                    RECOMMENDATION_ENTITY,
+                    format!("时刻推荐表操作失败：{error}"),
+                )
+            })?;
         Ok(total.0)
     }
 
@@ -465,11 +528,17 @@ impl MomentRecommendationRepository {
     /// **照抄**：「修正」成一致会让客户端在「换了池子但都是失效行」时
     /// 看不到时间戳。
     pub async fn latest_generated_at(&self) -> Result<Option<chrono::NaiveDateTime>, DbError> {
-        let sql = "SELECT generated_at FROM moment_recommendation ORDER BY generated_at DESC LIMIT 1";
+        let sql =
+            "SELECT generated_at FROM moment_recommendation ORDER BY generated_at DESC LIMIT 1";
         let row: Option<(chrono::NaiveDateTime,)> = sqlx::query_as(sql)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|error| DbError::business(RECOMMENDATION_ENTITY, format!("时刻推荐表操作失败：{error}")))?;
+            .map_err(|error| {
+                DbError::business(
+                    RECOMMENDATION_ENTITY,
+                    format!("时刻推荐表操作失败：{error}"),
+                )
+            })?;
         Ok(row.map(|tuple| tuple.0))
     }
 }

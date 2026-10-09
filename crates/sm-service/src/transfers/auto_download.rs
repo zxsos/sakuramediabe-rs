@@ -32,7 +32,7 @@
 //! （`no_candidate_found` / `indexer_search_failed` / `download_submit_failed`），
 //! 见 `catalog::movie_subscription_search_state`。
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::ServiceError;
 
@@ -95,7 +95,10 @@ pub fn size_in_window(size_bytes: Option<i64>) -> bool {
 /// 只有「黑名单」与「提交失败」消耗。前者是内容问题（换个种子可能就好），
 /// 后者是系统问题；体积问题是**索引器特性**，继续翻页没有意义。
 pub fn consumes_budget(reason: RejectReason) -> bool {
-    matches!(reason, RejectReason::Blacklisted | RejectReason::SubmitFailed)
+    matches!(
+        reason,
+        RejectReason::Blacklisted | RejectReason::SubmitFailed
+    )
 }
 
 /// 本次运行的统计。
@@ -114,9 +117,17 @@ pub struct AutoDownloadStats {
 }
 
 /// 自动下载服务。
+// `inner` 尚未被方法体引用（`run` 还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct SubscribedMovieAutoDownloadService {
     /// 可注入的搜索与提交依赖，测试时替身注入。
     inner: Option<Box<dyn AutoDownloadDeps>>,
+}
+
+impl Default for SubscribedMovieAutoDownloadService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 可注入依赖面。

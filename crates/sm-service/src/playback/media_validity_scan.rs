@@ -71,10 +71,7 @@ pub struct ValidityScanStats {
 ///
 /// 第三类**不自动新建**：provider 可能有宿主不关心的文件（字幕、封面、
 /// 别的工具留下的）。自动新建会让库被塞满垃圾。
-pub fn reconcile(
-    local: &[(i64, String)],
-    remote: &dyn Fn(&str) -> bool,
-) -> ReconcileOutcome {
+pub fn reconcile(local: &[(i64, String)], remote: &dyn Fn(&str) -> bool) -> ReconcileOutcome {
     let mut outcome = ReconcileOutcome::default();
     for (media_id, storage_ref) in local {
         if remote(storage_ref) {
@@ -92,6 +89,20 @@ pub struct ReconcileOutcome {
     pub mark_valid: Vec<i64>,
     pub mark_invalid: Vec<i64>,
     pub missing_from_remote: i64,
+}
+
+/// 有效性巡检服务。
+pub struct MediaValidityScanService;
+
+impl MediaValidityScanService {
+    /// ★ 跑一轮。任务执行体。
+    ///
+    /// 逐库：能力探测 -> 拿**库锁** -> 拉 provider 全量清单 -> 对账 -> 释放锁。
+    ///
+    /// 单库失败只记入 `library_errors`，**不中断**整批。
+    pub async fn scan_media_validity(&self) -> Result<ValidityScanStats, ServiceError> {
+        todo!("骨架：逐库 -> getattr 式能力探测(不支持则记 unsupported) -> 取库锁 -> 拉清单 -> reconcile")
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +139,7 @@ mod tests {
         let local = storage_refs(&[(1, "a")]);
         let outcome = reconcile(&local, &|key| key == "a" || key == "extra");
         assert_eq!(outcome.mark_valid, vec![1]);
-        assert_eq!(outcome.mark_invalid.is_empty());
+        assert!(outcome.mark_invalid.is_empty());
         assert_eq!(outcome.missing_from_remote, 1, "只计数，不新建");
     }
 
@@ -150,19 +161,5 @@ mod tests {
         let outcome = reconcile(&[], &|_| true);
         assert!(outcome.mark_valid.is_empty());
         assert!(outcome.mark_invalid.is_empty());
-    }
-}
-
-/// 有效性巡检服务。
-pub struct MediaValidityScanService;
-
-impl MediaValidityScanService {
-    /// ★ 跑一轮。任务执行体。
-    ///
-    /// 逐库：能力探测 -> 拿**库锁** -> 拉 provider 全量清单 -> 对账 -> 释放锁。
-    ///
-    /// 单库失败只记入 `library_errors`，**不中断**整批。
-    pub async fn scan_media_validity(&self) -> Result<ValidityScanStats, ServiceError> {
-        todo!("骨架：逐库 -> getattr 式能力探测(不支持则记 unsupported) -> 取库锁 -> 拉清单 -> reconcile")
     }
 }

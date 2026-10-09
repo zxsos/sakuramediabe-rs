@@ -13,8 +13,8 @@ use plugin_ref_local::fixture::{library_handle, media_handle, populate_tree, scr
 use plugin_ref_local::latency::{summarize, Summary};
 use plugin_ref_local::{connect, spawn, string_ref, LocalRefProvider};
 use sm_plugin_api::v1::{
-    storage_provider_client::StorageProviderClient, BrowseRequest, GenerateThumbnailsRequest,
-    ReadImportFileRequest, ScanImportSourceRequest,
+    generate_thumbnails_response, storage_provider_client::StorageProviderClient, BrowseRequest,
+    GenerateThumbnailsRequest, ReadImportFileRequest, ScanImportSourceRequest,
 };
 use tokio_stream::StreamExt;
 
@@ -155,14 +155,18 @@ async fn measure_stream(
 
         let first = stream.next().await.expect("首帧").expect("首帧不应出错");
         let elapsed = started.elapsed();
-        assert_eq!(first.current, 1);
+        let Some(generate_thumbnails_response::Payload::Progress(event)) = first.payload else {
+            panic!("首帧应当是进度事件：{first:?}");
+        };
+        assert_eq!(event.current, 1);
 
         // 收完剩余帧，确保生产端不会因为「被丢下」而留下脏任务。
         let mut remaining = 1;
-        while let Some(event) = stream.next().await {
-            event.expect("后续帧不应出错");
+        while let Some(frame) = stream.next().await {
+            frame.expect("后续帧不应出错");
             remaining += 1;
         }
+        // 4 = 3 个进度 + 1 个终态 `done`（P1-1 修订后流多了一条）。
         assert_eq!(remaining, 4);
 
         if round >= STREAM_WARMUP {

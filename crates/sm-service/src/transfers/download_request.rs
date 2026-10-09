@@ -87,9 +87,17 @@ pub fn validate_request(payload: &DownloadRequestCreateRequest) -> Result<(), Se
 }
 
 /// 提交服务。
+// `inner` 尚未被方法体引用（`create_request` 还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct DownloadRequestService {
     /// 可注入的搜索/提交依赖，测试时替身注入。
     inner: Option<Box<dyn RequestDeps>>,
+}
+
+impl Default for DownloadRequestService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 可注入依赖面。**存在是为了测试**，生产路径用 `None` 走真实实现。

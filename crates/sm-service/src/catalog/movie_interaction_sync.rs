@@ -56,7 +56,10 @@ pub struct InteractionSnapshot {
 /// JavDB 互动数查询。**出网**。
 pub trait InteractionProvider {
     /// 按 JavDB id 取互动数。`Ok(None)` = 该站没有这部片。
-    fn get_interactions(&self, javdb_movie_id: &str) -> Result<Option<InteractionSnapshot>, ServiceError>;
+    fn get_interactions(
+        &self,
+        javdb_movie_id: &str,
+    ) -> Result<Option<InteractionSnapshot>, ServiceError>;
 }
 
 /// 互动数写回 + 重算热度。
@@ -101,7 +104,7 @@ pub fn is_due(
     };
     let interval = match release_date {
         Some(release) => {
-            let age = now.date_naive().signed_duration_since(release).num_days();
+            let age = now.date().signed_duration_since(release).num_days();
             if age <= recent_window_days() {
                 RECENT_REFRESH_INTERVAL_DAYS
             } else {
@@ -114,6 +117,8 @@ pub fn is_due(
 }
 
 /// 同步服务。
+// 两个依赖尚未被方法体引用（同步动作还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MovieInteractionSyncService {
     provider: Option<Box<dyn InteractionProvider>>,
     writer: Option<Box<dyn InteractionWriter>>,
@@ -121,10 +126,7 @@ pub struct MovieInteractionSyncService {
 
 impl MovieInteractionSyncService {
     /// 构造。
-    pub fn new(
-        provider: Box<dyn InteractionProvider>,
-        writer: Box<dyn InteractionWriter>,
-    ) -> Self {
+    pub fn new(provider: Box<dyn InteractionProvider>, writer: Box<dyn InteractionWriter>) -> Self {
         Self {
             provider: Some(provider),
             writer: Some(writer),

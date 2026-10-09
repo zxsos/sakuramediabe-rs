@@ -194,9 +194,13 @@ impl Plugins {
     }
 
     fn admit(&mut self, plugin_id: String, registration: RegisterResponse, process: PluginProcess) {
+        // 控制面端点由**宿主**下发（proto 的注册响应里没有「我监听的地址」）——
+        // provider 的 storage/download rpc 都在这条通道上，没有它就查得到声明、
+        // 打不出去。见 `ProviderRegistration::plugin_endpoint`。
+        let endpoint = process.endpoint();
         // 一个插件可以有多个 provider，多个插件各有一张表 —— 合进宿主那一张，
         // 顺序由 `insert` 按 `enabled` 顺序续在后面。
-        for entry in collect_providers(&registration).entries() {
+        for entry in collect_providers(&registration, &endpoint).entries() {
             self.providers.insert(entry.clone());
         }
         self.collect(&registration);
@@ -340,16 +344,18 @@ impl Plugins {
     /// 比报缺口更难查。两条修法记在
     /// `sm_service::discovery::ranking::RankingSourceCatalog` 的文档里。
     pub fn ranking_sources(&self) -> sm_service::discovery::ranking::RankingSourceCatalog {
-        use sm_plugins::registration::EXTENSION_RANKING_SOURCE;
+        use sm_plugins::registration::capability::EXTENSION_RANKING_SOURCE;
         let entries = self
             .providers
             .providers_with(EXTENSION_RANKING_SOURCE)
             .into_iter()
-            .map(|provider| sm_service::discovery::ranking::RankingSourceDefinition {
-                source_key: provider.provider_key.clone(),
-                title: provider.display_name.clone(),
-                boards: Vec::new(),
-            })
+            .map(
+                |provider| sm_service::discovery::ranking::RankingSourceDefinition {
+                    source_key: provider.provider_key.clone(),
+                    title: provider.display_name.clone(),
+                    boards: Vec::new(),
+                },
+            )
             .collect();
         sm_service::discovery::ranking::RankingSourceCatalog::new(entries)
     }

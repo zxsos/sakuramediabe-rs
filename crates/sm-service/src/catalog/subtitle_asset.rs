@@ -46,7 +46,11 @@ pub fn is_subtitle_extension(file_name: &str) -> bool {
 }
 
 /// 字幕导入结果。**每一种都是正常结果**，包括「已存在」。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 派生 `serde::{Serialize, Deserialize}` 是因为它嵌在
+/// [`SubtitleImportResult`] 里，而那个结构体会进任务摘要（JSON）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubtitleImportStatus {
     /// 新写入。
     Imported,
@@ -151,4 +155,3 @@ mod tests {
         assert_eq!(statuses.len(), 5);
     }
 }
-

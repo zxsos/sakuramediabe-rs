@@ -34,11 +34,16 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use sm_db::common::now_utc;
 use sm_db::repo::discovery::{ImageSearchSessionRepository, NewImageSearchSession};
 
 use super::embedding::EmbeddingClient;
 use super::image_search_space::ImageSearchIndexSpaceService;
 use super::qdrant::dense::DenseStore;
+// 读 `ScoredPoint.payload` 的整数键：那个 map 的值是 qdrant 的 `Value`
+// （struct + `kind` oneof），**不是** `serde_json::Value`，所以不能
+// `and_then(serde_json::Value::as_i64)`。
+use super::qdrant::plot_image::payload_i64;
 use crate::error::ServiceError;
 
 /// 游标版本。改动游标结构时**必须** bump —— 老的游标解出来是错的 offset。
@@ -72,6 +77,10 @@ pub fn normalize_ids(ids: Option<&[i64]>) -> Option<Vec<i64>> {
     }
     Some(out)
 }
+
+/// [`crate::discovery::image_search::ImageSearchService::validate_create_params`]
+/// 归一化后的三元组：`(page_size, movie_ids, exclude_movie_ids)`。
+pub type SessionParams = (i64, Option<Vec<i64>>, Option<Vec<i64>>);
 
 /// 归一化页大小。
 ///
@@ -191,7 +200,11 @@ fn base64url_encode(bytes: &[u8]) -> String {
         // 3 字节 -> 4 字符；末组不足时先占位再统一去掉 '='。
         for i in 0..4 {
             let index = ((triple >> (18 - i * 6)) & 0x3f) as usize;
-            out.push(if i <= chunk.len() { B64URL[index] as char } else { '=' });
+            out.push(if i <= chunk.len() {
+                B64URL[index] as char
+            } else {
+                '='
+            });
         }
     }
     out.trim_end_matches('=').to_owned()
@@ -279,7 +292,13 @@ impl ImageSearchService {
         space: ImageSearchIndexSpaceService,
         limits: ImageSearchLimits,
     ) -> Self {
-        Self { store, embedding, sessions, space, limits }
+        Self {
+            store,
+            embedding,
+            sessions,
+            space,
+            limits,
+        }
     }
 
     /// 建会话前的索引就绪闸门。
@@ -291,7 +310,9 @@ impl ImageSearchService {
     ///
     /// **这个顺序不能换**：先查索引再建会话，否则会在索引不可用时留下一堆
     /// 永远查不出结果的会话。
-    pub async fn ensure_searchable_index(&self) -> Result<super::embedding::EmbeddingSpace, ServiceError> {
+    pub async fn ensure_searchable_index(
+        &self,
+    ) -> Result<super::embedding::EmbeddingSpace, ServiceError> {
         let space = self.embedding.describe().await?;
         // 重建错误由 `image_search_space` 转成 409（带 `reason` 等三个 details 键）。
         self.space.ensure_search_ready(&space.space_id).await?;
@@ -302,11 +323,14 @@ impl ImageSearchService {
     ///
     /// **读路径上带一次写**（上游每次取会话都跑）。不清理的话会话表无界增长。
     pub async fn purge_expired_sessions(&self) -> Result<u64, ServiceError> {
-        let now = crate::db_time::now_utc();
+        let now = now_utc();
         Ok(self.sessions.delete_expired(now).await?)
     }
 
     /// 校验并归一化建会话的参数。**顺序照上游**（`:122-128`）。
+    ///
+    /// 返回 [`SessionParams`] 而不是裸三元组 —— `clippy::type_complexity` 之外，
+    /// 调用点也不必再靠位置记住哪个是 `movie_ids`、哪个是 `exclude_movie_ids`。
     pub fn validate_create_params(
         &self,
         image_bytes: &[u8],
@@ -314,7 +338,7 @@ impl ImageSearchService {
         movie_ids: Option<&[i64]>,
         exclude_movie_ids: Option<&[i64]>,
         score_threshold: Option<f64>,
-    ) -> Result<(i64, Option<Vec<i64>>, Option<Vec<i64>>), ServiceError> {
+    ) -> Result<SessionParams, ServiceError> {
         if image_bytes.is_empty() {
             return Err(ServiceError::validation(
                 "image_search_empty_image",
@@ -380,16 +404,16 @@ impl ImageSearchService {
         // 维度必须与 describe 声明的一致 —— 推理换了模型而 describe 还报旧
         // 空间时，这里是唯一能发现的地方。
         debug_assert_eq!(
-            vector.len() as u32,
+            vector.len(),
             space.dimension,
             "推理返回的向量维度与 describe 声明的空间维度不一致"
         );
 
         let session_id = new_session_id();
-        let now = crate::db_time::now_utc();
+        let now = now_utc();
         let session = self
             .sessions
-            .create(NewImageSearchSession {
+            .create(&NewImageSearchSession {
                 session_id: session_id.clone(),
                 page_size: page_size as i32,
                 query_vector: Some(vector_json(&vector)),
@@ -401,8 +425,14 @@ impl ImageSearchService {
         // 字段，要靠 `set_exclusions` 单独补 —— 上游是一个 `create` 写全。
         // 分两次写有窗口期：会话已可见而过滤条件还没生效，那一页会**不过滤**。
         // 所以**建完立刻补**，不要留在中间。
+        let movie_ids_i32 = to_i32(movie_ids.as_deref());
+        let exclude_movie_ids_i32 = to_i32(exclude_movie_ids.as_deref());
         self.sessions
-            .set_filters(&session.session_id, to_i32(movie_ids.as_deref()), to_i32(exclude_movie_ids.as_deref()))
+            .set_filters(
+                &session.session_id,
+                movie_ids_i32.as_deref(),
+                exclude_movie_ids_i32.as_deref(),
+            )
             .await?;
 
         let page = self
@@ -427,7 +457,10 @@ impl ImageSearchService {
     ) -> Result<ImageSearchSessionPage, ServiceError> {
         // 文本版的「空」判据是**去空白后为空**（`min_length=1` 只挡空串）。
         if text.trim().is_empty() {
-            return Err(ServiceError::validation("image_search_empty_text", "text is empty"));
+            return Err(ServiceError::validation(
+                "image_search_empty_text",
+                "text is empty",
+            ));
         }
         let page_size = normalize_page_size(
             page_size,
@@ -448,13 +481,13 @@ impl ImageSearchService {
             ));
         }
         let vector = vectors.remove(0);
-        debug_assert_eq!(vector.len() as u32, space.dimension, "文本向量维度与空间不一致");
+        debug_assert_eq!(vector.len(), space.dimension, "文本向量维度与空间不一致");
 
         let session_id = new_session_id();
-        let now = crate::db_time::now_utc();
+        let now = now_utc();
         let session = self
             .sessions
-            .create(NewImageSearchSession {
+            .create(&NewImageSearchSession {
                 session_id: session_id.clone(),
                 page_size: page_size as i32,
                 query_vector: Some(vector_json(&vector)),
@@ -462,8 +495,14 @@ impl ImageSearchService {
                 expires_at: now + chrono::Duration::seconds(self.limits.session_ttl_seconds),
             })
             .await?;
+        let movie_ids_i32 = to_i32(movie_ids.as_deref());
+        let exclude_movie_ids_i32 = to_i32(exclude_movie_ids.as_deref());
         self.sessions
-            .set_filters(&session.session_id, to_i32(movie_ids.as_deref()), to_i32(exclude_movie_ids.as_deref()))
+            .set_filters(
+                &session.session_id,
+                movie_ids_i32.as_deref(),
+                exclude_movie_ids_i32.as_deref(),
+            )
             .await?;
         let page = self
             .search_page(&session, vector, 0, page_size as usize)
@@ -501,8 +540,13 @@ impl ImageSearchService {
             None => 0,
         };
         let vector = parse_query_vector(&session)?;
-        self.search_page(&session, vector, offset as usize, session.page_size as usize)
-            .await
+        self.search_page(
+            &session,
+            vector,
+            offset as usize,
+            session.page_size as usize,
+        )
+        .await
     }
 }
 impl ImageSearchService {
@@ -570,17 +614,19 @@ impl ImageSearchService {
                         continue;
                     }
                 }
-                let Some(payload) = point.payload else { continue };
+                // 缺键就跳过这条（与 `qdrant::thumbnail::parse_hit` 同口径）：
+                // 上游 `int(payload[...])` 缺键会抛 KeyError 炸掉整次检索，
+                // 而这里选择丢掉这一条。
+                let (Some(thumbnail_id), Some(media_id)) = (
+                    payload_i64(&point.payload, "thumbnail_id"),
+                    payload_i64(&point.payload, "media_id"),
+                ) else {
+                    continue;
+                };
                 items.push(ImageSearchItem {
-                    thumbnail_id: payload
-                        .get("thumbnail_id")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or_default(),
-                    media_id: payload
-                        .get("media_id")
-                        .and_then(serde_json::Value::as_i64)
-                        .unwrap_or_default(),
-                    movie_id: payload.get("movie_id").and_then(serde_json::Value::as_i64),
+                    thumbnail_id,
+                    media_id,
+                    movie_id: payload_i64(&point.payload, "movie_id"),
                     score,
                 });
                 if items.len() == page_size {
@@ -614,13 +660,84 @@ impl ImageSearchService {
 /// 在**一轮内**就填满。
 pub const SEARCH_SCAN_BATCH_SIZE: i64 = 100;
 
-}
 // ================================================================ 会话相关的共享函数
 //
 // 剧情图检索（`super::plot_image_search`）用的是**同一张表**、同一套生命周期。
 // 上游那两个服务各有一份 `_purge_expired_sessions` / `_get_session_model` 的
 // 副本 —— Rust 侧只保留一份，避免「两份实现漂移」。
 // （这正是 `normalize_ids` 那次教训的直接应用。）
+
+/// 生成会话 id。上游是 `uuid.uuid4().hex`（`:140`）—— **32 位小写十六进制，
+/// 无连字符**（`.hex` 而非 `str(uuid4())`）。
+///
+/// 用 `Uuid::new_v4().simple()` 对应：同样是 32 个十六进制字符。
+/// **不要改成带连字符的形式** —— 会话 id 会进 URL，且库里已有数据是无连字符的。
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// 查询向量 → `query_vector` 列的文本（JSON 浮点数组）。
+///
+/// 上游写的是 `query_vector=[float(item) for item in vector]`，peewee 的
+/// `JsonTextField.db_value` 落成 JSON 文本。**逐元素转 f32** 与上游一致，
+/// 不是直接序列化 `Vec<f64>`。
+pub fn vector_json(vector: &[f32]) -> String {
+    serde_json::to_string(vector).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// 读回会话的查询向量。
+///
+/// 上游是 `session.query_vector or []`（`:205`）—— **缺失即空向量**。
+/// 空向量送去检索会命中「距离最近但无意义」的一批，但上游就是这么做的
+/// （实际不会发生：建会话必然写向量）。**不在这里报错**，保持与上游一致。
+pub fn parse_query_vector(
+    session: &sm_db::discovery::image_search::ImageSearchSession,
+) -> Result<Vec<f32>, ServiceError> {
+    let Some(value) = sm_db::common::decode_json_text(session.query_vector.as_deref()) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        // 上游 `float(item)`：整数与浮点都收，字符串也收（能转就转）。
+        // 这里只收数字 —— 库里不该出现字符串，出现就是脏数据，丢掉整条。
+        match item.as_f64() {
+            Some(number) => out.push(number as f32),
+            None => {
+                return Err(ServiceError::validation(
+                    "image_search_session_vector_invalid",
+                    "会话存的查询向量不是数字数组",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 读回会话的 id 列表。**空列表归一成 `None`（不过滤）**。
+///
+/// 与 [`normalize_ids`] 同一条规则（`if not ids: return None`）：空与缺失
+/// **都是「不过滤」**，不是「排除全部」。这里是读侧的最后一道 —— 即便库里
+/// 存了个 `[]`，读回来也还是「不过滤」。
+pub fn parse_id_list(raw: Option<&str>) -> Option<Vec<i64>> {
+    let value = sm_db::common::decode_json_text(raw)?;
+    let items = value.as_array()?;
+    let mut out: Vec<i64> = Vec::with_capacity(items.len());
+    for item in items {
+        // 非整数元素跳过，不整条作废 —— 上游 `int(...)` 会对脏值抛异常，
+        // 那会让一行脏数据让整次翻页 500。
+        if let Some(id) = item.as_i64() {
+            out.push(id);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
 
 /// 建一个会话行。**只写会话本身**，排除条件要另调 `set_exclusions`。
 ///
@@ -634,9 +751,9 @@ pub async fn create_session(
     score_threshold: Option<f64>,
     session_ttl_seconds: i64,
 ) -> Result<sm_db::discovery::image_search::ImageSearchSession, ServiceError> {
-    let now = crate::db_time::now_utc();
+    let now = now_utc();
     Ok(repo
-        .create(NewImageSearchSession {
+        .create(&NewImageSearchSession {
             session_id: new_session_id(),
             page_size: page_size as i32,
             query_vector: Some(vector_json(&vector)),
@@ -672,7 +789,7 @@ pub async fn require_session(
 pub async fn purge_expired_sessions(
     repo: &ImageSearchSessionRepository,
 ) -> Result<u64, ServiceError> {
-    Ok(repo.delete_expired(crate::db_time::now_utc()).await?)
+    Ok(repo.delete_expired(now_utc()).await?)
 }
 
 /// 读回会话存的查询向量。

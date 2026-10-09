@@ -33,7 +33,14 @@ use crate::error::ServiceError;
 ///
 /// ⚠️ **由 provider 决定，不要建模成 enum。** 新增一个下载器就可能带来
 /// 新状态 —— 写死 enum 会让它在反序列化时炸掉。
-pub const DOWNLOAD_STATES: [&str; 6] = ["queued", "downloading", "completed", "failed", "seeding", "done"];
+pub const DOWNLOAD_STATES: [&str; 6] = [
+    "queued",
+    "downloading",
+    "completed",
+    "failed",
+    "seeding",
+    "done",
+];
 
 /// 视为「已下载完成」的状态（白名单，见 [`super::transfer_shared::is_download_complete`]）。
 pub const DOWNLOAD_COMPLETE_STATES: [&str; 4] = ["completed", "done", "seeding", "finished"];
@@ -78,7 +85,9 @@ pub fn require_indexer(indexer_name: &str) -> Result<IndexerRow, ServiceError> {
 }
 
 /// 取某个下载器客户端的 provider 句柄。
-pub fn download_provider(client: &DownloadClientRow) -> Result<PluginDownloadProvider, ServiceError> {
+pub fn download_provider(
+    client: &DownloadClientRow,
+) -> Result<PluginDownloadProvider, ServiceError> {
     let _ = client;
     todo!("骨架：经 sm-plugins 的 download_client 能力取句柄；未装 -> 503 provider_not_installed")
 }
@@ -102,7 +111,11 @@ pub fn provider_error(error: &ProviderOperationError) -> ServiceError {
         // 未知码 = provider 出了问题 = 上游依赖故障。
         _ => 502,
     };
-    ServiceError::from_status(status, format!("provider_{}", error.code), error.message.clone())
+    ServiceError::from_status(
+        status,
+        format!("provider_{}", error.code),
+        error.message.clone(),
+    )
 }
 
 /// 非空字符串校验。**空串与纯空白都算空**（上游 `value.strip()`）。
@@ -123,7 +136,9 @@ pub fn validate_non_empty(value: &str, code: &str, message: &str) -> Result<Stri
 /// `?state=`（空值）上游给的是 `None`，也就是**不过滤**。而显式传空列表在
 /// 其它端点（如 `movie_ids`）里表示「什么都不选」。混淆这两者会让「清空筛选」
 /// 变成「看全部」。
-pub fn normalize_state_filters(values: Option<&[String]>) -> Result<Option<Vec<String>>, ServiceError> {
+pub fn normalize_state_filters(
+    values: Option<&[String]>,
+) -> Result<Option<Vec<String>>, ServiceError> {
     let Some(values) = values else {
         return Ok(None);
     };
@@ -171,7 +186,9 @@ pub fn is_download_complete(state: &str) -> bool {
 ///
 /// 远端返回的字段类型不可信（JSON 解出来可能是字符串或 null），
 /// 逐个字段校验后才落库 —— 宁可这一条导入失败，也不要写进半截数据。
-pub fn validate_remote_download_task(raw: &serde_json::Value) -> Result<RemoteDownloadTask, ServiceError> {
+pub fn validate_remote_download_task(
+    raw: &serde_json::Value,
+) -> Result<RemoteDownloadTask, ServiceError> {
     let _ = raw;
     todo!("骨架：照上游 validate_remote_download_task 实现（逐字段校验 provider 返回的任务）")
 }
@@ -187,7 +204,9 @@ pub fn list_indexer_clients(indexer: &IndexerRow) -> Result<Vec<DownloadClientRo
 ///
 /// 上游 `resolve_preferred_client`：多于一个时**不猜**，报错让用户去配置里
 /// 指定。猜错的后果是把种子提交到错误的下载器上，而那不会有任何报错。
-pub fn resolve_preferred_client(clients: &[DownloadClientRow]) -> Result<DownloadClientRow, ServiceError> {
+pub fn resolve_preferred_client(
+    clients: &[DownloadClientRow],
+) -> Result<DownloadClientRow, ServiceError> {
     match clients {
         [] => Err(ServiceError::validation(
             "download_request_client_resolution_failed",
@@ -196,7 +215,10 @@ pub fn resolve_preferred_client(clients: &[DownloadClientRow]) -> Result<Downloa
         [only] => Ok(only.clone()),
         many => Err(ServiceError::validation(
             "download_request_client_resolution_failed",
-            format!("该索引器绑定了 {} 个下载器客户端，请先在配置中指定", many.len()),
+            format!(
+                "该索引器绑定了 {} 个下载器客户端，请先在配置中指定",
+                many.len()
+            ),
         )),
     }
 }
@@ -269,8 +291,8 @@ mod tests {
     /// 客户端要靠 `invalid_download_task_filter` 区分「筛选写错了」与「任务不存在」。
     #[test]
     fn an_unknown_state_filter_is_rejected_with_the_dedicated_code() {
-        let error = normalize_state_filters(Some(&["nope".to_owned()]))
-            .expect_err("未知状态应被拒");
+        let error =
+            normalize_state_filters(Some(&["nope".to_owned()])).expect_err("未知状态应被拒");
         assert_eq!(error.code(), "invalid_download_task_filter");
     }
 
@@ -294,7 +316,10 @@ mod tests {
             "downloading".to_owned(),
         ]))
         .expect("合法");
-        assert_eq!(filters, Some(vec!["queued".to_owned(), "downloading".to_owned()]));
+        assert_eq!(
+            filters,
+            Some(vec!["queued".to_owned(), "downloading".to_owned()])
+        );
     }
 
     /// 排序字段是**白名单**：自由字符串会被拼进 SQL。
@@ -302,7 +327,10 @@ mod tests {
     fn sort_must_come_from_the_allow_list() {
         assert_eq!(resolve_task_sort(None).expect("缺省不排序"), None);
         assert_eq!(resolve_task_sort(Some("  ")).expect("空串不排序"), None);
-        assert_eq!(resolve_task_sort(Some("-created_at")).expect("允许降序"), Some("-created_at".to_owned()));
+        assert_eq!(
+            resolve_task_sort(Some("-created_at")).expect("允许降序"),
+            Some("-created_at".to_owned())
+        );
         let error = resolve_task_sort(Some("id; DROP TABLE")).expect_err("注入应被拒");
         assert_eq!(error.code(), "invalid_download_task_filter");
     }
@@ -319,9 +347,15 @@ mod tests {
             enabled: true,
             provider_config: serde_json::json!({}),
         };
-        let error = resolve_preferred_client(&[client.clone(), client]).expect_err("多于一个应报错");
+        let error = resolve_preferred_client(&[client.clone(), client.clone()])
+            .expect_err("多于一个应报错");
         assert_eq!(error.code(), "download_request_client_resolution_failed");
-        assert_eq!(resolve_preferred_client(&[client.clone()]).expect("唯一绑定可用").id, 1);
+        assert_eq!(
+            resolve_preferred_client(&[client])
+                .expect("唯一绑定可用")
+                .id,
+            1
+        );
         assert!(resolve_preferred_client(&[]).is_err(), "零绑定也要报 422");
     }
 
@@ -345,7 +379,10 @@ mod tests {
                 message: "x".to_owned(),
                 operation: Some("browse".to_owned()),
             });
-            assert_eq!(error.status, expected, "provider 码 {code} 应映射到 {expected}");
+            assert_eq!(
+                error.status, expected,
+                "provider 码 {code} 应映射到 {expected}"
+            );
         }
     }
 

@@ -63,9 +63,9 @@ pub mod worker;
 pub use cron_spec::{builtin_jobs, JobSpec, RuntimeTimezone, ScheduleError, ScheduledJob};
 pub use tick::{TickReport, QUEUE_MUTEX_PREFIX};
 pub use worker::{
-builtin_handlers, HandlerDeps, HandlerRegistry, QdrantEndpoint, TaskWorker, TaskWorkerHandle,
-WorkerConfig, WorkerError, LANE_CONCURRENCY, LANE_DEFAULT, LANE_IMPORT, LANE_TRANSFER,
-NON_DEFAULT_LANE_TASK_KEYS,
+    builtin_handlers, HandlerDeps, HandlerRegistry, QdrantEndpoint, TaskWorker, TaskWorkerHandle,
+    WorkerConfig, WorkerError, LANE_CONCURRENCY, LANE_DEFAULT, LANE_IMPORT, LANE_TRANSFER,
+    NON_DEFAULT_LANE_TASK_KEYS,
 };
 
 use std::sync::Arc;

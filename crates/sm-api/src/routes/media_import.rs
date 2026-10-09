@@ -50,10 +50,7 @@ pub fn routes() -> Router<AppState> {
             "/import-sources/browse",
             post(browse_import_sources).fallback(method_not_allowed),
         )
-        .route(
-            "/imports",
-            post(create_import).fallback(method_not_allowed),
-        )
+        .route("/imports", post(create_import).fallback(method_not_allowed))
         .route(
             "/imports/{task_run_id}/failed-items",
             get(list_import_failed_items).fallback(method_not_allowed),

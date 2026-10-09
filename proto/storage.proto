@@ -163,8 +163,25 @@ message GenerateThumbnailsRequest {
   string workspace = 3;
 }
 
+// 生成缩略图的流：**进度事件 + 一个终态的产物清单**。
+//
+// 修订（`docs/parallel/grpc-plugin-report.md` §4.3 的 P1-1）：原先这里只有
+// `ThumbnailGeneration generation`，而 rpc 返回的是 `stream ProgressEvent` ——
+// 产物清单**没有通道**，宿主拿不到「生成了几张、叫什么名字、该写到哪一格
+// timeline」，`ThumbnailGeneration` 成了被冷落的定义。
+//
+// 现在把两者合成一个 oneof：
+//
+// - `progress`：过程中的进度（可多次）；
+// - `done`：**流里必须有且只有一个**，且是最后一条。宿主凭它落库。
+//
+// ⚠️ 插件**必须**以 `done` 收尾。没有它的流在宿主侧按「provider 违约」处理 ——
+// 因为没有产物清单就无法 `persist`，留着半成品比报错更糟。
 message GenerateThumbnailsResponse {
-  ThumbnailGeneration generation = 1;
+  oneof payload {
+    ProgressEvent progress = 1;
+    ThumbnailGeneration done = 2;
+  }
 }
 
 // 进度事件。Python 侧是 progress_callback(str)，这里用 server streaming
@@ -365,8 +382,8 @@ service StorageProvider {
   rpc ComputeFileHash(ComputeFileHashRequest) returns (ComputeFileHashResponse);
   // ⑩ plan_playback（原 handle_playback，改为返回播放计划）
   rpc PlanPlayback(PlanPlaybackRequest) returns (PlanPlaybackResponse);
-  // ⑪ generate_thumbnails（server streaming：进度事件）
-  rpc GenerateThumbnails(GenerateThumbnailsRequest) returns (stream ProgressEvent);
+  // ⑪ generate_thumbnails（server streaming：进度事件 + 终态产物清单）
+  rpc GenerateThumbnails(GenerateThumbnailsRequest) returns (stream GenerateThumbnailsResponse);
   // ⑫ create_clip
   rpc CreateClip(CreateClipRequest) returns (CreateClipResponse);
 

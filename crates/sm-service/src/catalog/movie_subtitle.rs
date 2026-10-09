@@ -19,7 +19,7 @@
 //!
 //! # 路径逃逸防护：读之前必须做
 //!
-//! [`Self::ensure_subtitle_path`]。字幕 id 来自 URL，转成路径时若不做
+//! [`ensure_subtitle_path`]。字幕 id 来自 URL，转成路径时若不做
 //! 前缀校验，`../` 就能读出字幕目录之外的文件。
 //!
 //! **不要**因为「id 是整数」就跳过 —— 落盘的路径是按 id 拼的，但记录里的
@@ -139,14 +139,18 @@ impl MovieSubtitleService {
         subtitle_id: i32,
     ) -> Result<SubtitleContent, SubtitleReadError> {
         let _ = (movie_id, subtitle_id);
-        todo!("骨架：查记录 -> 路径逃逸校验 -> stat 判上限 -> 读内容；Unavailable 与 NotFound 要分开")
+        todo!(
+            "骨架：查记录 -> 路径逃逸校验 -> stat 判上限 -> 读内容；Unavailable 与 NotFound 要分开"
+        )
     }
 
     /// 按番号取该影片的字幕列表（端点入口）。
     ///
     /// 上游 `get_movie_subtitles(cls, movie_number)`。**按番号**定位 ——
     /// 端点是 `/movies/{n}/subtitles`，`n` 就是番号。
-    pub async fn get_movie_subtitles(movie_number: &str) -> Result<Vec<SubtitleAsset>, ServiceError> {
+    pub async fn get_movie_subtitles(
+        movie_number: &str,
+    ) -> Result<Vec<SubtitleAsset>, ServiceError> {
         let _ = movie_number;
         todo!("骨架：按番号定位影片 -> list_subtitle_assets；影片不存在 -> 404 movie_not_found")
     }
@@ -161,6 +165,21 @@ impl MovieSubtitleService {
     }
 }
 
+impl SubtitleReadError {
+    /// 对应的 HTTP 状态码。
+    ///
+    /// `PathInvalid` 是 **403** 而不是 404 —— 路径不合法是「请求不被允许」，
+    /// 而「字幕不存在」才是 404。
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::MovieNotFound | Self::SubtitleNotFound => 404,
+            Self::PathInvalid => 403,
+            Self::Unavailable => 409,
+            Self::TooLarge => 413,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,11 +189,20 @@ mod tests {
     fn path_traversal_attempts_are_rejected() {
         let root = std::env::temp_dir();
         // 根之外的路径 -> 拒
-        assert!(!ensure_subtitle_path(std::path::Path::new("/etc/passwd"), &root));
+        assert!(!ensure_subtitle_path(
+            std::path::Path::new("/etc/passwd"),
+            &root
+        ));
         // 含 .. 的路径 -> 拒
-        assert!(!ensure_subtitle_path(std::path::Path::new("../../../etc/passwd"), &root));
+        assert!(!ensure_subtitle_path(
+            std::path::Path::new("../../../etc/passwd"),
+            &root
+        ));
         // 不存在的文件 -> 拒（交给上层报 Unavailable，而不是当成合法）
-        assert!(!ensure_subtitle_path(&root.join("definitely-not-here.srt"), &root));
+        assert!(!ensure_subtitle_path(
+            &root.join("definitely-not-here.srt"),
+            &root
+        ));
     }
 
     /// ★ `PathInvalid` 是 **403**，`SubtitleNotFound` 是 **404**。
@@ -203,21 +231,5 @@ mod tests {
             SubtitleReadError::Unavailable.status(),
             SubtitleReadError::SubtitleNotFound.status()
         );
-    }
-}
-
-
-impl SubtitleReadError {
-    /// 对应的 HTTP 状态码。
-    ///
-    /// `PathInvalid` 是 **403** 而不是 404 —— 路径不合法是「请求不被允许」，
-    /// 而「字幕不存在」才是 404。
-    pub fn status(&self) -> u16 {
-        match self {
-            Self::MovieNotFound | Self::SubtitleNotFound => 404,
-            Self::PathInvalid => 403,
-            Self::Unavailable => 409,
-            Self::TooLarge => 413,
-        }
     }
 }

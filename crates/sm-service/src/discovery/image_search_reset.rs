@@ -54,13 +54,14 @@
 //! 上游 `:25`：`{"task_key": ..., "blocking_task_run_id": ...}`。
 //! 两个都要 —— 前者告诉用户是哪个任务，后者让他能去任务中心看进度。
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
-use sm_service::system::optional_services::require_image_search;
-use sm_service::system::task_queue::{ConflictPolicy, EnqueueOutcome, TaskQueueService};
+use serde_json::Map;
 
+// ⚠️ 是 `crate::` 不是 `sm_service::` —— 本文件就在 `sm-service` 里，
+// 用 crate 名引用自己会找不到模块。
 use crate::error::ServiceError;
+use crate::system::optional_services::require_image_search;
+use crate::system::task_queue::{ConflictPolicy, EnqueueOutcome, TaskQueueService};
 
 /// 被触发的任务键。**与 `optional_services::job_disabled_reason` 里那个字符串
 /// 必须是同一个** —— 那里靠它把任务中心里的这一项置灰。
@@ -135,7 +136,9 @@ impl ImageSearchResetService {
             EnqueueOutcome::Enqueued(run) => Ok(ImageSearchResetResult {
                 task_run_id: run.id as i64,
             }),
-            EnqueueOutcome::Skipped { blocking_task_run_id } => {
+            EnqueueOutcome::Skipped {
+                blocking_task_run_id,
+            } => {
                 // 用了 `Raise` 还走到这里，说明互斥键被占。
                 // 两个 details 键都带上（见模块文档）。
                 Err(ServiceError::conflict(
@@ -149,8 +152,8 @@ impl ImageSearchResetService {
 }
 
 /// 409 的 details。两个键。
-fn details(task_key: &str, blocking_task_run_id: Option<i32>) -> HashMap<String, serde_json::Value> {
-    HashMap::from([
+fn details(task_key: &str, blocking_task_run_id: Option<i32>) -> Map<String, serde_json::Value> {
+    Map::from_iter([
         ("task_key".to_owned(), serde_json::json!(task_key)),
         (
             "blocking_task_run_id".to_owned(),

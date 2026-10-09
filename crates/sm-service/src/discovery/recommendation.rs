@@ -53,8 +53,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sm_db::repo::recommendation::MovieFeatureRepository;
 
-use super::qdrant::similarity::{MovieSimilarityHit, MovieSimilarityStore, SimilarityQueryError,
-                                SparsePoint};
+use super::qdrant::similarity::{
+    MovieSimilarityHit, MovieSimilarityStore, SimilarityQueryError, SparsePoint,
+};
 use crate::error::ServiceError;
 
 /// 演员在相似度里的权重。对应上游 `SIM_WEIGHT_ACTOR = 0.6`。
@@ -130,7 +131,7 @@ pub fn build_sparse_vector(
         if norm > 0.0 {
             // **`sqrt(SIM_WEIGHT_ACTOR)`** 而非 `SIM_WEIGHT_ACTOR`（见模块文档第 3 条）
             let scale = SIM_WEIGHT_ACTOR.sqrt() / norm;
-            for (actor_id, idf_value) in actor_ids.iter().zip(idfs.into_iter()) {
+            for (actor_id, idf_value) in actor_ids.iter().zip(idfs) {
                 let index = (actor_id * ACTOR_INDEX_SCALE) as u32;
                 weighted.push((index, (idf_value * scale) as f32));
             }
@@ -146,7 +147,7 @@ pub fn build_sparse_vector(
         let norm = idfs.iter().map(|v| v * v).sum::<f64>().sqrt();
         if norm > 0.0 {
             let scale = SIM_WEIGHT_TAG.sqrt() / norm;
-            for (tag_id, idf_value) in tag_ids.iter().zip(idfs.into_iter()) {
+            for (tag_id, idf_value) in tag_ids.iter().zip(idfs) {
                 let index = (tag_id * ACTOR_INDEX_SCALE + TAG_INDEX_OFFSET) as u32;
                 weighted.push((index, (idf_value * scale) as f32));
             }
@@ -160,7 +161,9 @@ pub fn build_sparse_vector(
     (indices, values)
 }
 /// 重建统计。键名与上游**逐字一致**（会进任务摘要）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+// ⚠️ **不能** derive `Copy`：`previous_collection: Option<String>` 带堆分配。
+// （骨架期这里写了 `Copy`，编译期就被拦下。）
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecomputeStats {
     /// 非集合影片总数（IDF 的分母）。
     pub total_movies: i64,
@@ -175,8 +178,17 @@ pub struct RecomputeStats {
 }
 
 /// 进度上报。签名与 `image_search_index` 那套一致（`Option<i32>` + patch）。
+///
+/// `+ Send` 的理由同那边：sink 要进 worker 的 handler future（`TaskHandler`
+/// 要求 `Send`）。
 pub type ProgressSink<'a> = Box<
-    dyn FnMut(Option<i32>, Option<i32>, &str, Option<&serde_json::Value>) -> BoxFuture<'a, Result<(), String>>
+    dyn FnMut(
+            Option<i32>,
+            Option<i32>,
+            &str,
+            Option<&serde_json::Value>,
+        ) -> BoxFuture<'a, Result<(), String>>
+        + Send
         + 'a,
 >;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -204,9 +216,21 @@ impl MovieRecommendationService {
     /// **单个删除失败只记 warn 不中断**（上游 `:177-182`）—— 清理是尽力而为，
     /// 一个删不掉的集合不该让整次重建失败。
     pub async fn purge_orphan_collections(&self) -> Result<i64, ServiceError> {
-        let active = self.store.alias_target().await?;
+        // `SimilarityQueryError` **不实现** `Into<ServiceError>` 的 blanket 转换 ——
+        // 那会让 `Unavailable` 也变成 503，把「降级」这条语义悄悄吃掉。
+        // 所以每个调用点显式 `map_err`，让「这里要报错」是看得见的。
+        let active = self
+            .store
+            .alias_target()
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
         let mut purged = 0i64;
-        for name in self.store.list_index_collections().await? {
+        let collections = self
+            .store
+            .list_index_collections()
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
+        for name in collections {
             if Some(&name) == active.as_ref() {
                 continue;
             }
@@ -260,7 +284,14 @@ impl MovieRecommendationService {
             tag_features: df.tags.values().sum(),
             ..Default::default()
         };
-        emit(&mut progress, 0, total_movies, "开始构建影片相似度索引", &stats).await;
+        emit(
+            &mut progress,
+            0,
+            total_movies,
+            "开始构建影片相似度索引",
+            &stats,
+        )
+        .await;
 
         stats.purged_collections = self.purge_orphan_collections().await?;
         // 集合名带纳秒时间戳 —— 天然唯一，且一眼看出建于何时。
@@ -272,7 +303,10 @@ impl MovieRecommendationService {
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
         );
-        self.store.create_collection(&collection).await?;
+        self.store
+            .create_collection(&collection)
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
 
         // ---- 写入阶段（失败删新集合）----
         let write_result = self
@@ -286,7 +320,11 @@ impl MovieRecommendationService {
         }
 
         // ---- 点数校验：切别名前的最后一道闸 ----
-        let stored = self.store.count(&collection).await?;
+        let stored = self
+            .store
+            .count(&collection)
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
         if stored != stats.indexed_movies as u64 {
             let _ = self.store.delete_collection(&collection).await;
             return Err(ServiceError::validation(
@@ -299,7 +337,11 @@ impl MovieRecommendationService {
         }
 
         // ---- 原子切别名（失败什么都不删）----
-        let previous = self.store.activate_collection(&collection).await?;
+        let previous = self
+            .store
+            .activate_collection(&collection)
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
         stats.previous_collection = previous.clone();
         if let Some(old) = previous.as_ref() {
             if old != &collection {
@@ -335,12 +377,20 @@ impl MovieRecommendationService {
         let mut last_movie_id = 0i32;
         let mut batch: Vec<SparsePoint> = Vec::with_capacity(INDEX_BATCH_SIZE);
         loop {
-            let movie_ids = self.features.page_movie_ids(last_movie_id, FEATURE_PAGE_SIZE).await?;
+            let movie_ids = self
+                .features
+                .page_movie_ids(last_movie_id, FEATURE_PAGE_SIZE)
+                .await?;
             if movie_ids.is_empty() {
                 break;
             }
             last_movie_id = *movie_ids.last().expect("刚判过非空");
-            for features in self.features.features_for_movies(&movie_ids).await?.values() {
+            for features in self
+                .features
+                .features_for_movies(&movie_ids)
+                .await?
+                .values()
+            {
                 // 既无演员也无标签 -> 构造不出向量，**跳过不入索引**。
                 // 所以 `indexed_movies` 通常小于 `total_movies`。
                 if features.actor_ids.is_empty() && features.tag_ids.is_empty() {
@@ -351,7 +401,9 @@ impl MovieRecommendationService {
                 batch.push((features.movie_id as i64, indices, values));
             }
             if batch.len() >= INDEX_BATCH_SIZE {
-                self.flush(collection, batch, stats, progress).await?;
+                // `take` 而不是 `batch.clone()`：整批已经写完，留一个空 Vec 继续攒。
+                self.flush(collection, std::mem::take(&mut batch), stats, progress)
+                    .await?;
             }
             // 不满一页说明已到末尾，省掉一次必然为空的探测。
             if movie_ids.len() < FEATURE_PAGE_SIZE as usize {
@@ -376,7 +428,10 @@ impl MovieRecommendationService {
             return Ok(());
         }
         let written = batch.len() as i64;
-        self.store.upsert_sparse_points(collection, &batch).await?;
+        self.store
+            .upsert_sparse_points(collection, &batch)
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
         stats.indexed_movies += written;
         emit(
             progress,
@@ -400,7 +455,13 @@ async fn emit(
 ) {
     if let Some(sink) = progress {
         let patch = serde_json::to_value(stats).ok();
-        let _ = sink(Some(current as i32), Some(total as i32), text, patch.as_ref()).await;
+        let _ = sink(
+            Some(current as i32),
+            Some(total as i32),
+            text,
+            patch.as_ref(),
+        )
+        .await;
     }
 }
 /// 相似影片条目。
@@ -412,54 +473,60 @@ pub struct SimilarMovieItem {
     pub score: f32,
 }
 
-/// 查相似影片。**降级路径返回空列表，不返回 Err。**
-///
-/// # 这是「错误分类属于调用方契约」的落点
-///
-/// | 上游异常 | 本函数 |
-/// |---|---|
-/// | `NotReady` | **返 `Err`** —— 索引没建好，要 503 让用户重试 |
-/// | `Unavailable` | **返回空列表 + warn** —— Qdrant 故障不该让影片详情页整体报错 |
-///
-/// 上游 `recommendation_service.py:341-348` 的注释：「与每日/瞬时推荐保持一致：
-/// Qdrant 故障只降级相似度信号，不让详情页整体报错」。
-///
-/// **「返回 Vec 而不是 Result」是刻意的类型选择** —— 让降级在类型上就是默认值，
-/// 而不是靠每个调用方记得写 `if let Err(...) { return vec![] }`。
-/// **靠调用方自觉的降级，迟早会漏一处。**
-pub async fn search_similar_movies(
-    &self,
-    source_movie_id: i64,
-    limit: i64,
-) -> Result<Vec<MovieSimilarityHit>, SimilarityQueryError> {
-    match self.store.search_many(&[source_movie_id], limit).await {
-        Ok(map) => Ok(map.get(&source_movie_id).cloned().unwrap_or_default()),
-        Err(SimilarityQueryError::NotReady) => Err(SimilarityQueryError::NotReady),
-        Err(SimilarityQueryError::Unavailable { detail }) => {
-            tracing::warn!(
-                source_movie_id,
-                detail,
-                "相似影片查询跳过：影片相似度服务不可用（只丢相似度信号）"
-            );
-            Ok(Vec::new())
+impl MovieRecommendationService {
+    /// 查相似影片。**降级路径返回空列表，不返回 Err。**
+    ///
+    /// # 这是「错误分类属于调用方契约」的落点
+    ///
+    /// | 上游异常 | 本函数 |
+    /// |---|---|
+    /// | `NotReady` | **返 `Err`** —— 索引没建好，要 503 让用户重试 |
+    /// | `Unavailable` | **返回空列表 + warn** —— Qdrant 故障不该让影片详情页整体报错 |
+    ///
+    /// 上游 `recommendation_service.py:341-348` 的注释：「与每日/瞬时推荐保持一致：
+    /// Qdrant 故障只降级相似度信号，不让详情页整体报错」。
+    ///
+    /// **「返回 Vec 而不是 Result」是刻意的类型选择** —— 让降级在类型上就是默认值，
+    /// 而不是靠每个调用方记得写 `if let Err(...) { return vec![] }`。
+    /// **靠调用方自觉的降级，迟早会漏一处。**
+    pub async fn search_similar_movies(
+        &self,
+        source_movie_id: i64,
+        limit: i64,
+    ) -> Result<Vec<MovieSimilarityHit>, SimilarityQueryError> {
+        match self.store.search_many(&[source_movie_id], limit).await {
+            Ok(map) => Ok(map.get(&source_movie_id).cloned().unwrap_or_default()),
+            Err(SimilarityQueryError::NotReady) => Err(SimilarityQueryError::NotReady),
+            Err(SimilarityQueryError::Unavailable { detail }) => {
+                tracing::warn!(
+                    source_movie_id,
+                    detail,
+                    "相似影片查询跳过：影片相似度服务不可用（只丢相似度信号）"
+                );
+                Ok(Vec::new())
+            }
         }
     }
-}
 
-/// 列出相似影片的 id 与分数。**`Unavailable` 降级成空列表。**
-///
-/// 上游 `list_similar`（`:313`）。`NotReady` 由调用方转 503。
-pub async fn list_similar(
-    &self,
-    source_movie_id: i64,
-    limit: i64,
-) -> Result<Vec<SimilarMovieItem>, ServiceError> {
-    let hits = self
-        .search_similar_movies(source_movie_id, limit)
-        .await
-        .map_err(SimilarityQueryError::into_service_error)?;
-    Ok(hits
-        .into_iter()
-        .map(|hit| SimilarMovieItem { movie_id: hit.movie_id, title: None, score: hit.score })
-        .collect())
+    /// 列出相似影片的 id 与分数。**`Unavailable` 降级成空列表。**
+    ///
+    /// 上游 `list_similar`（`:313`）。`NotReady` 由调用方转 503。
+    pub async fn list_similar(
+        &self,
+        source_movie_id: i64,
+        limit: i64,
+    ) -> Result<Vec<SimilarMovieItem>, ServiceError> {
+        let hits = self
+            .search_similar_movies(source_movie_id, limit)
+            .await
+            .map_err(SimilarityQueryError::into_service_error)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| SimilarMovieItem {
+                movie_id: hit.movie_id,
+                title: None,
+                score: hit.score,
+            })
+            .collect())
+    }
 }

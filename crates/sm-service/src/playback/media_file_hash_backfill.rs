@@ -53,7 +53,9 @@ pub struct MediaFileHashBackfillService;
 
 impl MediaFileHashBackfillService {
     /// ★ 跑一轮。任务执行体。
-    pub async fn backfill_missing_file_hashes(&self) -> Result<FileHashBackfillStats, ServiceError> {
+    pub async fn backfill_missing_file_hashes(
+        &self,
+    ) -> Result<FileHashBackfillStats, ServiceError> {
         todo!("骨架：查 file_hash IS NULL 的媒体 -> 逐个 provider compute_file_hash -> 校验格式 -> 回填")
     }
 }
@@ -80,6 +82,9 @@ mod tests {
             failed: 2,
             invalid_hash: 1,
         };
-        assert_eq!(stats.hashed + stats.failed + stats.invalid_hash, stats.examined);
+        assert_eq!(
+            stats.hashed + stats.failed + stats.invalid_hash,
+            stats.examined
+        );
     }
 }

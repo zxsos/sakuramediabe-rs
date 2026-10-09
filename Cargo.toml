@@ -30,6 +30,7 @@ unsafe_code = "forbid"
 hashing = { path = "crates/hashing" }
 media-file-hash = { path = "crates/media-file-hash" }
 svc-hash = { path = "crates/svc-hash" }
+svc-image = { path = "crates/svc-image" }
 plugin-ref-local = { path = "crates/plugin-ref-local" }
 sm-core = { path = "crates/sm-core" }
 sm-db = { path = "crates/sm-db" }
@@ -133,8 +134,24 @@ base64 = "0.23"
 percent-encoding = "2"
 url = "2"
 regex = "1"
+# 番号资产目录的分片名（`movies/<sha1 前 2 位>/<番号>`）。
+#
+# **必须是 SHA-1**：分片名要上游算出来一模一样，否则同一部影片在迁移后的
+# 数据目录里会散到两个分片下（找不到既有图片，等于全丢）。
+# 这不是「选个哈希都行」的场合 —— SHA-256 会算出完全不同的分片。
+sha1 = "0.10"
 # XML（Torznab 搜索响应）。替代上游的 xmltodict。
 quick-xml = "0.42"
+
+# ZIP 容器（影片图片包 `assets.zip` / 缩略图包 `thumbnails.zip`）。
+#
+# `default-features = false` 是**硬要求**：默认特性会把 bzip2 / deflate /
+# aes-crypto / zstd 一整套压缩与加密实现拖进来，而本仓只用 **STORED**（只打包
+# 不压缩）—— 图片（webp/jpg）本身已是压缩格式，deflate 几乎不省空间却要花
+# CPU，而这里的场景是局域网内传输，CPU 比空间贵。
+#
+# 读包同样不需要任何压缩特性：STORED 的条目就是原始字节。
+zip = { version = "8", default-features = false }
 
 # 图像（替代 Pillow + OpenCV）
 #

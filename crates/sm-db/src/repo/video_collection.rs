@@ -54,6 +54,12 @@ use crate::videos::{VideoCollection, VideoCollectionItem};
 
 const VIDEO_COLLECTION_ENTITY: &str = "VideoCollection";
 
+/// `video_collection_item` 的错误实体名。
+///
+/// 单独一个常量而不是在宏调用点再写一次字面量：本文件的 `impl` 块（成员分页）
+/// 与宏展开都要用它，两处写死就会有一天对不上。
+const VIDEO_COLLECTION_ITEM_ENTITY: &str = "VideoCollectionItem";
+
 /// 新建一个视频合集。
 #[derive(Debug, Clone)]
 pub struct NewVideoCollection {
@@ -144,6 +150,31 @@ impl VideoCollectionRepository {
                 .fetch_optional(&self.pool)
                 .await?,
         )
+    }
+
+    /// 列出全部合集，按 `updated_at DESC, id DESC`。**刻意不分页。**
+    ///
+    /// # 为什么不复用下面那个分页的 `list()`
+    ///
+    /// 排序键不同。分页的 `list()` 按 `name`（与唯一索引一致，利于分页稳定）；
+    /// 上游 `GET /video-collections` 返回的是 `list[...]` 而非 `PageResponse`，
+    /// 且顺序是「最近动过的在前」—— **增删成员都会 touch `updated_at`**。
+    /// 按 `name` 排会让「刚加过成员的合集」停在字母原处，与上游可见的顺序不符。
+    ///
+    /// # `updated_at` 可空，而 DESC 在 PostgreSQL 里是 NULLS FIRST
+    ///
+    /// 从未被 touch 过的合集会排到最前面。看着违反直觉，但**与上游一致**
+    /// （上游 `.updated_at.desc()` 落到 PG 上是同一串 SQL）。刻意不补
+    /// `NULLS LAST`：合集顺序是客户端会缓存并做乐观更新的状态。
+    ///
+    /// `id DESC` 作次级键：同一毫秒内被 touch 的两个合集 `updated_at` 会并列，
+    /// 只按它排会让列表在两次刷新间抖动。
+    pub async fn list_ordered_by_recency(&self) -> Result<Vec<VideoCollection>, DbError> {
+        Ok(sqlx::query_as::<_, VideoCollection>(
+            "SELECT * FROM video_collection ORDER BY updated_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     paged_list! {
@@ -314,8 +345,96 @@ crate::impl_ordered_member_repo!(
     VideoCollectionItem,
     "video_collection_item",
     "video_item_id",
-    "VideoCollectionItem"
+    VIDEO_COLLECTION_ITEM_ENTITY
 );
+
+/// 合集成员列表的排序键 → `ORDER BY` 片段。**白名单。**
+///
+/// 与 `sm_service::videos::VideoSort::as_str()` 逐字对应，且比
+/// [`super::video_item::VIDEO_LIST_SORT_FIELD_MAP`] **多一个 `position`**
+/// —— 那是成员表自己的列，只有这条路径有（上层的
+/// `COLLECTION_ITEM_SORT_KEYS` 与 `ITEM_SORT_KEYS` 就是这个差别）。
+///
+/// `duration` / `file_size` 两个片段**直接复用**视频那边的常量：它们只看
+/// `v.id` 与 `media` 表，与这边多出来的 `vci` 联结无关。抄一份会分叉。
+pub const VIDEO_COLLECTION_ITEM_SORT_FIELD_MAP: [(&str, &str); 5] = [
+    ("position", "vci.position"),
+    ("created_at", "v.created_at"),
+    ("title", "v.title"),
+    (
+        "duration",
+        super::video_item::VIDEO_FIRST_MEDIA_DURATION_COLUMN,
+    ),
+    (
+        "file_size",
+        super::video_item::VIDEO_FIRST_MEDIA_FILE_SIZE_COLUMN,
+    ),
+];
+
+/// 取排序片段。不在白名单 → `None`（调用方应报 422）。
+pub fn video_collection_item_sort_column(key: &str) -> Option<&'static str> {
+    VIDEO_COLLECTION_ITEM_SORT_FIELD_MAP
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, column)| *column)
+}
+
+impl VideoCollectionItemRepository {
+    /// 合集成员分页，按给定排序键。返回 `(本页成员行, 总数)`。
+    ///
+    /// # 为什么要 JOIN `video_item`
+    ///
+    /// `title` / `created_at` / `duration` / `file_size` 四个排序键都在
+    /// **条目**那张表上（或它的媒体上）。只按 `position` 排的话不 JOIN 也行，
+    /// 但那样就得为两种排序写两条路径 —— 一条 JOIN 覆盖全部五种，更省。
+    ///
+    /// # 排序键必须来自 [`VIDEO_COLLECTION_ITEM_SORT_FIELD_MAP`]
+    ///
+    /// 不在白名单 → **运行时** `Err`，不是 `debug_assert!`（release 下会被
+    /// 编译掉，那这份白名单就等于不存在，而它挡的是 SQL 注入）。
+    ///
+    /// 次序稳定项是 **`vci.id`**（不是 `v.id`）—— 上游 `_query_item_resources`
+    /// 的 `tie_breaker=VideoCollectionItem.id` 就是这个。同一集可能被加入
+    /// 多个合集，用 `v.id` 会在跨合集时不再唯一。
+    pub async fn list_page_with_video(
+        &self,
+        collection_id: i32,
+        sort_key: &str,
+        descending: bool,
+        request: &PageRequest,
+    ) -> Result<(Vec<VideoCollectionItem>, i64), DbError> {
+        let column = video_collection_item_sort_column(sort_key).ok_or_else(|| {
+            DbError::business(
+                VIDEO_COLLECTION_ITEM_ENTITY,
+                format!("未知的排序键：{sort_key:?}"),
+            )
+        })?;
+        let direction = if descending { "DESC" } else { "ASC" };
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM video_collection_item WHERE collection_id = $1",
+        )
+        .bind(collection_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(VIDEO_COLLECTION_ITEM_ENTITY))?;
+
+        let sql = format!(
+            "SELECT vci.* FROM video_collection_item vci \
+             JOIN video_item v ON v.id = vci.video_item_id \
+             WHERE vci.collection_id = $1 \
+             ORDER BY {column} {direction}, vci.id {direction} LIMIT $2 OFFSET $3"
+        );
+        let rows = sqlx::query_as::<_, VideoCollectionItem>(super::movie::safe_sql(sql))
+            .bind(collection_id)
+            .bind(request.limit())
+            .bind(request.offset())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(VIDEO_COLLECTION_ITEM_ENTITY))?;
+        Ok((rows, total))
+    }
+}
 
 /// 只在 `video_collection_item` 上存在的三个成员操作。
 ///

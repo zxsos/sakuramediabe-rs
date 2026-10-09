@@ -194,4 +194,3 @@ impl MovieImageService {
         todo!("骨架：下载 -> 落盘 -> 登记；image_url 为 None 时返回 Err")
     }
 }
-

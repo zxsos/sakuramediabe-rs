@@ -632,25 +632,37 @@ pub const FEMALE_GENDER: i32 = 1;
 /// 历史窗口里「只有一位女优」的影片，以及它们的女优与热度。
 ///
 /// 一行 = 一部影片 × 它的**那位**女优（因为筛选过了，每部只有一行）。
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub struct HistoryActorRow {
-    pub movie_id: i32,
-    pub actor_id: i32,
-    /// 影片热度。**库里可能为 NULL**（上游写 `float(heat or 0)`）。
-    pub heat: Option<i32>,
-    /// 发行日。**库里可能带时分秒**（见 service 层 `_release_date` 的归一化）。
-    pub release_date: chrono::NaiveDate,
-}
+///
+/// 位置依次是 **`(movie_id, actor_id, heat, release_date)`**。
+///
+/// # 为什么是元组而不是结构体
+///
+/// 它是 `movie_actor` × `movie` × `actor` **三表 JOIN 的投影**（还带一个
+/// `HAVING SUM(...) = 1` 的 CTE），不是任何一张表的镜像 —— 上游没有可对拍的
+/// Peewee 模型。写成 `pub struct` 会被 `parity/compare_schema.py` 报
+/// `UNCHECKED_STRUCT`，而豁免它是削弱那道门禁。取舍记录见
+/// `repo/moment.rs::MomentSeedRow`。
+///
+/// 消费方用 `let (movie_id, actor_id, heat, release_date) = *row;` 解构，
+/// 别用 `.0`/`.1` —— 前两位同类型，位置写错是静默的。
+///
+/// 各位置语义：
+///
+/// 1. `movie_id` 2. `actor_id`
+/// 3. `heat` —— 影片热度。**库里可能为 NULL**（上游写 `float(heat or 0)`）
+/// 4. `release_date` —— 发行日。**库里可能带时分秒**（见 service 层
+///    `_release_date` 的归一化）
+pub type HistoryActorRow = (i32, i32, Option<i32>, chrono::NaiveDate);
 
 /// 候选窗口里带女优的影片。
 ///
 /// 一行 = 一部影片 × 它的**每一位**女优（候选窗口不做「只有一位」筛选）。
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub struct CandidateRow {
-    pub movie_id: i32,
-    pub actor_id: i32,
-    pub release_date: chrono::NaiveDate,
-}
+///
+/// 位置依次是 **`(movie_id, actor_id, release_date)`**。
+///
+/// 元组而非结构体的理由同 [`HistoryActorRow`]（三表 JOIN 的投影）。
+/// 前两位都是 `i32`，消费方一律解构取名。
+pub type CandidateRow = (i32, i32, chrono::NaiveDate);
 
 /// 热播女优新作的查询。
 ///
@@ -850,25 +862,37 @@ impl ImageSearchSessionRepository {
 }
 
 /// 待索引的缩略图。
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct PendingThumbnail {
-    pub thumbnail_id: i32,
-    pub media_id: i32,
-    /// 归属影片。**可能为 `None`** —— 候选查询只取 `Media.movie IS NOT NULL`，
-    /// 所以走这条路径的行一定有值。
-    pub movie_id: Option<i32>,
-    pub movie_number: Option<String>,
-    /// 图片字节（`image.data`）。**推理客户端直接吃这个**。
-    pub image_bytes: Vec<u8>,
-}
+///
+/// 位置依次是 **`(thumbnail_id, media_id, movie_id, movie_number,
+/// offset_seconds, image_bytes)`**。
+///
+/// 元组而非结构体的理由同 [`HistoryActorRow`]：它是 `media_thumbnail` ×
+/// `media` × `movie` × `image` 的 JOIN 投影。
+///
+/// 消费方（`sm-service` 的 `index_thumbnail_batch`）用
+/// `let (thumbnail_id, media_id, movie_id, _movie_number, offset_seconds,
+/// _image_bytes) = item;` 一次解构完，别在循环里散用 `.0`/`.4`。
+///
+/// 各位置语义：
+///
+/// 1. `thumbnail_id` 2. `media_id`
+/// 3. `movie_id` —— 归属影片。**可能为 `None`**（候选查询只取
+///    `Media.movie IS NOT NULL`，所以走这条路径的行一定有值）
+/// 4. `movie_number`
+/// 5. `offset_seconds` —— 该帧在视频里的秒偏移（`media_thumbnail."offset"`）。
+///    **写向量库要用**：`ThumbnailVectorRecord.offset_seconds` 来自这里
+///    （上游 `thumbnail.offset`，`:336`）。检索结果要把它回给客户端定位帧，
+///    所以不能填 0 —— 那会让所有缩略图都指向第 0 秒。
+/// 6. `image_bytes` —— 图片字节（`image.data`）。**推理客户端直接吃这个**。
+pub type PendingThumbnail = (i32, i32, Option<i32>, Option<String>, Option<i32>, Vec<u8>);
 
 /// 待索引的剧情图。
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct PendingPlotImage {
-    pub plot_image_id: i32,
-    pub movie_id: Option<i32>,
-    pub image_bytes: Vec<u8>,
-}
+///
+/// 位置依次是 **`(plot_image_id, movie_id, image_bytes)`**。
+///
+/// 元组而非结构体的理由同 [`HistoryActorRow`]（`movie_plot_image` × `image`
+/// 的 JOIN 投影）。
+pub type PendingPlotImage = (i32, Option<i32>, Vec<u8>);
 
 /// 待索引图片的查询与状态回写。
 ///
@@ -905,15 +929,13 @@ impl PendingImageRepository {
     /// **无 `ORDER BY`** —— 上游也没有。后果是分页顺序不保证稳定，靠
     /// `status` 从 PENDING 翻到终态来推进。**不要**自己加 `ORDER BY id`：
     /// 那会让「先到先处理」变成「按 id 顺序」，在失败重试时行为不同。
-    pub async fn pending_thumbnails(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<PendingThumbnail>, DbError> {
+    pub async fn pending_thumbnails(&self, limit: i64) -> Result<Vec<PendingThumbnail>, DbError> {
         let sql = r#"
             SELECT t.id AS thumbnail_id,
                    t.media AS media_id,
                    m.movie AS movie_number,
                    m.id AS movie_id,
+                   t."offset" AS offset_seconds,
                    i.data AS image_bytes
             FROM media_thumbnail t
             JOIN image i ON i.id = t.image
@@ -923,18 +945,15 @@ impl PendingImageRepository {
               AND m.movie IS NOT NULL
             LIMIT $1
         "#;
-        Ok(sqlx::query_as::<_, PendingThumbnail>(sql)
+        sqlx::query_as::<_, PendingThumbnail>(sql)
             .bind(limit.max(1))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?)
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))
     }
 
     /// 一批待索引剧情图。
-    pub async fn pending_plot_images(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<PendingPlotImage>, DbError> {
+    pub async fn pending_plot_images(&self, limit: i64) -> Result<Vec<PendingPlotImage>, DbError> {
         let sql = r#"
             SELECT p.id AS plot_image_id,
                    p.movie AS movie_id,
@@ -944,11 +963,11 @@ impl PendingImageRepository {
             WHERE p.image_search_index_status = 0
             LIMIT $1
         "#;
-        Ok(sqlx::query_as::<_, PendingPlotImage>(sql)
+        sqlx::query_as::<_, PendingPlotImage>(sql)
             .bind(limit.max(1))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?)
+            .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))
     }
 
     /// 待处理总数（缩略图 + 剧情图）。
@@ -997,14 +1016,13 @@ impl PendingImageRepository {
                 format!("未知的 image_search_index_status: {status}"),
             ));
         }
-        let result = sqlx::query(
-            "UPDATE media_thumbnail SET image_search_index_status = $2 WHERE id = $1",
-        )
-        .bind(thumbnail_id)
-        .bind(status)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        let result =
+            sqlx::query("UPDATE media_thumbnail SET image_search_index_status = $2 WHERE id = $1")
+                .bind(thumbnail_id)
+                .bind(status)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
         Ok(result.rows_affected())
     }
 
@@ -1024,14 +1042,13 @@ impl PendingImageRepository {
                 format!("未知的 image_search_index_status: {status}"),
             ));
         }
-        let result = sqlx::query(
-            "UPDATE movie_plot_image SET image_search_index_status = $2 WHERE id = $1",
-        )
-        .bind(plot_image_id)
-        .bind(status)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        let result =
+            sqlx::query("UPDATE movie_plot_image SET image_search_index_status = $2 WHERE id = $1")
+                .bind(plot_image_id)
+                .bind(status)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
         Ok(result.rows_affected())
     }
 

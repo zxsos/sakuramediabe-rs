@@ -79,7 +79,9 @@ impl ProviderBrowseService {
     /// `provider_invalid_response` 是「provider 返回的东西我们解不了」。
     /// 前者更笼统，后者说明是契约被破坏 —— 客户端要靠它们区分「重试」与
     /// 「上报插件 bug」。
-    pub async fn browse(payload: ImportBrowseRequest) -> Result<ImportBrowseResponse, ServiceError> {
+    pub async fn browse(
+        payload: ImportBrowseRequest,
+    ) -> Result<ImportBrowseResponse, ServiceError> {
         let _ = payload;
         todo!("骨架：解析媒体库的 provider -> browse(parent_ref, cursor, limit) -> 原样透传 next_cursor")
     }

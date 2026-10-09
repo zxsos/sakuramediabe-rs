@@ -45,7 +45,10 @@ pub fn active_download_task_exists(movie_number: &str) -> (String, Vec<String>) 
         "EXISTS (SELECT 1 FROM download_task dt \
          WHERE dt.movie_number = $1 AND dt.state = ANY($2))"
             .to_owned(),
-        vec![movie_number.to_owned(), format!("{{{}}}", ACTIVE_DOWNLOAD_STATES.join(","))],
+        vec![
+            movie_number.to_owned(),
+            format!("{{{}}}", ACTIVE_DOWNLOAD_STATES.join(",")),
+        ],
     )
 }
 

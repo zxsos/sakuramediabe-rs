@@ -17,7 +17,8 @@
 //!
 //! **它们在 `[today-90, today-60)` 这 30 天里重叠。** 所以一部候选影片
 //! **可能同时**出现在历史证据里 —— 这不是 bug，是设计。后果是打分时必须
-//! **把影片自己的证据从女优总分里扣掉**，见 [`score_movies`]。
+//! **把影片自己的证据从女优总分里扣掉**，见
+//! [`HotActressReleaseService::score_movies`]。
 //!
 //! # 三处最容易照抄错的地方
 //!
@@ -113,24 +114,28 @@ pub struct HotActressReleasePage {
     /// **候选影片总数**（不是本页条数）。
     pub total: i64,
 }
+/// 四个窗口边界。
+///
+/// **历史窗口的右端是 `today - 60` 而不是 `today`** —— 成熟期（见
+/// [`HotActressReleaseService::windows`]）。
+///
+/// ⚠️ 定义在 `impl` **外面**：Rust 不允许在 `impl` 块里定义 `struct`
+/// （E0408）。它逻辑上属于本服务，但语法上必须提到模块级。
+#[derive(Debug, Clone, Copy)]
+pub struct Windows {
+    pub history_start: chrono::NaiveDate,
+    pub history_end: chrono::NaiveDate,
+    pub candidate_start: chrono::NaiveDate,
+    pub candidate_end: chrono::NaiveDate,
+}
+
 /// 读侧服务。
 pub struct HotActressReleaseService;
 
 impl HotActressReleaseService {
-    /// 窗口起点与终点。
-    ///
-    /// **历史窗口的右端是 `today - 60` 而不是 `today`** —— 成熟期。
-    #[derive(Debug, Clone, Copy)]
-    pub struct Windows {
-        pub history_start: chrono::NaiveDate,
-        pub history_end: chrono::NaiveDate,
-        pub candidate_start: chrono::NaiveDate,
-        pub candidate_end: chrono::NaiveDate,
-    }
-
     /// 按基准日算四个窗口边界。
-    pub fn windows(today: chrono::NaiveDate) -> Self::Windows {
-        Self::Windows {
+    pub fn windows(today: chrono::NaiveDate) -> Windows {
+        Windows {
             history_start: today - chrono::Duration::days(HISTORY_LOOKBACK_DAYS),
             // 右开区间：不含 `today - 60` 当天
             history_end: today - chrono::Duration::days(HISTORY_MATURITY_DAYS),
@@ -157,28 +162,31 @@ impl HotActressReleaseService {
     /// - `heat` 为 `None` 时按 **0** 算（上游 `float(heat or 0)`）—— 不是跳过，
     ///   是算作零证据。跳过会让「没热度但有作品」的女优凭空消失。
     /// - `age_days` **下界 60**（见模块文档第 2 条）。
-    pub fn evidence(
-        heat: Option<i32>,
-        age_days: i64,
-    ) -> f64 {
+    pub fn evidence(heat: Option<i32>, age_days: i64) -> f64 {
         let heat = heat.unwrap_or(0) as f64;
         (1.0 + heat / age_days.max(HISTORY_MATURITY_DAYS) as f64).ln()
     }
 
     /// 汇总历史证据。**纯函数** —— 不碰数据库，便于直接测。
-    pub fn build_evidence(rows: &[HistoryActorRow], today: chrono::NaiveDate) -> HashMap<i32, ActorEvidence> {
+    pub fn build_evidence(
+        rows: &[HistoryActorRow],
+        today: chrono::NaiveDate,
+    ) -> HashMap<i32, ActorEvidence> {
         let mut out: HashMap<i32, ActorEvidence> = HashMap::new();
         for row in rows {
-            let released = Self::release_date(row.release_date);
+            // 解构取名而不是 `.0`/`.1` —— 前两位同类型，位置写错编译不报。
+            // 位置含义见 `sm_db::repo::discovery::HistoryActorRow`。
+            let (movie_id, actor_id, heat, release_date) = *row;
+            let released = Self::release_date(release_date);
             // 上游 `max((today - released_on).days, MATURITY_DAYS)`。
             // 这里**不取绝对值** —— 未来发行的片子会得到负数，被下界抬到 60。
             // 照抄上游：它也没取绝对值。
             let age_days = (today - released).num_days();
-            let evidence = Self::evidence(row.heat, age_days);
-            let entry = out.entry(row.actor_id).or_default();
+            let evidence = Self::evidence(heat, age_days);
+            let entry = out.entry(actor_id).or_default();
             entry.total += evidence;
             entry.movie_count += 1;
-            entry.by_movie_id.insert(row.movie_id, evidence);
+            entry.by_movie_id.insert(movie_id, evidence);
         }
         out
     }
@@ -198,32 +206,35 @@ impl HotActressReleaseService {
     ) -> Vec<ScoredMovie> {
         let mut best_by_movie: HashMap<i32, ScoredMovie> = HashMap::new();
         for row in candidates {
-            let Some(actor) = evidence.get(&row.actor_id) else {
+            // 同 `build_evidence`：解构取名，位置含义见
+            // `sm_db::repo::discovery::CandidateRow`。
+            let (movie_id, actor_id, release_date) = *row;
+            let Some(actor) = evidence.get(&actor_id) else {
                 continue;
             };
             // 影片自己的证据（可能没有 —— 候选窗口右半段不进历史）。
-            let own = actor.by_movie_id.get(&row.movie_id).copied();
+            let own = actor.by_movie_id.get(&movie_id).copied();
             let historical_movie_count = actor.movie_count - i64::from(own.is_some());
             if historical_movie_count < MIN_HISTORICAL_MOVIES {
                 continue;
             }
             let score = (actor.total - own.unwrap_or(0.0)) / historical_movie_count as f64;
             let candidate = ScoredMovie {
-                movie_id: row.movie_id as i64,
-                release_date: row.release_date,
-                actor_id: row.actor_id as i64,
+                movie_id: movie_id as i64,
+                release_date,
+                actor_id: actor_id as i64,
                 historical_movie_count,
                 score,
             };
             // 平局取 actor_id **小**者：比较 `(score, -actor_id)` 取大者。
-            let replace = match best_by_movie.get(&(row.movie_id)) {
+            let replace = match best_by_movie.get(&movie_id) {
                 None => true,
                 Some(current) => {
                     (candidate.score, -candidate.actor_id) > (current.score, -current.actor_id)
                 }
             };
             if replace {
-                best_by_movie.insert(row.movie_id, candidate);
+                best_by_movie.insert(movie_id, candidate);
             }
         }
         let mut out: Vec<ScoredMovie> = best_by_movie.into_values().collect();
@@ -279,10 +290,7 @@ impl HotActressReleaseQuery {
     /// `total` 是**候选影片总数**（打分后的长度），**不是数据库里的行数** ——
     /// 上游 `len(scored_movies)`（`:237`）。所以 `total` 依赖打分结果，
     /// 不能用 `COUNT(*)` 顶替。
-    pub async fn scored(
-        &self,
-        today: chrono::NaiveDate,
-    ) -> Result<Vec<ScoredMovie>, ServiceError> {
+    pub async fn scored(&self, today: chrono::NaiveDate) -> Result<Vec<ScoredMovie>, ServiceError> {
         let windows = HotActressReleaseService::windows(today);
         let repo = self.repo.clone();
         // 两个查询都跑在各自的快照事务里。要「同一快照」得合并成一次调用，
@@ -294,7 +302,10 @@ impl HotActressReleaseQuery {
             repo.candidate_rows(windows.candidate_start, windows.candidate_end),
         )?;
         let evidence = HotActressReleaseService::build_evidence(&history_rows, today);
-        Ok(HotActressReleaseService::score_movies(&candidate_rows, &evidence))
+        Ok(HotActressReleaseService::score_movies(
+            &candidate_rows,
+            &evidence,
+        ))
     }
 
     /// 今日（本地日期）为基准的全量打分结果。

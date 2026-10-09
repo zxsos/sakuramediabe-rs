@@ -15,7 +15,7 @@
 //!
 //! # 「JavDB 补录」要等 7 天
 //!
-//! [`JAVDB_CHECK_INTERVAL`] = 7 天。导入时 JavDB 可能还没收录这部片，
+//! [`JAVDB_CHECK_INTERVAL_DAYS`] = 7 天。导入时 JavDB 可能还没收录这部片，
 //! 立刻重试只会白等（见 [`super::movie_javdb_backfill`]：那是 cron 任务的事）。
 //!
 //! # 图片：先下载到临时文件，全部成功才落盘
@@ -34,13 +34,16 @@
 //! 删图片记录时要清对应的向量，但**只在图搜启用时**做（`image_search_enabled()`）。
 //! 没启用就没建过索引，清它是白费一次网络往返。
 
+use std::sync::Arc;
+
 use crate::error::ServiceError;
 
 /// 导入后再次检查 JavDB 的间隔（天）。
 pub const JAVDB_CHECK_INTERVAL_DAYS: i64 = 7;
 
 /// 一部影片的导入结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// ⚠️ **不能** derive `Copy`：`updated_fields: Vec<String>` 带堆分配。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CatalogImportResult {
     pub movie_id: i64,
     /// ★ 本次**是否新建**。`false` = 已存在并被更新。
@@ -49,11 +52,43 @@ pub struct CatalogImportResult {
     pub updated_fields: Vec<String>,
 }
 
+/// ★ 目录写入的**窄接口**。由 [`CatalogImportService`] 实现。
+///
+/// # 为什么要抽出 trait
+///
+/// [`super::metadata_source`] 只**需要**「把元数据写进去」这一件事。若它直接
+/// 依赖 `CatalogImportService`（具体 struct），就把图片下载、封面切割、
+/// 资产包重建全拖进了依赖图 —— 而那些与「哪个来源提供了元数据」毫无关系。
+///
+/// 窄接口让两个模块能各自独立测试。
+pub trait CatalogImport {
+    /// 按番号导入（**不存在才建**，已有则只补空字段）。
+    ///
+    /// 返回 `(movie_id, 是否新建)`。
+    fn import_movie_if_missing(
+        &mut self,
+        movie_number: &str,
+        detail: &serde_json::Value,
+    ) -> Result<(i64, bool), ServiceError>;
+
+    /// 从 JavDB 资源 upsert 一位演员，返回演员 id。
+    fn upsert_actor(&mut self, actor_resource: &serde_json::Value) -> Result<i64, ServiceError>;
+}
+
+/// 图片下载器（出网）。**可注入**，测试用替身。
+///
+/// 抽成别名：`Box<dyn Fn(&str, &Path) -> Result<(), ServiceError>>` 这个形状
+/// 在字段与构造参数上各写一遍，`clippy::type_complexity` 也会在这里报警。
+pub type ImageDownloader = Box<dyn Fn(&str, &std::path::Path) -> Result<(), ServiceError>>;
+
 /// 目录导入服务。**元数据落地的唯一入口**。
+// 三个字段都是构造时注入、**尚未被方法体引用**的依赖（那些方法还是
+// `todo!()`）。落地时删掉这行 allow —— 它不该长期存在。
+#[allow(dead_code)]
 pub struct CatalogImportService {
     image_service: Option<Box<dyn super::movie_image::ImageTasksBuilder>>,
     /// 图片下载器（出网）。**可注入**，测试用替身。
-    image_downloader: Option<Box<dyn Fn(&str, &std::path::Path) -> Result<(), ServiceError>>>,
+    image_downloader: Option<ImageDownloader>,
     /// 持久化锁。**同一影片的并发导入要串行** ——
     /// 两个来源同时补录同一部片会互相覆盖，且最后写入的可能更旧。
     persist_lock: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -63,7 +98,7 @@ impl CatalogImportService {
     /// 构造。
     pub fn new(
         image_service: Box<dyn super::movie_image::ImageTasksBuilder>,
-        image_downloader: Box<dyn Fn(&str, &std::path::Path) -> Result<(), ServiceError>>,
+        image_downloader: ImageDownloader,
     ) -> Self {
         Self {
             image_service: Some(image_service),
@@ -85,7 +120,9 @@ impl CatalogImportService {
         force_subscribed: bool,
     ) -> Result<CatalogImportResult, ServiceError> {
         let _ = (detail, force_subscribed);
-        todo!("骨架：查番号(规范化) -> 不存在则建 -> 存在则只补空字段；写经 movie_ownership_gateway")
+        todo!(
+            "骨架：查番号(规范化) -> 不存在则建 -> 存在则只补空字段；写经 movie_ownership_gateway"
+        )
     }
 
     /// 从插件来源导入。上游 `import_plugin_movie(detail, source, provider, *, force_subscribed)`。
@@ -163,4 +200,3 @@ impl CatalogImportService {
         todo!("骨架：查 JavDB id -> 建或更新 -> 头像经 actor_ownership_gateway(javdb owner)；性别默认不改")
     }
 }
-

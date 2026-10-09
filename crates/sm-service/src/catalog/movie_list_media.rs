@@ -53,7 +53,6 @@ pub fn attach_movie_list_media_checked(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// `can_play` 的语义是「**至少一条**有效媒体」。
     ///

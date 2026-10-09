@@ -176,7 +176,7 @@ mod tests {
     /// 他要问的问题。
     #[test]
     fn blocked_targets_are_listed_with_a_reason() {
-        let targets = vec![
+        let targets = [
             MediaStorageTransferTarget {
                 library_id: 1,
                 library_name: "本地盘".to_owned(),

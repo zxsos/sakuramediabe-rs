@@ -116,11 +116,12 @@ async fn seed_media(db: &TestDb) -> i32 {
 async fn seed_point(db: &TestDb) -> i32 {
     MediaPointRepository::new(db.pool().clone())
         .insert(
-            seed_image(db).await,
-            0,
             Some(seed_media(db).await),
             None,
+            seed_image(db).await,
             None,
+            None,
+            0,
         )
         .await
         .expect("insert media_point")

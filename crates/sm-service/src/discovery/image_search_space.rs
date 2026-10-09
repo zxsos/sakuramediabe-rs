@@ -154,7 +154,22 @@ impl ImageSearchIndexRebuildRequired {
         ServiceError::conflict(
             "image_search_index_rebuild_required",
             "图片搜索索引需要重建",
-            Some(self.details().into_iter().collect()),
+            // `details()` 的值是可空字符串，而 `Map<String, Value>` 要的是
+            // `Value` —— `None` 显式落成 `Null`（**不省略这个键**：客户端要靠
+            // 它区分「没有历史空间」与「读不到」）。
+            Some(
+                self.details()
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            value
+                                .map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    })
+                    .collect(),
+            ),
         )
     }
 }
@@ -243,10 +258,7 @@ impl ImageSearchIndexSpaceService {
     }
 
     /// 查询前的闸门。**只在 `rebuild_required` 时抛**（见模块文档第 1 条）。
-    pub async fn ensure_search_ready(
-        &self,
-        current_space_id: &str,
-    ) -> Result<(), ServiceError> {
+    pub async fn ensure_search_ready(&self, current_space_id: &str) -> Result<(), ServiceError> {
         let status = self.get_status(Some(current_space_id)).await?;
         if status.state == STATE_REBUILD_REQUIRED {
             return Err(ImageSearchIndexRebuildRequired { status }.into_service_error());
@@ -258,10 +270,7 @@ impl ImageSearchIndexSpaceService {
     ///
     /// `uninitialized` 时**把状态行建成已索引** —— 上游行为，照抄。后果写在
     /// 模块文档里：首次索引中途失败会让状态说「已索引」而实际没有向量。
-    pub async fn prepare_for_indexing(
-        &self,
-        current_space_id: &str,
-    ) -> Result<(), ServiceError> {
+    pub async fn prepare_for_indexing(&self, current_space_id: &str) -> Result<(), ServiceError> {
         let status = self.get_status(Some(current_space_id)).await?;
         match status.state.as_str() {
             // 已经是当前空间 -> 无事可做。

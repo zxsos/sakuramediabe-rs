@@ -24,7 +24,7 @@
 //! [`crate::query`] 里那些「非法值降级」的约定**不同** —— 那里降级是因为
 //! 上游本身宽松，而这里上游严格，所以照上游。
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};

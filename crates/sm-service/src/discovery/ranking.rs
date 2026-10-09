@@ -59,7 +59,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sm_db::common::page::PageRequest;
 use sm_db::repo::discovery::{NewRankingItem, RankingItemRepository};
-use sm_db::PgPool;
+// `sm_db` 没有公开导出 `PgPool`（它是 `sqlx::PgPool` 的私有别名），
+// 直接引 `sqlx` —— 本 crate 本来就依赖它。
+use sqlx::PgPool;
 
 use crate::error::ServiceError;
 
@@ -134,7 +136,10 @@ pub struct RankingCatalogService {
 impl RankingCatalogService {
     /// 构造。
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, sources: RankingSourceCatalog::default() }
+        Self {
+            pool,
+            sources: RankingSourceCatalog::default(),
+        }
     }
 
     /// 挂上排行源快照。**只有组合根会调**（它才能读插件注册表）。
@@ -252,7 +257,8 @@ impl RankingCatalogService {
         // 两条路径都走同一个索引 (`source_key, board_key, period`)，排序一致。
         let items = match limit {
             Some(limit) if limit > 0 => {
-                repo.top_by_board(source_key, board_key, period, limit as i32).await?
+                repo.top_by_board(source_key, board_key, period, limit as i32)
+                    .await?
             }
             _ => repo.list_by_board(source_key, board_key, period).await?,
         };
@@ -301,11 +307,16 @@ impl RankingCatalogService {
     ///
     /// **不写「返回空数组」的假实现** —— 那会让接口「成功」但永远没数据，
     /// 比报缺口更难查。
-    pub async fn list_boards(&self, _source_key: &str) -> Result<Vec<RankingBoardResource>, ServiceError> {
+    pub async fn list_boards(
+        &self,
+        _source_key: &str,
+    ) -> Result<Vec<RankingBoardResource>, ServiceError> {
         Err(ServiceError::not_found_with(
             "ranking_board_definitions_unavailable",
             "榜单定义尚未接入：插件注册载荷里的榜单定义还没有 Rust 侧的存放处",
-            [("source_key".to_owned(), serde_json::json!(_source_key))].into_iter().collect(),
+            [("source_key".to_owned(), serde_json::json!(_source_key))]
+                .into_iter()
+                .collect(),
         ))
     }
 }
@@ -464,12 +475,17 @@ impl RankingSourceCatalog {
     }
 
     /// 源不存在 → 404。这是路由层「源不存在」错误的**唯一**来源。
-    pub fn require_definition(&self, source_key: &str) -> Result<&RankingSourceDefinition, ServiceError> {
+    pub fn require_definition(
+        &self,
+        source_key: &str,
+    ) -> Result<&RankingSourceDefinition, ServiceError> {
         self.definition(source_key).ok_or_else(|| {
             ServiceError::not_found_with(
                 "ranking_source_not_found",
                 format!("排行源 {source_key} 不存在"),
-                [("source_key".to_owned(), serde_json::json!(source_key))].into_iter().collect(),
+                [("source_key".to_owned(), serde_json::json!(source_key))]
+                    .into_iter()
+                    .collect(),
             )
         })
     }

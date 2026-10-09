@@ -54,6 +54,9 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+// 删除参数与「两步确认」的校验都在 service 层，**不在路由层复制一份**
+// （`handoff.md` 纪律第 7 条）。
+use sm_service::transfers::download_task::DeleteTaskQuery;
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -73,24 +76,12 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/download-tasks/{task_id}",
-            delete(delete_download_task)
-                .fallback(method_not_allowed),
+            delete(delete_download_task).fallback(method_not_allowed),
         )
         .route(
             "/download-tasks/{task_id}/import",
             post(trigger_download_task_import).fallback(method_not_allowed),
         )
-}
-
-/// 删除任务的查询参数 —— **两步确认**。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct DeleteTaskQuery {
-    /// 是否连带删除已下载文件。默认 `false`。
-    #[serde(default)]
-    pub delete_files: bool,
-    /// 是否已确认。**`delete_files = true` 时必须也为 `true`**，否则 422。
-    #[serde(default)]
-    pub confirm_delete_files: bool,
 }
 
 /// `DELETE /download-tasks/{task_id}`

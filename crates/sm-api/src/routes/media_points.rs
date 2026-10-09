@@ -46,7 +46,10 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/media-points", get(list_media_points))
-        .route("/media-points/{point_id}/collections", get(list_media_point_collections))
+        .route(
+            "/media-points/{point_id}/collections",
+            get(list_media_point_collections),
+        )
         .route("/media-points/{point_id}", delete(delete_media_point))
 }
 

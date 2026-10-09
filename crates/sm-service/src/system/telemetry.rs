@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ServiceError;
 
 /// 任务统计。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+// ⚠️ **不能** derive `Eq`：`success_rate: Option<f64>`，而 `f64` 没有 `Eq`
+// （NaN != NaN）。要比较就自己写，别指望 derive 过得了。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskTelemetry {
     /// 总运行数。
     pub total: i64,
@@ -163,4 +165,3 @@ mod tests {
         assert!(ready.searchable);
     }
 }
-

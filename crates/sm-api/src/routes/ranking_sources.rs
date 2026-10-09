@@ -19,7 +19,9 @@
 //! `sm-plugins -> sm-scheduler -> sm-service` 是一条依赖链，
 //! **`sm-service` 依赖 `sm-plugins` 会成环**；`sm-api` 同样不依赖它。
 //!
-//! 所以走 `AppState::ranking`（[`RankingSourceCatalog`]）—— 与
+//! 所以走 `AppState::ranking`
+//! （[`RankingSourceCatalog`](sm_service::discovery::ranking::RankingSourceCatalog)）
+//! —— 与
 //! `AppState::jobs`（`JobCatalog`）**同一个模式**：组合根读完塞进来。
 //! 详见 `sm-service/src/discovery/ranking.rs` 里 `RankingSourceCatalog` 的文档。
 //!
@@ -87,8 +89,8 @@ async fn list_ranking_sources(
     _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<sm_service::discovery::ranking::RankingSourceResource>>, ErrorResponse> {
-    let service = RankingCatalogService::new(state.db().clone())
-        .with_sources(state.ranking().clone());
+    let service =
+        RankingCatalogService::new(state.db().clone()).with_sources(state.ranking().clone());
     Ok(Json(service.list_sources()))
 }
 
@@ -103,12 +105,19 @@ async fn list_ranking_boards(
 ) -> Result<Json<Vec<sm_service::discovery::ranking::RankingBoardResource>>, ErrorResponse> {
     // 先确认源存在 —— 「源不存在」与「定义没接入」是两个不同的 404。
     state.ranking().require_definition(&source_key)?;
-    let service = RankingCatalogService::new(state.db().clone())
-        .with_sources(state.ranking().clone());
-    service.list_boards(&source_key).await.map(Json)
+    let service =
+        RankingCatalogService::new(state.db().clone()).with_sources(state.ranking().clone());
+    // `?` 而不是 `.map(Json)`：返回的是 `ServiceError`，要靠
+    // `From<ServiceError> for ErrorResponse` 转成信封。
+    let boards = service.list_boards(&source_key).await?;
+    Ok(Json(boards))
 }
 
 /// `GET /ranking-sources/{source_key}/boards/{board_key}/items`
+// ⚠️ `sort` 目前**只被解析、没被转交** —— `RankingCatalogService::list_board_items`
+// 的签名里没有排序参数（上游行为见模块文档的「非法值降级」）。这是**契约缺口**，
+// 不是有意的：客户端传 `sort=nonsense` 会被静默忽略。已在 `handoff.md` 记下。
+#[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
 struct BoardItemsQuery {
     /// 不传则用榜单默认周期；传了但不支持 → **422**。
@@ -127,16 +136,18 @@ async fn list_ranking_board_items(
     Path((source_key, board_key)): Path<(String, String)>,
     EnvelopeQuery(query): EnvelopeQuery<BoardItemsQuery>,
 ) -> Result<Json<BoardItemPage>, ErrorResponse> {
-    let service = RankingCatalogService::new(state.db().clone())
-        .with_sources(state.ranking().clone());
+    let service =
+        RankingCatalogService::new(state.db().clone()).with_sources(state.ranking().clone());
 
     // 源与榜单都要存在 —— 两个 404 语义不同，不要合并。
-    let (_, board) = state.ranking().require_source_and_board(&source_key, &board_key)?;
+    let (_, board) = state
+        .ranking()
+        .require_source_and_board(&source_key, &board_key)?;
     // 周期解析：不支持则 422，**不静默回退**。
     let period = RankingCatalogService::resolve_period(board, query.period.as_deref())?;
 
-    service
+    let items = service
         .list_board_items(&source_key, &board_key, &period, query.limit)
-        .await
-        .map(Json)
+        .await?;
+    Ok(Json(items))
 }

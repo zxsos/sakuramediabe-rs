@@ -52,7 +52,9 @@ impl MovieMetadataSearchService {
     ///
     /// 错误码：番号为空 → `422 invalid_movie_number`；两个来源都没收录 →
     /// `NotFound`（由调用方映射成 404）。
-    pub async fn search_by_number(movie_number: &str) -> Result<MetadataSearchResponse, ServiceError> {
+    pub async fn search_by_number(
+        movie_number: &str,
+    ) -> Result<MetadataSearchResponse, ServiceError> {
         let _ = movie_number;
         todo!("骨架：查 JavDB + 已启用插件来源 -> 各下载封面到 24h 缓存 -> 按置信度降序")
     }
@@ -60,9 +62,14 @@ impl MovieMetadataSearchService {
     /// 把 `candidate_id` 解成来源引用。上游 `resolve_candidate_reference(candidate_id) -> dict[str, str]`。
     ///
     /// 错误码：id 格式不对 → `422 invalid_metadata_candidate`。
-    pub fn resolve_candidate_reference(candidate_id: &str) -> Result<serde_json::Value, ServiceError> {
+    pub fn resolve_candidate_reference(
+        candidate_id: &str,
+    ) -> Result<serde_json::Value, ServiceError> {
         let _ = candidate_id;
-        todo!("骨架：解出 {source, external_id}；格式不对 -> 422 invalid_metadata_candidate")
+        // ⚠️ 消息里**不能出现 `{...}`** —— `todo!` 的第一参数是格式串，
+        // 里面的花括号会被当占位符（`{source, external_id}` 不是合法占位符）。
+        // 上游我写成「解出 source 与 external_id」正是为了避开它。
+        todo!("骨架：解出 source 与 external_id；格式不对 -> 422 invalid_metadata_candidate")
     }
 
     /// ★ 取候选详情，**闭包内有效**。
@@ -75,9 +82,9 @@ impl MovieMetadataSearchService {
     pub async fn fetch_candidate<R>(
         &self,
         candidate_id: &str,
-        use: impl AsyncFnOnce(serde_json::Value, serde_json::Value) -> R,
+        consume: impl AsyncFnOnce(serde_json::Value, serde_json::Value) -> R,
     ) -> Result<R, ServiceError> {
-        let _ = (candidate_id, use);
+        let _ = (candidate_id, consume);
         todo!("骨架：解析 id -> 取详情 -> 校验来源匹配(422) -> use(detail, source).await")
     }
 
@@ -111,7 +118,7 @@ mod tests {
     /// 候选列表按 `confidence` **降序** —— 客户端取第一个作默认选中项。
     #[test]
     fn candidates_are_ordered_by_confidence_descending() {
-        let mut candidates = vec![
+        let mut candidates = [
             MetadataCandidate {
                 candidate_id: "a".to_owned(),
                 title: "A".to_owned(),
@@ -147,7 +154,6 @@ mod tests {
         assert!(!candidate.candidate_id.is_empty());
     }
 }
-
 
 /// 搜索响应。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -32,9 +32,9 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{get, patch};
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::auth::CurrentUser;
 use crate::error::ErrorResponse;
@@ -42,8 +42,14 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/media-libraries", get(list_media_libraries).post(create_media_library))
-        .route("/media-libraries/providers", get(list_media_library_providers))
+        .route(
+            "/media-libraries",
+            get(list_media_libraries).post(create_media_library),
+        )
+        .route(
+            "/media-libraries/providers",
+            get(list_media_library_providers),
+        )
         .route(
             "/media-libraries/{library_id}",
             patch(update_media_library).delete(delete_media_library),

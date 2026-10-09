@@ -155,7 +155,7 @@ impl From<TokenPair> for TokenResource {
 async fn docs_login(
     State(_state): State<AppState>,
     axum::extract::Form(_form): axum::extract::Form<DocsLoginForm>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
+) -> Result<axum::Json<serde_json::Value>, ErrorResponse> {
     todo!("骨架：同 create_token_pair，但收 form-urlencoded；不进 OpenAPI 文档")
 }
 

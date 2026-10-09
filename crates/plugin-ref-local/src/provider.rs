@@ -19,10 +19,11 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_types::Struct;
 use sm_plugin_api::provider::StorageProviderExt;
 use sm_plugin_api::v1::{
-    playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType, GenerateThumbnailsRequest,
-    ImportFile, ImportFileEntry, LibraryHandle, MediaHandle, PlanPlaybackRequest,
-    PlanPlaybackResponse, PlaybackDelivery, PlaybackPlan, ProgressEvent, RedirectPlan,
-    ScanImportSourceRequest,
+    generate_thumbnails_response, playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType,
+    GenerateThumbnailsRequest, GenerateThumbnailsResponse, ImportFile, ImportFileEntry,
+    LibraryHandle, MediaHandle, PlanPlaybackRequest, PlanPlaybackResponse, PlaybackDelivery,
+    PlaybackPlan, ProgressEvent, RedirectPlan, ScanImportSourceRequest, ThumbnailArtifact,
+    ThumbnailGeneration,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -264,7 +265,8 @@ impl StorageProviderExt for LocalRefProvider {
     async fn generate_thumbnails(
         &self,
         request: Request<GenerateThumbnailsRequest>,
-    ) -> Result<Response<BoxStream<'static, Result<ProgressEvent, Status>>>, Status> {
+    ) -> Result<Response<BoxStream<'static, Result<GenerateThumbnailsResponse, Status>>>, Status>
+    {
         let payload = request.into_inner();
         let library = payload
             .library
@@ -291,6 +293,7 @@ impl StorageProviderExt for LocalRefProvider {
                 return;
             }
 
+            let mut artifacts: Vec<ThumbnailArtifact> = Vec::with_capacity(total as usize);
             for index in 1..=total {
                 // 本 crate 不解码视频，落一个占位文件代表「第 index 张真图」。
                 let artifact = format!("{stem}-{index:04}.jpg");
@@ -304,21 +307,44 @@ impl StorageProviderExt for LocalRefProvider {
                         .await;
                     return;
                 }
+                // 均分到整条时长上：第 i 张落在 i/(total+1) 处，不落在首尾帧
+                // （首帧常是黑场、末帧常是片尾）。
+                let divisor = i64::from(total) + 1;
+                let offset_seconds = (media.duration_seconds.max(0) * i64::from(index)) / divisor;
+                artifacts.push(ThumbnailArtifact {
+                    offset_seconds: offset_seconds as i32,
+                    relative_path: artifact.clone(),
+                });
 
-                let event = ProgressEvent {
+                let progress = ProgressEvent {
                     text: format!("已生成第 {index}/{total} 张：{artifact}"),
                     current: index,
                     total,
                 };
-                if sender.send(Ok(event)).await.is_err() {
+                if sender
+                    .send(Ok(GenerateThumbnailsResponse {
+                        payload: Some(generate_thumbnails_response::Payload::Progress(progress)),
+                    }))
+                    .await
+                    .is_err()
+                {
                     // 客户端断开：直接收尾，不要往已关闭的流里塞。
                     return;
                 }
             }
-            // GAP: 流就这样结束了。`ThumbnailGeneration`（含 expected_count 与
-            // 产物列表）没有任何返回通道 —— `GenerateThumbnailsResponse`
-            // 定义了却没被这个 rpc 用上，宿主拿不到产物文件名。
-            // 见报告 §4.3。
+
+            // ★ 以 `done` 收尾 —— 宿主**凭这一条**落库。
+            // （P1-1 修订前流就这样结束了，宿主拿不到产物清单。）
+            let _ = sender
+                .send(Ok(GenerateThumbnailsResponse {
+                    payload: Some(generate_thumbnails_response::Payload::Done(
+                        ThumbnailGeneration {
+                            expected_count: total,
+                            artifacts,
+                        },
+                    )),
+                }))
+                .await;
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))

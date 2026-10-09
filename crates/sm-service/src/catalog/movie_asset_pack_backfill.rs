@@ -124,4 +124,3 @@ mod tests {
         assert_eq!(TASK_KEY, "movie_asset_pack_backfill");
     }
 }
-

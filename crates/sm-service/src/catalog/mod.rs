@@ -45,6 +45,12 @@ pub mod actor_merge;
 pub mod actor_ownership_gateway;
 pub mod catalog_import;
 pub mod image_cleanup;
+// 路径原语与图片包字节原语。上游在 `common/media_paths.py` 与
+// `common/image_store.py`，本仓没有 `common` 层，而它们的用户
+// （`image_cleanup` / `movie_asset_pack` / 未来的 `media_thumbnail_service`）
+// 跨 `catalog` 与 `playback` 两侧 —— 谁都不该被另一个服务"拥有"。
+pub mod image_store;
+pub mod media_paths;
 pub mod metadata_source;
 pub mod movie;
 pub mod movie_asset_pack;
@@ -57,12 +63,12 @@ pub mod movie_list_media;
 pub mod movie_metadata_refresh;
 pub mod movie_metadata_search;
 pub mod movie_ownership_gateway;
-pub mod movie_subtitle;
 pub mod movie_subscription;
 pub mod movie_subscription_search_state;
+pub mod movie_subtitle;
 pub mod movie_task;
 pub mod movie_thin_cover_backfill;
 pub mod resolution;
-pub mod subtitle_asset;
 pub mod subscribed_actor_movie_sync;
+pub mod subtitle_asset;
 pub mod tag;

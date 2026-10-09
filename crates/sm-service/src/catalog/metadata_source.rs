@@ -48,9 +48,15 @@ pub enum MetadataSourceError {
 /// JavDB 查询能力。**出网**。
 pub trait MetadataProvider {
     /// 按番号取影片详情。
-    fn get_movie_by_number(&self, movie_number: &str) -> Result<Option<serde_json::Value>, MetadataSourceError>;
+    fn get_movie_by_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError>;
     /// 按 JavDB id 取影片详情。
-    fn get_movie_by_javdb_id(&self, javdb_id: &str) -> Result<Option<serde_json::Value>, MetadataSourceError>;
+    fn get_movie_by_javdb_id(
+        &self,
+        javdb_id: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError>;
     /// 搜演员。
     fn search_actors(&self, keyword: &str) -> Result<Vec<serde_json::Value>, MetadataSourceError>;
 }
@@ -68,6 +74,8 @@ pub struct PluginDelivery {
 }
 
 /// 元数据来源服务。
+// `sources` 尚未被方法体引用（`fetch_movie` 还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MetadataSourceService {
     /// 已启用的插件来源。**从配置读**，不是硬编码列表。
     sources: Vec<RegisteredSource>,
@@ -88,7 +96,9 @@ impl MetadataSourceService {
     }
 
     /// 读配置里已启用的来源。`None` = 一个都没启用。
-    pub fn enabled_plugin_sources(config: &serde_json::Value) -> Result<Vec<RegisteredSource>, MetadataSourceError> {
+    pub fn enabled_plugin_sources(
+        config: &serde_json::Value,
+    ) -> Result<Vec<RegisteredSource>, MetadataSourceError> {
         let _ = config;
         todo!("骨架：读 plugins.enabled + 每个插件的 data_dir 约定")
     }
@@ -108,9 +118,9 @@ impl MetadataSourceService {
         &self,
         plugin_id: &str,
         movie_number: &str,
-        use: impl AsyncFnOnce(PluginDelivery) -> R,
+        consume: impl AsyncFnOnce(PluginDelivery) -> R,
     ) -> Result<R, MetadataSourceError> {
-        let _ = (plugin_id, movie_number, use);
+        let _ = (plugin_id, movie_number, consume);
         todo!("骨架：向插件索取 -> 校验交付目录前缀 -> Pillow 校验 -> use(delivery).await -> 清理目录")
     }
 
@@ -121,9 +131,9 @@ impl MetadataSourceService {
     pub async fn fetch<R>(
         &self,
         movie_number: &str,
-        use: impl AsyncFnOnce(PluginDelivery) -> R,
+        consume: impl AsyncFnOnce(PluginDelivery) -> R,
     ) -> Result<R, MetadataSourceError> {
-        let _ = (movie_number, use);
+        let _ = (movie_number, consume);
         todo!("骨架：先 JavDB(NotFound 不算错) -> 再按顺序试已启用插件 -> 都没有则 NotFound")
     }
 
@@ -167,7 +177,9 @@ mod tests {
     fn only_enabled_sources_are_used() {
         let enabled = sources(&["local", "115"]);
         assert!(MetadataSourceService::is_plugin_enabled(&enabled, "local"));
-        assert!(!MetadataSourceService::is_plugin_enabled(&enabled, "unknown"));
+        assert!(!MetadataSourceService::is_plugin_enabled(
+            &enabled, "unknown"
+        ));
     }
 
     /// 一个来源都没有时，`is_plugin_enabled` 全部为假 —— 不报错。
@@ -187,4 +199,3 @@ mod tests {
         assert_ne!(not_found, failed);
     }
 }
-

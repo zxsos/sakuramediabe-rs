@@ -36,6 +36,9 @@
 
 use serde::{Deserialize, Serialize};
 
+// 只被 `#[cfg(test)]` 里的用例用到 —— 不打 `cfg` 会在 lib 构建时报
+// unused import。
+#[cfg(test)]
 use super::import_service::ImportFailure;
 use crate::error::ServiceError;
 
@@ -147,7 +150,9 @@ impl ImportTaskService {
     /// （worker 代码写错了），不是用户请求的问题。
     pub async fn enqueue_batch(download_task_ids: &[i64]) -> Result<(), ServiceError> {
         let _ = download_task_ids;
-        todo!("骨架：空列表 -> 编程错误；跨库 -> 编程错误；否则按 mode=download_tasks 建一个 TaskRun")
+        todo!(
+            "骨架：空列表 -> 编程错误；跨库 -> 编程错误；否则按 mode=download_tasks 建一个 TaskRun"
+        )
     }
 
     /// `GET /imports/{task_run_id}/failed-items`
@@ -212,9 +217,15 @@ mod tests {
     /// 系统错误走告警，而那其实是正常跳过。
     #[test]
     fn only_two_reasons_count_as_user_fixable() {
-        assert!(ImportTaskService::is_manual_search_failure("movie_number_not_found"));
-        assert!(ImportTaskService::is_manual_search_failure("metadata_fetch_failed"));
-        assert!(!ImportTaskService::is_manual_search_failure("is_collection"));
+        assert!(ImportTaskService::is_manual_search_failure(
+            "movie_number_not_found"
+        ));
+        assert!(ImportTaskService::is_manual_search_failure(
+            "metadata_fetch_failed"
+        ));
+        assert!(!ImportTaskService::is_manual_search_failure(
+            "is_collection"
+        ));
         assert!(!ImportTaskService::is_manual_search_failure("stage_failed"));
     }
 

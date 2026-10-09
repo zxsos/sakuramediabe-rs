@@ -16,6 +16,8 @@ sm-db = { workspace = true }
 media-file-hash = { workspace = true }
 svc-hash = { workspace = true }
 chrono = { workspace = true }
+# 图搜会话 id：上游是 `uuid.uuid4().hex`（32 位无连字符十六进制）。
+uuid = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,6 +35,12 @@ regex = { workspace = true }
 sqlx = { workspace = true }
 # Torznab 搜索响应是 XML。
 quick-xml = { workspace = true }
+# 番号目录分片名要 SHA-1（与上游一致，见根 Cargo.toml）。
+sha1 = { workspace = true }
+# 宿主侧图像原语：缩略图校验要 `is_webp`，读尺寸要 `decode`。
+svc-image = { workspace = true }
+# 图片包（`assets.zip` / `thumbnails.zip`）：只写/读 STORED 条目，见根 Cargo.toml。
+zip = { workspace = true }
 
 [dev-dependencies]
 sm-db = { workspace = true }

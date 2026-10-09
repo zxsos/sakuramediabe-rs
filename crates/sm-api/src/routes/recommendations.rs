@@ -32,27 +32,21 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sm_service::discovery::daily_recommendation::DailyRecommendationItem;
 use sm_db::repo::discovery::HotActressReleaseRepository;
+use sm_service::discovery::daily_recommendation::DailyRecommendationItem;
 use sm_service::discovery::hot_actress_release::{HotActressReleaseItem, HotActressReleaseQuery};
-use sm_service::discovery::moment_recommendation::MomentRecommendationRow;
 
 use crate::auth::CurrentUser;
 use crate::dto::{ImageResource, MovieListItemResource};
 use crate::error::ErrorResponse;
+use crate::query::{one, twenty};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/daily-recommendations", get(list_daily_recommendations))
-        .route(
-            "/moment-recommendations",
-            get(list_moment_recommendations),
-        )
-        .route(
-            "/hot-actress-releases",
-            get(list_hot_actress_releases),
-        )
+        .route("/moment-recommendations", get(list_moment_recommendations))
+        .route("/hot-actress-releases", get(list_hot_actress_releases))
 }
 
 /// 泛型分页查询（daily / hot-actress 共用）。
@@ -66,9 +60,6 @@ struct BoundedPageQuery {
     #[serde(default = "twenty")]
     page_size: i64,
 }
-
-fn one() -> i64 { 1 }
-fn twenty() -> i64 { 20 }
 
 /// 泛型分页响应（对应上游 `PageResponse[T]`）。
 #[derive(Debug, Serialize)]
@@ -93,6 +84,8 @@ async fn list_daily_recommendations(
 /// 上游 `moment_recommendations.py:16-17` 是 `Query(default=1)` 与
 /// `Query(default=20)`，**没有 `ge` / `le`**。所以不能复用上面的
 /// [`BoundedPageQuery`]：加了上界就改变了契约。
+// 两个字段都还没接上（handler 体是 `todo!()`），但它们是契约的一部分。落地后删 allow。
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct UnboundedPageQuery {
     #[serde(default = "one")]
@@ -183,7 +176,7 @@ async fn list_hot_actress_releases(
     let repo = HotActressReleaseRepository::new(state.db().clone());
     let query_service = HotActressReleaseQuery::new(repo);
     let scored = query_service.scored_today().await?;
-    let total = scored.len() as i64;
+    let _total = scored.len() as i64;
     let start = ((page - 1) * page_size) as usize;
     let _ = (scored, start);
     // TODO: 填影片卡片与女优资料（`PageContext` 的两个方法）。

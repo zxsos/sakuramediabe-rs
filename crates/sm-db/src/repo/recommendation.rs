@@ -24,8 +24,8 @@
 //! `moment_recommendation` 的对应约束落在 `thumbnail_id` 上（一个缩略图至多
 //! 被推荐一次），`movie_id` 不唯一 —— 因为同一部影片的不同时刻是不同的推荐。
 
-use sqlx::PgPool;
 use sqlx::AssertSqlSafe;
+use sqlx::PgPool;
 
 use crate::common::page::{Page, PageRequest};
 use crate::discovery::rankings::{DailyRecommendationItem, MomentRecommendation};
@@ -538,12 +538,11 @@ impl MovieFeatureRepository {
     /// **排除 `is_collection`** —— 集合片不是「某部影片」，不该进相似度索引，
     /// 也不该计入 IDF 的分母。
     pub async fn total_movies(&self) -> Result<i64, DbError> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM movie WHERE is_collection = false",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM movie WHERE is_collection = false")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
         Ok(total)
     }
 
@@ -626,18 +625,15 @@ impl MovieFeatureRepository {
     ///
     /// **不含任何特征过滤** —— 「跳过无特征影片」在上层做（因为要同时看演员
     /// 与标签两张表，一层 SQL 判不了）。
-    pub async fn page_movie_ids(
-        &self,
-        after_id: i32,
-        limit: i64,
-    ) -> Result<Vec<i32>, DbError> {
-        let sql = "SELECT id FROM movie WHERE is_collection = false AND id > $1 ORDER BY id LIMIT $2";
-        Ok(sqlx::query_scalar::<_, i32>(sql)
+    pub async fn page_movie_ids(&self, after_id: i32, limit: i64) -> Result<Vec<i32>, DbError> {
+        let sql =
+            "SELECT id FROM movie WHERE is_collection = false AND id > $1 ORDER BY id LIMIT $2";
+        sqlx::query_scalar::<_, i32>(sql)
             .bind(after_id)
             .bind(limit.max(1))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?)
+            .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))
     }
 
     /// 一次取一批影片的演员 / 标签，按影片聚合。
@@ -653,7 +649,11 @@ impl MovieFeatureRepository {
             .map(|id| {
                 (
                     *id,
-                    MovieFeatures { movie_id: *id, actor_ids: Vec::new(), tag_ids: Vec::new() },
+                    MovieFeatures {
+                        movie_id: *id,
+                        actor_ids: Vec::new(),
+                        tag_ids: Vec::new(),
+                    },
                 )
             })
             .collect();
@@ -689,18 +689,29 @@ impl MovieFeatureRepository {
 }
 /// 剧情图 → 影片链接（检索结果拼装用）。
 ///
+/// 位置依次是 **`(plot_image_id, movie_id, movie_number, image_id)`**。
+///
 /// # 为什么需要单独一次查询
 ///
 /// 向量库里只有 `plot_image_id` 与 `movie_id`，**没有番号**（`movie_number`）。
 /// 而响应要带番号 —— 所以必须回表。
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
-pub struct PlotImageLink {
-    pub plot_image_id: i32,
-    pub movie_id: Option<i32>,
-    pub movie_number: Option<String>,
-    /// 图片字节或路径所需的信息。**这里只带 id**，URL 延迟拼。
-    pub image_id: i32,
-}
+///
+/// # 为什么是元组而不是结构体
+///
+/// 它是 `movie_plot_image` × `image` × `movie` **三表 JOIN 的列子集**，
+/// 不是任何一张表的镜像 —— 上游没有可对拍的 Peewee 模型，写成 `pub struct`
+/// 会被门禁报 `UNCHECKED_STRUCT`。取舍记录见
+/// `repo/moment.rs::MomentSeedRow`。
+///
+/// 消费方用 `let (_, movie_id, movie_number, _) = link;` 解构，别用 `.1`/`.2`。
+///
+/// 各位置语义：
+///
+/// 1. `plot_image_id`（`movie_plot_image.id`）
+/// 2. `movie_id` —— **可为 `None`**：`p.movie` 是番号字符串，关联不上就是空
+/// 3. `movie_number` —— **可为 `None`**，同上
+/// 4. `image_id` —— 图片字节或路径所需的信息。**这里只带 id**，URL 延迟拼。
+pub type PlotImageLink = (i32, Option<i32>, Option<String>, i32);
 
 impl PendingImageRepository {
     /// 取剧情图 → 影片链接。
@@ -747,6 +758,7 @@ impl PendingImageRepository {
             .fetch_all(self.pool())
             .await
             .map_err(|e| DbError::from(e).with_entity(MOVIE_FEATURE_ENTITY))?;
-        Ok(rows.into_iter().map(|link| (link.plot_image_id, link)).collect())
+        // `.0` = `plot_image_id`（见 [`PlotImageLink`] 的位置说明）。
+        Ok(rows.into_iter().map(|link| (link.0, link)).collect())
     }
 }

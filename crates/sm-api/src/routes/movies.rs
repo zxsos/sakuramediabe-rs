@@ -46,7 +46,7 @@ use crate::dto::MovieListItemResource;
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
-use crate::query::deser_bool;
+use crate::query::{deser_bool, one, twenty};
 use crate::routes::method_not_allowed;
 use crate::signing::{now_seconds, signing_secret};
 use crate::state::AppState;
@@ -101,7 +101,10 @@ pub fn routes() -> Router<AppState> {
         //
         // 但**别**把 `"/movies/{movie_number}"` 写成 `"/movies/{*rest}"`：
         // 那样它会匹配任意深度，`/movies/latest` 这类静态路径就再也匹配不到了。
-        .route("/movies/{movie_number}", get(get_movie_detail).fallback(method_not_allowed))
+        .route(
+            "/movies/{movie_number}",
+            get(get_movie_detail).fallback(method_not_allowed),
+        )
         .route(
             "/movies/{movie_number}/reviews",
             get(get_movie_reviews).fallback(method_not_allowed),
@@ -776,6 +779,9 @@ async fn get_movie_detail(
 ///
 /// 上游 `Query(default=20, ge=1)` —— **无 `le`**。所以 `page_size=10000` 合法。
 /// 与 daily/hot-actress 的 `ge=1, le=100` 不同，**别**复用那个有上界的结构。
+// 三个字段都还没接上 —— handler 体是 `todo!()`，但它们是**契约的一部分**
+// （客户端会传），所以不能删。落地后删掉这行 allow。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct MovieReviewQuery {
     #[serde(default = "one")]
@@ -815,6 +821,8 @@ async fn get_movie_subtitles(
 }
 
 /// `limit` 的边界是 `0..=100`（**下界 0**，见 handler 文档）。
+// `limit` 还没接上（handler 体是 `todo!()`），但它是契约的一部分。落地后删 allow。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct SimilarMoviesQuery {
     #[serde(default = "twenty")]
@@ -849,6 +857,9 @@ async fn list_similar_movies(
 ///
 /// 上游 `library_id: int = Query(..., ge=1)` —— **无默认值**，缺参即 **422**。
 /// 所以下面**没有** `#[serde(default)]`：缺了它会把「缺参」变成「library_id=0」。
+// `library_id` 还没接上（handler 体是 `todo!()`），但它是**必填**契约参数。
+// 落地后删 allow。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct MergedPlaybackQuery {
     library_id: i64,
@@ -875,7 +886,9 @@ async fn refresh_movie_metadata(
     Path(movie_number): Path<String>,
 ) -> Result<Json<serde_json::Value>, ErrorResponse> {
     let _ = movie_number;
-    todo!("骨架：接 MovieMetadataRefreshService::refresh_movie_metadata；409 番号冲突 / 502 调用失败")
+    todo!(
+        "骨架：接 MovieMetadataRefreshService::refresh_movie_metadata；409 番号冲突 / 502 调用失败"
+    )
 }
 
 /// `POST /movies/{movie_number}/heat-recompute` —— ★ **202 Accepted**。

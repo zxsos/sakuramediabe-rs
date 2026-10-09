@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use serde_json::json;
-use sm_service::discovery::{EmbeddingClient, EmbeddingSpace};
+use sm_service::discovery::embedding::{EmbeddingClient, EmbeddingSpace};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

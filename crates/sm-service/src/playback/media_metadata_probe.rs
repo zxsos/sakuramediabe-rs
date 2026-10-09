@@ -28,8 +28,6 @@
 //! `0` 与「探测不到」同义。上游的 dataclass 默认值就是 0。
 //! 调用方判「有没有探测到」要用 `> 0`。
 
-use std::path::PathBuf;
-
 /// 探测结果。对齐上游 `MediaMetadataProbeResult`（frozen dataclass）。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MediaMetadataProbeResult {
@@ -137,4 +135,3 @@ mod tests {
         assert!(only_duration.is_probed());
     }
 }
-

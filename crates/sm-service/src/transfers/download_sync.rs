@@ -28,7 +28,7 @@
 //! 导入也入队了，但 TaskRun 记录在进程崩溃时丢了。这类任务不会再被第一个
 //! 方法捞到（因为它只认「刚变成完成」），不专门捞就永远漏。
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use super::download_common::DownloadClientRow;
 use crate::error::ServiceError;
@@ -93,9 +93,17 @@ impl DownloadSyncAllResponse {
 }
 
 /// 对账服务。
+// `factory` 尚未被方法体引用（`sync` 还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct DownloadSyncService {
     /// 可注入的 provider 工厂。**存在是为了测试**（替身不必起真实下载器）。
     factory: Option<Box<dyn SyncProviderFactory>>,
+}
+
+impl Default for DownloadSyncService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// provider 侧的任务快照来源。
@@ -115,7 +123,9 @@ impl DownloadSyncService {
 
     /// 构造（注入替身，测试用）。
     pub fn with_factory(factory: Box<dyn SyncProviderFactory>) -> Self {
-        Self { factory: Some(factory) }
+        Self {
+            factory: Some(factory),
+        }
     }
 
     /// 对账**单个**客户端。失败返回 `Err`（映射成 `502
@@ -139,7 +149,9 @@ impl DownloadSyncService {
     }
 
     /// 捞崩溃残留（启动时调一次）。见模块文档。
-    pub async fn recover_orphaned_imports_only(&self) -> Result<RecoverOrphanedResult, ServiceError> {
+    pub async fn recover_orphaned_imports_only(
+        &self,
+    ) -> Result<RecoverOrphanedResult, ServiceError> {
         todo!("骨架：查「下载已完成 且 导入 TaskRun 记录缺失」-> 重新入队")
     }
 }

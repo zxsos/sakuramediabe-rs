@@ -182,13 +182,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                     // 让 worker 起不来并写清原因，比静默用空快照（于是所有
                     // handler 都看到「qdrant 没配」）好排查得多。
                     qdrant: sm_scheduler::worker::QdrantEndpoint::from_snapshot(
-                        &config_service
-                            .snapshot()
-                            .map_err(|error| anyhow::anyhow!(
+                        &config_service.snapshot().map_err(|error| {
+                            anyhow::anyhow!(
                                 "读取配置失败（{}）：{}",
                                 error.code(),
                                 error.api.message
-                            ))?,
+                            )
+                        })?,
                     ),
                 },
             )),

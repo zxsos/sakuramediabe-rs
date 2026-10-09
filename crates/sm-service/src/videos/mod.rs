@@ -58,7 +58,9 @@ use serde_json::{Map, Value};
 use crate::error::{details_of, ServiceError};
 
 pub use collection::{Added, VideoCollectionService, VideoCollectionUpdate};
-pub use item::{VideoItemCreate, VideoItemService, VideoItemUpdate};
+pub use item::{
+    VideoCollectionRef, VideoItemCreate, VideoItemService, VideoItemUpdate, VideoListItem,
+};
 
 /// 分页与筛选类校验的错误码。
 ///

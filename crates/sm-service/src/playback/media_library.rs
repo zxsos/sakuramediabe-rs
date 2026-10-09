@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::provider_helpers::{LibraryHandle, LibraryRecord, SpaceUsage};
+use super::provider_helpers::SpaceUsage;
 use crate::error::ServiceError;
 
 /// 空间占用缓存 TTL（秒）。
@@ -74,8 +74,16 @@ impl CachedUsage {
 }
 
 /// 媒体库服务。
+// `cache` 尚未被方法体引用（`space_usage` 还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MediaLibraryService {
     cache: std::sync::Mutex<std::collections::HashMap<i64, CachedUsage>>,
+}
+
+impl Default for MediaLibraryService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MediaLibraryService {
@@ -94,7 +102,10 @@ impl MediaLibraryService {
     /// ★ 空间占用，**带 300 秒缓存**。
     ///
     /// 缓存**按库**，且 **provider 失败不写缓存**（见模块文档）。
-    pub async fn storage_space_usages(&self, now: i64) -> Result<std::collections::HashMap<i64, SpaceUsage>, ServiceError> {
+    pub async fn storage_space_usages(
+        &self,
+        now: i64,
+    ) -> Result<std::collections::HashMap<i64, SpaceUsage>, ServiceError> {
         let _ = now;
         todo!("骨架：命中未过期缓存则返回；否则问 provider -> 写缓存；失败不写缓存")
     }
@@ -206,4 +217,3 @@ mod tests {
         assert!(library.space_usage.is_none());
     }
 }
-

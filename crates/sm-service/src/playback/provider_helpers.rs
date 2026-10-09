@@ -103,16 +103,16 @@ pub fn require_provider(provider_key: &str) -> Result<PluginStorageProvider, Ser
     todo!("骨架：经 sm-plugins 取 media.provider 能力；未装 -> 503")
 }
 
-/// 插件的存储能力。**形状待插件 ABI 定型**，这里只声明 playback 域用到的部分。
-pub trait PluginStorageProvider {
-    /// 探测空间占用。
-    fn get_space_usage(&self, library: &LibraryHandle) -> Result<SpaceUsage, ServiceError>;
-    /// 准备库（首次使用前建目录/建表等）。
-    fn prepare_library(&self, library: &LibraryHandle) -> Result<(), ServiceError>;
-    /// 删除一个媒体（含物理文件）。
-    fn delete_media(&self, media: &MediaHandle) -> Result<(), ServiceError>;
-    /// 算文件哈希。
-    fn compute_file_hash(&self, media: &MediaHandle) -> Result<String, ServiceError>;
+/// 插件的存储能力。**形状待插件 ABI 定型**。
+///
+/// ★ 这里刻意用 **struct** 而不是 `trait`：它出现在
+/// [`require_provider`] 的返回类型位置上，而 trait 不能作返回类型
+/// （需要 `dyn Trait` 或泛型，而那时我们还没有可用的具体实现）。
+///
+/// 真正的多态接入（按 `provider_key` 分发到不同插件）是 `sm-plugins` 的事；
+/// 那一层落地后这里会换成持有 gRPC client 的 struct。
+pub struct PluginStorageProvider {
+    pub provider_key: String,
 }
 
 /// 空间占用。

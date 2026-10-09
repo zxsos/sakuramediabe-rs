@@ -127,6 +127,14 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # 纯值对象：字段主权补丁与护栏，不落库
         "FieldPatch",
         "FieldGuard",
+        # 聚合值对象：一部影片的「演员 id 列表 + 标签 id 列表」，用于构造稀疏向量。
+        #
+        # 满足豁免条件 1：**没有 `#[derive(FromRow)]`、不是 `query_as` 的目标**。
+        # 它是 `MovieFeatureRepository::features_for_movies` 用两次元组查询
+        # （`SELECT movie, actor` / `SELECT movie, tag`）在内存里拼出来的累加器 ——
+        # 不是任何表的列集合（`movie_features` 这张表在两侧 DDL 里都不存在，
+        # 上游也没有对应 Peewee 模型）。
+        "MovieFeatures",
         # 纯值对象：领取范围（并发道），只作为 bind 参数传给
         # `claim_in`，没有 FromRow、不参与 query_as
         "TaskLanes",
@@ -214,6 +222,29 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         "NewDailyRecommendation",
         "MomentRecommendationRepository",
         "NewMomentRecommendation",
+        # `UnitOfWork::record_thumbnail_artifacts` 的入参：一件待登记的缩略图
+        # 产物（origin + 偏移）。**纯入参 DTO** —— 不带 `FromRow`、不被任何
+        # `query_as` 使用，满足豁免条件 1。
+        #
+        # 它没有对应的上游 Peewee 模型，因为上游那里传的是 `(ThumbnailArtifact,
+        # Path)` 元组、字段散在代码里；这里收成一个具名类型只是为了不被位置参数
+        # 错位坑到（位置元组错位是**静默**的）。
+        "ThumbnailArtifactRecord",
+        # discovery / recommendation / moment 三个仓储文件的仓储类型。
+        #
+        # 它们与上面那批 Repository 是同一个形状：**持 `PgPool`，本身不映射
+        # 任何表**（没有 `#[derive(FromRow)]`、不是 `query_as` 的目标），
+        # 满足豁免条件 1。此前漏登记，于是对拍报 `UNCHECKED_STRUCT` ——
+        # 那是登记遗漏，不是「门禁抓到了问题」。
+        #
+        # ⚠️ 同文件里的**投影行**（`CandidateRow` / `PendingThumbnail` /
+        # `MovieFeatures` …）不在豁免范围：它们带 `FromRow`、被 `query_as`
+        # 使用。按 `sm-db/src/repo/movie.rs` 的既定选法，那类要改成
+        # `pub type XRow = (...)` 元组别名，具名类型放 `sm-service`。
+        "HotActressReleaseRepository",
+        "MomentSeedRepository",
+        "PendingImageRepository",
+        "MovieFeatureRepository",
         "MomentCollectionItemRepository",
         "ClipCollectionItemRepository",
         # transfer 批次（transfer.rs）

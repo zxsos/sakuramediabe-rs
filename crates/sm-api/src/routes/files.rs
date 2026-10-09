@@ -72,10 +72,7 @@ pub struct SignedUrlQuery {
 /// 验签。**过期或签名不匹配 → 403**（不是 401，见模块文档）。
 ///
 /// 两个端点都调它 —— 验签逻辑只有这一处。
-pub fn verify_signature(
-    query: &SignedUrlQuery,
-    scope: &str,
-) -> Result<(), ErrorResponse> {
+pub fn verify_signature(query: &SignedUrlQuery, scope: &str) -> Result<(), ErrorResponse> {
     let (Some(expires), Some(signature)) = (query.expires, query.signature.as_deref()) else {
         return Err(ErrorResponse::new(
             axum::http::StatusCode::FORBIDDEN,
@@ -83,7 +80,7 @@ pub fn verify_signature(
             "缺少签名参数",
         ));
     };
-    if *(&expires) < 0 {
+    if expires < 0 {
         return Err(ErrorResponse::new(
             axum::http::StatusCode::FORBIDDEN,
             "signed_url_expired",

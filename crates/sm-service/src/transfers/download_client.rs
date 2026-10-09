@@ -81,7 +81,9 @@ pub struct DownloadClientUpdateRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub config: Option<serde_json::Value>,
-    /// `kind` **不提供** —— 见模块文档「`kind` 不可改」。
+    // ★ `kind` **刻意不提供** —— 见模块文档「`kind` 不可改」。
+    // 用普通注释而非 `///`：doc comment 必须紧跟一个项，挂在 `}` 前会报
+    // "documentation comment that doesn't document anything"。
 }
 
 /// 探测请求。**不落库。**
@@ -128,7 +130,10 @@ impl DownloadClientProvider {
     }
 
     /// 当前库里是否还有该客户端的任务在跑。
-    pub async fn has_running_tasks(&self, client: &DownloadClientRow) -> Result<bool, ServiceError> {
+    pub async fn has_running_tasks(
+        &self,
+        client: &DownloadClientRow,
+    ) -> Result<bool, ServiceError> {
         let _ = client;
         todo!("骨架：查 download_task 是否有该客户端的进行中任务")
     }

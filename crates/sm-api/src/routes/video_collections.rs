@@ -35,15 +35,54 @@
 //!
 //! 生成播放 URL 要走签名流程（见 `routes/media_playback.rs`），逐条生成不
 //! 便宜。别「优化」成总是返回。
+//!
+//! # 骨架期写错、本轮对照上游更正的四处
+//!
+//! 读的是 `schema/videos/collections.py` 与
+//! `service/videos/video_collection_service.py`：
+//!
+//! | 项 | 骨架期 | 上游实际 |
+//! |---|---|---|
+//! | 合集资源字段 | 只有 `id` / `name` / `item_count` | 还有 `description` / `cover_image` / `created_at` / `updated_at` |
+//! | 创建请求 | 只有 `name` | 还有 `description` |
+//! | 添加条目请求字段 | `item_id` | **`video_item_id`** |
+//! | 重排请求字段 | `item_ids` | **`ordered_item_ids`**（且 `min_length=1`）|
+//!
+//! 还有一处**文档写反**的：骨架写「添加条目已存在 → 409」，而上游
+//! `add_item` 查到已有成员就 `return` —— **幂等 204**（见下面 handler）。
+//!
+//! # 本轮只接线了 5 个合集级端点
+//!
+//! `GET ""` / `POST ""` / `GET /{id}` / `PATCH /{id}` / `DELETE /{id}` 已接通。
+//! 剩下四个成员端点（`GET /{id}/items`、`POST /{id}/items`、
+//! `DELETE /{id}/items/{item_id}`、`POST /{id}/items/reorder`）**仍是
+//! `todo!()`** —— 它们要组装 `VideoCollectionItemResource`，而那条资源的
+//! `video` 字段是完整的 `VideoItemListItemResource`（14 个字段，含
+//! 首条有效媒体的时长/大小/分辨率 + 合集引用），与 `GET /videos` 共用同一套
+//! 组装，属下一批。
+//!
+//! 那四个端点里 `play_url` 还需要**插件 ABI**（上游
+//! `MEDIA_PROVIDER_REGISTRY.require(provider_key)` 拿 `playback_deliveries[0]`）。
+//! 它的默认值是 `false`，所以默认路径不受影响；但
+//! `include_play_url=true` 在插件落地前做不到 —— **不要用空串冒充**，
+//! 客户端会把空地址当成「不可播放」而禁用整条播放列表。
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use sm_service::videos::{Field, VideoCollectionService, VideoCollectionUpdate};
+
 use crate::auth::CurrentUser;
+use crate::dto::{
+    deserialize_double_option, sign_image_origin, ImageResource, VideoItemListItemResource,
+};
 use crate::error::ErrorResponse;
+use crate::extract::Json as EnvelopeJson;
+use crate::extract::Query as EnvelopeQuery;
+use crate::query::{one, twenty};
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
@@ -78,142 +117,361 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// 视频集合。
+/// 视频集合（上游 `VideoCollectionResource`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoCollectionResource {
-    pub id: i64,
+    pub id: i32,
     pub name: String,
-    pub item_count: i64,
+    pub description: String,
+    pub item_count: i32,
+    /// 首个成员的条目封面。**空合集为 `None`**。
+    pub cover_image: Option<ImageResource>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
-/// 集合条目。
+/// 集合条目（上游 `VideoCollectionItemResource`）。
+///
+/// ⚠️ 骨架期写成 `{ item_id, title, play_url, duration_seconds }` —— 上游是
+/// `{ item_id, position, video, play_url, first_media_id }`，`video` 内嵌一个
+/// **完整的 14 字段列表项**（与 `GET /videos` 同一个资源）。已按上游重写。
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoCollectionItemResource {
-    pub item_id: i64,
-    pub title: Option<String>,
-    /// 仅当请求带 `include_play_url=true` 时出现。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// **关联行 id**（`video_collection_item.id`），不是视频条目 id ——
+    /// 「移除成员」端点收的也是它。两者外观相同，见 `sm_service::videos`。
+    pub item_id: i32,
+    pub position: i32,
+    pub video: VideoItemListItemResource,
+    /// 「首个有效媒体」的签名播放地址。
+    ///
+    /// **仅在 `include_play_url=true` 时才有值**；而它需要插件 ABI
+    /// （`playback_deliveries[0]`），插件落地前恒为 `None`。
+    ///
+    /// **不要用空串冒充** —— 空串在客户端是「这个媒体有，但播不了」，
+    /// 会让整条播放列表被判成不可播放。`None` 才是「没提供」。
+    ///
+    /// 与上游一致地**不省略这个键**（上游 `SchemaModel` 不过滤 `None`，
+    /// 序列化出来是 `null`）。骨架期那个 `skip_serializing_if` 会让键消失。
     pub play_url: Option<String>,
-    pub duration_seconds: Option<i64>,
+    /// 「首个有效媒体」的 id，**恒返回**（不依赖 `include_play_url`）。
+    /// 成员没有有效媒体时为 `None`。连播页关键帧面板用它。
+    pub first_media_id: Option<i32>,
 }
 
+/// 创建请求（上游 `VideoCollectionCreateRequest`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateRequest {
     pub name: String,
+    /// 缺省空串。上游 `description: str = ""`。
+    #[serde(default)]
+    pub description: String,
 }
 
+/// 更新请求（上游 `VideoCollectionUpdateRequest`）。
+///
+/// # 为什么是 `Option<Option<T>>`
+///
+/// 上游用 `model_dump(exclude_unset=True)`，要区分**三**种状态：
+/// 缺键 / 显式 `null` / 有值。而 `update_collection` 的判据是
+/// `if "name" in update_data and update_data["name"] is not None` ——
+/// 所以 `{"name": null}` 在上游是**非空更新**（过得了空更新检查），
+/// 但**不改任何字段**，只推进 `updated_at`，返回 **200**。
+///
+/// 用 `Option<String>` 会把「缺键」与「null」压成同一件事，于是
+/// `{"name": null}` 被当成空更新报 422 —— 那是**改变契约**。
+/// 外层 `None` = 缺键，`Some(None)` = 显式 null，`Some(Some(v))` = 有值。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdateRequest {
-    pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub description: Option<Option<String>>,
 }
 
+/// 三态搬运：`Option<Option<T>>` → [`Field<T>`]。
+fn to_field(value: Option<Option<String>>) -> Field<String> {
+    match value {
+        None => Field::Absent,
+        Some(None) => Field::Null,
+        Some(Some(text)) => Field::Value(text),
+    }
+}
+
+/// 添加条目请求（上游 `VideoCollectionItemAddRequest`）。
+///
+/// ⚠️ 骨架期字段名写成 `item_id`，上游是 **`video_item_id`**（且 `gt=0`）。
+/// 取值空间相同、外观相同，写错不会报错，只会「加了一个不存在的条目」。
+/// 已按上游更正 —— 虽然端点本身还没接线。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemAddRequest {
-    pub item_id: i64,
+    pub video_item_id: i32,
 }
 
-/// 重排请求。
+/// 重排请求（上游 `VideoCollectionReorderRequest`）。
+///
+/// ⚠️ 骨架期字段名写成 `item_ids`，上游是 **`ordered_item_ids`**，且
+/// `min_length=1`（空列表直接 422 —— service 层也拦了一道，见
+/// `VideoCollectionService::reorder`）。
+///
+/// 元素类型是 `i32`：关联行 id 与 `video_item.id` 在库里都是 `integer`，
+/// 骨架期的 `Vec<i64>` 会在绑定时才暴露宽度不符。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ReorderRequest {
-    /// 目标顺序，**元素是 item_id**。
-    pub item_ids: Vec<i64>,
+    /// 目标顺序，**元素是关联行 id（`video_collection_item.id`）**。
+    pub ordered_item_ids: Vec<i32>,
+}
+
+/// 每请求解析出的签名密钥（合集封面要签图片 URL）。
+fn secret(state: &AppState) -> Result<String, ErrorResponse> {
+    let config = crate::config::snapshot_or_500(state)?;
+    Ok(
+        crate::config::string_at(&config, "auth", "file_signature_secret")
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+fn timestamp(value: Option<chrono::NaiveDateTime>) -> String {
+    value
+        .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+fn collection_resource(
+    secret: &str,
+    row: &sm_service::videos::collection::VideoCollectionWithCount,
+) -> VideoCollectionResource {
+    VideoCollectionResource {
+        id: row.collection.id,
+        name: row.collection.name.clone(),
+        description: row.collection.description.clone(),
+        item_count: row.item_count,
+        // `item_count == 0` 时**不解析封面** —— 与上游
+        // `_collection_cover(...) if item_count else None` 一致。
+        cover_image: row
+            .cover
+            .as_ref()
+            .filter(|_| row.item_count > 0)
+            .map(|image| ImageResource {
+                id: image.id,
+                origin: sign_image_origin(secret, &image.origin, now_seconds()),
+            }),
+        created_at: timestamp(row.collection.created_at),
+        updated_at: timestamp(row.collection.updated_at),
+    }
 }
 
 /// `GET ""`
 async fn list_collections(
     _user: CurrentUser,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<VideoCollectionResource>>, ErrorResponse> {
-    todo!("骨架：接视频集合列表")
+    let secret = secret(&state)?;
+    let service = VideoCollectionService::new(state.db());
+    let rows = service.list_collections().await?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| collection_resource(&secret, row))
+            .collect(),
+    ))
 }
 
 /// `POST ""` —— **201**。重名 → **409**。
 async fn create_collection(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    axum::extract::Json(_payload): axum::extract::Json<CreateRequest>,
+    State(state): State<AppState>,
+    EnvelopeJson(payload): EnvelopeJson<CreateRequest>,
 ) -> Result<(StatusCode, Json<VideoCollectionResource>), ErrorResponse> {
-    todo!("骨架：接创建（201；重名 -> 409）")
+    let service = VideoCollectionService::new(state.db());
+    let created = service
+        .create(&payload.name, Some(&payload.description))
+        .await?;
+    // 新建合集成员数必为 0 → 没有封面，也就不必解析签名密钥。
+    Ok((
+        StatusCode::CREATED,
+        Json(VideoCollectionResource {
+            id: created.id,
+            name: created.name,
+            description: created.description,
+            item_count: 0,
+            cover_image: None,
+            created_at: timestamp(created.created_at),
+            updated_at: timestamp(created.updated_at),
+        }),
+    ))
 }
 
 /// `GET /{id}` —— 404。
 async fn get_collection(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
 ) -> Result<Json<VideoCollectionResource>, ErrorResponse> {
-    todo!("骨架：接单个查询")
+    let secret = secret(&state)?;
+    let service = VideoCollectionService::new(state.db());
+    let row = service.get_with_count(collection_id).await?;
+    Ok(Json(collection_resource(&secret, &row)))
 }
 
 /// `PATCH /{id}` —— 部分更新。
 async fn update_collection(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
-    axum::extract::Json(_payload): axum::extract::Json<UpdateRequest>,
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
+    EnvelopeJson(payload): EnvelopeJson<UpdateRequest>,
 ) -> Result<Json<VideoCollectionResource>, ErrorResponse> {
-    todo!("骨架：接部分更新")
+    let secret = secret(&state)?;
+    let service = VideoCollectionService::new(state.db());
+    service
+        .update(
+            collection_id,
+            VideoCollectionUpdate {
+                name: to_field(payload.name),
+                description: to_field(payload.description),
+            },
+        )
+        .await?;
+    // 返回带计数的行：上游 `update_collection` 结尾是 `get_collection(...)`。
+    let row = service.get_with_count(collection_id).await?;
+    Ok(Json(collection_resource(&secret, &row)))
 }
 
-/// `DELETE /{id}` —— **204，无 body**。
+/// `DELETE /{id}` —— **204，无 body**。成员行随外键 CASCADE 清掉。
 async fn delete_collection(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接删除（204 无 body）")
+    let service = VideoCollectionService::new(state.db());
+    service.delete(collection_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /{id}/items` —— 分页 + `include_play_url`。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ListItemsQuery {
+    /// `field:direction`，白名单见 `sm_service::videos::COLLECTION_ITEM_SORT_KEYS`
+    /// （比条目列表多一个 `position`）。缺省 `position:asc`。
     pub sort: Option<String>,
-    #[serde(default)]
-    pub page: Option<i64>,
-    #[serde(default)]
-    pub page_size: Option<i64>,
-    /// **默认 `false`**。
-    #[serde(default)]
+    #[serde(default = "one")]
+    pub page: i64,
+    #[serde(default = "twenty")]
+    pub page_size: i64,
+    /// **默认 `false`**。用 pydantic 的宽松布尔口径解析
+    /// （`1` / `yes` / `on` 等 6 种真值），否则 `?include_play_url=1`
+    /// 在 Rust 侧会 422 而上游是 `True`。
+    #[serde(default, deserialize_with = "crate::query::deser_bool")]
     pub include_play_url: bool,
+}
+
+/// 一个成员行的资源化。`play_url` 由调用方决定（见两处调用点）。
+fn item_resource(
+    secret: &str,
+    now: i64,
+    row: &sm_service::videos::collection::VideoCollectionItemRow,
+    play_url: Option<String>,
+) -> VideoCollectionItemResource {
+    VideoCollectionItemResource {
+        item_id: row.item.id,
+        position: row.item.position,
+        video: VideoItemListItemResource::from_list_item(secret, now, &row.video),
+        play_url,
+        first_media_id: row.first_media_id,
+    }
 }
 
 async fn list_collection_items(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
-    axum::extract::Query(_query): axum::extract::Query<ListItemsQuery>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接条目分页列表；include_play_url 默认 false")
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
+    EnvelopeQuery(query): EnvelopeQuery<ListItemsQuery>,
+) -> Result<Json<sm_core::pagination::Paginated<VideoCollectionItemResource>>, ErrorResponse> {
+    let secret = secret(&state)?;
+    let service = VideoCollectionService::new(state.db());
+    let (rows, total) = service
+        .list_items_paged(
+            collection_id,
+            query.sort.as_deref(),
+            query.page,
+            query.page_size,
+        )
+        .await?;
+    let now = now_seconds();
+    // `include_play_url=true` 需要插件 ABI 才能签出地址（见
+    // `VideoCollectionItemResource::play_url`），所以现在**恒为 `None`** ——
+    // 客户端会退化成逐集拉详情，而不是拿到一个「不可播放」的空串。
+    let _ = query.include_play_url;
+    let items = rows
+        .iter()
+        .map(|row| item_resource(&secret, now, row, None))
+        .collect();
+    Ok(Json(sm_core::pagination::Paginated::new(
+        items,
+        query.page,
+        query.page_size,
+        total,
+    )))
 }
 
 /// `POST /{id}/items` —— **204，无 body**。**是 `POST` 不是 `PUT`**。
-/// 已存在 → **409**。
+///
+/// 已存在 → **仍然 204**（幂等，不是 409）。骨架期这里写的是「已存在 → 409」，
+/// 与上游相反：`add_item` 查到已是成员就 `return`。
 async fn add_collection_item(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
-    axum::extract::Json(_payload): axum::extract::Json<ItemAddRequest>,
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
+    EnvelopeJson(payload): EnvelopeJson<ItemAddRequest>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接添加条目（POST + 204 无 body；已存在 -> 409）")
+    let service = VideoCollectionService::new(state.db());
+    // `Added` / `AlreadyPresent` 两个分支都返回 204 —— 上游就是这么写的。
+    service
+        .add_item(collection_id, payload.video_item_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /{id}/items/{item_id}` —— **204，无 body**，**幂等**。
+///
+/// `item_id` 是**关联行 id**（`video_collection_item.id`），不是视频条目 id。
 async fn remove_collection_item(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path((_collection_id, _item_id)): Path<(i64, i64)>,
+    State(state): State<AppState>,
+    Path((collection_id, item_id)): Path<(i32, i32)>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接移除条目（幂等；204 无 body）")
+    let service = VideoCollectionService::new(state.db());
+    service.remove_item(collection_id, item_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /{id}/items/reorder` —— **200 + 完整新列表**（唯一返回数据的写操作）。
 ///
 /// 响应里**不含** `play_url` —— reorder 请求没有 `include_play_url`。
+/// 返回的是**重排后的全部成员**（不分页），客户端据此确认权威顺序。
 async fn reorder_collection_items(
     _user: CurrentUser,
-    State(_state): State<AppState>,
-    Path(_collection_id): Path<i64>,
-    axum::extract::Json(_payload): axum::extract::Json<ReorderRequest>,
+    State(state): State<AppState>,
+    Path(collection_id): Path<i32>,
+    EnvelopeJson(payload): EnvelopeJson<ReorderRequest>,
 ) -> Result<Json<Vec<VideoCollectionItemResource>>, ErrorResponse> {
-    todo!("骨架：接重排；校验全做完再动数据；返回重排后的权威顺序")
+    let secret = secret(&state)?;
+    let service = VideoCollectionService::new(state.db());
+    service
+        .reorder(collection_id, &payload.ordered_item_ids)
+        .await?;
+    // 重新读一遍成员 —— `reorder` 返回的是重排前的行（位置是旧值），而上游
+    // `reorder_items` 结尾是 `_query_item_resources(collection)`，读的是库。
+    let rows = service.list_item_rows(collection_id).await?;
+    let now = now_seconds();
+    Ok(Json(
+        rows.iter()
+            .map(|row| item_resource(&secret, now, row, None))
+            .collect(),
+    ))
 }

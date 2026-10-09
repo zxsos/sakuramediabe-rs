@@ -49,11 +49,14 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sm_db::repo::recommendation::MovieFeatureRepository;
+use sm_db::repo::discovery::{ImageSearchSessionRepository, PendingImageRepository};
 
 use super::embedding::EmbeddingClient;
-use super::image_search::{ImageSearchLimits, decode_cursor, encode_cursor, normalize_ids,
-                          validate_score_threshold};
+use super::image_search::{
+    decode_cursor, encode_cursor, normalize_ids, to_i32, validate_score_threshold,
+    ImageSearchLimits,
+};
+use super::image_search_space::ImageSearchIndexSpaceService;
 use super::qdrant::plot_image::PlotImageVectorStore;
 use crate::error::ServiceError;
 
@@ -94,10 +97,21 @@ pub struct PlotImageSearchSessionPage {
 pub const SEARCH_SCAN_BATCH_SIZE: i64 = 100;
 
 /// 剧情图检索服务。
+///
+/// # 两个仓储是**两个不同的东西**，别合成一个
+///
+/// - `sessions` 是 `image_search_session` 表 —— 与图搜**同一张表**（上游
+///   `ImageSearchSession.get_or_none` 两边都用）。
+/// - `links` 是 `movie_plot_image` → `movie` 的回表查询，住在
+///   `PendingImageRepository`（`plot_image_links`）。
+///
+/// 骨架期这里只有一个 `MovieFeatureRepository`，**两个都对不上**，所以拆成两个。
 pub struct MoviePlotImageSearchService {
     store: Arc<PlotImageVectorStore>,
     embedding: Arc<EmbeddingClient>,
-    links: MovieFeatureRepository,
+    space: ImageSearchIndexSpaceService,
+    sessions: ImageSearchSessionRepository,
+    links: PendingImageRepository,
     limits: ImageSearchLimits,
 }
 
@@ -106,10 +120,19 @@ impl MoviePlotImageSearchService {
     pub fn new(
         store: Arc<PlotImageVectorStore>,
         embedding: Arc<EmbeddingClient>,
-        links: MovieFeatureRepository,
+        space: ImageSearchIndexSpaceService,
+        sessions: ImageSearchSessionRepository,
+        links: PendingImageRepository,
         limits: ImageSearchLimits,
     ) -> Self {
-        Self { store, embedding, links, limits }
+        Self {
+            store,
+            embedding,
+            space,
+            sessions,
+            links,
+            limits,
+        }
     }
 
     /// 页大小归一化。**直接复用图搜那一份**（上游两处逻辑相同）。
@@ -119,6 +142,28 @@ impl MoviePlotImageSearchService {
             self.limits.default_page_size,
             self.limits.max_page_size,
         )
+    }
+
+    /// 索引就绪闸门。**与图搜共用**那份实现（上游两处 `_ensure_searchable_index`
+    /// 逐行相同）。
+    pub async fn ensure_searchable_index(&self) -> Result<(), ServiceError> {
+        super::image_search::ensure_searchable_index(&self.embedding, &self.space).await?;
+        Ok(())
+    }
+
+    /// 清过期会话。**图搜那一份要传仓储**，骨架期这里是零参调用。
+    pub async fn purge_expired_sessions(&self) -> Result<u64, ServiceError> {
+        super::image_search::purge_expired_sessions(&self.sessions).await
+    }
+
+    /// 单图取向量。
+    pub async fn embed_one_image(&self, image_bytes: &[u8]) -> Result<Vec<f32>, ServiceError> {
+        super::image_search::embed_one_image(&self.embedding, image_bytes).await
+    }
+
+    /// 单文本取向量。
+    pub async fn embed_one_text(&self, text: &str) -> Result<Vec<f32>, ServiceError> {
+        super::image_search::embed_one_text(&self.embedding, text).await
     }
 }
 impl MoviePlotImageSearchService {
@@ -169,7 +214,7 @@ impl MoviePlotImageSearchService {
             let hits = self
                 .store
                 .search(
-                    vector.to_vec(),
+                    vector,
                     batch_size as usize,
                     raw_offset,
                     movie_ids,
@@ -181,7 +226,8 @@ impl MoviePlotImageSearchService {
             }
             let hit_count = hits.len();
             // 先把这一批的链接一次查回来（**避免逐条查**）。
-            let plot_image_ids: Vec<i32> = hits.iter().map(|hit| hit.plot_image_id as i32).collect();
+            let plot_image_ids: Vec<i32> =
+                hits.iter().map(|hit| hit.plot_image_id as i32).collect();
             let links = self.links.plot_image_links(&plot_image_ids).await?;
 
             for hit in hits {
@@ -201,10 +247,13 @@ impl MoviePlotImageSearchService {
                         continue;
                     }
                 }
+                // 解构而不是 `.1`/`.2` —— 位置含义在 `sm_db::repo::recommendation::
+                // PlotImageLink` 上，这里用名字把两处绑在一起。
+                let (_, linked_movie_id, linked_movie_number, _) = link;
                 items.push(PlotImageSearchItem {
-                    plot_image_id: hit.plot_image_id as i64,
-                    movie_id: link.movie_id.map(|id| id as i64),
-                    movie_number: link.movie_number.clone(),
+                    plot_image_id: hit.plot_image_id,
+                    movie_id: linked_movie_id.map(|id| id as i64),
+                    movie_number: linked_movie_number.clone(),
                     score,
                 });
                 if items.len() == page_size {
@@ -251,7 +300,10 @@ impl MoviePlotImageSearchService {
         score_threshold: Option<f64>,
     ) -> Result<PlotImageSearchSessionPage, ServiceError> {
         if image_bytes.is_empty() {
-            return Err(ServiceError::validation("image_search_empty_image", "image file is empty"));
+            return Err(ServiceError::validation(
+                "image_search_empty_image",
+                "image file is empty",
+            ));
         }
         let page_size = self.page_size(page_size)?;
         let movie_ids = normalize_ids(movie_ids);
@@ -259,10 +311,16 @@ impl MoviePlotImageSearchService {
         validate_score_threshold(score_threshold)?;
 
         self.ensure_searchable_index().await?;
-        super::image_search::purge_expired_sessions().await?;
+        self.purge_expired_sessions().await?;
         let vector = self.embed_one_image(image_bytes).await?;
-        self.finish_session(vector, page_size, movie_ids, exclude_movie_ids, score_threshold)
-            .await
+        self.finish_session(
+            vector,
+            page_size,
+            movie_ids,
+            exclude_movie_ids,
+            score_threshold,
+        )
+        .await
     }
 
     /// 以文本为 query 建会话并返回第一页。
@@ -275,7 +333,10 @@ impl MoviePlotImageSearchService {
         score_threshold: Option<f64>,
     ) -> Result<PlotImageSearchSessionPage, ServiceError> {
         if text.trim().is_empty() {
-            return Err(ServiceError::validation("image_search_empty_text", "text is empty"));
+            return Err(ServiceError::validation(
+                "image_search_empty_text",
+                "text is empty",
+            ));
         }
         let page_size = self.page_size(page_size)?;
         let movie_ids = normalize_ids(movie_ids);
@@ -283,10 +344,16 @@ impl MoviePlotImageSearchService {
         validate_score_threshold(score_threshold)?;
 
         self.ensure_searchable_index().await?;
-        super::image_search::purge_expired_sessions().await?;
+        self.purge_expired_sessions().await?;
         let vector = self.embed_one_text(text).await?;
-        self.finish_session(vector, page_size, movie_ids, exclude_movie_ids, score_threshold)
-            .await
+        self.finish_session(
+            vector,
+            page_size,
+            movie_ids,
+            exclude_movie_ids,
+            score_threshold,
+        )
+        .await
     }
 
     /// 建会话 + 补排除条件 + 检索第一页。
@@ -299,7 +366,7 @@ impl MoviePlotImageSearchService {
         score_threshold: Option<f64>,
     ) -> Result<PlotImageSearchSessionPage, ServiceError> {
         let session = super::image_search::create_session(
-            &self.links,
+            &self.sessions,
             vector.clone(),
             page_size,
             score_threshold,
@@ -308,8 +375,14 @@ impl MoviePlotImageSearchService {
         .await?;
         // 补排除条件。`NewImageSearchSession` 没有这两个字段（见 image_search 的
         // 缺口说明），所以要单独写 —— 紧跟创建，不留窗口期。
-        self.links
-            .set_filters(&session.session_id, to_i32(movie_ids.as_deref()), to_i32(exclude_movie_ids.as_deref()))
+        let movie_ids_i32 = to_i32(movie_ids.as_deref());
+        let exclude_movie_ids_i32 = to_i32(exclude_movie_ids.as_deref());
+        self.sessions
+            .set_filters(
+                &session.session_id,
+                movie_ids_i32.as_deref(),
+                exclude_movie_ids_i32.as_deref(),
+            )
             .await?;
         let page = self
             .search_page(
@@ -339,8 +412,8 @@ impl MoviePlotImageSearchService {
         session_id: &str,
         cursor: Option<&str>,
     ) -> Result<PlotImageSearchSessionPage, ServiceError> {
-        super::image_search::purge_expired_sessions().await?;
-        let session = super::image_search::require_session(&self.links, session_id).await?;
+        // `require_session` 内部**先清过期**再取（与图搜 `list_results` 同口径）。
+        let session = super::image_search::require_session(&self.sessions, session_id).await?;
         let offset = match cursor {
             Some(cursor) => decode_cursor(cursor)?,
             None => 0,

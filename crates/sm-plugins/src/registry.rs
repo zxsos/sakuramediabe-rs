@@ -42,6 +42,19 @@ pub struct ProviderRegistration {
     /// 数据面端点（gRPC）。有它时 proxy 播放与转存走这个端点，不再走控制面
     /// 的字节流（上游注释：避免为「只有 IO 的 provider」再实现一遍字节流）。
     pub data_plane_endpoint: Option<String>,
+    /// **提供它的那个插件的控制面端点**（`http://127.0.0.1:port`）。
+    ///
+    /// # 为什么注册表里必须有它
+    ///
+    /// `StorageProvider` / `DownloadProvider` 这两个 service 与 `PluginControl`
+    /// 由**同一个插件进程**提供（proto 里各是一个 service，但没有字段声明另一个
+    /// 端口），所以「调 provider」= 「连它的控制面再建一个 client」。
+    /// 没有这个字段，查表只能查到「capabilities 里有 SCAN_MEDIA_REFS」这类声明，
+    /// 却**打不出去**。
+    ///
+    /// 与上面的 `data_plane_endpoint` 是两回事：那个是**数据面**（大文件字节
+    /// 流），这个是**控制面**（结构化 rpc）。
+    pub plugin_endpoint: String,
 }
 
 impl ProviderRegistration {
@@ -171,6 +184,7 @@ mod tests {
             plugin_id: plugin.to_owned(),
             capabilities,
             data_plane_endpoint: None,
+            plugin_endpoint: "http://127.0.0.1:0".to_owned(),
         }
     }
 

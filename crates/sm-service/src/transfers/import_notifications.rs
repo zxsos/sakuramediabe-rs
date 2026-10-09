@@ -99,7 +99,11 @@ mod tests {
     fn the_count_reflects_every_new_movie_not_the_truncated_list() {
         let items: Vec<_> = (0..30).map(|i| item(&format!("ABC-{i:03}"))).collect();
         let reminder = build_new_media_reminder(&items, Some(9)).expect("有新增就该有提醒");
-        assert!(reminder.title.contains('30'), "标题应写 30，实际：{}", reminder.title);
+        assert!(
+            reminder.title.contains("30"),
+            "标题应写 30，实际：{}",
+            reminder.title
+        );
         assert_eq!(reminder.items.len(), 20, "条目截断到 20");
         assert_eq!(reminder.related_task_run_id, Some(9));
     }

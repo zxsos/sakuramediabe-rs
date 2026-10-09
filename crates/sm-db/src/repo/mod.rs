@@ -173,14 +173,16 @@ pub use collection::{
     ClipCollectionItemRepository, ClipCollectionRepository, MomentCollectionItemRepository,
     MomentCollectionRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository,
 };
-pub use ctx::{commit_or_rollback, Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
+pub use ctx::{
+    commit_or_rollback, Ctx, CtxConnection, GeneratedThumbnail, ThumbnailArtifactRecord, UnitOfWork,
+};
 pub use discovery::{
     ImageSearchIndexStateRepository, ImageSearchSessionRepository, NewImageSearchSession,
     NewRankingItem, RankingItemRepository,
 };
 pub use download::{DownloadTaskRepository, NewDownloadTask};
 pub use gateway::{FieldCodec, FieldPatch, FieldValue, MovieOwnershipGateway};
-pub use image::{ImageRepository, NewImage};
+pub use image::{ImageRepository, NewImage, IMAGE_REFERENCE_SITES};
 pub use library::{MediaLibraryRepository, NewMediaLibrary};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};

@@ -42,6 +42,8 @@ pub struct ThinCoverBackfillStats {
 }
 
 /// 回填服务。
+// `import_service` 尚未被方法体引用（回填动作还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MovieThinCoverBackfillService {
     import_service: Option<Box<dyn ThinCoverBackfill>>,
 }
@@ -90,7 +92,10 @@ mod tests {
             skipped: 2,
             failed: 1,
         };
-        assert_eq!(stats.examined, stats.backfilled + stats.skipped + stats.failed);
+        assert_eq!(
+            stats.examined,
+            stats.backfilled + stats.skipped + stats.failed
+        );
         assert_eq!(stats.failed, 1, "切割失败单独计数");
     }
 }

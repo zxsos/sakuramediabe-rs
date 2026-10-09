@@ -73,7 +73,9 @@ impl MediaVideoInfoBackfillService {
     /// ★ 跑一轮。任务执行体。
     ///
     /// 单条失败不中断；provider 不支持探测时**整批跳过**（不是失败）。
-    pub async fn backfill_missing_video_infos(&self) -> Result<VideoInfoBackfillStats, ServiceError> {
+    pub async fn backfill_missing_video_infos(
+        &self,
+    ) -> Result<VideoInfoBackfillStats, ServiceError> {
         todo!("骨架：查缺时长的媒体 -> 探测能力存在性(getattr 式) -> 逐个 probe_video_info -> 回填")
     }
 }

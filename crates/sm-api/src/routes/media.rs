@@ -55,22 +55,35 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 
+use sm_service::playback::media::MediaService;
+
 use crate::auth::CurrentUser;
+use crate::dto::{MediaPointResource, MediaProgressResource, MediaThumbnailResource};
 use crate::error::ErrorResponse;
+use crate::extract::Json as EnvelopeJson;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/media", get(list_media))
-        .route("/media/thumbnail-generation/reset", post(reset_terminal_media_thumbnails))
+        .route(
+            "/media/thumbnail-generation/reset",
+            post(reset_terminal_media_thumbnails),
+        )
         .route("/media/invalid", get(list_invalid_media))
         .route("/media/duplicates", get(list_duplicate_media_groups))
-        .route("/media/multi-version-movies", get(list_multi_version_movies))
+        .route(
+            "/media/multi-version-movies",
+            get(list_multi_version_movies),
+        )
         .route(
             "/media/{media_id}/points",
             get(list_media_points_for_media).post(create_media_point),
         )
-        .route("/media/{media_id}/points/{point_id}", delete(delete_media_point))
+        .route(
+            "/media/{media_id}/points/{point_id}",
+            delete(delete_media_point),
+        )
         .route("/media/{media_id}/progress", put(update_media_progress))
         .route("/media/{media_id}/thumbnails", get(list_media_thumbnails))
         .route("/media/{media_id}", delete(delete_media))
@@ -87,6 +100,24 @@ pub struct PageQuery {
     #[serde(default)]
     pub page_size: Option<i64>,
 }
+/// `POST /media/{media_id}/points` 的请求体（上游 `MediaPointCreateRequest`）。
+///
+/// **只有一个字段，且是必填**（上游 `Field(gt=0)` + validator）。
+/// 时刻的秒偏移**不在这里** —— 它取自 `thumbnail.offset`，见
+/// `MediaService::create_point` 的文档（两个真相源会打架）。
+#[derive(Debug, Deserialize)]
+pub struct MediaPointCreateRequest {
+    pub thumbnail_id: i32,
+}
+
+/// `PUT /media/{media_id}/progress` 的请求体（上游
+/// `MediaProgressUpdateRequest`）。
+#[derive(Debug, Deserialize)]
+pub struct MediaProgressUpdateRequest {
+    /// 上游 `Field(ge=0)`。负值在 service 层拦成 422 `validation_error`。
+    pub position_seconds: i32,
+}
+
 /// `GET /media` 的查询参数。
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMediaQuery {
@@ -183,51 +214,157 @@ async fn list_multi_version_movies(
     todo!("骨架：接多版本影片查询")
 }
 
-/// `GET /media/{media_id}/points`
-async fn list_media_points_for_media(
-    State(_state): State<AppState>,
-    _user: CurrentUser,
-    Path(_media_id): Path<i64>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接媒体点列表")
+/// 建服务。`MediaService` 要 `Db` 与 `ConfigService`（删时刻要图片根目录，
+/// 而图片根从配置读 —— 见 `media_paths::media_image_root_path`）。
+fn service(state: &AppState) -> MediaService {
+    MediaService::new(state.db(), state.config())
 }
 
-/// `POST /media/{media_id}/points`
-async fn create_media_point(
-    State(_state): State<AppState>,
+/// 每请求解析出的签名密钥（时刻点的图片要签 URL）。
+fn secret(state: &AppState) -> Result<String, ErrorResponse> {
+    let config = crate::config::snapshot_or_500(state)?;
+    Ok(
+        crate::config::string_at(&config, "auth", "file_signature_secret")
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// 路径里的 id 是 `i64`（见模块文档），而库里的列是 `i32`。
+///
+/// # 超出 `i32` 时是 **404，不是 400**
+///
+/// 上游是 Python 的 `int`，**没有上界** —— 那种 id 会一路走到查询、查不到、
+/// 报「不存在」。用 `Path<i32>` 会在提取阶段就变成 400，与上游不一致。
+/// 所以这里保留 `i64` 再显式收窄，溢出按「不存在」处理。
+fn narrow_media_id(media_id: i64) -> Result<i32, ErrorResponse> {
+    i32::try_from(media_id).map_err(|_| {
+        let mut details = serde_json::Map::new();
+        details.insert("media_id".to_owned(), serde_json::Value::from(media_id));
+        ErrorResponse::from(sm_service::error::ServiceError::not_found_with(
+            "media_not_found",
+            "Media not found",
+            details,
+        ))
+    })
+}
+
+/// 同上，但用于 `point_id`：**404 而不是 400**，理由见 [`narrow_media_id`]。
+fn narrow_point_id(point_id: i64) -> Result<i32, ErrorResponse> {
+    i32::try_from(point_id).map_err(|_| {
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "media_point_id".to_owned(),
+            serde_json::Value::from(point_id),
+        );
+        ErrorResponse::from(sm_service::error::ServiceError::not_found_with(
+            "media_point_not_found",
+            "media_point not found",
+            details,
+        ))
+    })
+}
+
+/// `GET /media/{media_id}/points` —— **裸列表**（不分页）。
+async fn list_media_points_for_media(
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_media_id): Path<i64>,
-    _payload: axum::extract::Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接媒体点创建")
+    Path(media_id): Path<i64>,
+) -> Result<Json<Vec<MediaPointResource>>, ErrorResponse> {
+    let secret = secret(&state)?;
+    let values = service(&state)
+        .list_points(narrow_media_id(media_id)?)
+        .await?;
+    let now = now_seconds();
+    Ok(Json(
+        values
+            .iter()
+            .map(|value| MediaPointResource::from_value(&secret, now, value))
+            .collect(),
+    ))
+}
+
+/// `POST /media/{media_id}/points` —— **新建 201 / 已存在 200**。
+///
+/// 状态码取决于 service 的第二个返回值：上游 `create_point` 是幂等的，
+/// 命中既有行时报 `False`，路由据此返回 **200**（不是 201）。
+/// 这不是「返回码随意」—— 客户端靠它区分「我这次真的建了一个点」。
+async fn create_media_point(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path(media_id): Path<i64>,
+    EnvelopeJson(payload): EnvelopeJson<MediaPointCreateRequest>,
+) -> Result<(StatusCode, Json<MediaPointResource>), ErrorResponse> {
+    let secret = secret(&state)?;
+    let (value, created) = service(&state)
+        .create_point(narrow_media_id(media_id)?, payload.thumbnail_id)
+        .await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(MediaPointResource::from_value(
+            &secret,
+            now_seconds(),
+            &value,
+        )),
+    ))
 }
 
 /// `DELETE /media/{media_id}/points/{point_id}` —— **204 且无 body**。
+///
+/// 服务侧会连带清掉那张只服务于这个时刻的图（记录 + 磁盘文件，经
+/// `ImageCleanupService`）。
 async fn delete_media_point(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path((_media_id, _point_id)): Path<(i64, i64)>,
+    Path((media_id, point_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, ErrorResponse> {
-    todo!("骨架：接媒体点删除（成功返回 204，不带 body）")
+    service(&state)
+        .delete_point(narrow_media_id(media_id)?, narrow_point_id(point_id)?)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `PUT /media/{media_id}/progress`
 async fn update_media_progress(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_media_id): Path<i64>,
-    _payload: axum::extract::Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接播放进度更新")
+    Path(media_id): Path<i64>,
+    EnvelopeJson(payload): EnvelopeJson<MediaProgressUpdateRequest>,
+) -> Result<Json<MediaProgressResource>, ErrorResponse> {
+    let value = service(&state)
+        .update_progress(narrow_media_id(media_id)?, payload.position_seconds)
+        .await?;
+    Ok(Json(MediaProgressResource::from_value(&value)))
 }
 
-/// `GET /media/{media_id}/thumbnails`
+/// `GET /media/{media_id}/thumbnails` —— **裸列表**（不分页）。
 async fn list_media_thumbnails(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    Path(_media_id): Path<i64>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：接缩略图列表")
+    Path(media_id): Path<i64>,
+) -> Result<Json<Vec<MediaThumbnailResource>>, ErrorResponse> {
+    let secret = secret(&state)?;
+    let values = service(&state)
+        .list_thumbnails(narrow_media_id(media_id)?)
+        .await?;
+    let now = now_seconds();
+    Ok(Json(
+        values
+            .iter()
+            .map(|value| MediaThumbnailResource::from_value(&secret, now, value))
+            .collect(),
+    ))
 }
 
 /// `DELETE /media/{media_id}` —— **204 且无 body**。

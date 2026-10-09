@@ -188,7 +188,9 @@ mod tests {
     /// 的无限循环。
     #[test]
     fn only_retryable_states_are_candidates() {
-        let condition = candidate_condition(chrono::NaiveDateTime::UNIX_EPOCH);
+        // `DateTime::UNIX_EPOCH`（`NaiveDateTime::UNIX_EPOCH` 已废弃）；
+        // `candidate_condition` 收 naive，所以再 `naive_utc()`。
+        let condition = candidate_condition(chrono::DateTime::UNIX_EPOCH.naive_utc());
         assert_eq!(condition.states, [STATE_PENDING, STATE_FAILED_RETRYABLE]);
         assert!(!condition.states.contains(&STATE_SUCCEEDED.to_owned()));
         assert!(!condition.states.contains(&STATE_EXHAUSTED.to_owned()));

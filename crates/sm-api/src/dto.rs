@@ -255,6 +255,136 @@ pub fn sign_image_origin(secret: &str, origin: &str, now_seconds: i64) -> String
         .unwrap_or_else(|_| trimmed.to_owned())
 }
 
+/// 把「显式 `null`」与「缺键」分开的反序列化器。
+///
+/// # 为什么需要它
+///
+/// 上游的局部更新走 `payload.model_dump(exclude_unset=True)`，于是有三种状态：
+/// **缺键** / **显式 `null`** / **有值**。而它们的处理各不相同，例如
+/// `VideoItemUpdateRequest`：
+///
+/// ```text
+/// {"cover_thumbnail_id": null}  -> 422（明确禁止清空封面）
+/// {"title": null}               -> 忽略该字段，只推进 updated_at
+/// {"release_date": null}        -> 清空发布日期
+/// {}                            -> 422 空更新
+/// ```
+///
+/// `Option<T>` 只有两种状态，会把「缺键」与「null」压成同一件事，于是上面
+/// 三条里的两条会**改变契约**。
+///
+/// # 用法
+///
+/// 字段写成 `Option<Option<T>>` 并配 `#[serde(default, deserialize_with = ...)]`：
+/// `#[serde(default)]` 让**缺键**走默认值（外层 `None`），于是这个函数只在
+/// **键存在**时被调用 —— 显式 `null` 得到 `Some(None)`，有值得到 `Some(Some(v))`。
+/// 之后用 `sm_service::videos::Field` 的三态枚举搬运。
+pub fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// 视频归属合集的精简引用（上游 `VideoCollectionRef`）。
+///
+/// 只有 `id` 与 `name` —— 列表/详情里的「所属合集」标签只用得上这两个，
+/// 带 `item_count` / `cover_image` 是浪费（前端 DTO 的注释也是这么写的）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoCollectionRefResource {
+    pub id: i32,
+    pub name: String,
+}
+
+/// 非 JAV 视频条目的列表项（上游 `VideoItemListItemResource`，14 个字段）。
+///
+/// # 字段名逐字对齐，前端 `VideoItemListItemDto` 逐个读它们
+///
+/// `id` / `title` / `summary` / `cover_image` / `release_date` /
+/// `duration_seconds` / `file_size_bytes` / `cover_width` / `cover_height` /
+/// `media_count` / `can_play` / `collections` / `created_at` / `updated_at`。
+///
+/// ⚠️ **骨架期这个类型写成了 6 个字段的另一套**（`thumbnail_url` /
+/// `description` / `metadata`）—— 那三个键前端一个都不读。已按上游重写。
+///
+/// # `created_at` / `updated_at` 为什么是 `String`
+///
+/// 与 [`PlaylistResource`] 同一处理：naive UTC 输出
+/// `YYYY-MM-DDTHH:MM:SS`，DB 列为空时输出空串。**已知偏差**，见模块文档。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoItemListItemResource {
+    pub id: i32,
+    pub title: String,
+    pub summary: String,
+    pub cover_image: Option<ImageResource>,
+    pub release_date: Option<String>,
+    /// 首条**有效**媒体的时长（秒）。无有效媒体时为 0。
+    pub duration_seconds: i32,
+    pub file_size_bytes: i64,
+    /// 封面像素宽高（= 首条有效媒体探测分辨率）。探测失败 / 无媒体时为 `None`，
+    /// 前端按 16:9 占位。
+    pub cover_width: Option<i32>,
+    pub cover_height: Option<i32>,
+    /// **全部**媒体数（含失效的）。
+    pub media_count: i64,
+    pub can_play: bool,
+    /// 归属合集，后端按合集名升序返回。
+    pub collections: Vec<VideoCollectionRefResource>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl VideoItemListItemResource {
+    /// 由 service 的列表项组装响应资源。
+    ///
+    /// `now` 由调用方传入而不是在这里取 —— 同一批条目必须用**同一个**时间戳
+    /// 签名，否则列表里会出现几张图的有效期差几毫秒（可观测，但无意义）。
+    pub fn from_list_item(
+        secret: &str,
+        now: i64,
+        item: &sm_service::videos::VideoListItem,
+    ) -> Self {
+        Self {
+            id: item.video.id,
+            title: item.video.title.clone(),
+            summary: item.video.summary.clone(),
+            cover_image: item.cover.as_ref().map(|image| ImageResource {
+                id: image.id,
+                origin: sign_image_origin(secret, &image.origin, now),
+            }),
+            release_date: item
+                .video
+                .release_date
+                .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string()),
+            duration_seconds: item.duration_seconds,
+            file_size_bytes: item.file_size_bytes,
+            cover_width: item.cover_width,
+            cover_height: item.cover_height,
+            media_count: item.media_count,
+            can_play: item.can_play,
+            collections: item
+                .collections
+                .iter()
+                .map(|row| VideoCollectionRefResource {
+                    id: row.id,
+                    name: row.name.clone(),
+                })
+                .collect(),
+            created_at: item
+                .video
+                .created_at
+                .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default(),
+            updated_at: item
+                .video
+                .updated_at
+                .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// 片段所属合集的摘要（上游 `ClipCollectionSummary`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipCollectionSummary {
@@ -305,6 +435,119 @@ pub struct MediaClipThumbnailResource {
     /// **相对片段起点**的秒数，供进度条定位跳转。
     pub offset_seconds: i32,
     pub image: ImageResource,
+}
+
+/// 媒体点（时刻）—— 上游 `MediaPointResource`。
+///
+/// # 键名是 `point_id`
+///
+/// 客户端按它调 `DELETE /media/{media_id}/points/{point_id}`。骨架期 service
+/// 层那个类型用的字段名是 `id`，序列化出去键名不对 —— 已随本轮一起更正。
+///
+/// # `image` 在这里才是**可用的 URL**
+///
+/// service 层（`MediaPointValue`）带的是未签名的 `image_origin`，签名要密钥、
+/// 只有这一层有 —— 所以这个 DTO 由 `sm_api` 组装，不由 service 直接返回。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaPointResource {
+    pub point_id: i32,
+    /// 来源 Media。**可为 `None`** —— 来源被删后置空，时刻点仍在。
+    pub media_id: Option<i32>,
+    pub thumbnail_id: Option<i32>,
+    pub offset_seconds: i32,
+    pub image: ImageResource,
+    /// 上游非可空（`datetime`）而 DB 列可空 —— 缺失输出空串，与其余 DTO 一致。
+    pub created_at: String,
+}
+
+impl MediaPointResource {
+    /// 由 service 的值对象组装。`now` 由调用方传入 —— 一批必须用同一个时间戳。
+    pub fn from_value(
+        secret: &str,
+        now: i64,
+        value: &sm_service::playback::media::MediaPointValue,
+    ) -> Self {
+        Self {
+            point_id: value.point_id,
+            media_id: value.media_id,
+            thumbnail_id: value.thumbnail_id,
+            offset_seconds: value.offset_seconds,
+            image: ImageResource {
+                id: value.image_id,
+                origin: sign_image_origin(secret, &value.image_origin, now),
+            },
+            created_at: value
+                .created_at
+                .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// 播放进度 —— 上游 `MediaProgressResource`。
+// `last_watched_at` 是 `String`（带堆分配），所以**不能** derive `Copy`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaProgressResource {
+    pub media_id: i32,
+    pub last_position_seconds: i32,
+    /// 上游非可空（`datetime`）而 DB 列可空 —— 缺失输出空串。
+    pub last_watched_at: String,
+}
+
+impl MediaProgressResource {
+    pub fn from_value(value: &sm_service::playback::media::MediaProgressValue) -> Self {
+        Self {
+            media_id: value.media_id,
+            last_position_seconds: value.last_position_seconds,
+            last_watched_at: value
+                .last_watched_at
+                .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// 媒体缩略图 —— 上游 `MediaThumbnailResource`。
+///
+/// # 键名与骨架不同：`thumbnail_id` / `offset_seconds`，且多了 `width`/`height`
+///
+/// 骨架的 service 层类型用的是 `id` / `offset` / `image_path`，序列化出去键名
+/// 全不对。见 `sm_service::playback::thumbnails::artifacts::MediaThumbnailValue`。
+///
+/// # `width` / `height` 是**整组共享**的
+///
+/// 取自该媒体的**第一条**缩略图（同一视频流的尺寸相同）。解不出来时两者都是
+/// `null` —— 前端据此回退到固定比例，而不是把卡片撑成 0 高。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaThumbnailResource {
+    pub thumbnail_id: i32,
+    pub media_id: i32,
+    /// **相对该视频起点**的秒数。
+    pub offset_seconds: i32,
+    pub image: ImageResource,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+impl MediaThumbnailResource {
+    /// 由 service 的值对象组装。`now` 由调用方传入 —— 一批必须用同一个时间戳。
+    pub fn from_value(
+        secret: &str,
+        now: i64,
+        value: &sm_service::playback::thumbnails::artifacts::MediaThumbnailValue,
+    ) -> Self {
+        Self {
+            thumbnail_id: value.thumbnail_id,
+            media_id: value.media_id,
+            offset_seconds: value.offset_seconds,
+            image: ImageResource {
+                id: value.image_id,
+                origin: sign_image_origin(secret, &value.image_origin, now),
+            },
+            width: value.width,
+            height: value.height,
+        }
+    }
 }
 
 /// `PATCH /media-clips/{id}` 的请求体。

@@ -1,9 +1,9 @@
 //! 路由层共享状态。
 
 use sm_db::Db;
+use sm_service::discovery::ranking::RankingSourceCatalog;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::config::ConfigService;
-use sm_service::discovery::ranking::RankingSourceCatalog;
 use sm_service::system::JobCatalog;
 
 /// 所有路由共享的运行时状态。

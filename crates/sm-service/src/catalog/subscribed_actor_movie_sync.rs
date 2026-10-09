@@ -32,6 +32,8 @@
 use crate::error::ServiceError;
 
 /// 抓取服务。
+// 两个依赖尚未被方法体引用（抓取动作还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct SubscribedActorMovieSyncService {
     provider: Option<Box<dyn ActorMoviesProvider>>,
     import_service: Option<Box<dyn MovieImporter>>,
@@ -96,7 +98,9 @@ impl SubscribedActorMovieSyncService {
     /// **单个演员失败不中断整批** —— 一位演员的页面 404 不该让其他 500 位
     /// 的同步都停掉。
     pub async fn sync_subscribed_actor_movies(&self) -> Result<ActorSyncStats, ServiceError> {
-        todo!("骨架：逐个已订阅演员 -> 翻页 -> 判重 -> 入库 -> 写两个 synced_at；单个演员失败不中断")
+        todo!(
+            "骨架：逐个已订阅演员 -> 翻页 -> 判重 -> 入库 -> 写两个 synced_at；单个演员失败不中断"
+        )
     }
 }
 
@@ -114,7 +118,10 @@ mod tests {
             skipped_existing: 6,
             failed: 1,
         };
-        assert_eq!(stats.imported + stats.skipped_existing + stats.failed, stats.entries);
+        assert_eq!(
+            stats.imported + stats.skipped_existing + stats.failed,
+            stats.entries
+        );
     }
 
     /// 入库失败是**独立计数** —— 抓取成功但元数据失败不该让整个任务失败。

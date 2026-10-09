@@ -49,6 +49,7 @@ use crate::dto::{
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
+use crate::query::{one, twenty};
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
@@ -100,14 +101,6 @@ struct ListQuery {
     movie_number: Option<String>,
     keyword: Option<String>,
     exclude_collection_id: Option<i32>,
-}
-
-fn one() -> i64 {
-    1
-}
-
-fn twenty() -> i64 {
-    20
 }
 
 /// `exclude_collection_id` 的 `ge=1`。

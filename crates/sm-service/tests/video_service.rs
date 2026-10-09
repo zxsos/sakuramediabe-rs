@@ -536,7 +536,7 @@ async fn renaming_to_the_current_name_skips_the_uniqueness_check() {
     let db = TestDb::require().await;
     let svc = VideoCollectionService::new(db.pool());
     let id = seed_collection(&db).await;
-    let current = svc.get(id).await.unwrap().name;
+    let current = svc.get_with_count(id).await.unwrap().collection.name;
 
     let updated = svc
         .update(

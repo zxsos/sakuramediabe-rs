@@ -42,7 +42,10 @@ pub struct PendingBackfill {
 /// JavDB 查询能力。**出网**。
 pub trait JavdbProvider {
     /// 按番号取影片详情。`Ok(None)` = JavDB **没有收录**（不是错误）。
-    fn get_movie_by_number(&self, movie_number: &str) -> Result<Option<serde_json::Value>, ServiceError>;
+    fn get_movie_by_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Option<serde_json::Value>, ServiceError>;
 }
 
 /// 把 JavDB 详情写回影片。
@@ -65,6 +68,8 @@ pub struct BackfillStats {
 }
 
 /// 补录服务。
+// 两个依赖尚未被方法体引用（补录动作还是 `todo!()`），落地后删 allow。
+#[allow(dead_code)]
 pub struct MovieJavdbBackfillService {
     provider: Option<Box<dyn JavdbProvider>>,
     import_service: Option<Box<dyn PluginMovieBackfill>>,

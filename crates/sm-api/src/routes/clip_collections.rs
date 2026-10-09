@@ -42,6 +42,7 @@ use crate::dto::{
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
+use crate::query::{one, twenty};
 use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
@@ -93,14 +94,6 @@ struct ListClipsQuery {
     page: i64,
     #[serde(default = "twenty")]
     page_size: i64,
-}
-
-fn one() -> i64 {
-    1
-}
-
-fn twenty() -> i64 {
-    20
 }
 
 /// 每请求解析出的运行时依赖。

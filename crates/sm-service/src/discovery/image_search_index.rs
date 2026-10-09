@@ -47,7 +47,11 @@ use sm_db::repo::discovery::{
 
 use super::embedding::{EmbeddingClient, EmbeddingSpace};
 use super::image_search_space::ImageSearchIndexSpaceService;
-use super::qdrant::dense::DenseStore;
+// 缩略图与剧情图是**两个不同的集合**，各自有记录 → point 的映射
+// （`ThumbnailVectorRecord` / `PlotImageVectorRecord`）。骨架期这里两个字段
+// 都写成 `Arc<DenseStore>`，写侧就找不到 `upsert_records`。
+use super::qdrant::plot_image::{PlotImageVectorRecord, PlotImageVectorStore};
+use super::qdrant::thumbnail::{ThumbnailVectorRecord, ThumbnailVectorStore};
 use crate::error::ServiceError;
 
 /// 缩略图索引状态。
@@ -126,16 +130,25 @@ pub struct IndexSummary {
 ///    succeeded / failed 三个数。而**这三个数正是上面 6 个 stats 的聚合**。
 ///
 /// **节流由调用方做**（上游 `:170-184` 是 2 秒 / 30 秒两级节流）。
+// `+ Send`：sink 会被 move 进 worker 的 handler future，而 `TaskHandler`
+// 要求 `Send`。只给内层 `BoxFuture` 加 `Send` 是不够的 —— 闭包对象本身
+// 也要能跨线程转移。
 pub type ProgressSink<'a> = Box<
-    dyn FnMut(Option<i32>, Option<i32>, &str, Option<&serde_json::Value>) -> BoxFuture<'a, Result<(), String>>
+    dyn FnMut(
+            Option<i32>,
+            Option<i32>,
+            &str,
+            Option<&serde_json::Value>,
+        ) -> BoxFuture<'a, Result<(), String>>
+        + Send
         + 'a,
 >;
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// 索引服务。
 pub struct ImageSearchIndexService {
-    thumbnails: Arc<DenseStore>,
-    plot_images: Arc<DenseStore>,
+    thumbnails: Arc<ThumbnailVectorStore>,
+    plot_images: Arc<PlotImageVectorStore>,
     embedding: Arc<EmbeddingClient>,
     pending: PendingImageRepository,
     space: ImageSearchIndexSpaceService,
@@ -146,14 +159,17 @@ pub struct ImageSearchIndexService {
     /// `stores_ready` 强制重建。
     ///
     /// 初始 `None`，所以第一次 `ensure_stores_ready` 一定会建表。
-    current_dimension: Option<u32>,
+    ///
+    /// 类型跟 [`EmbeddingSpace::dimension`] 走（`usize`）—— 骨架期这里是
+    /// `Option<u32>`，与 `describe()` 的返回值对不上。
+    current_dimension: Option<usize>,
 }
 
 impl ImageSearchIndexService {
     /// 构造。
     pub fn new(
-        thumbnails: Arc<DenseStore>,
-        plot_images: Arc<DenseStore>,
+        thumbnails: Arc<ThumbnailVectorStore>,
+        plot_images: Arc<PlotImageVectorStore>,
         embedding: Arc<EmbeddingClient>,
         pending: PendingImageRepository,
         state: ImageSearchIndexStateRepository,
@@ -181,7 +197,7 @@ impl ImageSearchIndexService {
     /// 置位后**同一维度内**不再重复建表（建表是重操作）。但
     /// [`prepare_index_space`](Self::prepare_index_space) 每轮都调 `describe()`，
     /// **维度变了要清掉这个标志** —— 见 `index_pending`。
-    pub async fn ensure_stores_ready(&self, vector_size: u32) -> Result<(), ServiceError> {
+    pub async fn ensure_stores_ready(&self, vector_size: usize) -> Result<(), ServiceError> {
         if self.stores_ready {
             return Ok(());
         }
@@ -191,10 +207,12 @@ impl ImageSearchIndexService {
                 "推理服务返回的向量维度无效",
             ));
         }
-        for store in [&self.thumbnails, &self.plot_images] {
-            store.ensure_table(vector_size as usize).await?;
-            store.ensure_scalar_indices().await?;
-        }
+        // 两个集合的类型不同（`ThumbnailVectorStore` / `PlotImageVectorStore`），
+        // **进不了同一个数组** —— 写两遍而不是把它们塞进一个 `dyn` 里。
+        self.thumbnails.ensure_table(vector_size).await?;
+        self.thumbnails.ensure_scalar_indices().await?;
+        self.plot_images.ensure_table(vector_size).await?;
+        self.plot_images.ensure_scalar_indices().await?;
         Ok(())
     }
 
@@ -233,7 +251,13 @@ impl ImageSearchIndexService {
 
         // ---- 阶段 1/2：重置 ----
         if reset {
-            emit(&mut progress, 0, 0, "阶段 1/2 · 重置旧索引 · 正在清空图像搜索索引").await;
+            emit(
+                &mut progress,
+                0,
+                0,
+                "阶段 1/2 · 重置旧索引 · 正在清空图像搜索索引",
+            )
+            .await;
             reset_stats = self.reset_for_rebuild().await?;
             emit(
                 &mut progress,
@@ -270,16 +294,17 @@ impl ImageSearchIndexService {
         loop {
             let thumbnails = self.pending.pending_thumbnails(work_batch_size).await?;
             let plot_images = self.pending.pending_plot_images(work_batch_size).await?;
-            if thumbnails.is_empty(); plot_images.is_empty() {
+            // **两边都空才退出** —— 只有一边空说明那一类处理完了，另一类还有活。
+            if thumbnails.is_empty() && plot_images.is_empty() {
                 break;
             }
 
             // **每轮都查空间** —— 模块文档的重点。
             let space = self.prepare_index_space().await?;
-            if space.dimension != self.current_dimension {
+            if Some(space.dimension) != self.current_dimension {
                 // 维度变了 -> 集合要重建 -> 标志清掉。
                 self.stores_ready = false;
-                self.current_dimension = space.dimension;
+                self.current_dimension = Some(space.dimension);
             }
             self.ensure_stores_ready(space.dimension).await?;
             self.stores_ready = true;
@@ -305,7 +330,8 @@ impl ImageSearchIndexService {
             // 2 秒时等价。**不实现严格节流**，那是优化不是契约。
             pending = self.pending.pending_count().await?;
             let processed = stats.processed_thumbnails as i64 + stats.processed_plot_images as i64;
-            let succeeded = stats.successful_thumbnails as i64 + stats.successful_plot_images as i64;
+            let succeeded =
+                stats.successful_thumbnails as i64 + stats.successful_plot_images as i64;
             let failed = stats.failed_thumbnails as i64 + stats.failed_plot_images as i64;
             emit(
                 &mut progress,
@@ -326,7 +352,10 @@ impl ImageSearchIndexService {
         stats.succeeded = stats.successful_thumbnails + stats.successful_plot_images;
         stats.failed = stats.failed_thumbnails + stats.failed_plot_images;
         stats.pending = remaining;
-        let summary = IndexSummary { reset: reset_stats, stats };
+        let summary = IndexSummary {
+            reset: reset_stats,
+            stats,
+        };
         // 收尾这次**带 `summary_patch`** —— 统计数字要进任务摘要，否则任务中心
         // 只能看到一句话，看不到 processed / succeeded / failed。
         emit_final(
@@ -373,10 +402,10 @@ impl ImageSearchIndexService {
     /// 而要求再次重建 —— **反复重置却永远不 ready**。
     pub async fn reset_for_rebuild(&mut self) -> Result<ResetStats, ServiceError> {
         let space = self.embedding.describe().await?;
-        self.thumbnails.clear().await?;
-        self.plot_images.clear().await?;
+        self.thumbnails.inner().clear().await?;
+        self.plot_images.inner().clear().await?;
         self.stores_ready = false;
-        self.current_dimension = space.dimension;
+        self.current_dimension = Some(space.dimension);
 
         let mut tx = self.pending.pool().begin().await?;
         let sessions_deleted = sqlx::query("DELETE FROM image_search_session")
@@ -444,38 +473,46 @@ impl ImageSearchIndexService {
         let mut ok = 0u32;
         let mut bad = 0u32;
         for chunk in batch.chunks(inference_batch_size.max(1) as usize) {
-            let payloads: Vec<Vec<u8>> =
-                chunk.iter().map(|item| item.image_bytes.clone()).collect();
+            // `.5` = `image_bytes`（位置含义见
+            // `sm_db::repo::discovery::PendingThumbnail`）。
+            let payloads: Vec<Vec<u8>> = chunk.iter().map(|item| item.5.clone()).collect();
             match self.embedding.embed_images(&payloads).await {
                 Ok(vectors) => {
-                    for (item, vector) in chunk.iter().zip(vectors.into_iter()) {
+                    for (item, vector) in chunk.iter().zip(vectors) {
+                        // 一次解构完，循环里不再出现位置下标。
+                        let (thumbnail_id, media_id, movie_id, _movie_number, offset_seconds, _) =
+                            item;
+                        // `movie_id` 可能为空（非 JAV 媒体的缩略图），而
+                        // `ThumbnailVectorRecord.movie_id` 是 `i64` —— 候选查询
+                        // 已过滤掉这一类，走到这里为空就跳过。
+                        let Some(movie_id) = *movie_id else {
+                            continue;
+                        };
                         let written = self
                             .thumbnails
-                            .upsert_thumbnail(
-                                item.thumbnail_id as i64,
-                                item.media_id as i64,
-                                item.movie_id.map(|id| id as i64),
+                            .upsert_records(&[ThumbnailVectorRecord {
+                                thumbnail_id: *thumbnail_id as i64,
+                                media_id: *media_id as i64,
+                                movie_id: movie_id as i64,
+                                offset_seconds: (*offset_seconds).unwrap_or_default() as i64,
                                 vector,
-                            )
+                            }])
                             .await;
                         match written {
                             Ok(()) => {
                                 self.pending
-                                    .set_thumbnail_status(
-                                        item.thumbnail_id,
-                                        thumbnail_status::SUCCESS,
-                                    )
+                                    .set_thumbnail_status(*thumbnail_id, thumbnail_status::SUCCESS)
                                     .await?;
                                 ok += 1;
                             }
                             Err(error) => {
                                 tracing::warn!(
-                                    thumbnail_id = item.thumbnail_id,
+                                    thumbnail_id = *thumbnail_id,
                                     code = error.code(),
                                     "缩略图向量写入失败，标记为 FAILED"
                                 );
                                 self.pending
-                                    .set_thumbnail_status(item.thumbnail_id, thumbnail_status::FAILED)
+                                    .set_thumbnail_status(*thumbnail_id, thumbnail_status::FAILED)
                                     .await?;
                                 bad += 1;
                             }
@@ -489,8 +526,10 @@ impl ImageSearchIndexService {
                         "推理服务失败，该批缩略图全部标记为 FAILED"
                     );
                     for item in chunk {
+                        // 整批推理失败时**每张图单独进一次循环**，所以这里
+                        // 没有上面的解构 —— 只取第 1 位。
                         self.pending
-                            .set_thumbnail_status(item.thumbnail_id, thumbnail_status::FAILED)
+                            .set_thumbnail_status(item.0, thumbnail_status::FAILED)
                             .await?;
                         bad += 1;
                     }
@@ -512,34 +551,40 @@ impl ImageSearchIndexService {
         let mut ok = 0u32;
         let mut bad = 0u32;
         for chunk in batch.chunks(inference_batch_size.max(1) as usize) {
-            let payloads: Vec<Vec<u8>> =
-                chunk.iter().map(|item| item.image_bytes.clone()).collect();
+            // `.2` = `image_bytes`（位置含义见
+            // `sm_db::repo::discovery::PendingPlotImage`）。
+            let payloads: Vec<Vec<u8>> = chunk.iter().map(|item| item.2.clone()).collect();
             match self.embedding.embed_images(&payloads).await {
                 Ok(vectors) => {
-                    for (item, vector) in chunk.iter().zip(vectors.into_iter()) {
+                    for (item, vector) in chunk.iter().zip(vectors) {
+                        // 一次解构完，循环里不再出现位置下标。
+                        let (plot_image_id, movie_id, _) = item;
+                        let Some(movie_id) = *movie_id else {
+                            continue;
+                        };
                         let written = self
                             .plot_images
-                            .upsert_plot_image(
-                                item.plot_image_id as i64,
-                                item.movie_id.map(|id| id as i64),
+                            .upsert_records(&[PlotImageVectorRecord {
+                                plot_image_id: *plot_image_id as i64,
+                                movie_id: movie_id as i64,
                                 vector,
-                            )
+                            }])
                             .await;
                         match written {
                             Ok(()) => {
                                 self.pending
-                                    .set_plot_image_status(item.plot_image_id, plot_status::SUCCESS)
+                                    .set_plot_image_status(*plot_image_id, plot_status::SUCCESS)
                                     .await?;
                                 ok += 1;
                             }
                             Err(error) => {
                                 tracing::warn!(
-                                    plot_image_id = item.plot_image_id,
+                                    plot_image_id = *plot_image_id,
                                     code = error.code(),
                                     "剧情图向量写入失败，标记为 FAILED"
                                 );
                                 self.pending
-                                    .set_plot_image_status(item.plot_image_id, plot_status::FAILED)
+                                    .set_plot_image_status(*plot_image_id, plot_status::FAILED)
                                     .await?;
                                 bad += 1;
                             }
@@ -553,8 +598,9 @@ impl ImageSearchIndexService {
                         "推理服务失败，该批剧情图全部标记为 FAILED"
                     );
                     for item in chunk {
+                        // 同缩略图那半：单独循环里没有解构，只取第 1 位。
                         self.pending
-                            .set_plot_image_status(item.plot_image_id, plot_status::FAILED)
+                            .set_plot_image_status(item.0, plot_status::FAILED)
                             .await?;
                         bad += 1;
                     }
@@ -572,12 +618,7 @@ impl ImageSearchIndexService {
 ///
 /// 任务表用 `i32` 存进度。这里统一转成 `Option`，**全部进度都是「有总数」的**
 /// —— 上游每一条文案都带 `已完成 x/y`，所以没有「总数未知」的情形。
-async fn emit(
-    progress: &mut Option<ProgressSink<'_>>,
-    current: i64,
-    total: i64,
-    text: &str,
-) {
+async fn emit(progress: &mut Option<ProgressSink<'_>>, current: i64, total: i64, text: &str) {
     if let Some(sink) = progress {
         let _ = sink(Some(current as i32), Some(total as i32), text, None).await;
     }
@@ -597,6 +638,12 @@ async fn emit_final(
 ) {
     if let Some(sink) = progress {
         let patch = serde_json::to_value(summary).ok();
-        let _ = sink(Some(current as i32), Some(total as i32), text, patch.as_ref()).await;
+        let _ = sink(
+            Some(current as i32),
+            Some(total as i32),
+            text,
+            patch.as_ref(),
+        )
+        .await;
     }
 }

@@ -66,6 +66,20 @@ pub fn default_true() -> bool {
     true
 }
 
+/// 分页缺省：`Query(default=1, ge=1)` 的 **1**。
+///
+/// ⚠️ 全仓只有这一份 —— 曾同时在 `clip_collections` / `media_clips` /
+/// `recommendations` / `movies` 各写一遍（`handoff.md` 纪律第 7 条：重复常量
+/// 是缺陷）。改默认值时只改这里。
+pub fn one() -> i64 {
+    1
+}
+
+/// 分页缺省：`Query(default=20, ge=1, le=100)` 的 **20**。见 [`one`]。
+pub fn twenty() -> i64 {
+    20
+}
+
 /// 纯函数形式，便于单元测试与复用。
 pub fn parse(raw: &str) -> Option<bool> {
     // 上游 pydantic 不 trim：`" true"` 不是合法布尔。这里照做 ——
