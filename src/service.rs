@@ -103,7 +103,6 @@ impl PluginControl for Control {
                             current: 0,
                             total: 0,
                             text: "订阅抓取需要宿主提供影片列表，暂未实现".to_owned(),
-                            ..Default::default()
                         },
                     )),
                 };
@@ -240,7 +239,6 @@ fn progress_event(current: i32, total: i32, text: String) -> JobEvent {
                 current,
                 total,
                 text,
-                ..Default::default()
             },
         )),
     }
@@ -258,7 +256,7 @@ fn status_of(err: &SubtitleCatError) -> Status {
 /// 简单的 base64 编码（不引入新依赖）。
 fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = *chunk.get(1).unwrap_or(&0) as u32;
