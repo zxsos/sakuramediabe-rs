@@ -30,11 +30,11 @@
 
 use serde::Serialize;
 
-use sm_db::Db;
 use sm_db::common::page::PageRequest;
 use sm_db::repo::{DownloadClientRepository, DownloadTaskRepository, NewDownloadTask};
+use sm_db::Db;
 
-use super::download_common::{require_client, DownloadClientRow, RemoteDownloadTask};
+use super::download_common::{require_client, DownloadClientRow};
 use crate::error::ServiceError;
 
 /// 会对账的状态（见模块文档）。
@@ -174,7 +174,10 @@ impl DownloadSyncService {
             }
             response.remote_count += 1;
 
-            match task_repo.find_by_remote(client_id, &remote.remote_id).await? {
+            match task_repo
+                .find_by_remote(client_id, &remote.remote_id)
+                .await?
+            {
                 Some(existing) => {
                     // 状态或进度变了 → 更新；完全一致 → 不动。
                     let state_changed = existing.state != remote.state;
@@ -199,8 +202,9 @@ impl DownloadSyncService {
                     };
                     task_repo.insert(&new_task).await?;
                     // 刚插入的状态可能是空，同步 provider 的状态。
-                    if let Some(created) =
-                        task_repo.find_by_remote(client_id, &remote.remote_id).await?
+                    if let Some(created) = task_repo
+                        .find_by_remote(client_id, &remote.remote_id)
+                        .await?
                     {
                         if created.state != remote.state {
                             task_repo

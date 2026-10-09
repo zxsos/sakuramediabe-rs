@@ -810,10 +810,7 @@ impl ImportTaskService {
         // ⑤ 番号不能为空（422）。
         let movie_number = movie_number.trim();
         if movie_number.is_empty() {
-            return Err(ServiceError::validation(
-                "validation_error",
-                "番号不能为空",
-            ));
+            return Err(ServiceError::validation("validation_error", "番号不能为空"));
         }
 
         // ⑥ 实际搜索走插件 ABI（metadata_source），宿主侧调用面未接线。
@@ -1040,7 +1037,9 @@ impl ImportTaskService {
                     summary.imported_count += single.imported_count;
                     summary.skipped_count += single.skipped_count;
                     summary.failed_count += single.failed_count;
-                    summary.new_playable_movies.extend(single.new_playable_movies);
+                    summary
+                        .new_playable_movies
+                        .extend(single.new_playable_movies);
                     summary.created_video_ids.extend(single.created_video_ids);
                     summary.failed_files.extend(single.failed_files);
                 }
@@ -1172,10 +1171,10 @@ impl ImportTaskService {
         let task_run = self.require_import_task_run(original_task_run_id).await?;
         ensure_retryable_task(&task_run)?;
 
-        let failure: ImportFailure = serde_json::from_value(failure_item)
-            .map_err(|error| request_validation_error(&format!("failure_item 形状非法：{error}")))?;
-        let operation_key =
-            format!("import-retry:{original_task_run_id}:{failure_item_id}");
+        let failure: ImportFailure = serde_json::from_value(failure_item).map_err(|error| {
+            request_validation_error(&format!("failure_item 形状非法：{error}"))
+        })?;
+        let operation_key = format!("import-retry:{original_task_run_id}:{failure_item_id}");
         let outcome = self
             .require_import_service()?
             .retry_failed_file(&failure, candidate_id, &operation_key)
@@ -1239,7 +1238,10 @@ impl ImportTaskService {
     ) -> Result<(), ServiceError> {
         let patch = replace_failure_item(items, failure_item_id, changes)?;
         BackgroundTaskRunRepository::new(self.db.clone())
-            .merge_result_summary(original_task_run_id, Some(&json!({ "failed_files": patch })))
+            .merge_result_summary(
+                original_task_run_id,
+                Some(&json!({ "failed_files": patch })),
+            )
             .await?;
         Ok(())
     }

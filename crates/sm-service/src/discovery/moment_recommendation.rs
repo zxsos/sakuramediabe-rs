@@ -751,8 +751,8 @@ impl MomentRecommendationService {
                 .map(|row| (row.0, row))
                 .collect();
             for hit in &hits {
-                let Some(thumbnail_id) = payload_i64(&hit.payload, "thumbnail_id")
-                    .and_then(|id| i32::try_from(id).ok())
+                let Some(thumbnail_id) =
+                    payload_i64(&hit.payload, "thumbnail_id").and_then(|id| i32::try_from(id).ok())
                 else {
                     continue;
                 };

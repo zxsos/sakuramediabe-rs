@@ -344,10 +344,9 @@ impl ImageTasksBuilder for MovieImageService {
         movie_number: &str,
         resolution: ThinCoverResolution,
     ) -> Result<Option<i32>, ServiceError> {
-        let (Some(temp_path), Some(relative_path)) = (
-            resolution.thin_cover_path,
-            resolution.relative_path,
-        ) else {
+        let (Some(temp_path), Some(relative_path)) =
+            (resolution.thin_cover_path, resolution.relative_path)
+        else {
             return Ok(None);
         };
         let size_bytes = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);

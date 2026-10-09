@@ -357,9 +357,7 @@ impl AppState {
 
     /// provider 宿主侧工厂。`None` = 没装插件 —— 调用方据此报 503
     /// `provider_not_installed`（service 层各方法的既有语义）。
-    pub fn provider_factory(
-        &self,
-    ) -> Option<Arc<dyn sm_plugin_api::host::HostProviderFactory>> {
+    pub fn provider_factory(&self) -> Option<Arc<dyn sm_plugin_api::host::HostProviderFactory>> {
         self.provider_factory.clone()
     }
 

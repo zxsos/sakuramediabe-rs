@@ -354,10 +354,7 @@ impl DownloadTaskService {
         // 2. 导入中 -> 409，不能删
         if task.import_status == IMPORT_STATUS_RUNNING {
             let mut details = serde_json::Map::new();
-            details.insert(
-                "task_id".to_owned(),
-                serde_json::Value::from(task.id),
-            );
+            details.insert("task_id".to_owned(), serde_json::Value::from(task.id));
             return Err(ServiceError::conflict(
                 "download_task_import_running",
                 "Cannot delete a download task while importing media",

@@ -234,9 +234,8 @@ pub async fn library_provider(
     library: &MediaLibraryRow,
     factory: Option<&dyn HostProviderFactory>,
 ) -> Result<Arc<dyn HostStorageProvider>, ServiceError> {
-    let factory = factory.ok_or_else(|| {
-        ServiceError::unavailable("provider_not_installed", "媒体提供方未安装")
-    })?;
+    let factory = factory
+        .ok_or_else(|| ServiceError::unavailable("provider_not_installed", "媒体提供方未安装"))?;
     factory
         .for_provider_key(&library.provider_key)
         .await
@@ -632,7 +631,6 @@ pub(crate) fn provider_config_object(raw: Option<&str>) -> serde_json::Value {
 /// 同理，占位的 `PluginStorageProvider`（unit struct）也已删除：
 /// 存储 provider 的真实形状是 `sm_plugin_api::host::HostStorageProvider`
 /// 那个 trait（宿主侧调用抽象），取句柄走 [`library_provider`]。
-
 #[cfg(test)]
 mod tests {
     use super::*;

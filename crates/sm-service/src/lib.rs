@@ -32,7 +32,6 @@
 //!
 //! 见 [`crate::error::ServiceError`]：状态码与错误码绑在一起，逐条对齐
 //! 上游 `ApiError(status, code, message, details)`。
-
 pub mod catalog;
 pub mod collections;
 pub mod discovery;

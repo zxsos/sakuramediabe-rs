@@ -324,6 +324,8 @@ pub struct DownloadTask {
     pub progress: f64,
     /// 结构由**同 bundle 的 storage provider** 定义，不是 client 的。
     pub completed_source_ref: Option<String>,
+    /// 最近一次在 provider 快照中出现的时间；NULL 表示从未出现过。
+    pub remote_seen_at: Option<chrono::NaiveDateTime>,
     /// 宿主导入状态，默认 `pending`。
     pub import_status: String,
     /// 关联的后台任务台账。删台账记录只置空，不影响下载任务。
@@ -447,6 +449,7 @@ mod tests {
             state: state.to_owned(),
             progress: 0.0,
             completed_source_ref: None,
+            remote_seen_at: None,
             import_status: import.to_owned(),
             import_task_run_id: None,
             created_at: None,

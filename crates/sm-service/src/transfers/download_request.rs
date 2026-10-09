@@ -168,10 +168,9 @@ impl DownloadRequestService {
         })?;
 
         // 5. 算资源哈希
-        let info_hash = super::download_resource_hash::resolve_resource_hash(
-            &payload.candidate.source_uri,
-        )
-        .await?;
+        let info_hash =
+            super::download_resource_hash::resolve_resource_hash(&payload.candidate.source_uri)
+                .await?;
 
         // 6. 查黑名单（提交之前是硬要求）
         if deps.is_blacklisted(&info_hash)? {

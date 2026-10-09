@@ -16,9 +16,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use sm_plugin_api::host::{
-    HostProviderError, HostProviderFactory, HostStorageProvider,
-};
+use sm_plugin_api::host::{HostProviderError, HostProviderFactory, HostStorageProvider};
 use sm_plugin_api::v1::{
     BrowsePage, ImportPlacement, LibraryHandle, MediaHandle, StagedMediaTransfer,
     TransferSourceSession,
@@ -112,10 +110,7 @@ impl HostStorageProvider for GrpcStorageProvider {
         .map_err(to_host_error)
     }
 
-    async fn close_transfer_source(
-        &self,
-        session_id: String,
-    ) -> Result<(), HostProviderError> {
+    async fn close_transfer_source(&self, session_id: String) -> Result<(), HostProviderError> {
         let mut client = self.client.lock().await;
         provider_calls::close_transfer_source(&mut client, &self.provider_key, &session_id)
             .await

@@ -986,9 +986,7 @@ pub async fn assert_transfer_source_unchanged(
         })
         .await
         .map(|response| response.into_inner().unchanged)
-        .map_err(|status| {
-            classify_status(provider_key, "assert_transfer_source_unchanged", status)
-        })
+        .map_err(|status| classify_status(provider_key, "assert_transfer_source_unchanged", status))
 }
 
 /// 关闭源会话。上游 `open_transfer_source` 上下文管理器的退出。

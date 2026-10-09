@@ -1,6 +1,7 @@
 //! `system` 域模型（5 张表）。
 
 pub mod activity;
+pub mod api_key;
 pub mod migration;
 pub mod user;
 

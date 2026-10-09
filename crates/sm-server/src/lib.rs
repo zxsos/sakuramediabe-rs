@@ -194,10 +194,9 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // provider 宿主侧工厂（浏览 / 转存等走 `sm-plugin-api` 契约的操作）。
     // 与上面的 `ProviderGateway` 同一个「活的注册表」纪律：插件重启换端点时
     // 不受影响。`sm-service` 只认 trait（`HostProviderFactory`），实现由这里给。
-    let provider_factory_source =
-        std::sync::Arc::new(sm_plugins::host_impl::RegistryProviderFactory::new(
-            loaded_plugins.provider_registry(),
-        ));
+    let provider_factory_source = std::sync::Arc::new(
+        sm_plugins::host_impl::RegistryProviderFactory::new(loaded_plugins.provider_registry()),
+    );
     let provider_factory: std::sync::Arc<dyn sm_plugin_api::host::HostProviderFactory> =
         provider_factory_source;
     // 排行同步（写侧）：目录（4b 才有的快照）+ 取数网关（每次现取插件的控制面

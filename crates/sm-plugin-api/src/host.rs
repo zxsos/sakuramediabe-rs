@@ -147,8 +147,7 @@ pub trait HostStorageProvider: Send + Sync {
     /// 关闭源会话。对应 `CloseTransferSource`。
     ///
     /// 宿主保证**一定调用**（上游 `open_transfer_source` 上下文管理器的退出语义）。
-    async fn close_transfer_source(&self, session_id: String)
-        -> Result<(), HostProviderError>;
+    async fn close_transfer_source(&self, session_id: String) -> Result<(), HostProviderError>;
 
     /// 清理源（只删当前会话对应且未变化的源文件）。对应 `CleanupTransferSource`。
     ///

@@ -164,9 +164,9 @@ impl MediaTransferTaskService {
 
     /// 取 provider 工厂。没注入 → 503 `provider_not_installed`。
     fn factory(&self) -> Result<&dyn HostProviderFactory, ServiceError> {
-        self.provider_factory.as_deref().ok_or_else(|| {
-            ServiceError::unavailable("provider_not_installed", "媒体提供方未安装")
-        })
+        self.provider_factory
+            .as_deref()
+            .ok_or_else(|| ServiceError::unavailable("provider_not_installed", "媒体提供方未安装"))
     }
 
     /// 能力检查：上游 `supports_media_transfer_*` 的 gRPC 世界等价物。
@@ -251,7 +251,9 @@ impl MediaTransferTaskService {
         // 4. 目标路径（上游 `_placement_for`）。
         let path = placement_for(&media)?;
         // 5. 目标库列表（`library_ids` 限定；查不到 → 404，不是空列表）。
-        let libraries = self.candidate_libraries(request.library_ids.as_deref()).await?;
+        let libraries = self
+            .candidate_libraries(request.library_ids.as_deref())
+            .await?;
         // 6. 逐个判目标能力。不可写的**也要列出来**（带原因），只列可写的
         //    会让用户以为看全了。
         let mut targets = Vec::with_capacity(libraries.len());
@@ -264,10 +266,7 @@ impl MediaTransferTaskService {
                 .has_capability(&library.provider_key, capability::TRANSFER_TARGET)
             {
                 None => (false, Some("provider_not_installed".to_owned())),
-                Some(false) => (
-                    false,
-                    Some("media_transfer_target_unsupported".to_owned()),
-                ),
+                Some(false) => (false, Some("media_transfer_target_unsupported".to_owned())),
                 Some(true) => (true, None),
             };
             targets.push(MediaStorageTransferTarget {
@@ -462,8 +461,7 @@ impl MediaTransferTaskService {
                 let has_staged = params
                     .get("_staged_transfers")
                     .is_some_and(|v| !v.is_null());
-                let active =
-                    run.state == task_state::PENDING || run.state == task_state::RUNNING;
+                let active = run.state == task_state::PENDING || run.state == task_state::RUNNING;
                 let has_versions = params.get("_library_versions").is_some();
                 if has_staged || (active && !has_versions) {
                     return Err(ServiceError::conflict(
@@ -675,10 +673,7 @@ impl MediaTransferTaskService {
             validate_transfer_source(session, media)?;
             // 暂存（上游 `stage_transfer`）。
             reason = "stage_failed";
-            let placement_path = request
-                .target_path
-                .clone()
-                .unwrap_or(placement_for(media)?);
+            let placement_path = request.target_path.clone().unwrap_or(placement_for(media)?);
             let target_handle = library_handle_for(target_library);
             let staged = target_provider
                 .stage_transfer(
@@ -824,7 +819,10 @@ impl MediaTransferTaskService {
             .as_deref()
             .and_then(|text| serde_json::from_str(text).ok())
             .unwrap_or(serde_json::Value::Null);
-        if let Some(item) = params.get_mut("_current_item").and_then(|v| v.as_object_mut()) {
+        if let Some(item) = params
+            .get_mut("_current_item")
+            .and_then(|v| v.as_object_mut())
+        {
             item.insert(
                 "phase".to_owned(),
                 serde_json::Value::String("media_switched".to_owned()),
@@ -929,7 +927,8 @@ impl MediaTransferTaskService {
             }));
             map.insert("issues".to_owned(), serde_json::Value::Array(issues));
         }
-        repo.merge_result_summary(task_run_id, Some(&summary)).await?;
+        repo.merge_result_summary(task_run_id, Some(&summary))
+            .await?;
         Ok(())
     }
 
@@ -959,9 +958,7 @@ impl MediaTransferTaskService {
         if params.get("_library_versions").is_none() || run.state == task_state::COMPLETED {
             return Ok(());
         }
-        let had_item = params
-            .get("_current_item")
-            .is_some_and(|v| !v.is_null());
+        let had_item = params.get("_current_item").is_some_and(|v| !v.is_null());
         if let serde_json::Value::Object(map) = &mut params {
             map.remove("_current_item");
         }
@@ -1006,7 +1003,8 @@ impl MediaTransferTaskService {
                 serde_json::Value::String(reason_code.to_owned()),
             );
         }
-        repo.merge_result_summary(task_run_id, Some(&summary)).await?;
+        repo.merge_result_summary(task_run_id, Some(&summary))
+            .await?;
         Ok(())
     }
 
@@ -1236,10 +1234,7 @@ fn library_config_version(library: &MediaLibraryRow) -> String {
 /// 按 `ConstraintViolation` 变体判，而不是字符串匹配 SQLSTATE ——
 /// 变体是本仓的稳定 API。
 fn is_conflict(err: &sm_db::DbError) -> bool {
-    matches!(
-        err,
-        sm_db::DbError::ConstraintViolation { .. }
-    )
+    matches!(err, sm_db::DbError::ConstraintViolation { .. })
 }
 
 /// 把 [`HostProviderError`] 映射成 [`ServiceError`]（转存版）。
@@ -1253,9 +1248,7 @@ fn map_host_error(err: &HostProviderError, default_code: &str) -> ServiceError {
     let code = format!("provider_{}", err.code);
     match err.code.as_str() {
         "invalid_config" => ServiceError::from_status(422, code, err.safe_message.clone()),
-        "authentication_failed" => {
-            ServiceError::from_status(401, code, err.safe_message.clone())
-        }
+        "authentication_failed" => ServiceError::from_status(401, code, err.safe_message.clone()),
         "source_not_found" => ServiceError::from_status(404, code, err.safe_message.clone()),
         _ => ServiceError::bad_gateway(
             default_code,

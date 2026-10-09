@@ -150,9 +150,7 @@ impl ProviderBrowseService {
         let handle = LibraryHandle {
             library_id: library.id as i64,
             provider_key: library.provider_key.clone(),
-            provider_config: sm_plugin_api::json_struct::json_to_struct(
-                &library.provider_config,
-            ),
+            provider_config: sm_plugin_api::json_struct::json_to_struct(&library.provider_config),
             account_key: None,
         };
         let page = provider
@@ -236,18 +234,14 @@ fn map_host_error(err: &HostProviderError) -> ServiceError {
                 },
             )
         }
-        _ => ServiceError::bad_gateway(
-            "provider_browse_failed",
-            err.safe_message.clone(),
-            {
-                let mut details = serde_json::Map::new();
-                details.insert(
-                    "provider_code".to_owned(),
-                    serde_json::Value::from(err.code.clone()),
-                );
-                details
-            },
-        ),
+        _ => ServiceError::bad_gateway("provider_browse_failed", err.safe_message.clone(), {
+            let mut details = serde_json::Map::new();
+            details.insert(
+                "provider_code".to_owned(),
+                serde_json::Value::from(err.code.clone()),
+            );
+            details
+        }),
     }
 }
 
