@@ -494,11 +494,20 @@ async fn walk_and_emit(
             let Ok(metadata) = tokio::fs::metadata(&path).await else {
                 continue;
             };
-            let relative = path
-                .strip_prefix(&base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
+            // `Path` 的 `Display` 用**平台分隔符** —— Windows 上会产出
+            // `b-movies\c-nested\deep-01.mov`。而 `source_ref` 与
+            // `relative_path` 是协议字段，契约是 POSIX 的 `/`（`fixture.rs`
+            // 取文件名也用 `rsplit('/')`）。所以不能直接 `to_string_lossy()`，
+            // 要按组件拼。
+            //
+            // 这不只是测试洁癖：宿主拿到的 ref 要当 storage key 用，
+            // Windows 上分隔符不一致会让同一文件在两个平台上产生两条记录。
+            let relative_path_ref = path.strip_prefix(&base).unwrap_or(&path);
+            let relative = relative_path_ref
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let entry = ImportFileEntry {
                 file: Some(ImportFile {
                     source_ref: Some(string_ref(&relative)),
@@ -530,9 +539,28 @@ fn thumbnail_count(duration_seconds: i64) -> i32 {
 }
 
 /// `file://` URL。路径里的空格等字符必须转义，否则宿主的 HTTP 客户端会解析出错。
+///
+/// # 分隔符必须转成 `/`
+///
+/// 和上面 `walk_and_emit` 里的 `relative_path` 是**同一个 bug 的第二处**：
+/// `Path` 的 `Display` 用平台分隔符，Windows 上是 `\`，而 URL 的路径部分是
+/// 由 `/` 分隔的。`file://C:\dir\a.mkv` 不是一个合法 URL —— 宿主拿去解析会
+/// 拿到错误的 host 或空的 path。
+///
+/// Windows 上还要多一个斜杠：`C:\dir\a.mkv` 的正确形态是
+/// `file:///C:/dir/a.mkv`（`file://` + 空 host + `/C:/...`）。直接用
+/// `path.to_string_lossy()` 得到的是 `C:\...`，拼出来是 `file://C:\...`
+/// —— 少一个斜杠，host 段会被解析成 `C:`。
 fn file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    format!("file://{}", utf8_percent_encode(&raw, FILE_URL_ESCAPE))
+    let raw = path.to_string_lossy().replace('\\', "/");
+    // 盘符绝对路径（`C:/...`）前面要补 `/` 才是合法的 file URL。
+    let needs_leading_slash = !raw.starts_with('/');
+    let body = if needs_leading_slash {
+        format!("/{raw}")
+    } else {
+        raw
+    };
+    format!("file://{}", utf8_percent_encode(&body, FILE_URL_ESCAPE))
 }
 
 /// 按扩展名猜 Content-Type。

@@ -16,6 +16,8 @@
 //! 只靠第 1 条不够：赢家收口后输的一方仍会走
 //! `complete_task_run(..., notify_result=...)` 的通知分支。
 
+use sm_core::pagination::Paginated;
+use sm_db::common::page::PageRequest;
 use sm_db::repo::{NewNotification, SystemNotificationRepository};
 use sm_db::system::activity::{notification_category, BackgroundTaskRun, SystemNotification};
 
@@ -46,9 +48,7 @@ fn detect_failed_summary(summary: &serde_json::Value) -> bool {
         }
         match value {
             serde_json::Value::Bool(flag) => *flag,
-            serde_json::Value::Number(number) => number
-                .as_f64()
-                .is_some_and(|n| n > 0.0),
+            serde_json::Value::Number(number) => number.as_f64().is_some_and(|n| n > 0.0),
             _ => false,
         }
     })
@@ -137,6 +137,85 @@ async fn create_task_run_notification(
     // `create_once` 重复调用返回既有行，所以这里不会重复插入。
     let row = repo.create_once(&draft).await?;
     Ok(Some(row))
+}
+
+/// 批量标记已读的结果。对应上游 `NotificationBatchReadResponse`
+/// （`schema/system/activity.py:54-58`）。
+///
+/// `unread_count` 是**操作之后**的剩余未读数，而 `updated_count` 是本次新置
+/// 为已读的条数。两个数缺一不可：只有 `updated_count` 的话客户端无法把 tab
+/// 上的红点更新掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchReadResult {
+    pub updated_count: u64,
+    pub unread_count: i64,
+}
+
+/// 通知的读侧服务。对应上游 `NotificationService` 的读侧方法。
+///
+/// 写侧（[`notify_task_result`]）是自由函数 —— 它由收口路径调用、不需要额外
+/// 状态；读侧要按分类/已读筛选并分页，收成一个结构更清楚。
+#[derive(Debug, Clone)]
+pub struct NotificationService {
+    repo: SystemNotificationRepository,
+}
+
+impl NotificationService {
+    pub fn new(db: &sm_db::Db) -> Self {
+        Self {
+            repo: SystemNotificationRepository::new(db.clone()),
+        }
+    }
+
+    /// 分页查询通知。对应上游 `list_notifications`（`notifications.py:205`）。
+    ///
+    /// `category` 走白名单校验（非法值 422 `invalid_activity_filter`），
+    /// `is_read` 是布尔**不校验** —— `normalize_allowed_filter` 是给字符串
+    /// 白名单用的，套在布尔上会变成字符串比较。
+    pub async fn list_notifications(
+        &self,
+        category: Option<&str>,
+        is_read: Option<bool>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<Paginated<SystemNotification>, ServiceError> {
+        let category = super::filters::normalize_allowed_filter(
+            category,
+            "category",
+            &notification_category::ALL,
+        )?;
+        let request = PageRequest::new(page, page_size)?;
+        // `paged_list!` 把 `page: PageRequest` 追加在声明的参数之后。
+        let result = self.repo.list_all(category, is_read, request).await?;
+        Ok(result.into_paginated(&request))
+    }
+
+    /// 未读总数。对应上游 `get_unread_count`（`notifications.py:238`）。
+    pub async fn unread_count(&self) -> Result<i64, ServiceError> {
+        Ok(self.repo.count_unread().await?)
+    }
+
+    /// 批量标记已读。对应上游 `mark_notifications_read`（`notifications.py:246`）。
+    pub async fn mark_read(&self, ids: &[i32]) -> Result<BatchReadResult, ServiceError> {
+        let updated_count = self.repo.mark_notifications_read(ids).await?;
+        // 未读数**必须在写完之后**查：先查再写的话客户端拿到的红点是改之前的数。
+        let unread_count = self.unread_count().await?;
+        Ok(BatchReadResult {
+            updated_count,
+            unread_count,
+        })
+    }
+
+    /// 全部标记已读。对应上游 `mark_all_notifications_read`
+    /// （`notifications.py:265`）。
+    pub async fn mark_all_read(&self) -> Result<BatchReadResult, ServiceError> {
+        let updated_count = self.repo.mark_all_read().await?;
+        let unread_count = self.unread_count().await?;
+        Ok(BatchReadResult {
+            updated_count,
+            unread_count,
+        })
+    }
 }
 
 #[cfg(test)]

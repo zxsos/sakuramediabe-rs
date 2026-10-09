@@ -1007,3 +1007,94 @@ pub struct AccountPasswordChangeRequest {
     pub current_password: String,
     pub new_password: String,
 }
+
+// ---------------------------------------------------------------- 活动中心
+
+/// 通知，字段与上游 `NotificationResource`
+/// （`src/schema/system/activity.py:26-40`）一致。
+///
+/// # 刻意**没有** `read_at`
+///
+/// 上游这个 resource 就没带 `read_at` —— 只有 `NotificationReadResponse` 有，
+/// 而 `activity.py` 的六个端点**一个都不用**那个 resource。所以照抄：客户端
+/// 从列表里拿不到「何时被读到的时刻」。
+///
+/// 看起来像漏字段，但补上就是**契约变更**：客户端会开始依赖一个上游不保证的
+/// 键，而上游哪天加上/改掉它，两边就静默分叉了。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NotificationResource {
+    pub id: i32,
+    pub category: String,
+    pub title: String,
+    pub content: String,
+    pub event_type: Option<String>,
+    pub dedupe_key: Option<String>,
+    pub resource_type: Option<String>,
+    pub resource_id: Option<i32>,
+    pub is_read: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub related_task_run_id: Option<i32>,
+    pub related_resource_type: Option<String>,
+    pub related_resource_id: Option<i32>,
+}
+
+impl From<&sm_db::system::activity::SystemNotification> for NotificationResource {
+    fn from(item: &sm_db::system::activity::SystemNotification) -> Self {
+        Self {
+            id: item.id,
+            category: item.category.clone(),
+            title: item.title.clone(),
+            content: item.content.clone(),
+            event_type: item.event_type.clone(),
+            dedupe_key: item.dedupe_key.clone(),
+            resource_type: item.resource_type.clone(),
+            resource_id: item.resource_id,
+            is_read: item.is_read,
+            created_at: format_timestamp(item.created_at),
+            updated_at: format_timestamp(item.updated_at),
+            related_task_run_id: item.related_task_run_id,
+            related_resource_type: item.related_resource_type.clone(),
+            related_resource_id: item.related_resource_id,
+        }
+    }
+}
+
+/// `POST /system/notifications/read` 请求体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotificationReadBatchRequest {
+    pub ids: Vec<i32>,
+}
+
+/// 批量标记已读的结果。`read` 与 `read-all` **共用**这一种响应。
+///
+/// 字段与上游 `NotificationBatchReadResponse`（`activity.py:54-58`）一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationBatchReadResponse {
+    /// 本次新置为已读的条数。
+    pub updated_count: u64,
+    /// 操作**之后**剩余的未读总数。客户端靠它更新 tab 上的红点。
+    pub unread_count: i64,
+}
+
+impl From<sm_service::system::activity::BatchReadResult> for NotificationBatchReadResponse {
+    fn from(value: sm_service::system::activity::BatchReadResult) -> Self {
+        Self {
+            updated_count: value.updated_count,
+            unread_count: value.unread_count,
+        }
+    }
+}
+
+/// 首屏聚合响应。字段与上游 `ActivityBootstrapResource`
+/// （`activity.py:61-65`）一致。
+///
+/// 两份分页 + 两个标量，一次返回 —— 理由见
+/// [`sm_service::system::activity::bootstrap`] 的模块文档。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityBootstrapResource {
+    pub notifications: sm_core::pagination::Paginated<NotificationResource>,
+    pub unread_count: i64,
+    pub active_task_runs: Vec<TaskRunResource>,
+    pub task_runs: sm_core::pagination::Paginated<TaskRunResource>,
+}

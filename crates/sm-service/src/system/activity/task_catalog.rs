@@ -79,10 +79,7 @@ mod tests {
 
     #[test]
     fn blank_and_none_names_fall_through_to_the_registry() {
-        assert_eq!(
-            resolve_task_name("movie_heat_update", None),
-            "影片热度更新"
-        );
+        assert_eq!(resolve_task_name("movie_heat_update", None), "影片热度更新");
         assert_eq!(
             resolve_task_name("movie_heat_update", Some("   ")),
             "影片热度更新"

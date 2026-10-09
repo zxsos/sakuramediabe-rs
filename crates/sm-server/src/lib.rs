@@ -84,13 +84,47 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // `slow_log` —— 遮蔽后那句会静默变成读 `ConfigService` 的不存在的字段。
     let config_service = sm_service::system::ConfigService::new(config.config_path.clone());
 
+    // 3b. **配置读不了就拒绝启动**（fail fast）。
+    //
+    // 为什么放在这里：配置坏了以后，**每个**请求都会坏。放到请求期才发现，
+    // 服务看起来是健康的（能连库、能响应），只是逐个接口开始 500 —— 排查
+    // 方向会被带偏到「某个接口坏了」，而真正的病因是配置文件。
+    //
+    // 以前没有这道校验，于是 `clip_collections` / `media_clips` / `jobs` /
+    // `movie_subscriptions` / 签名五处都用 `snapshot().unwrap_or_default()`
+    // 把「读不了」吞成全默认配置 —— 见 `sm_api::config` 的模块文档。
+    // 那 6 个红测试就是它留下的症状。
+    //
+    // 「文件不存在」不算失败（首次启动的正常路径）。`validate` 同时查字段取值
+    // 合法性，所以「能解析但 `qdrant.url` 缺 scheme」这类也会在这里被拦下。
+    if let Err(error) = config_service.validate() {
+        // 日志系统此刻已就绪（第 1 步），所以错误能进结构化日志而不只是 stderr。
+        tracing::error!(
+            code = error.code(),
+            details = ?error.details(),
+            path = %config.config_path.display(),
+            "配置校验未通过，拒绝启动"
+        );
+        return Err(anyhow::anyhow!(
+            "配置校验未通过（{}）：{}",
+            error.code(),
+            error.api.message
+        ));
+    }
+
     // 4. 插件。**在路由装配与调度器之前** —— 任务目录里有插件任务，反过来的话
     //    手动触发会把它们判成「未知任务」；调度表也会漏掉它们的 cron
     //    （而没有任何错误会提示）。
     //
     // 配置从**磁盘快照**读（`plugins` 是只读键，可能含插件凭据，不进 API 响应）。
+    //
+    // 第 3b 步已经保证配置读得了，所以这里**不需要** `unwrap_or_default()` ——
+    // 那一行是第 6 处静默降级：配置坏了会让插件配置变成空，从而「插件全部
+    // 静默禁用」，而日志里一句提示都没有。
     let plugin_config =
-        plugins::PluginConfig::from_snapshot(&config_service.snapshot().unwrap_or_default());
+        plugins::PluginConfig::from_snapshot(&config_service.snapshot().map_err(|error| {
+            anyhow::anyhow!("读取配置失败（{}）：{}", error.code(), error.api.message)
+        })?);
     let loaded_plugins = plugins::Plugins::load(plugin_config).await;
     let plugin_specs = loaded_plugins.scheduler_specs();
     let job_catalog = loaded_plugins.catalog();

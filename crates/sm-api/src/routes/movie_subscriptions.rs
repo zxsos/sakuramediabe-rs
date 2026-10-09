@@ -197,9 +197,17 @@ fn timestamp_of(value: Option<chrono::NaiveDateTime>) -> Option<String> {
     value.map(|value| value.format("%Y-%m-%dT%H:%M:%S").to_string())
 }
 
-/// 从运行期配置读两个订阅检索参数；读不到用**配置声明的默认值**（3 / 90）。
-fn subscription_search_settings(state: &AppState) -> (i32, i64) {
-    let snapshot = state.config().snapshot().unwrap_or_default();
+/// 从运行期配置读两个订阅检索参数。
+///
+/// # 「键不存在」用默认值，「配置读不了」报错
+///
+/// 原来返回 `(i32, i64)` 且内部 `unwrap_or_default()`。缺键时用 3 / 90 是对的
+/// —— 那是**配置声明的默认值**，属于业务判断。但配置文件整个读不了时也返回
+/// 3 / 90 就成了静默降级：用户改的检索窗口不生效，且没有任何提示。
+///
+/// 现在把两种情况分开：缺键 -> 默认值（3 / 90）；配置坏 -> 500 `config_invalid`。
+fn subscription_search_settings(state: &AppState) -> Result<(i32, i64), ErrorResponse> {
+    let snapshot = crate::config::snapshot_or_500(state)?;
     let downloads = snapshot.get("downloads");
     let pick = |key: &str| {
         downloads
@@ -208,7 +216,7 @@ fn subscription_search_settings(state: &AppState) -> (i32, i64) {
     };
     let attempt_limit = pick("subscription_search_stale_attempt_limit").unwrap_or(3);
     let fresh_days = pick("subscription_search_fresh_days").unwrap_or(90);
-    (attempt_limit as i32, fresh_days)
+    Ok((attempt_limit as i32, fresh_days))
 }
 
 async fn list_subscriptions(
@@ -227,7 +235,7 @@ async fn list_subscriptions(
         .with_details(details_of("detail", error.message())));
     }
 
-    let (attempt_limit, fresh_days) = subscription_search_settings(&state);
+    let (attempt_limit, fresh_days) = subscription_search_settings(&state)?;
     let params = SubscriptionListParams {
         status: query.status.as_filter().map(str::to_owned),
         sort: query.sort.into(),
@@ -240,7 +248,7 @@ async fn list_subscriptions(
         .list_subscriptions(&params, query.page, query.page_size)
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items

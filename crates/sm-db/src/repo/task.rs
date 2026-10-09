@@ -646,10 +646,7 @@ impl BackgroundTaskRunRepository {
     ///
     /// 合并规则见 [`crate::system::activity::result_summary::merge`]，
     /// 公开成仓储方法只为少写一次 `to_column_text`。
-    fn merge_summary_column(
-        base: Option<&str>,
-        patch: Option<&serde_json::Value>,
-    ) -> String {
+    fn merge_summary_column(base: Option<&str>, patch: Option<&serde_json::Value>) -> String {
         let base_value = crate::system::activity::result_summary::from_column_text(base);
         let merged = crate::system::activity::result_summary::merge(Some(&base_value), patch);
         crate::system::activity::result_summary::to_column_text(&merged)
@@ -970,7 +967,7 @@ impl BackgroundTaskRunRepository {
         .bind(task_state::ACTIVE)
         .fetch_all(&self.pool)
         .await
-            .map_err(Into::into)
+        .map_err(Into::into)
     }
 
     /// 列出**全部**租约过期的 `running` 行。**刻意不分页。**

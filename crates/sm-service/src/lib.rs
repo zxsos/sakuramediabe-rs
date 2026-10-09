@@ -35,6 +35,7 @@
 
 pub mod catalog;
 pub mod collections;
+pub mod discovery;
 pub mod error;
 pub mod movie_numbers;
 pub mod playback;

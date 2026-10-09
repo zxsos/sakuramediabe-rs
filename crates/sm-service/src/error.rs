@@ -22,6 +22,7 @@
 //! | [`ServiceError::conflict`] | 409 | `playlist_name_conflict`、`playlist_reserved_name`、`playlist_managed_by_system` |
 //! | [`ServiceError::not_found`] | 404 | `playlist_not_found`、`movie_not_found` |
 //! | [`ServiceError::bad_gateway`] | 502 | `download_candidate_search_failed` |
+//! | [`ServiceError::unavailable`] | 503 | `image_search_inference_unavailable` |
 //!
 //! 上游 `require_by_id` 默认生成 `{entity}_not_found` 与 `{entity}_id` 详情键
 //! —— [`ServiceError::not_found`] 的 `details_key` 参数保留了这个约定。
@@ -147,6 +148,62 @@ impl ServiceError {
         Self {
             status: 404,
             api: Box::new(ApiError::new(code, message).with_details(details)),
+        }
+    }
+
+    /// 配置文件**读不了或不是合法 TOML**（500）。
+    ///
+    /// # 为什么不复用 `ProgrammerError` 那条
+    ///
+    /// 那条给的是 `programmer_error` —— 客户端看到它会以为是代码 bug，
+    /// 而实际上是**部署坏了**：配置文件被手改坏、编码不对、权限不足。
+    /// 两者的排查方向完全不同，所以单独一个码。
+    ///
+    /// # 为什么是 500 而不是 503
+    ///
+    /// 按本文件顶部定的分界：503 是「依赖连不上，**退避后重试**可能变好」，
+    /// 500 是「自身状态错了，重试只会重复失败」。配置文件坏了正属于后者 ——
+    /// 同一个文件再读一百次还是坏的。**该做的是改文件或回滚，不是等重试。**
+    ///
+    /// 但它和 [`ServiceError::unavailable`] 有个共同点：**都不能静默降级**。
+    /// 曾经 `clip_collections.rs` / `media_clips.rs` / `jobs.rs` /
+    /// `movie_subscriptions.rs` 用 `snapshot().unwrap_or_default()` 把它吞成
+    /// 全默认配置，于是 `media_clip_root_path` 变成空串、`clip_root` 退化成
+    /// 进程工作目录、产物存在性判定恒为 false。**一个手误的转义符，静默关掉
+    /// 了路径解析。** 这条构造器存在的意义就是让那条路走不通。
+    pub fn config_invalid(message: impl Into<String>, details: Map<String, Value>) -> Self {
+        Self {
+            status: 500,
+            api: Box::new(ApiError::new("config_invalid", message).with_details(details)),
+        }
+    }
+
+    /// 外部依赖**不可用**（503）。
+    ///
+    /// 与 [`ServiceError::bad_gateway`] 的分界是**能不能重试**：
+    ///
+    /// | | 状态 | 含义 | 客户端处置 |
+    /// |---|---|---|---|
+    /// | [`ServiceError::unavailable`] | 503 | 依赖**连不上或超时**（网络层） | 退避后重试 |
+    /// | [`ServiceError::bad_gateway`] | 502 | 依赖**连上了但没成功**（协议层） | 换参数或换依赖后重试 |
+    ///
+    /// 上游 `embedding_client.py:45-58` 正是按这个分界写的：`TimeoutException`
+    /// 与 `NetworkError` → 503 `image_search_inference_unavailable`，其余
+    /// `HTTPError` → 502 `image_search_inference_failed`。**这个 503/502 的
+    /// 分界要保留** —— 它决定客户端是退避重试还是改请求。
+    ///
+    /// 但上游那两支**之间**的区分（`timed out` vs `is unreachable`）在 Rust
+    /// 侧复现不了：reqwest 0.13 对「连接被拒」与「连接超时」返回相同的分类
+    /// （实测见 `discovery::embedding::EmbeddingClient` 的
+    /// `tests/embedding_http.rs::probe_reqwest_error_classification`）。
+    /// 两支的 `code` 与状态码本就相同，所以合并文案不影响客户端分支。
+    ///
+    /// 真正透传远端状态码的是 `status >= 400` 那一支（上游 `:59-64`）——
+    /// 那个状态码由远端决定，不属于本文件的构造器，调用方直接构造结构体。
+    pub fn unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: 503,
+            api: Box::new(ApiError::new(code, message)),
         }
     }
 

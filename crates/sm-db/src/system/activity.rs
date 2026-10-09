@@ -450,7 +450,7 @@ mod tests {
     fn note() -> SystemNotification {
         SystemNotification {
             id: 1,
-            category: "plugin".to_owned(),
+            category: "info".to_owned(),
             title: "t".to_owned(),
             content: "c".to_owned(),
             event_type: None,

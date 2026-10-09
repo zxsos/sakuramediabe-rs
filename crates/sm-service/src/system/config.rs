@@ -95,15 +95,94 @@ impl ConfigService {
     ///
     /// 上游 `load_persisted_settings()` 的行为：**缺文件不是错误**，那正是
     /// 首次启动的路径。
+    ///
+    /// # 读不了就报错，不退回默认值
+    ///
+    /// 「文件不存在」与「文件存在但读不了/非法」是**两件事**：
+    ///
+    /// | 情况 | 处置 |
+    /// |---|---|
+    /// | 文件不存在 | `Ok(默认值)` —— 首次启动的正常路径 |
+    /// | 读不了（权限/编码/被占用） | `Err(config_invalid)` |
+    /// | 不是合法 TOML | `Err(config_invalid)` |
+    ///
+    /// 后两种以前会退化成全默认配置，于是 `media_clip_root_path` 变空串、
+    /// `clip_root` 退化成进程工作目录、产物存在性判定恒为 false ——
+    /// **一个手误的转义符静默关掉了路径解析**，而且不报任何错。
+    /// 改成 `Err` 之后，调用方必须显式决定怎么办（见
+    /// `sm_api::config::snapshot_or_500` 与组合根的启动期校验）。
     pub fn snapshot(&self) -> Result<Value, ServiceError> {
         if !self.path.exists() {
             return Ok(schema::defaults_json());
         }
         let text = std::fs::read_to_string(&self.path)
-            .map_err(|e| io_error(&self.path, "读取配置失败", e))?;
+            .map_err(|e| self.config_invalid("读取配置失败", e.to_string()))?;
         let from_disk: Value = toml::from_str(&text)
-            .map_err(|e| ProgrammerError::new(format!("配置不是合法 TOML: {e}")))?;
+            .map_err(|e| self.config_invalid("配置不是合法 TOML", e.to_string()))?;
         Ok(schema::overlay_defaults(from_disk))
+    }
+
+    /// 启动期校验：**配置读不了就直接失败**，让进程拒绝启动。
+    ///
+    /// 为什么需要它：`snapshot()` 的错误要到请求期才暴露，而请求期的处置
+    /// 最多是「这个请求 500」。配置坏了意味着**每个**请求都会坏 ——
+    /// 与其让服务看起来健康、逐个请求地报错，不如启动就拒绝。
+    ///
+    /// 「文件不存在」不算失败（首次启动的正常路径，见 [`Self::snapshot`]）。
+    ///
+    /// 顺带做一件 `snapshot()` 不做的事：检查**值**的合法性
+    /// （`schema::validate`）。前者只保证「能解析」，后者保证「字段取值
+    /// 合法」—— 比如 `qdrant.url` 写成 `localhost:6333`（缺 scheme）。
+    /// 只查前者会让「解析得出来但字段不合法」的配置溜过去。
+    pub fn validate(&self) -> Result<(), ServiceError> {
+        let snapshot = self.snapshot()?;
+        let object = snapshot
+            .as_object()
+            .ok_or_else(|| self.config_invalid("配置不是合法的表", "根节点不是表".to_owned()))?;
+        let errors = schema::validate_strict(object);
+        if errors.is_empty() {
+            return Ok(());
+        }
+        // 逐条列进 details：配置坏了要能**指出是哪个字段**，
+        // 只回一句「校验失败」等于让运维去猜。
+        let mut details = Map::new();
+        details.insert(
+            "config_path".to_owned(),
+            Value::from(self.path.display().to_string()),
+        );
+        details.insert(
+            "fields".to_owned(),
+            Value::Array(
+                errors
+                    .iter()
+                    .map(|error| {
+                        let mut entry = Map::new();
+                        entry.insert("field".to_owned(), Value::from(error.loc.clone()));
+                        entry.insert("reason".to_owned(), Value::from(error.reason.clone()));
+                        Value::Object(entry)
+                    })
+                    .collect(),
+            ),
+        );
+        Err(ServiceError::config_invalid(
+            format!("配置有 {} 个字段不合法", errors.len()),
+            details,
+        ))
+    }
+
+    /// 读/解析失败 → `config_invalid`，并把路径与底层原因放进 `details`。
+    ///
+    /// **路径必须进 `details` 而不是 `message`** —— `message` 是面向用户的中文
+    /// 提示，而配置文件路径在这类问题里正是要定位的信息，放在 details 里
+    /// 既能被日志结构化采集，也不会混进用户可见文案。
+    fn config_invalid(&self, what: &str, cause: String) -> ServiceError {
+        let mut details = Map::new();
+        details.insert(
+            "config_path".to_owned(),
+            Value::from(self.path.display().to_string()),
+        );
+        details.insert("cause".to_owned(), Value::from(cause));
+        ServiceError::config_invalid(format!("{what}（{}）", self.path.display()), details)
     }
 
     /// 读当前值的**公开**快照（剔除只读键）。

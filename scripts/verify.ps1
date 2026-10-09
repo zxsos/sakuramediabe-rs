@@ -17,9 +17,17 @@
 # Labels are ASCII on purpose: PowerShell 5.1 reads a BOM-less file as
 # ANSI, and CJK in the output turned into mojibake.
 #
-# Usage:  powershell -File scripts/verify.ps1
+# Usage:
+#   powershell -File scripts/verify.ps1 -Tier fast   # 秒级：fmt + lint + 单元测试
+#   powershell -File scripts/verify.ps1 -Tier db     # 加数据库集成测试
+#   powershell -File scripts/verify.ps1              # 提交前：全量 + parity
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    # fast = 不碰数据库的循环；db = 加集成测试；full = 全部（默认）。
+    # 分层的理由：全量一次要几分钟，而绝大多数提交只需要「我改的东西没坏」。
+    # 顺序即代价递增，所以默认仍是 full —— 便宜的全跑不能替代贵的。
+    [ValidateSet('fast', 'db', 'full')]
+    [string]$Tier = 'full'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -29,6 +37,9 @@ $parity = Join-Path $PSScriptRoot '..\parity'
 # Integration tests need a real database. Without this they skip rather
 # than fail, so a green run locally does not imply they executed.
 $env:SMDB_TEST_DATABASE_URL = 'postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test'
+# Qdrant tests skip without this too. Port 6334 is gRPC (what the client
+# speaks); the 6333 default in config_schema is REST and will not work.
+$env:SMVEC_TEST_QDRANT_URL = 'http://127.0.0.1:6334'
 
 $failed = New-Object System.Collections.ArrayList
 
@@ -72,25 +83,55 @@ Step 'clippy --all-targets --all-features' {
     cargo clippy --manifest-path $manifest --workspace --all-targets --all-features -- -D warnings
 }
 
+# The test tiers. `fast` shrinks the expensive steps rather than silently
+# skipping them, so the label always says what actually ran.
+$runIntegration = $Tier -ne 'fast'
+$runQdrant = $Tier -eq 'full'
+$runParity = $Tier -eq 'full'
+
 if (-not $SkipTests) {
     Write-Host 'test'
-    Step 'cargo test --offline' { cargo test --manifest-path $manifest --offline }
+    # `--lib` only: the in-crate unit tests, no database, no linking of the
+    # 57 integration binaries. That linking is most of the wall clock on a
+    # cold target dir, and it is wasted work for a fast loop.
+    Step 'cargo test --lib (unit only)' {
+        cargo test --manifest-path $manifest --offline --workspace --lib
+    }
+    if ($runIntegration) {
+        # --tests picks up every tests/ target, which is where TestDb lives.
+        Step 'cargo test --tests (integration, needs PostgreSQL)' {
+            cargo test --manifest-path $manifest --offline --workspace --tests
+        }
+    }
+    if ($runQdrant) {
+        # Named explicitly: these skip silently when SMVEC_TEST_QDRANT_URL is
+        # unset, and a skip looks exactly like a pass in the summary.
+        Step 'qdrant (needs Qdrant on :6334)' {
+            cargo test --manifest-path $manifest --offline -p sm-service --test qdrant_dense
+        }
+    }
 }
 
-Write-Host 'parity'
-Step 'schema' { python (Join-Path $parity 'compare_schema.py') }
-Step 'compare' { python (Join-Path $parity 'compare.py') }
-Step 'core' { python (Join-Path $parity 'compare_core.py') }
+if ($runParity) {
+    Write-Host 'parity'
+    Step 'schema' { python (Join-Path $parity 'compare_schema.py') }
+    Step 'compare' { python (Join-Path $parity 'compare.py') }
+    Step 'core' { python (Join-Path $parity 'compare_core.py') }
 
-# 第七道门。存在的原因见 parity/check_paged_wrappers.py 的文档字符串：
-# paged_list! 自己会生成整个方法（含 page 参数），在外面再手写一层包装
-# 会让函数体返回 ()。编译器会报，但指向宏展开处而不是真正的错误位置。
-# 这个错在本次重构里犯了五次，每一次都要等编译失败才发现。
-Step 'paged wrappers' { python (Join-Path $parity 'check_paged_wrappers.py') }
+    # 第七道门。存在的原因见 parity/check_paged_wrappers.py 的文档字符串：
+    # paged_list! 自己会生成整个方法（含 page 参数），在外面再手写一层包装
+    # 会让函数体返回 ()。编译器会报，但指向宏展开处而不是真正的错误位置。
+    # 这个错在本次重构里犯了五次，每一次都要等编译失败才发现。
+    Step 'paged wrappers' { python (Join-Path $parity 'check_paged_wrappers.py') }
+}
+else {
+    Write-Host 'parity'
+    Write-Host '  SKIP  parity (needs -Tier full)'
+}
 
 Write-Host ''
 if ($failed.Count -gt 0) {
     Write-Host ('FAILED: ' + ($failed -join ', '))
     exit 1
 }
-Write-Host 'all gates passed'
+Write-Host ('all gates passed (tier: ' + $Tier + ')')

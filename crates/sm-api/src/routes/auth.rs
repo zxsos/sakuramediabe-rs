@@ -11,10 +11,37 @@
 //! 但它是上游的既有行为，改掉会让「access 过期、只剩 refresh」的客户端
 //! 拿不到新令牌 —— 那正是刷新存在的场景。上游既然这么写，就照搬。
 //!
-//! # 不实现 `/auth/docs-token`
+//! # `/auth/docs-token` **刻意不实现**（是决定，不是待办）
 //!
-//! 上游有个 `include_in_schema=False` 的 `docs-token`（`:46-55`），只为
-//! Swagger 的 OAuth2 表单服务，不在 OpenAPI 契约里。本批不搬。
+//! 上游有个 `include_in_schema=False` 的 `POST /auth/docs-token`
+//! （`routers/system/auth.py:46-55`），只做两件事：
+//!
+//! 1. 收 **form 编码**的 `username` / `password`（`OAuth2PasswordRequestForm`，
+//!    不是 JSON —— 与本模块两个端点的 `EnvelopeJson` 不同）
+//! 2. 只回 `{access_token, token_type}` 两个字段（**没有** `refresh_token`）
+//!
+//! 它的**唯一消费方是 Swagger UI 的 OAuth2 密码表单**
+//! （`deps.py:8` 的 `tokenUrl="/auth/docs-token"`）。
+//!
+//! ## 本仓库没有那个消费方
+//!
+//! 实测：`sm-api` 无 `/docs` 路由，全仓无 `utoipa` 依赖（0 处引用），
+//! 无 Swagger / Redoc / Rapidoc / Scalar。`enable_docs` 这个配置键只在
+//! `sm_core::config_schema.rs:132` 的**键描述**里出现（从上游 schema 抄来的），
+//! 没有任何代码读它。
+//!
+//! ## 所以不实现
+//!
+//! 实现它要付出：为 `axum` 加 `form` feature、写一个新的 form 提取器
+//! （本仓库的 `extract.rs` 只有 `Json` / `Query` / `Multipart`）、
+//! 加一个没人调用的 handler。**用一个没有调用方的端点去把上游的 126 凑齐，
+//! 会让「端点数」这个指标失去意义** —— 它本来就不该计入契约。
+//!
+//! 什么时候该做：等仓库真的接了 OpenAPI/Swagger（那时 `include_in_schema`
+//! 才有对应物，`utoipa` 的 `#[utoipa(path(exclude))]` 才能落地）。
+//!
+//! 参考：`docs/handoff.md` 第五节「上游的缺陷刻意照抄」是另一回事 ——
+//! 那条是**照抄缺陷**，这条是**不实现无消费方的端点**。
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};

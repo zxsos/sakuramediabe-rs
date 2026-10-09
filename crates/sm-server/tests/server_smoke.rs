@@ -29,6 +29,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 const STARTUP_BUDGET: Duration = Duration::from_secs(20);
+/// 优雅关闭的等待上限。**只有 Unix 用例用得上** —— Windows 上没有跨进程
+/// SIGTERM，那个断言被 `#[cfg(unix)]` 排除了（理由见用例文档）。常量必须
+/// 一起排除，否则 clippy 的 `-D warnings` 会报 never-used。
+#[cfg(unix)]
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 
 fn test_url() -> Option<String> {
@@ -58,7 +62,7 @@ fn wait_until_listening(addr: SocketAddr, budget: Duration) {
 }
 
 #[tokio::test]
-async fn the_binary_serves_the_error_envelope_and_exits_cleanly_on_sigterm() {
+async fn the_binary_serves_the_error_envelope() {
     let Some(database_url) = test_url() else {
         eprintln!("SKIP: 未设置 SMDB_TEST_DATABASE_URL / DATABASE_URL");
         return;
@@ -94,6 +98,49 @@ async fn the_binary_serves_the_error_envelope_and_exits_cleanly_on_sigterm() {
         body["error"]["message"].is_string(),
         "信封必须带 message：{body}"
     );
+
+    // 跨平台到这里为止。优雅关闭的断言见下面的 Unix 专属用例。
+    child.kill().await.ok();
+}
+
+/// SIGTERM → 优雅关闭，退出码 0。
+///
+/// # 为什么只在 Unix 上跑
+///
+/// **Windows 没有跨进程 SIGTERM。** `kill -TERM` 在 Windows 上要么不存在，
+/// 要么被映射成 `TerminateProcess`（等同强杀）—— 于是
+/// `status.success()` 拿到的不是 0，而下面断言的正是「走优雅关闭路径才拿 0」。
+///
+/// 这不是「Windows 支持不好」，而是**这条断言测的是信号语义**。把它硬套到
+/// Windows 上只有两种结果：假红，或者把断言改成「反正能退出」而失去意义。
+/// 所以按平台切开：跨平台部分在上面那个用例里验（启动 + 404 信封），
+/// 优雅关闭只在它真正成立的平台上验。
+///
+/// 在 Windows 上想要等价的覆盖，验的是另一件事：`child.kill()` 之后进程确实
+/// 消失（`kill_on_drop(true)` 已经兜底），而不是「优雅关闭返回 0」。
+#[cfg(unix)]
+#[tokio::test]
+async fn the_binary_exits_cleanly_on_sigterm() {
+    let Some(database_url) = test_url() else {
+        eprintln!("SKIP: 未设置 SMDB_TEST_DATABASE_URL / DATABASE_URL");
+        return;
+    };
+
+    let port = free_port();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_sm-server"))
+        .env("SAKURAMEDIA_DATABASE_URL", &database_url)
+        .env("SAKURAMEDIA_JWT_SECRET", "smoke-secret")
+        .env("SAKURAMEDIA_HOST", "127.0.0.1")
+        .env("SAKURAMEDIA_PORT", port.to_string())
+        .env("SAKURAMEDIA_SCHEDULER_ENABLED", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("启动 sm-server");
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    wait_until_listening(addr, STARTUP_BUDGET);
 
     // SIGTERM → 优雅关闭。容器里发的是它。
     let killed = std::process::Command::new("kill")

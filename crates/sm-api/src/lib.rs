@@ -42,6 +42,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod config;
 pub mod dto;
 pub mod error;
 pub mod extract;
@@ -67,6 +68,7 @@ use tower_http::cors::CorsLayer;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(routes::account::routes())
+        .merge(routes::activity::routes())
         .merge(routes::actors::routes())
         .merge(routes::auth::routes())
         .merge(routes::clip_collections::routes())

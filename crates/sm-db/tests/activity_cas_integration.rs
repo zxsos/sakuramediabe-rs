@@ -68,13 +68,21 @@ async fn mark_running_only_moves_pending_and_never_rewrites_started_at() {
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let id = seed(&repo, "mark_running").await;
 
-    let first = repo.mark_running(id).await.expect("第一次").expect("行存在");
+    let first = repo
+        .mark_running(id)
+        .await
+        .expect("第一次")
+        .expect("行存在");
     assert_eq!(first.state, task_state::RUNNING);
     let started_at = first.started_at;
     assert!(started_at.is_some(), "running 行必须有 started_at");
 
     // 幂等：第二次不匹配 pending，返回原行且不改写 started_at。
-    let second = repo.mark_running(id).await.expect("第二次").expect("行存在");
+    let second = repo
+        .mark_running(id)
+        .await
+        .expect("第二次")
+        .expect("行存在");
     assert_eq!(second.state, task_state::RUNNING);
     assert_eq!(
         second.started_at, started_at,
@@ -85,8 +93,16 @@ async fn mark_running_only_moves_pending_and_never_rewrites_started_at() {
     repo.complete_active(id, Some(&json!({"ok": 1})), None)
         .await
         .expect("收口");
-    let after = repo.mark_running(id).await.expect("终态后再调").expect("行存在");
-    assert_eq!(after.state, task_state::COMPLETED, "终态行不得被拉回 running");
+    let after = repo
+        .mark_running(id)
+        .await
+        .expect("终态后再调")
+        .expect("行存在");
+    assert_eq!(
+        after.state,
+        task_state::COMPLETED,
+        "终态行不得被拉回 running"
+    );
 }
 
 #[tokio::test]
@@ -116,7 +132,10 @@ async fn complete_active_merges_summary_and_derives_text_from_it() {
     let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let id = seed(&repo, "merge").await;
-    repo.mark_running(id).await.expect("标记运行").expect("行存在");
+    repo.mark_running(id)
+        .await
+        .expect("标记运行")
+        .expect("行存在");
 
     // 先写一次进度摘要。
     repo.report_progress_active(id, &TaskProgress::default(), Some(&json!({"processed": 3})))
@@ -149,7 +168,10 @@ async fn losing_the_race_yields_the_persisted_terminal_state() {
     let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let id = seed(&repo, "race").await;
-    repo.mark_running(id).await.expect("标记运行").expect("行存在");
+    repo.mark_running(id)
+        .await
+        .expect("标记运行")
+        .expect("行存在");
 
     let (_, first_won) = repo
         .fail_active(id, "先到的失败", None)
@@ -188,7 +210,10 @@ async fn fail_active_also_releases_the_mutex_key() {
     let mut draft = task("mutex_release");
     draft.mutex_key = Some("aps:mutex_release".to_owned());
     let run = repo.enqueue(&draft).await.expect("入队");
-    repo.mark_running(run.id).await.expect("标记运行").expect("行存在");
+    repo.mark_running(run.id)
+        .await
+        .expect("标记运行")
+        .expect("行存在");
 
     let (failed, won) = repo
         .fail_active(run.id, "boom", None)
@@ -211,7 +236,10 @@ async fn report_progress_active_touches_only_the_fields_it_was_given() {
     let db = TestDb::require().await;
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let id = seed(&repo, "progress").await;
-    repo.mark_running(id).await.expect("标记运行").expect("行存在");
+    repo.mark_running(id)
+        .await
+        .expect("标记运行")
+        .expect("行存在");
 
     repo.report_progress_active(
         id,
@@ -261,11 +289,7 @@ async fn report_progress_active_touches_only_the_fields_it_was_given() {
         .expect("终态后写进度")
         .expect("行存在");
     assert_eq!(terminal.state, task_state::COMPLETED);
-    assert_ne!(
-        terminal.progress_current,
-        Some(9),
-        "终态行不得再被写进度"
-    );
+    assert_ne!(terminal.progress_current, Some(9), "终态行不得再被写进度");
 }
 
 #[tokio::test]
@@ -274,7 +298,11 @@ async fn create_once_keeps_exactly_one_notification_per_dedupe_key() {
     let repo = SystemNotificationRepository::new(db.pool().clone());
     // `related_task_run_id` 有外键指向 `background_task_run`，必须给一个
     // 真实存在的行 —— 这正是「通知挂在任务上」这条契约的 enforcement。
-    let run_id = seed(&BackgroundTaskRunRepository::new(db.pool().clone()), "notify_target").await;
+    let run_id = seed(
+        &BackgroundTaskRunRepository::new(db.pool().clone()),
+        "notify_target",
+    )
+    .await;
 
     let first = repo
         .create_once(&task_result_notification(run_id, "task_run_result:1"))
@@ -309,7 +337,11 @@ async fn create_once_rejects_a_blank_dedupe_key_instead_of_skipping_dedupe() {
 async fn releasing_the_dedupe_key_allows_the_next_reminder() {
     let db = TestDb::require().await;
     let repo = SystemNotificationRepository::new(db.pool().clone());
-    let run_id = seed(&BackgroundTaskRunRepository::new(db.pool().clone()), "release_target").await;
+    let run_id = seed(
+        &BackgroundTaskRunRepository::new(db.pool().clone()),
+        "release_target",
+    )
+    .await;
 
     let first = repo
         .create_once(&task_result_notification(run_id, "task_run_result:2"))

@@ -6,12 +6,15 @@
 
 | 项 | 值 |
 |---|---|
-| API 端点 | 65 / 126（~52%） |
-| 服务域 | 2 完成（`collections` / `videos`）、4 进行中、1 未开工（`discovery`） |
+| API 端点 | **76 / 126（~60%）** —— 方法级口径，实测 2026-10-05 |
+| 服务域 | 6 个域有代码（`system` 17 文件 / `catalog` 7 / `playback` 6 / `collections` 4 / `transfers` 3 / `videos` 3），`discovery` 未开工 |
+| 调度 | 19 个内建任务，cron **16/16 全注册**（3 个是 `manual_only`，按 `contracts.py:43-49` 本就不该有 cron）；worker 骨架已落地，**handler 1/21** |
 | 门禁 | 七道全绿（fmt / doc / clippy / workspace test / schema 40-40 对拍 / hash 44-44 / core 64-64 / paged wrappers） |
-| 代码量 | Rust src 约 49k + tests 约 24k（含 13k 文档注释） |
+| 代码量 | `sm-service` src 43 文件 / 13,715 行；tests 15 文件 / 6,809 行 |
 
 开工前先跑一遍 `bash scripts/verify.sh` 确认基线是绿的，再动手。
+**`upstream/` 是目录联接（junction）**指向 `../sakuramediabe` 等真实仓库，
+不占额外磁盘 —— 别把它当成副本删掉。
 
 ## 二、上游参照物（都已克隆在 `upstream/`，`.gitignore` 忽略）
 
@@ -32,7 +35,8 @@
 待做（按序）：
 
 1. ~~**`RunJob` 的流式调用**~~ **已完成**（`runner.rs` + `scheduling.rs`）：`stream JobEvent` 收敛成终态，超时即 `drop(stream)` 表达取消（proto 的「宿主直接断开流」）；cron 触发那半是 `JobDefinition.default_cron` / `manual_only` → `sm_scheduler::JobSpec`，与内建任务共用同一套到点判定与 coalesce。
-   **唯一没接的是组合根**：`sm-server` 仍刻意不依赖 `sm-plugins`，等第 3 步（进程生命周期）落地时把 `scheduler_specs()` 并进 `builtin_jobs()` —— 在那之前插件任务只能由集成测试驱动。
+   组合根**已接上**（原先这里写的是「仍刻意不依赖 `sm-plugins`」，与下面第 3 步的「看门狗与组合根也已接上」自相矛盾 —— `sm-server/Cargo.toml` 里 `sm-plugins = { workspace = true }`，`sm-server/src/plugins.rs` 存在，插件任务已并进调度表）。
+   剩一处刻意的局限：插件重启后**新增**的 cron 任务要等下次进程启动才生效（`Scheduler` 的任务清单构造时定死），已在表里的不受影响。
 2. **三个扩展点的调用面**：`media.provider`（已有注册表）/ `catalog.metadata_source` / `discovery.ranking_source`。
    **已完成**（`extensions.rs` + `extension_calls.rs`）：两个扩展点的载荷校验、`source_key` / `board_key` 形状、缺 capability 不收、排行榜 `source_key` 冲突时该插件的榜单全部不收（对齐 `apply_plugin_ranking_sources`）；调用面真发 rpc，并把「未收录」（`found=false`）与「调用失败」分成两类结果。
    **交付校验已补**（`movie_delivery.rs`）：图片必须落在 `FetchMovieRequest.delivery_dir` 内、是普通文件、再深一层且同一请求目录；`release_date` 严格 `YYYY-MM-DD`、`duration > 0`；用完 `cleanup_delivery`。判据是 proto 给的，不依赖 `plugins.root_dir`。
@@ -43,9 +47,14 @@
    **一处刻意的局限**：重启后不重挂调度表（`Scheduler` 的任务清单构造时定死），所以插件重启后**新增**的 cron 任务要等下次进程启动才生效；已在表里的不受影响。
 4. **数据面**（`data_plane_endpoint`）：**经查证上游 Python 与 proto 均无协议定义**，是预留设计位 —— 协议定了再做，不要凭空发明。
 
-### 块 B：`system` 剩 11 个文件
+### 块 B：`system` 域 —— `jobs` 与 `activity` 已落地
 
-`jobs` / `activity` 等可做；`plugins` 那部分要等插件宿主。
+原写「剩 11 个文件」，实测已经不成立：
+
+- **`jobs`**：`GET /system/jobs`（列表）与 `POST /system/jobs/{task_key}/run`（触发）两条都在 `routes/jobs.rs`。列表的 `last_task_run` 用一次子查询（`MAX(id) GROUP BY task_key`）拿全部，不是 N+1。
+- **`activity`**：整包 6 个端点在 `routes/activity.rs` —— bootstrap / notifications 列表 / 批量已读 / 全部已读 / task-runs / task-runs-active。DB → service → 路由三层都在。
+
+剩下的 `telemetry`（约 188 行）可做；`plugins` 那部分要等插件宿主，`image_search_reset` 与 `metadata_provider_probe` 要等 Qdrant 与 metadata source。
 
 ### 块 C：插件 ABI 之后才解锁的（约 40 条端点）
 
@@ -86,6 +95,6 @@ transfers 编排、`/files/*` 与 `/media/{id}/play/{path}` 签名路由、multi
 
 ## 六、待确认/待办
 
-- `scripts/run-tests.sh`（未跟踪）引用了不存在的 `scripts/test_targets.py` —— 要么补要么删。
-- 有个残留的 `git stash` 条目（含 `scripts/run-tests.sh`），清理前先确认内容。
+- ~~`scripts/run-tests.sh`（未跟踪）引用了不存在的 `scripts/test_targets.py`~~ —— **已失效**：工作区 0 个未跟踪文件，`scripts/run-tests.sh` 本身已不存在。
+- `stash@{0}` 还在，内容**不是**上面那条 —— 是「契约层拆仓」那批（根 `Cargo.toml` 改 `git + tag = "v0.1.0"` 依赖、删 `crates/sm-plugin-api/` 与 `proto/`，10 文件 -2315 行）。契约 crate 本身已验证能编译，**三个引用方（`sm-plugins` / `sm-server` / `plugin-ref-local`）当时未验证**就存起来了。取出前先跑一遍那三个 crate 的 `cargo check`。
 - 前端契约对拍还没做（前端已在 `upstream/sakuramedia`）。已知两处可能与前端不一致：分页响应多一个 `synced_at: null`；时间戳是 naive UTC 而上游是运行时本地时区。

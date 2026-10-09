@@ -56,8 +56,8 @@ use sm_db::Db;
 use sm_service::system::activity::{run_task, TaskHandler, TaskRunError, TaskRunService};
 use sm_service::system::activity_cleanup::RetentionPolicy;
 use sm_service::system::optional_services::job_disabled_reason;
-use sm_service::system::ActivityCleanupService;
 use sm_service::system::task_queue::{TaskQueueService, DEFAULT_LEASE_SECONDS};
+use sm_service::system::ActivityCleanupService;
 use sm_service::system::ConfigService;
 use tracing::{error, info, warn};
 
@@ -71,11 +71,8 @@ pub const LANE_TRANSFER: &str = "transfer";
 /// 各道的默认并发度。对应上游 `LANE_CONCURRENCY`
 /// （`queue_tasks.py:23-27`），其中 `default` 会被配置
 /// `scheduler.worker_default_concurrency` 覆盖。
-pub const LANE_CONCURRENCY: [(&str, usize); 3] = [
-    (LANE_DEFAULT, 4),
-    (LANE_IMPORT, 2),
-    (LANE_TRANSFER, 1),
-];
+pub const LANE_CONCURRENCY: [(&str, usize); 3] =
+    [(LANE_DEFAULT, 4), (LANE_IMPORT, 2), (LANE_TRANSFER, 1)];
 
 /// default 道领取时**必须排除**的 `task_key`。
 ///
@@ -110,9 +107,8 @@ pub type HandlerFactory =
 /// 「租约被回收」这两种「可能留下半成品」的情形收口。
 ///
 /// 收口本身要查库，所以是异步的 —— 与 [`HandlerFactory`] 同样的理由。
-pub type BusinessRecovery = Box<
-    dyn Fn(&Db) -> Pin<Box<dyn Future<Output = Result<(), WorkerError>> + Send>> + Send + Sync,
->;
+pub type BusinessRecovery =
+    Box<dyn Fn(&Db) -> Pin<Box<dyn Future<Output = Result<(), WorkerError>> + Send>> + Send + Sync>;
 
 /// worker 侧的错误。
 #[derive(Debug)]
@@ -192,12 +188,7 @@ impl HandlerRegistry {
         self.recoveries.contains_key(task_key)
     }
 
-    fn build(
-        &self,
-        db: &Db,
-        task_key: &str,
-        params: &Value,
-    ) -> Result<TaskHandler, WorkerError> {
+    fn build(&self, db: &Db, task_key: &str, params: &Value) -> Result<TaskHandler, WorkerError> {
         self.factories
             .get(task_key)
             .ok_or_else(|| WorkerError::NoHandler(task_key.to_owned()))?(db, params)
@@ -329,10 +320,12 @@ fn lanes_for(name: &str) -> TaskLanes {
     if name == LANE_DEFAULT {
         TaskLanes::excluding(NON_DEFAULT_LANE_TASK_KEYS)
     } else {
-        TaskLanes::including(NON_DEFAULT_LANE_TASK_KEYS
-            .iter()
-            .copied()
-            .filter(|key| lane_of(key) == name))
+        TaskLanes::including(
+            NON_DEFAULT_LANE_TASK_KEYS
+                .iter()
+                .copied()
+                .filter(|key| lane_of(key) == name),
+        )
     }
 }
 
@@ -350,7 +343,8 @@ pub fn lane_of(task_key: &str) -> &'static str {
 
 /// 后台 worker 句柄。
 ///
-/// 组合根（`sm-server`）拿它 [`spawn`](TaskWorkerHandle::spawn)，关停时
+/// 组合根（`sm-server`）拿它启动，关停时调
+/// [`shutdown`](TaskWorkerHandle::shutdown)，
 /// [`shutdown`](TaskWorkerHandle::shutdown)。
 pub struct TaskWorkerHandle {
     stop: Arc<AtomicBool>,
@@ -368,11 +362,9 @@ impl TaskWorkerHandle {
         self.stop.store(true, Ordering::Relaxed);
         for join in self.joins.drain(..) {
             join.await.map_err(|error| {
-                sm_service::error::ServiceError::from(
-                    sm_service::error::ProgrammerError::new(format!(
-                        "worker 任务异常结束：{error}"
-                    )),
-                )
+                sm_service::error::ServiceError::from(sm_service::error::ProgrammerError::new(
+                    format!("worker 任务异常结束：{error}"),
+                ))
             })?;
         }
         Ok(())
@@ -547,7 +539,12 @@ async fn execute(ctx: &ClaimContext, claimed: sm_db::repo::ClaimedTask) {
                 )
                 .await
             {
-                error!(task_key, task_run_id, code = error.code(), "跳过任务的收口失败");
+                error!(
+                    task_key,
+                    task_run_id,
+                    code = error.code(),
+                    "跳过任务的收口失败"
+                );
             } else {
                 info!(task_key, task_run_id, reason = %reason, "任务因功能停用被跳过");
             }
@@ -565,7 +562,12 @@ async fn execute(ctx: &ClaimContext, claimed: sm_db::repo::ClaimedTask) {
                 .fail_task_run(task_run_id, &error.to_string(), None, true)
                 .await
             {
-                error!(task_key, task_run_id, code = failure.code(), "未知任务键的收口失败");
+                error!(
+                    task_key,
+                    task_run_id,
+                    code = failure.code(),
+                    "未知任务键的收口失败"
+                );
             } else {
                 warn!(
                     task_key,
@@ -584,14 +586,7 @@ async fn execute(ctx: &ClaimContext, claimed: sm_db::repo::ClaimedTask) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(task_run_id);
 
-    let outcome = run_task(
-        &ctx.db,
-        handler,
-        task_run_id,
-        Some(&task_key),
-        true,
-    )
-    .await;
+    let outcome = run_task(&ctx.db, handler, task_run_id, Some(&task_key), true).await;
 
     // ④ 无论成败都要移出在飞行集合 —— 否则 housekeeper 会一直续一条已经
     // 终态的行的租约，而它已经不需要租约了。
@@ -614,10 +609,18 @@ async fn execute(ctx: &ClaimContext, claimed: sm_db::repo::ClaimedTask) {
         }
         Err(TaskRunError::Finalized { state, .. }) => {
             // 别人收的终态。不重试、不改判 —— 服从持久状态。
-            warn!(task_key, task_run_id, state, "本执行器未赢得状态转移，已服从持久终态");
+            warn!(
+                task_key,
+                task_run_id, state, "本执行器未赢得状态转移，已服从持久终态"
+            );
         }
         Err(TaskRunError::Service(error)) => {
-            error!(task_key, task_run_id, code = error.code(), "任务执行时服务层出错");
+            error!(
+                task_key,
+                task_run_id,
+                code = error.code(),
+                "任务执行时服务层出错"
+            );
         }
     }
 }

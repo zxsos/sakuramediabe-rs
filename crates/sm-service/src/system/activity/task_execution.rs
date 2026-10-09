@@ -49,8 +49,7 @@ pub type TaskHandlerResult = Result<Value, String>;
 
 /// 任务执行体。返回一个 boxed future —— handler 需要 `await`。
 pub type TaskHandler = Box<
-    dyn FnOnce(TaskRunReporter) -> Pin<Box<dyn Future<Output = TaskHandlerResult> + Send>>
-        + Send,
+    dyn FnOnce(TaskRunReporter) -> Pin<Box<dyn Future<Output = TaskHandlerResult> + Send>> + Send,
 >;
 
 /// 进度与摘要的上报句柄。
@@ -96,12 +95,11 @@ impl TaskRunReporter {
         summary_patch: Option<&Value>,
     ) -> Result<(), ServiceError> {
         {
-            let mut guard = self
-                .summary
-                .lock()
-                .map_err(|_| ServiceError::from(crate::error::ProgrammerError::new(
+            let mut guard = self.summary.lock().map_err(|_| {
+                ServiceError::from(crate::error::ProgrammerError::new(
                     "TaskRunReporter 的 summary 锁已中毒",
-                )))?;
+                ))
+            })?;
             *guard = result_summary::merge(Some(&guard), summary_patch);
         }
         let snapshot = self.snapshot();
@@ -220,7 +218,12 @@ pub async fn run_task(
         Err(error_message) => {
             let reporter_summary = reporter.snapshot();
             let failure = task_runs
-                .fail_task_run(task_run_id, &error_message, Some(&reporter_summary), notify_result)
+                .fail_task_run(
+                    task_run_id,
+                    &error_message,
+                    Some(&reporter_summary),
+                    notify_result,
+                )
                 .await
                 .map_err(TaskRunError::Service)?;
 
@@ -239,10 +242,7 @@ pub async fn run_task(
                 return Err(TaskRunError::Finalized {
                     state: failure.run.state,
                     task_run_id,
-                    detail: terminal_detail(
-                        &failure.run.error_message,
-                        &failure.run.result_text,
-                    ),
+                    detail: terminal_detail(&failure.run.error_message, &failure.run.result_text),
                 });
             }
 
@@ -281,11 +281,7 @@ pub async fn run_task(
                 ));
             }
 
-            tracing::info!(
-                task = log_task_name,
-                task_run_id,
-                "任务执行完成"
-            );
+            tracing::info!(task = log_task_name, task_run_id, "任务执行完成");
             Ok(result)
         }
     }

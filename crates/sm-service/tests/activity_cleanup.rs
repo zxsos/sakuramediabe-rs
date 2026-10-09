@@ -110,7 +110,7 @@ async fn count_key(db: &TestDb, task_key: &str) -> i64 {
 async fn notify(db: &TestDb, title: &str, related: Option<i32>) -> i32 {
     SystemNotificationRepository::new(db.pool().clone())
         .notify(&NewNotification {
-            category: "system".to_owned(),
+            category: "reminder".to_owned(),
             title: title.to_owned(),
             content: "c".to_owned(),
             event_type: None,

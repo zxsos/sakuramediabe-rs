@@ -109,28 +109,33 @@ struct Runtime {
     clip_root: PathBuf,
 }
 
-fn runtime(state: &AppState) -> Runtime {
-    let config = state.config().snapshot().unwrap_or_default();
-    let secret = config
-        .get("auth")
-        .and_then(|auth| auth.get("file_signature_secret"))
-        .and_then(serde_json::Value::as_str)
+/// 每请求解析出的运行时依赖。
+///
+/// # 配置读不了就让请求失败
+///
+/// 原来是 `state.config().snapshot().unwrap_or_default()`。那会把「配置文件
+/// 非法」吞成全默认配置，于是 `media_clip_root_path` 变空串、`clip_root`
+/// 退化成 `PathBuf::from(".")`，产物路径相对**进程工作目录**解析 ——
+/// `has_valid_artifact` 恒为 false，`clip_count` 恒为 0，而且不报任何错。
+///
+/// 这就是 `clip_collections_http.rs` 那 6 个测试的成因。它们不是测试的问题，
+/// 是这里静默降级被测出来了。
+fn runtime(state: &AppState) -> Result<Runtime, ErrorResponse> {
+    let config = crate::config::snapshot_or_500(state)?;
+    let secret = crate::config::string_at(&config, "auth", "file_signature_secret")
         .unwrap_or_default()
         .to_owned();
-    let root = config
-        .get("media")
-        .and_then(|media| media.get("media_clip_root_path"))
-        .and_then(serde_json::Value::as_str)
+    let root = crate::config::string_at(&config, "media", "media_clip_root_path")
         .unwrap_or_default()
         .to_owned();
-    Runtime {
+    Ok(Runtime {
         secret,
         clip_root: PathBuf::from(if root.is_empty() {
             ".".to_owned()
         } else {
             root
         }),
-    }
+    })
 }
 
 /// 两个 service：`ClipCollectionService` 管合集与成员，
@@ -216,7 +221,7 @@ async fn list_clip_collections(
     _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ClipCollectionResource>>, ErrorResponse> {
-    let rt = runtime(&state);
+    let rt = runtime(&state)?;
     let (collections, media) = services(&state, &rt);
     let rows = collections.list_collections(&media).await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -231,7 +236,7 @@ async fn get_clip_collection(
     State(state): State<AppState>,
     Path(path): Path<CollectionPath>,
 ) -> Result<Json<ClipCollectionResource>, ErrorResponse> {
-    let rt = runtime(&state);
+    let rt = runtime(&state)?;
     let (collections, media) = services(&state, &rt);
     let row = collections
         .get_with_count(&media, path.collection_id)
@@ -246,7 +251,7 @@ async fn create_clip_collection(
     State(state): State<AppState>,
     EnvelopeJson(payload): EnvelopeJson<ClipCollectionCreateRequest>,
 ) -> Result<(StatusCode, Json<ClipCollectionResource>), ErrorResponse> {
-    let rt = runtime(&state);
+    let rt = runtime(&state)?;
     let (collections, _media) = services(&state, &rt);
     // 宏的 `create` 返回 `ClipCollection` 本身（不是带计数的结构体）——
     // 而新建合集成员数必为 0，所以不需要再查一次。
@@ -273,7 +278,7 @@ async fn update_clip_collection(
     Path(path): Path<CollectionPath>,
     EnvelopeJson(payload): EnvelopeJson<ClipCollectionUpdateRequest>,
 ) -> Result<Json<ClipCollectionResource>, ErrorResponse> {
-    let rt = runtime(&state);
+    let rt = runtime(&state)?;
     let (collections, media) = services(&state, &rt);
     // `CollectionUpdate` 按值传 —— 宏生成的签名如此。宏的 `update` 返回
     // `ClipCollection` 本身，所以随后再取一次带计数的行。
@@ -300,7 +305,7 @@ async fn delete_clip_collection(
     State(state): State<AppState>,
     Path(path): Path<CollectionPath>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let (collections, _) = services(&state, &runtime(&state));
+    let (collections, _) = services(&state, &runtime(&state)?);
     collections.delete(path.collection_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -311,7 +316,7 @@ async fn list_clip_collection_clips(
     Path(path): Path<CollectionPath>,
     EnvelopeQuery(query): EnvelopeQuery<ListClipsQuery>,
 ) -> Result<Json<sm_core::pagination::Paginated<ClipCollectionClipItemResource>>, ErrorResponse> {
-    let rt = runtime(&state);
+    let rt = runtime(&state)?;
     let (collections, media) = services(&state, &rt);
     // 先确认合集存在 —— 上游 `_require_collection` 在 `validate_page` **之前**，
     // 所以「合集不存在」不能被报成分页错误。
@@ -359,7 +364,7 @@ async fn add_clip_to_collection(
     State(state): State<AppState>,
     Path(path): Path<MemberPath>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let (collections, _) = services(&state, &runtime(&state));
+    let (collections, _) = services(&state, &runtime(&state)?);
     collections.add(path.collection_id, path.clip_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -370,7 +375,7 @@ async fn remove_clip_from_collection(
     State(state): State<AppState>,
     Path(path): Path<MemberPath>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let (collections, _) = services(&state, &runtime(&state));
+    let (collections, _) = services(&state, &runtime(&state)?);
     collections.remove(path.collection_id, path.clip_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -385,7 +390,7 @@ async fn set_clip_collection_clips(
     Path(path): Path<CollectionPath>,
     EnvelopeJson(payload): EnvelopeJson<ClipCollectionSetClipsRequest>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let (collections, _) = services(&state, &runtime(&state));
+    let (collections, _) = services(&state, &runtime(&state)?);
     collections
         .set_members(path.collection_id, &payload.clip_ids)
         .await?;

@@ -4,7 +4,7 @@
 //! 上游那个类叫 `TaskRunService`，与 `TaskExecutionService` /
 //! `NotificationService` / `ActivityBootstrapService` 一起被 `ActivityService`
 //! 多继承组合。Rust 没有 mixin，所以按职责拆成模块、由
-//! [`super::ActivityService`] 持有一份仓储并转发。
+//! `super::ActivityService` 持有一份仓储并转发。
 //!
 //! # 为什么这一层不直接调 `finish` / `fail`
 //!
@@ -29,12 +29,14 @@
 //! `list_active_task_runs` 服务于 `GET /system/task-runs` 那批端点，
 //! 随 activity 的 HTTP 层一起落地。
 
+use serde_json::Value;
+use sm_core::pagination::Paginated;
+use sm_db::common::page::PageRequest;
 use sm_db::repo::{BackgroundTaskRunRepository, SystemNotificationRepository, TaskProgress};
 use sm_db::system::activity::BackgroundTaskRun;
 use sm_db::Db;
-use serde_json::Value;
 
-use crate::error::ServiceError;
+use crate::error::{details_of, ServiceError};
 
 use super::notifications::notify_task_result;
 use super::task_catalog::resolve_task_name;
@@ -48,6 +50,30 @@ fn task_run_not_found(task_run_id: i32) -> ServiceError {
         task_run_id,
     )
 }
+
+/// `trigger_type` 的合法取值。对应上游 `ALLOWED_TASK_TRIGGER_TYPES`
+/// （`task_runs.py:20`）。
+///
+/// 数据库对该列**没有 CHECK 约束** —— 上游也是。所以白名单只在这层生效，
+/// 绕过 service 直写库能塞进任何字面量，而按白名单筛选时它会静默消失。
+pub const ALLOWED_TASK_TRIGGER_TYPES: [&str; 5] =
+    ["scheduled", "manual", "startup", "internal", "plugin"];
+
+/// 合法排序规则。对应上游 `TASK_RUN_SORT_FIELDS`（`task_runs.py:23-30`）。
+///
+/// 每个值是 `字段:方向`。`id` 次级键由仓储固定追加，不在这里列出 ——
+/// 它不是可选维度。
+pub const TASK_RUN_SORT_FIELDS: [&str; 6] = [
+    "started_at:desc",
+    "started_at:asc",
+    "created_at:desc",
+    "created_at:asc",
+    "updated_at:desc",
+    "updated_at:asc",
+];
+
+/// 缺省排序。上游 `(sort or "started_at:desc")`（`task_runs.py:105`）。
+pub const DEFAULT_TASK_RUN_SORT: &str = "started_at:desc";
 
 /// 一次终态转移的结果。
 ///
@@ -210,6 +236,70 @@ impl TaskRunService {
     /// `task_catalog` 这个模块。
     pub fn resolve_task_name(&self, task_key: &str, task_name: Option<&str>) -> String {
         resolve_task_name(task_key, task_name)
+    }
+
+    // ------------------------------------------------------------ 读侧
+
+    /// 分页查询任务运行记录。
+    ///
+    /// 对应上游 `TaskRunService.list_task_runs`（`task_runs.py:347-367`）。
+    /// 三个筛选与排序都在这里**先校验再下发** —— 仓储层不认白名单，传非法值
+    /// 会退化成「只按 id DESC 排」，那是个稳定但无意义的顺序。
+    pub async fn list_task_runs(
+        &self,
+        state: Option<&str>,
+        trigger_type: Option<&str>,
+        task_key: Option<&str>,
+        sort: Option<&str>,
+        page: i64,
+        page_size: i64,
+    ) -> Result<Paginated<BackgroundTaskRun>, ServiceError> {
+        let state = super::filters::normalize_allowed_filter(
+            state,
+            "state",
+            &sm_db::system::activity::task_state::ALL,
+        )?;
+        let trigger_type = super::filters::normalize_allowed_filter(
+            trigger_type,
+            "trigger_type",
+            &ALLOWED_TASK_TRIGGER_TYPES,
+        )?;
+        // 任务键**区分大小写**，只折叠空白不 lower —— 见 filters 模块文档。
+        let task_key = super::filters::normalize_string_filter(task_key);
+
+        // 排序要 lower + trim（上游 `(sort or "started_at:desc").strip().lower()`）
+        let sort = super::filters::normalize_string_filter(sort)
+            .unwrap_or_else(|| DEFAULT_TASK_RUN_SORT.to_owned())
+            .to_lowercase();
+        if !TASK_RUN_SORT_FIELDS.contains(&sort.as_str()) {
+            return Err(ServiceError::validation_with(
+                "invalid_task_run_sort",
+                "任务排序规则不合法",
+                {
+                    let mut details = details_of("sort", sort);
+                    let mut allowed = TASK_RUN_SORT_FIELDS.to_vec();
+                    allowed.sort_unstable();
+                    details.insert("allowed_values".to_owned(), Value::from(allowed));
+                    details
+                },
+            ));
+        }
+
+        let request = PageRequest::new(page, page_size)?;
+        // `paged_list!` 把 `page: PageRequest` 追加在声明的参数之后。
+        let result = self
+            .runs
+            .list_runs(state, trigger_type, task_key, sort, request)
+            .await?;
+        Ok(result.into_paginated(&request))
+    }
+
+    /// 列出**进行中**（`pending` + `running`）的任务运行，新的在前。
+    ///
+    /// 对应上游 `list_active_task_runs`（`task_runs.py:370-376`）。**不
+    /// 分页** —— 语义是「现在有什么在跑」，分页会把在跑的任务挤到第二页。
+    pub async fn list_active_task_runs(&self) -> Result<Vec<BackgroundTaskRun>, ServiceError> {
+        Ok(self.runs.list_active_runs().await?)
     }
 }
 

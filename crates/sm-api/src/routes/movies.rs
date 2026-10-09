@@ -149,7 +149,7 @@ async fn list_subscribed_actor_latest_movies(
         .list_subscribed_actor_latest_movies(query.page, query.page_size)
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items
@@ -210,7 +210,7 @@ async fn list_movies_by_series(
         )
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items
@@ -419,7 +419,7 @@ async fn list_movies(
         .list_movies(&params, query.page, query.page_size)
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items
@@ -465,7 +465,7 @@ async fn list_latest_movies(
         .list_latest_movies(query.page, query.page_size)
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items

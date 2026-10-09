@@ -148,23 +148,27 @@ struct Runtime {
 /// 「列表里能拿到 stream_url、点开却 403」—— 看起来像签名算法坏了，
 /// 实际是取错了访问器。
 ///
-/// 取不到时**不报错**而是给空串 / 当前目录：那会让签名校验必然失败（403），
-/// 而不是让整个列表端点 500。配置缺失是部署问题，不该让读接口全部不可用。
-fn runtime(state: &AppState) -> Runtime {
-    let config = state.config().snapshot().unwrap_or_default();
-    let secret = config
-        .get("auth")
-        .and_then(|auth| auth.get("file_signature_secret"))
-        .and_then(serde_json::Value::as_str)
+/// # 「键不存在」容忍，「配置读不了」不容忍
+///
+/// 这两件事原来被 `unwrap_or_default()` 混成一件：
+///
+/// | 情况 | 处置 | 理由 |
+/// |---|---|---|
+/// | 配置文件不存在 | 用默认值 | 首次启动的正常路径 |
+/// | 配置合法但没有这个键 | 空串 / `.` | 功能没开，签名必然 403 —— 这是可诊断的 |
+/// | **配置文件非法** | **500 `config_invalid`** | 部署坏了，不该伪装成「功能没开」 |
+///
+/// 第三种原来会退化成第二种，于是 `clip_root` 指向进程工作目录、
+/// 产物存在性判定恒为 false，而错误信息是 403 或 0 —— **完全指错方向**。
+fn runtime(state: &AppState) -> Result<Runtime, ErrorResponse> {
+    let config = crate::config::snapshot_or_500(state)?;
+    let secret = crate::config::string_at(&config, "auth", "file_signature_secret")
         .unwrap_or_default()
         .to_owned();
-    let root = config
-        .get("media")
-        .and_then(|media| media.get("media_clip_root_path"))
-        .and_then(serde_json::Value::as_str)
+    let root = crate::config::string_at(&config, "media", "media_clip_root_path")
         .unwrap_or_default()
         .to_owned();
-    Runtime {
+    Ok(Runtime {
         secret,
         // 上游 `expanduser()` + 相对路径转 cwd + `resolve()`。这里只做绝对化：
         // 片段根目录在生产上是绝对路径，而 `~` 展开需要引入额外的 home 查找。
@@ -173,7 +177,7 @@ fn runtime(state: &AppState) -> Runtime {
         } else {
             root
         }),
-    }
+    })
 }
 
 fn service(state: &AppState, runtime: &Runtime) -> MediaClipService {
@@ -229,7 +233,7 @@ async fn list_media_clips(
     EnvelopeQuery(query): EnvelopeQuery<ListQuery>,
 ) -> Result<Json<sm_core::pagination::Paginated<MediaClipResource>>, ErrorResponse> {
     validate_exclude_collection_id(query.exclude_collection_id)?;
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     let page = service(&state, &runtime)
         .list(&ClipListParams {
             page: query.page,
@@ -284,7 +288,7 @@ async fn list_clips_for_media(
     State(state): State<AppState>,
     Path(media_id): Path<i32>,
 ) -> Result<Json<Vec<MediaClipResource>>, ErrorResponse> {
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     let page = service(&state, &runtime).list_for_media(media_id).await?;
     let now = now_seconds();
     Ok(Json(
@@ -305,7 +309,7 @@ async fn get_clip(
     State(state): State<AppState>,
     Path(path): Path<ClipPath>,
 ) -> Result<Json<MediaClipDetailResource>, ErrorResponse> {
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     let detail = service(&state, &runtime).detail(path.clip_id).await?;
     Ok(Json(detail_resource(&runtime, &detail)))
 }
@@ -339,7 +343,7 @@ async fn list_clip_thumbnails(
     State(state): State<AppState>,
     Path(path): Path<ClipPath>,
 ) -> Result<Json<Vec<MediaClipThumbnailResource>>, ErrorResponse> {
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     let detail = service(&state, &runtime).detail(path.clip_id).await?;
 
     // 详情已把图片批量取回；缩略图条目按 `image_id` 对回去，避免第二次查库。
@@ -373,7 +377,7 @@ async fn update_clip(
     Path(path): Path<ClipPath>,
     EnvelopeJson(payload): EnvelopeJson<MediaClipUpdateRequest>,
 ) -> Result<Json<MediaClipResource>, ErrorResponse> {
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     let (clip, cover) = service(&state, &runtime)
         .update_title(path.clip_id, &payload.title)
         .await?;
@@ -391,7 +395,7 @@ async fn delete_clip(
     State(state): State<AppState>,
     Path(path): Path<ClipPath>,
 ) -> Result<StatusCode, ErrorResponse> {
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
     service(&state, &runtime).delete(path.clip_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -443,7 +447,7 @@ async fn stream_clip(
         return Err(signature_invalid());
     }
 
-    let runtime = runtime(&state);
+    let runtime = runtime(&state)?;
 
     // 2) 验签。过期与不匹配是两个不同��错误码，客户端据此决定是「刷新 URL」
     //    还是「URL 被篡改」。

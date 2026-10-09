@@ -294,7 +294,7 @@ impl MoviePlotImageRepository {
 /// 新建一条通知。
 #[derive(Debug, Clone)]
 pub struct NewNotification {
-    /// 分类，有索引。取值必须是 [`notification_category`] 白名单之一。
+    /// 分类，有索引。取值必须是 `notification_category` 白名单之一。
     ///
     /// 此前这里是空的（上游枚举没被搬过来），所以只校验非空；白名单补全后
     /// 校验也跟着收紧 —— 未知分类会让客户端的分类筛选渲染不出对应分支。
@@ -467,10 +467,7 @@ impl SystemNotificationRepository {
     /// `dedupe_key` 为空是**调用错误**：上游直接
     /// `raise ValueError("notification_dedupe_key_required")`。想要不带
     /// 去重的普通通知请用 [`Self::notify`]（`NULL` 不参与唯一约束）。
-    pub async fn create_once(
-        &self,
-        new: &NewNotification,
-    ) -> Result<SystemNotification, DbError> {
+    pub async fn create_once(&self, new: &NewNotification) -> Result<SystemNotification, DbError> {
         new.validate()?;
         let dedupe_key = new
             .dedupe_key
@@ -489,14 +486,9 @@ impl SystemNotificationRepository {
         }
 
         // 冲突落败：回读既有行。唯一约束保证它此刻一定存在。
-        self.find_by_dedupe_key(dedupe_key)
-            .await?
-            .ok_or_else(|| {
-                DbError::business(
-                    NOTIFICATION_ENTITY,
-                    "create_once 冲突后回读不到既有行",
-                )
-            })
+        self.find_by_dedupe_key(dedupe_key).await?.ok_or_else(|| {
+            DbError::business(NOTIFICATION_ENTITY, "create_once 冲突后回读不到既有行")
+        })
     }
 
     /// 按去重键取一行。
@@ -519,13 +511,12 @@ impl SystemNotificationRepository {
     /// （`activity/notifications.py:103`）。**保留通知历史**以便下次同类事件
     /// 重新提醒 —— 置空键而不是删行正是这个用意。
     pub async fn release_dedupe_key(&self, dedupe_key: &str) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "UPDATE system_notification SET dedupe_key = NULL WHERE dedupe_key = $1",
-        )
-        .bind(dedupe_key)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
+        let result =
+            sqlx::query("UPDATE system_notification SET dedupe_key = NULL WHERE dedupe_key = $1")
+                .bind(dedupe_key)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DbError::from(e).with_entity(NOTIFICATION_ENTITY))?;
         Ok(result.rows_affected())
     }
 

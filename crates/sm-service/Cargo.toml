@@ -19,7 +19,11 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `discovery::qdrant` 的 upsert 重试要用 `tokio::time::sleep` 做退避。
+tokio = { workspace = true }
 reqwest = { workspace = true }
+# discovery 域的向量库存储层。Qdrant 走 gRPC，与插件 ABI 共用同一套 tonic/prost。
+qdrant-client = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
 sqlx = { workspace = true }
@@ -33,5 +37,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bcrypt = { workspace = true }
 sqlx = { workspace = true }
+# 集成测试（tests/）只链接 dev-dependencies，拿不到普通依赖里的 reqwest。
+# `embedding_http.rs` 要用 `reqwest::Client::builder().no_proxy()` 构造注入的
+# 客户端 —— no_proxy 是契约的一部分（见 TorznabClient 同款理由），不能省。
+reqwest = { workspace = true }
 # Torznab 的 HTTP 路径用假 indexer 起真实回环服务测（ADR §6）。
 wiremock = "0.6"

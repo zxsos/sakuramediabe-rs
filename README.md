@@ -46,15 +46,38 @@ SakuraMedia 后端的 Rust 重写实现。
 |---|---|---|---|
 | 模型 `model/` | 40 表 | 40 表 | **100% ✅** |
 | 仓储层 | 40 张表的读写 | 40 张表 | **100% ✅** |
-| 服务 `service/` | 114 文件 / 25,174 行 | `collections` + `videos` + `system`(8/11) + `playback`(3/19) | **~19%** |
+| 服务 `service/` | 43 文件 / 13,715 行 | `system`(17) + `catalog`(7) + `playback`(6) + `collections`(4) + `transfers`(3) + `videos`(3) | 6/7 域有代码 |
 | Schema `schema/` | 44 文件 | DTO 随端点落地（`sm-api::dto`） | 按需 |
-| API `api/` | 126 端点 | 65 个（auth 2 + config 2 + indexer-settings 3 + playlists 9 + status 4 + clip-collections 9 + media-clips 7 + actors 11 + downloads 1 + movies 11 + tags 3 + movie-subscriptions 3） | **~52%** |
-| 调度 `scheduler` | 19 个内建任务 | 16 个 cron 已注册（只入队） | **~84%** |
-| 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | 参考插件（4/37 rpc）+ 可行性实测 | **~3%** |
+| API `api/` | 126 端点 | 76 个（account 3 + activity 6 + actors 11 + auth 2 + clip-collections 9 + config 2 + downloads 1 + indexer-settings 3 + jobs 2 + media-clips 7 + movie-subscriptions 3 + movies 11 + playlists 9 + status 4 + tags 3） | **~60%** |
+| 调度 `scheduler` | 19 个内建任务 | **cron 注册 16/16 = 100%**；worker 骨架已落地；**handler 1/21** | 见下 |
+| 插件宿主 `sm-plugins` | 12 文件 / 3,090 行 | 注册 / 加载 / 执行 / 生命周期 / 扩展点 | 宿主可用，**缺真实 provider 插件** |
+| 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | ⚠️ **未复核**（用户要求先不管插件） | — |
+
+> 端点口径是**方法级**（path + method 组合），统计只取 `routes()` 函数体且**剥掉注释**。
+> 曾经用 `\.route\(` 计数会漏掉链式首调，用正则直接数又会漏掉 `axum::routing::put(...)`
+> 这种限定写法 —— 两种错法都让数字偏小，而偏小的进度看起来是「还差一些」而不是
+> 「统计口径本身就不可信」。
+
+### 调度的真实缺口不在 cron
+
+原文写「16/19 = 84%」，**分母是错的**。19 个内建任务里有 3 个是
+`manual_only=True`（`media_video_info_backfill`、`media_thumbnail_pack_backfill`、
+`movie_asset_pack_backfill`），而 `contracts.py:43-49` 的校验器**禁止 manual_only
+任务声明 cron** —— 所以应该有 cron 的就是 16 个，而 16 个已全部注册，**cron 这一半
+早就是 100%**。
+
+真正的缺口是 **handler 落地 1/21**（`sm-scheduler/src/worker.rs` 的
+`HandlerRegistry` 里只注册了 `activity_record_cleanup`）。其余 20 个按各自域的
+阻塞原因分布，见 [docs/service-progress.md](docs/service-progress.md) 的阻塞地图。
 
 > 逐域台账（已落规则 / 刻意不复刻 / 待核对项）见
-> [docs/service-progress.md](docs/service-progress.md)。**为什么只有 65 个端点**
+> [docs/service-progress.md](docs/service-progress.md)。**为什么只有 76 个端点**
 > 与「哪些端点在等哪个域」也记在那里 —— 百分比本身看不出这些。
+>
+> 上面这张表的数字实测于 **2026-10-05**。端点一项做了逐文件交叉校验：12 个原有
+> 文件的计数与旧表逐个吻合（合计 65），新增 11 个（account 3 + activity 6 +
+> jobs 由 1 增至 2）。改动端点时请一并更新此表，**并用同样的口径复算** ——
+> 口径错了数字只会偏小，而偏小的进度看不出「统计本身不可信」。
 
 ## 零外部依赖
 

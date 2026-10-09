@@ -33,19 +33,28 @@
 //! 落地，因为它们是纯函数、可以独立断言，且能挡住「空白与 `None` 混淆」
 //! 这类错误在读侧落地时才被发现。
 
+pub mod bootstrap;
 pub mod filters;
 pub mod notifications;
 pub mod task_catalog;
 pub mod task_execution;
 pub mod task_runs;
 
-pub use filters::{normalize_allowed_filter, normalize_string_filter};
-pub use notifications::{notify_task_result, task_result_dedupe_key, TASK_RESULT_EVENT};
-pub use task_catalog::{lookup_task_name, resolve_task_name, TASK_NAME_REGISTRY};
-pub use task_execution::{
-    run_task, TaskHandler, TaskHandlerResult, TaskRunError, TaskRunReporter,
+pub use bootstrap::{
+    ActivityBootstrap, ActivityBootstrapQuery, ActivityBootstrapService,
+    ACTIVITY_BOOTSTRAP_PAGE_SIZE,
 };
-pub use task_runs::{TaskRunService, TaskRunTransition};
+pub use filters::{normalize_allowed_filter, normalize_string_filter};
+pub use notifications::{
+    notify_task_result, task_result_dedupe_key, BatchReadResult, NotificationService,
+    TASK_RESULT_EVENT,
+};
+pub use task_catalog::{lookup_task_name, resolve_task_name, TASK_NAME_REGISTRY};
+pub use task_execution::{run_task, TaskHandler, TaskHandlerResult, TaskRunError, TaskRunReporter};
+pub use task_runs::{
+    TaskRunService, TaskRunTransition, ALLOWED_TASK_TRIGGER_TYPES, DEFAULT_TASK_RUN_SORT,
+    TASK_RUN_SORT_FIELDS,
+};
 
 /// `background_task_run.state` 的合法取值。
 ///

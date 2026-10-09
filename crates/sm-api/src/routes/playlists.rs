@@ -189,7 +189,7 @@ async fn list_playlist_movies(
         .await?;
 
     // 密钥与当前时间每次请求现取 —— 见 [`crate::signing`]。
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items

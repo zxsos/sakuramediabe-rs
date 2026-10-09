@@ -72,8 +72,13 @@ tonic-prost-build = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 
+# 向量库客户端（替代 Python qdrant-client）。与 tonic/prost 同一套 gRPC 栈，
+# 版本精确一致（Cargo.lock 里不会因此出现第二份 tonic/prost）。
+# 它唯一的必需增量是 `derive_builder`。
+qdrant-client = "1.19"
+
 # HTTP 客户端（替代 httpx）
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart"] }
 
 # 时间与标识
 chrono = { version = "0.4", features = ["serde"] }

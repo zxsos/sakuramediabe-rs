@@ -722,10 +722,8 @@ mod tests {
     /// 照抄理由与 `docs/handoff.md` 第五节那两条一致：修它会改变客户端
     /// 已渲染的文字，属于契约变更，该单独开一个 fix 并同步上游。
     /// **新增**内建任务若缺显示名，那不是照抄而是真缺陷 —— 断言会拦。
-    const UPSTREAM_REGISTRY_GAPS: [&str; 2] = [
-        "movie_asset_pack_backfill",
-        "media_thumbnail_pack_backfill",
-    ];
+    const UPSTREAM_REGISTRY_GAPS: [&str; 2] =
+        ["movie_asset_pack_backfill", "media_thumbnail_pack_backfill"];
 
     #[test]
     fn every_builtin_task_key_has_a_display_name_in_the_service_registry() {

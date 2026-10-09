@@ -30,8 +30,8 @@ pub mod task_queue;
 
 pub use account::AccountService;
 pub use activity::{
-    run_task, normalize_allowed_filter, normalize_string_filter, notification_category,
-    notify_task_result, resolve_task_name, task_result_dedupe_key, task_state, TaskHandler,
+    normalize_allowed_filter, normalize_string_filter, notification_category, notify_task_result,
+    resolve_task_name, run_task, task_result_dedupe_key, task_state, TaskHandler,
     TaskHandlerResult, TaskRunError, TaskRunReporter, TaskRunService, TaskRunTransition,
     TASK_NAME_REGISTRY, TASK_RESULT_EVENT,
 };

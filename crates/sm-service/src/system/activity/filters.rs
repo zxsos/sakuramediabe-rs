@@ -49,7 +49,12 @@ pub fn normalize_allowed_filter(
     details.insert("value".to_owned(), Value::String(normalized));
     details.insert(
         "allowed_values".to_owned(),
-        Value::Array(allowed.into_iter().map(|item| Value::String(item.to_owned())).collect()),
+        Value::Array(
+            allowed
+                .into_iter()
+                .map(|item| Value::String(item.to_owned()))
+                .collect(),
+        ),
     );
     Err(ServiceError::validation_with(
         "invalid_activity_filter",
@@ -103,7 +108,12 @@ mod tests {
         // allowed_values 必须排过序，否则客户端拿到的候选列表顺序不稳定。
         assert_eq!(
             details.get("allowed_values"),
-            Some(&serde_json::json!(["completed", "failed", "pending", "running"]))
+            Some(&serde_json::json!([
+                "completed",
+                "failed",
+                "pending",
+                "running"
+            ]))
         );
     }
 }

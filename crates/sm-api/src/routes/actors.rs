@@ -280,7 +280,7 @@ async fn list_actors(
     };
 
     let page = ActorService::new(state.db()).list(&params).await?;
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items
@@ -318,7 +318,7 @@ async fn get_actor(
     let view = ActorService::new(state.db()).detail(path.actor_id).await?;
     Ok(Json(ActorDetailResource::from_view(
         &view,
-        &signing_secret(&state),
+        &signing_secret(&state)?,
         now_seconds(),
     )))
 }
@@ -334,7 +334,7 @@ async fn update_actor(
         .await?;
     Ok(Json(ActorDetailResource::from_view(
         &view,
-        &signing_secret(&state),
+        &signing_secret(&state)?,
         now_seconds(),
     )))
 }
@@ -353,7 +353,7 @@ async fn merge_actor(
         .await?;
     Ok(Json(ActorDetailResource::from_view(
         &view,
-        &signing_secret(&state),
+        &signing_secret(&state)?,
         now_seconds(),
     )))
 }
@@ -381,7 +381,7 @@ async fn clear_actor_profile_image(
         .await?;
     Ok(Json(ActorDetailResource::from_view(
         &view,
-        &signing_secret(&state),
+        &signing_secret(&state)?,
         now_seconds(),
     )))
 }

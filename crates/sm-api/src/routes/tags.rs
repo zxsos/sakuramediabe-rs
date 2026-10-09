@@ -153,7 +153,7 @@ async fn list_tag_movies(
         .list_tag_movies(path.tag_id, &filters, query.page, query.page_size)
         .await?;
 
-    let secret = signing_secret(&state);
+    let secret = signing_secret(&state)?;
     let now = now_seconds();
     let items = page
         .items

@@ -78,7 +78,7 @@ async fn list_jobs(
     _user: CurrentUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<JobMetadataResource>>, ErrorResponse> {
-    let config = state.config().snapshot().unwrap_or_default();
+    let config = crate::config::snapshot_or_500(&state)?;
     let entries = state.jobs().entries().to_vec();
     let task_keys: Vec<String> = entries.iter().map(|entry| entry.task_key.clone()).collect();
 
@@ -103,8 +103,7 @@ async fn list_jobs(
                 cron_expr: entry.cron_expr.clone(),
                 disabled_reason: disabled_reason.clone(),
                 // 「声明允许」且「当前没被停用」—— 见模块文档。
-                manual_trigger_allowed: entry.manual_trigger_allowed
-                    && disabled_reason.is_none(),
+                manual_trigger_allowed: entry.manual_trigger_allowed && disabled_reason.is_none(),
                 params_schema: None,
                 last_task_run: latest.get(&entry.task_key).map(TaskRunResource::from),
             }
@@ -136,7 +135,7 @@ async fn trigger(
     }
     // 能力开关（上游 `require_job_enabled`）：409 而不是 422 —— 该去开配置，
     // 不是改请求。
-    let config = state.config().snapshot().unwrap_or_default();
+    let config = crate::config::snapshot_or_500(&state)?;
     if let Some(reason) = job_disabled_reason(&task_key, &config) {
         return Err(ErrorResponse::new(
             StatusCode::CONFLICT,

@@ -45,7 +45,7 @@ impl Fixture {
             &config_path,
             format!(
                 "[auth]\nfile_signature_secret = \"{SECRET}\"\n\n\
-                 [media]\nmedia_clip_root_path = \"{}\"\n",
+                 [media]\nmedia_clip_root_path = '{}'\n",
                 root.display()
             ),
         )
