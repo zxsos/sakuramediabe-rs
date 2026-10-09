@@ -29,7 +29,7 @@ pub fn normalize_movie_number(value: &str) -> String {
         .filter(|c| *c != ' ')
         .collect();
     let is_digits_dash_digits = {
-        let parts: Vec<&str> = v.split(|c| c == '-' || c == '_').collect();
+        let parts: Vec<&str> = v.split(['-', '_']).collect();
         parts.len() == 2
             && !parts[0].is_empty()
             && !parts[1].is_empty()
@@ -204,8 +204,10 @@ mod tests {
 
     #[test]
     fn tag_match_marks_short_movie() {
-        let mut config = DurationCollectionSettings::default();
-        config.tag_names = ["合集".to_owned()].into_iter().collect();
+        let config = DurationCollectionSettings {
+            tag_names: ["合集".to_owned()].into_iter().collect(),
+            ..Default::default()
+        };
         let mut m = movie(1, 60, "ABP-001", false);
         m.tag_names = vec!["合集".to_owned()];
         assert_eq!(decide(&m, &config, "x"), Decision::Mark);
