@@ -26,3 +26,7 @@ upstream
 
 # CodeBuddy 的项目数据目录（IDE 生成，不入库）
 .codebuddy/
+
+# 本地手工联调用的临时工作目录（跑完即删，不入库）。
+# 典型内容：临时 config.toml、插件包、灌库 SQL、造包的 python 脚本。
+.tmp-*/

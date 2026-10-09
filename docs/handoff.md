@@ -11,7 +11,7 @@
 |---|---|
 | 铺开阶段 | ✅ 已完成（2026-10-05）。路由模块 32/32、端点路径 **136/136**、服务层 106/113 文件 |
 | 验证阶段 | ✅ 编译 + clippy + rustdoc + `compare*.py` + `check_paged_wrappers.py` 全绿（2026-10-05） |
-| 端点方法体 | **实测 `todo!()` 共 63 个**：`sm-service` **30** + `sm-api` **33**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
+| 端点方法体 | **实测 `todo!()` 共 59 个**：`sm-service` **28** + `sm-api` **31**。`sm-db` / `sm-scheduler` / `sm-core` / `sm-plugins` **各 0 个** |
 | 端点（方法级） | 上游 177 / Rust **175 已注册**；其中 **33 条 handler 仍是 `todo!()`**。未注册 2 条：`/actors/{}/profile-image\|PUT`、`/media/{}/clips\|POST` |
 | 完成的域 | `collections`、`system`、**`videos`（3/7）** —— `system` 本轮清零 |
 | 调度 | 19 个内建任务，cron **16/16 全注册**；worker **handler 6/21** |
@@ -1869,7 +1869,128 @@ reqwest —— 同步签名会被逼成 `block_on`）。**还没接端点**：�
 部分（见 `tests/embedding_http.rs` 与 `wiremock` 的用法），再接 SSE。
 登录态（`_ensure_logged_in`）**先不做** —— 未登录也能拿到这三条要的数据。
 
-### 7.3 剩余 63 条的**卡点表**（按卡点而非按文件归类）
+### 7.2g ★ 图搜那 9 条**不缺客户端**（纠正一个错判，2026-10-08）
+
+先前把 `image_search` 那 9 条标成「卡在 Qdrant / 嵌入客户端缺失」。**那是错的** ——
+客户端早就写完了，逐个核实：
+
+| 模块 | 行数 | `todo!()` |
+|---|---|---|
+| `sm_service::discovery::qdrant::dense` | 631 | **0** |
+| `sm_service::discovery::qdrant::similarity` | 552 | **0** |
+| `sm_service::discovery::qdrant::thumbnail` | 170 | **0** |
+| `sm_service::discovery::qdrant::plot_image` | 167 | **0** |
+| `sm_service::discovery::embedding`（SigLIP2 HTTP） | 515 | **0** |
+
+`EmbeddingClient` 的 `describe` / `embed_images` / `embed_texts` 都在，
+`dense.rs` 里连 collection 名（`media_thumbnail_vectors_siglip2_v1`）与
+payload 索引声明（`THUMBNAIL_PAYLOAD_INDEX = ["movie_id", "media_id"]`）都齐了。
+
+**真实卡点是「上游语义没读」**，骨架期自己写下的（`image_search_space.rs:316`）：
+
+> 「照上游 `image_search_input.py` 实现（848B；**校验规则待确认，不猜**）」
+
+也就是说 `normalize_image_search_query` 缺的是**上游那 848 行的校验规则**
+（尺寸上限、格式白名单），而不是缺一个 HTTP 客户端。骨架作者当年没读透，
+所以刻意留空 —— 这个判断是对的，**别把它当成"接线"顺手填一个**。
+
+其余几条要读的上游文件：
+
+| 端点 | 要读的上游 |
+|---|---|
+| `POST /image-search/sessions`（图搜会话） | `image_search_service.py` 的会话创建段 |
+| `GET …/results` 两条 | ✅ **已落地**（见下）|
+| `POST …/text-sessions` 等四条 | `image_search_input.py`（**18 行**，见 §7.2 那条纠正；尺寸上限与格式白名单**不在**这里，在 `image_search_service.py`）|
+
+#### ✅ `GET …/results` 两条已落地（2026-10-08），顺带清掉两个错记
+
+落地时才发现两处**先前记错/没做**的事：
+
+1. **两条不是纯接线 —— 但也不是缺零件。** `ImageSearchService::list_results`
+   与 `MoviePlotImageSearchService::list_results` 都在（零 `todo!`），可**全仓
+   没有一处构造过这两个服务**。真正缺的是**组合根装配**，已在
+   `sm_server::build_image_search_services` 补上（照 `build_similarity_store`
+   的模式：未启用 → `Ok(None)`，建连失败只 warn 不让进程起不来）。
+
+2. **「未启用」该是 **409** 而不是空列表。** 上游把 `require_image_search()`
+   挂成 **router 级依赖**（`image_search.py:30`），未启用时六个端点统一
+   `ApiError(409, "feature_disabled", ...)`（`optional_services.py:22-24`）。
+   本仓没有 router 级依赖机制，所以在每个 handler 里显式取一次 —— 判据是
+   「组合根有没有挂上服务」。**别照 `similarity` 那侧写成降级空列表**：
+   相似度只是推荐信号之一，而图搜是用户主动发起的整个功能，返回空结果会让
+   用户以为「搜过了、没有」。
+
+#### ⚠️ 纠正一处**我上一轮写错并误导了验收**的顺序（2026-10-08）
+
+这一节先前写着「空 `cursor` 要 422，**先于**能力检查」，理由是「pydantic 参数校验
+在依赖注入之前」。**那个理由不成立**，而我当时的网络测试是照自己的实现去验的，
+等于自己给自己发了一张合格证。
+
+真相（FastAPI `solve_dependencies`，`fastapi/dependencies/utils.py`）：
+
+1. 它**先**跑 `dependant.dependencies` 的循环 —— `APIRouter(dependencies=[...])`
+   里的 `require_image_search` 就在这一层；
+2. `request_params_to_args`（query / form / file 的参数校验）在循环**之后**；
+3. 而 `require_image_search` 是直接 `raise ApiError(409, ...)`，**不是**累积进
+   `errors` 列表 —— 所以一旦未启用就立刻返回，参数校验根本没机会跑。
+
+所以：**未启用时，一切参数错误（空 cursor、缺 file、坏 CSV、错误 content-type）
+都该是 409，不是 422。**
+
+在这个框架下把能力检查做成提取器而不是 handler 里的一行，原因也变了 —— 见下。
+
+#### ✅ 四个建会话端点已落地（同日），三条工程要点
+
+**1. 能力检查必须是 `FromRequestParts` 提取器，不能写在 handler 里。**
+
+axum 的提取器按参数顺序解析，读 body 的（`Multipart` / `Form`）必须在最后。
+把 `RequireImageSearch` / `RequirePlotImageSearch` 做成 `FromRequestParts` 并放在
+`Multipart` / `Form` **之前**，才等价于上游那个 router 依赖的位置。
+
+写成 handler 体内的一行则不行：`Multipart` 那时已经解析完了，
+「未启用 + 错误 content-type」会得到 422 而不是 409。
+
+**2. `extract::Multipart` 加了 `receive_file_with_fields`。**
+
+`next_file` **跳过**非文件字段（过滤参数会丢），`receive_to_file` 把文件**写盘**
+（图搜要的是立刻送进推理服务的字节，落盘再读回是绕路）。所以补了这个方法：
+第一个文件进内存 + 收下所有文本字段，文件和每个文本字段各有一道上限。
+
+**3. `parse_csv_positive_ints` 先前有两处偏差（已修）。**
+
+| | 上游 `_utils.py:21` | 骨架期写的 |
+|---|---|---|
+| 状态码 | **422** | 400 |
+| 空串 | **报错** | `Some(vec![])` |
+
+空串那条尤其危险：把「客户端拼了个空变量」静默变成「排除全部」，用户看到零结果
+而不知道为什么。它当时**无人调用**，所以改动零风险 —— 这也说明写它的人没去看
+调用方，是直接照自己的设想写的。
+
+#### ⚠️ 留给下一轮的契约偏差（**已知，未修**）
+
+两个 session page DTO 与上游 resource **不齐**：
+
+| | 上游 `...SessionPageResource` | 本仓 DTO |
+|---|---|---|
+| 字段 | `session_id` / `status` / `page_size` / `next_cursor` / **`expires_at`** / `items` | 只有 `session_id` + `items` + `next_cursor` |
+
+图搜侧服务层 `list_results` 本来就只返回 `ImageSearchPage`（`items` +
+`next_cursor`），剧情侧返回的是平铺的 `PlotImageSearchSessionPage`（有
+`status` / `page_size` 但被拆开了）。**两边互不一致，且都与上游不齐。**
+
+**建议留到接四个建会话端点时一并处理**：那时 `ImageSearchSessionPage` 也要凑
+齐同一组字段，改一处能一起验，比现在单独改两个 DTO 更不容易漏。
+
+**顺序建议**：先读 `image_search_service.py` 的会话创建段（四条建会话端点共用），
+再读它的过滤解析。读完就把 §7.3 里那行的「Qdrant / 嵌入探测客户端缺失」
+改成真实卡点，别让下一个人以为要去写客户端。
+
+Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534 MB /
+`on_disk` 71.6 MB，峰值是稳态的 2 倍）见 [`deployment.md` §3.4](deployment.md) ——
+那里也记着两处**待实测校正**的偏差（没建 payload 索引、每部媒体几张缩略图未测）。
+
+### 7.3 剩余 59 条的**卡点表**（按卡点而非按文件归类）
 
 > 总数与分域计数以 `docs/progress-baseline.md` 为准（那份由脚本生成）；下表按
 > **卡点**归类，只用来判断「下一步该动哪一块」。
@@ -1879,8 +2000,8 @@ reqwest —— 同步签名会被逼成 `block_on`）。**还没接端点**：�
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
 | **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、下载器注册表 |
-| **`MovieService` 方法不存在** | `movies.rs` 6 | 详情（10 个子资源的汇合点）/ reviews / merged-playback（要 provider）/ metadata-refresh + 2 条 SSE（要 JavBus）。`set_subscription` 与 `unsubscribe_movie` **已落地**（`803337f`）|
-| **Qdrant / 嵌入探测客户端缺失** | `image_search.rs` 7、`status.rs` 2 | 上游会 probe 嵌入服务与 Qdrant（`status_service.py:410-443`） |
+| **`MovieService` 方法不存在** | `movies.rs` 5 | reviews（要 JavBus）/ merged-playback（要 provider）/ metadata-refresh（要 JavBus **+** 详情）/ 2 条 SSE（要 JavBus）。**详情、订阅、退订已落地**（`803337f`、本轮）|
+| ~~**Qdrant / 嵌入探测客户端缺失**~~ | ~~`image_search.rs` 7~~ | ⚠️ **已作废（见 §7.2g）**：客户端 2000+ 行早已实现、零 todo。真卡点是「上游 `image_search_input.py` 848 行没读」。`status.rs` 2 条仍卡在 probe（要健康探测端点） |
 | **插件管理的剩余 2 条** | `plugins.rs` 2 | 两个 settings。它们**不是接线**：上游的 `schema`/`defaults` 来自插件的 pydantic `settings_model`，要先定「Rust 插件怎么声明自己的设置项」 |
 | 待核 | `actors.rs` 1 | 卡点已查清（见 §7.2f）：SSE，阻塞在 JavBus provider 缺失 |
 | ~~service IO 编排缺失~~ | ~~`recommendations.rs` 3~~ | ✅ **已解决**：读侧 `c801441` + 生成侧 `2655f4d` |

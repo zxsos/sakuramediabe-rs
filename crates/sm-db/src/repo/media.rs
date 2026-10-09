@@ -781,6 +781,52 @@ impl MediaRepository {
         Ok(rows)
     }
 
+    /// ★ 至少有一张缩略图的**全部** media id（去重、升序、**不分页**）。
+    ///
+    /// 上游 `MediaThumbnailPackBackfillService._candidate_media_ids`
+    /// （`media_thumbnail_pack_backfill_service.py:34-44`）：
+    ///
+    /// ```python
+    /// MediaThumbnail.select(MediaThumbnail.media).distinct()
+    /// ```
+    ///
+    /// # 为什么要全量列而不是「查缺包的那几条」
+    ///
+    /// 「缺包」这个条件**在文件系统上**（`thumbnails.zip` 存不存在），SQL 判不了。
+    /// 上游因此也是全量列出、由服务层逐个查盘 —— 这条方法照抄那个口径。
+    ///
+    /// 不分页是**刻意的**：分页会让「这一页全都已有包」时直接返回空，
+    /// 服务层看不出是「本页恰好都有」还是「全都有」，于是永远推进不到下一页。
+    pub async fn list_media_ids_with_thumbnails(&self) -> Result<Vec<i32>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT DISTINCT media_id FROM media_thumbnail ORDER BY media_id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 某个 media 的缩略图行：`(offset, origin)`，按 `offset` 升序。
+    ///
+    /// 上游 `_media_thumbnail_rows`（`:46-57`）—— `media_thumbnail` join `image`
+    /// 取 `origin`（包内条目名就是它，见 `catalog::media_paths`）。
+    ///
+    /// `origin` 为空的行**照样返回**（`String` 不取 Option）：让服务层去
+    /// 判「这条能不能打包」—— 判据是路径推导，不是 origin 非空
+    /// （`image.origin` 的历史数据里确实有空值，模块文档里记着）。
+    pub async fn list_thumbnail_origins(
+        &self,
+        media_id: i32,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT t.offset, i.origin FROM media_thumbnail t \
+             JOIN image i ON i.id = t.image_id \
+             WHERE t.media_id = $1 ORDER BY t.offset ASC",
+        )
+        .bind(media_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// ★ 延迟一次：源还没就绪，但**不该**算失败。
     ///
     /// 上游 `_mark_deferred`。与 [`Self::record_thumbnail_failure`] 的关键差别是

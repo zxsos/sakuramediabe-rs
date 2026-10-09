@@ -249,6 +249,78 @@ impl Multipart {
             return Ok(Some(file));
         }
     }
+
+    /// 取**第一个文件**进内存，同时收下所有**文本字段**。
+    ///
+    /// 给「一个文件 + 若干过滤参数」那类请求用（图搜的两个建会话端点：
+    /// `file` + `page_size` / `movie_ids` / `exclude_movie_ids` /
+    /// `score_threshold`）。
+    ///
+    /// # 为什么不能只调 [`Self::next_file`]
+    ///
+    /// 它**跳过**非文件字段（`:246`），那样过滤参数就丢了。而
+    /// [`receive_to_file`] 虽然也收文本字段，但它把文件**写盘** —— 图搜的
+    /// 查询图是要立刻送进推理服务的，落盘再读回纯属绕路。
+    ///
+    /// # 上限是**双份**的
+    ///
+    /// 文件走 `max_bytes`（默认 [`DEFAULT_MAX_BYTES`]），每个文本字段另外走
+    /// [`MAX_TEXT_FIELD_BYTES`]。与 [`receive_to_file`] 那个「总量」口径不同：
+    /// 这里文件本来就在内存里，文本字段的闸门防的是「一个巨大的普通字段
+    /// 把内存撑爆」，两件事各自设限更清楚。
+    pub async fn receive_file_with_fields(&mut self) -> Result<ReceivedForm, ErrorResponse> {
+        let mut form = ReceivedForm::default();
+        while let Some(mut field) = self.inner.next_field().await.map_err(ErrorResponse::from)? {
+            let name = field.name().unwrap_or_default().to_owned();
+            if field.file_name().is_some() {
+                // 文件：只留第一个（与 `receive_to_file` 同口径），
+                // 但**每个**仍要读并计入上限 —— 不读的话后面的字段解析不出来。
+                let mut bytes: Vec<u8> = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(ErrorResponse::from)? {
+                    if bytes.len() + chunk.len() > self.max_bytes {
+                        return Err(ErrorResponse::new(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "http_error",
+                            "Uploaded file is too large",
+                        )
+                        .with_details(details_of_pair(
+                            "field",
+                            &name,
+                            "max_bytes",
+                            self.max_bytes as i64,
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                if form.file.is_none() {
+                    form.file = Some(ReceivedFile {
+                        field: name.clone(),
+                        file_name: field.file_name().map(str::to_owned),
+                        content_type: field.content_type().map(str::to_owned),
+                        bytes_written: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    });
+                    form.file_bytes = bytes;
+                }
+            } else {
+                let text = field.text().await.map_err(ErrorResponse::from)?;
+                if text.len() > MAX_TEXT_FIELD_BYTES {
+                    return Err(ErrorResponse::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "http_error",
+                        "Form field is too large",
+                    )
+                    .with_details(details_of_pair(
+                        "field",
+                        &name,
+                        "max_bytes",
+                        MAX_TEXT_FIELD_BYTES as i64,
+                    )));
+                }
+                form.fields.insert(name, text);
+            }
+        }
+        Ok(form)
+    }
 }
 
 /// 默认单文件上限 8 MiB。
@@ -288,6 +360,12 @@ pub struct ReceivedForm {
     pub file: Option<ReceivedFile>,
     /// 普通文本字段（字段名 → 值）。同名字段后者覆盖前者。
     pub fields: std::collections::BTreeMap<String, String>,
+    /// 第一个文件的**字节**。只有 [`Multipart::receive_file_with_fields`]
+    /// 会填它 —— [`receive_to_file`] 是流式写盘的，字节在 `dest` 里而不在内存。
+    ///
+    /// 与 `file` 分开而不是塞进 [`ReceivedFile`]：写盘那条路径拿不到字节，
+    /// 让 `ReceivedFile` 多一个「永远是 0 字节」的字段会误导调用方。
+    pub file_bytes: Vec<u8>,
 }
 
 /// [`ReceivedForm`] 里的那个文件字段。

@@ -2,13 +2,13 @@
 
 | 指标 | 现在 |
 |---|---|
-| 未实现的方法体（`todo!()`） | **62** 处（`sm-service` 30 + 路由 32）|
-| 端点（方法级） | 175 / 177 已注册，**其中 32 条仍是 `todo!()`** |
+| 未实现的方法体（`todo!()`） | **52** 处（`sm-service` 27 + 路由 25）|
+| 端点（方法级） | 175 / 177 已注册，**其中 25 条仍是 `todo!()`** |
 | 端点（路径级） | 136 / 136（未注册的方法级端点 2 条）|
 | 完成的域 | `collections`、`system`、`videos`（3/7 个域） |
-| 待办最多的域 | `transfers` 16 · `catalog` 6 · `playback` 5 |
+| 待办最多的域 | `transfers` 16 · `catalog` 6 · `playback` 3 |
 | worker handler | 6 / 21 |
-| 基线提交 | `3f565fa`（生成时的 HEAD）|
+| 基线提交 | `c9e1d2f`（生成时的 HEAD）|
 
 > 数字由 `pwsh -File scripts/progress.ps1 -Write` 生成（**不要手数**：手数三次错过
 > 分母，126 应为 177）。改完代码就跑 `-Write` 并提交本文件 —— 门禁里有 `-Diff`，
@@ -18,23 +18,23 @@
 
 口径：`todo!(` / `unimplemented!(` 出现次数（剥掉注释）。与「注册了多少」是两件事。
 
-- 全仓合计：**62** 处
-- 其中 `crates/sm-api/src/routes/*.rs`：**32** 处（= 已注册但**未实现**的端点 / 辅助函数）
+- 全仓合计：**52** 处
+- 其中 `crates/sm-api/src/routes/*.rs`：**25** 处（= 已注册但**未实现**的端点 / 辅助函数）
 
 | crate | `todo!()` |
 |---|---|
-| `sm-api` | 32 |
-| `sm-service` | 30 |
+| `sm-service` | 27 |
+| `sm-api` | 25 |
 
 ### 按模块目录
 
 | 位置 | `todo!()` |
 |---|---|
-| `sm-api/routes` | 32 |
+| `sm-api/routes` | 25 |
 | `sm-service/transfers` | 16 |
 | `sm-service/catalog` | 6 |
-| `sm-service/playback` | 5 |
-| `sm-service/discovery` | 3 |
+| `sm-service/playback` | 3 |
+| `sm-service/discovery` | 2 |
 
 ### `sm-service` 按文件（降序）
 
@@ -47,10 +47,7 @@
 | `catalog\movie_metadata_search.rs` | 2 |
 | `discovery\moment_recommendation.rs` | 2 |
 | `catalog\catalog_import.rs` | 1 |
-| `discovery\image_search_space.rs` | 1 |
 | `playback\media_file_hash_backfill.rs` | 1 |
-| `playback\media_metadata_probe.rs` | 1 |
-| `playback\media_thumbnail_pack_backfill.rs` | 1 |
 | `playback\media_validity_scan.rs` | 1 |
 | `playback\media_video_info_backfill.rs` | 1 |
 | `transfers\auto_download.rs` | 1 |
@@ -76,7 +73,7 @@
 - `/actors/{}/profile-image|PUT`
 - `/media/{}/clips|POST`
 
-⚠️ 注册 ≠ 能用：其中 **32** 条的 handler 还是 `todo!()`。
+⚠️ 注册 ≠ 能用：其中 **25** 条的 handler 还是 `todo!()`。
 
 ### 已注册端点（按文件）
 
@@ -94,7 +91,7 @@
 | `download_tasks.rs` | 4 | 2 |
 | `downloads.rs` | 1 | 0 |
 | `files.rs` | 2 | 0 |
-| `image_search.rs` | 7 | 7 |
+| `image_search.rs` | 7 | 0 |
 | `indexer_settings.rs` | 3 | 0 |
 | `jobs.rs` | 2 | 0 |
 | `media_clips.rs` | 7 | 0 |
@@ -135,12 +132,12 @@
 |---|---|---|---|---|
 | catalog | 27 | 12491 | 27 | 7556 |
 | collections | 4 | 2062 | 5 | 1292 |
-| discovery | 17 | 7772 | 16 | 4485 |
-| playback | 20 | 7075 | 19 | 3741 |
+| discovery | 17 | 7847 | 16 | 4485 |
+| playback | 20 | 7624 | 19 | 3741 |
 | system | 20 | 6072 | 19 | 2935 |
 | transfers | 17 | 7771 | 23 | 4248 |
 | videos | 3 | 1735 | 4 | 927 |
-| **合计** | **108** | **44978** | **113** | **25184** |
+| **合计** | **108** | **45602** | **113** | **25184** |
 
 > ⚠️ **行数比不是完成度**（本仓注释占大头）；看上面的 `todo!()`。
 

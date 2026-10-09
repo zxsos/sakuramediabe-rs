@@ -98,6 +98,27 @@ pub struct AppState {
     /// 而不是报错（上游的降级语义，见
     /// `sm_service::discovery::recommendation::search_similar_movies`）。
     similarity: Option<Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>>,
+    /// 图搜（以图搜图 / 以文搜图）的**检索**服务。`None` = 没启用。
+    ///
+    /// # 与 `similarity` 的一处关键差别：`None` 要报 **409** 而不是降级
+    ///
+    /// `similarity` 是**推荐信号**之一，读不到就少一个理由、别的照常，所以
+    /// 它 `None` 时端点返回空列表。而图搜是**用户主动发起的整个功能**：上游
+    /// 把 `require_image_search()` 挂成了 **router 级依赖**
+    /// （`image_search.py:30`），未启用时六个端点统一 409 `feature_disabled`
+    /// （`optional_services.py:22-24`）—— 不是「返回空结果」。
+    ///
+    /// 返回空结果会让用户以为「搜过了、没有」，而真相是「这台机器没开」。
+    ///
+    /// # 为什么是「活的」而不是每次请求构造
+    ///
+    /// 它持有 `DenseStore::connect` 出来的 Qdrant 连接与 `EmbeddingClient`
+    /// 的连接池 —— 两者都是**网络资源**。每次请求现造等于每次请求重新建连，
+    /// 与 `similarity` 那条注释同源。
+    image_search: Option<Arc<sm_service::discovery::image_search::ImageSearchService>>,
+    /// 剧情图搜的检索服务。理由与 `image_search` 完全一致（同一组 router 依赖）。
+    plot_image_search:
+        Option<Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>>,
 }
 
 impl AppState {
@@ -115,6 +136,8 @@ impl AppState {
             media_libraries: None,
             plugins: None,
             similarity: None,
+            image_search: None,
+            plot_image_search: None,
         }
     }
 
@@ -151,6 +174,41 @@ impl AppState {
         &self,
     ) -> Option<&Arc<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>> {
         self.similarity.as_ref()
+    }
+
+    /// 挂上图搜检索服务。**只有组合根会调**。
+    pub fn with_image_search(
+        mut self,
+        service: Arc<sm_service::discovery::image_search::ImageSearchService>,
+    ) -> Self {
+        self.image_search = Some(service);
+        self
+    }
+
+    /// 图搜检索服务。`None` = 未启用。
+    ///
+    /// 调用方**必须**报 409 `feature_disabled`，不能降级成空结果 —— 理由见
+    /// 字段的文档（上游是 router 级依赖，六个端点统一拒绝）。
+    pub fn image_search(
+        &self,
+    ) -> Option<&Arc<sm_service::discovery::image_search::ImageSearchService>> {
+        self.image_search.as_ref()
+    }
+
+    /// 挂上剧情图搜检索服务。只有组合根会调。
+    pub fn with_plot_image_search(
+        mut self,
+        service: Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>,
+    ) -> Self {
+        self.plot_image_search = Some(service);
+        self
+    }
+
+    /// 剧情图搜检索服务。`None` = 未启用 —— 同 [`Self::image_search`]，报 409。
+    pub fn plot_image_search(
+        &self,
+    ) -> Option<&Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>> {
+        self.plot_image_search.as_ref()
     }
 
     /// 挂上任务目录。只有组合根会调 —— 它才知道有哪些插件任务。

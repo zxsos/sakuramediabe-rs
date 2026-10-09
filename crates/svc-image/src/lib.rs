@@ -46,4 +46,4 @@ pub mod cover_split;
 pub mod webp;
 
 pub use cover_split::{column_gradient, detect_split_points, to_gray, DEFAULT_CENTER_RANGE};
-pub use webp::{decode, encode_lossless, is_webp};
+pub use webp::{decode, decode_oriented, encode_lossless, is_webp, normalize_for_embedding};

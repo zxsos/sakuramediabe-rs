@@ -297,8 +297,8 @@ impl ImageSearchIndexSpaceService {
 }
 /// 归一化检索用图片字节。
 ///
-/// 上游 `normalize_image_search_query`（`image_search_input.py:7`，848B 的
-/// 独立文件）。**这是整个 image_search 的入口校验** —— 拿到的字节要转成
+/// 上游 `normalize_image_search_query`（`image_search_input.py:7`，全文
+/// **18 行**）。**这是整个 image_search 的入口转换** —— 拿到的字节要转成
 /// 推理服务能吃的格式。
 ///
 /// # 为什么放在这个文件而不是 `image_search.rs`
@@ -306,12 +306,87 @@ impl ImageSearchIndexSpaceService {
 /// 它被**两条**检索路径共用（图搜与剧情图搜），放进任一个都会让另一条反向
 /// 依赖。这个文件是两者共同的**前置状态**，所以放这儿。
 ///
-/// # 上游全文只有 8 行，但它是个**校验**而不是转换
+/// # 上游全文只有 18 行，而它是个**转换器**不是校验器
 ///
-/// 从函数名与调用点看，它做的是「校验这段字节能不能当检索图」。**具体校验
-/// 规则（尺寸上限、格式白名单）没在骨架阶段确认**，所以这里保留签名但不猜
-/// 实现 —— 猜错的后果是「接受了不该接受的大图」或「拒绝了合法的 WebP」。
-pub fn normalize_image_search_query(image_bytes: &[u8]) -> Vec<u8> {
-    let _ = image_bytes;
-    todo!("骨架：照上游 image_search_input.py 实现（848B；校验规则待确认，不猜）")
+/// 骨架期这里写「具体校验规则（尺寸上限、格式白名单）没在骨架阶段确认，所以
+/// 保留签名但不猜实现」。**读完上游全文后这句话作废** —— 骨架作者把
+/// 「848B」当成了行数（它是**字节数**），因而以为后面还有一大堆没读到。真相是
+/// 那 18 行里**既没有尺寸上限，也没有格式白名单**：
+///
+/// ```python
+/// with PillowImage.open(BytesIO(image_bytes)) as image:
+///     image.seek(0); image.load()
+///     normalized = ImageOps.exif_transpose(image)          # 方向转正
+///     if normalized.mode not in {"RGB", "RGBA"}:            # 模式归一
+///         normalized = normalized.convert("RGBA" if "transparency" in normalized.info else "RGB")
+///     normalized.save(output, format="WEBP", lossless=True) # 无损 WebP
+/// ```
+///
+/// 真正要做的只有三件：**EXIF 转正 → 模式归一 → 无损 WebP**。尺寸上限与格式
+/// 白名单在**别的**文件（`image_search_service.py`）里，接那两条端点时再去读。
+///
+/// # 为什么签名从 `Vec<u8>` 改成 `Result`
+///
+/// 骨架签名 **无法表达失败**，而上游会抛 `ValueError`（路由层转成 **400**）。
+/// 强行 `unwrap` 或返回空 `Vec`，都会把「用户传了张坏图」变成「静默搜不出
+/// 东西」—— 那比报错难查得多。
+///
+/// # 模式归一的一处**已知差异**（比上游更保守）
+///
+/// 上游按 `"transparency" in info` 决定 RGBA / RGB；这里按解码后的
+/// `color().has_alpha()`。差异只在 **PNG 的 `tRNS` 块**上：Pillow 把它当透明
+/// 通道，本仓解码器**丢掉**它，于是「灰度 + `tRNS`」的 PNG 会从带 alpha 变成
+/// 不带。图搜场景里**没有可见后果**（只用像素内容做 embedding，不看 alpha），
+/// 但别把它当「完全等价」—— 动解码器时要记得这条。
+pub fn normalize_image_search_query(image_bytes: &[u8]) -> Result<Vec<u8>, ServiceError> {
+    // 转换链（EXIF 转正 / 模式归一 / 无损 WebP）在 `svc_image` 里 —— 那才是
+    // 唯一依赖 `image` 的地方，测试也才能造真图。这里只做**错误映射**。
+    //
+    // 400 而不是 422：上游是 `raise ValueError` → 路由 `except ValueError` →
+    // `HTTPException(400)`（`image_search.py:56-57`）。而 422 在本仓是
+    // 「请求体本身不合 schema」—— 图能解码失败不是 schema 的问题。
+    svc_image::normalize_for_embedding(image_bytes).map_err(|error| {
+        ServiceError::from_status(
+            400,
+            "invalid_image_search_query",
+            format!("上传图片无效或不支持的格式：{error}"),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ 坏输入 → **400 `invalid_image_search_query`**（不是 500、不是静默空图）。
+    ///
+    /// 转换本身（EXIF 转正 / 模式归一 / 无损 WebP）的真图测试在
+    /// [`svc_image::normalize_for_embedding`] 那侧 —— 那里才有 `image` crate
+    /// 能造 PNG / JPEG / 带 EXIF 的图。本文件是薄封装，只负责错误映射。
+    #[test]
+    fn garbage_input_is_a_400_not_a_500() {
+        for bad in [
+            b"not an image at all".to_vec(),
+            Vec::new(),
+            // 只有 SOI 的截断 JPEG
+            vec![0xFF, 0xD8, 0xFF],
+            // RIFF 容器但不是 WebP
+            b"RIFF\x00\x00\x00\x00WAVEfmt ".to_vec(),
+        ] {
+            let error = normalize_image_search_query(&bad).expect_err("坏输入该报错");
+            assert_eq!(error.status, 400, "{bad:?}");
+            assert_eq!(error.code(), "invalid_image_search_query");
+        }
+    }
+
+    /// 错误消息要说清是「图」的问题，不是把它当成内部故障。
+    #[test]
+    fn the_message_names_the_problem_as_the_uploaded_image() {
+        let error = normalize_image_search_query(b"nope").expect_err("该报错");
+        assert!(
+            error.api.message.contains("图片"),
+            "消息要指向用户能理解的原因：{}",
+            error.api.message
+        );
+    }
 }

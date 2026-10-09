@@ -187,6 +187,10 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 #   jpeg -> zune-jpeg（纯 Rust）  png -> png（纯 Rust）  webp -> image-webp（纯 Rust）
 # 封面书脊检测的 Sobel 是自写的（crates/svc-image），不引 imageproc ——
 # 后者会拖进 nalgebra / rayon / rustdct，为 40 行卷积不值得。
+#
+# `apply_orientation`（EXIF 方向转正，`normalize_image_search_query` 要用）
+# 在 0.25 里是**无条件可用**的 —— 核实过它的 features 表，没有 `exif` 这个
+# feature（0.26 才把它拆出来），所以这里不需要为它开任何东西。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # dev（`cargo test` / `cargo check` / `cargo clippy`）默认 `debug = true`，而 MSVC 下

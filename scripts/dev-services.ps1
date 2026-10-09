@@ -48,7 +48,15 @@ $PgEnv = @(
     '-e', 'TZ=UTC', '-e', 'PGTZ=UTC',
     '-v', "${PgVolume}:/var/lib/postgresql/data"
 )
-$PgCommand = @('postgres', '-c', 'timezone=UTC', '-c', 'max_locks_per_transaction=1024')
+# ⚠️ `-p 5433` 不能漏：它是 **postgres 自己的监听端口**（不是 podman 的端口映射）。
+# 漏掉时容器监听 5432，而下面 `Write-Durability` / `pg_isready` 两处探针、
+# 以及 `scripts/verify.ps1` 用的 `SMDB_TEST_DATABASE_URL`（`...@127.0.0.1:5433/...`）
+# 全都打 5433 —— 于是「容器 up 了、脚本自己说 BROKEN、集成测试全部连不上」。
+# 2026-10-08 实测踩过：容器日志写 `listening on port 5432`，而宿主侧 5433 拒绝连接。
+$PgCommand = @(
+    'postgres', '-p', '5433',
+    '-c', 'timezone=UTC', '-c', 'max_locks_per_transaction=1024'
+)
 
 function Test-Running([string]$Name) {
     return (podman inspect -f '{{.State.Running}}' $Name 2>$null) -eq 'true'

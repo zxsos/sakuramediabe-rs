@@ -66,15 +66,39 @@ impl MediaMetadataProbeService {
     ///
     /// **部署检查**：宿主启动时调一次，为假就在任务摘要里显式报
     /// 「未安装媒体探测依赖」。见模块文档的两类跳过。
+    ///
+    /// # 当前恒为 `false`，而这不是占位
+    ///
+    /// 逐条核实过（2026-10-08）：
+    ///
+    /// | 上游手段 | 本仓对应物 |
+    /// |---|---|
+    /// | `import av`（PyAV） | **无** —— workspace 里没有 ffmpeg 绑定 |
+    /// | 用 `av.open()` 读源 | **无** —— 也没有调用 `ffmpeg` / `ffprobe` CLI 的地方 |
+    ///
+    /// `media_clip` 那个模块里有 `media_clip_ffmpeg_timeout_seconds` 配置键，
+    /// 但**只是超时配置**，没有实际调用 —— 别把它当「已有 ffmpeg 通路」的证据。
+    ///
+    /// 所以 `false` 是**如实反映后端不存在**，对应上游 `av = None` 那一档：
+    /// 上游 pyav 没装时 `probe_file` 同样返回空结果、不报错。两条路径的
+    /// 可观察行为因此一致 —— 不是「Rust 侧还没写」，而是「部署缺依赖」。
+    ///
+    /// ★ 接入后端时**只改这一处**。调用方（`media_video_info_backfill` /
+    /// `media_validity_scan` / `media_file_hash_backfill`）只该问这个函数，
+    /// 各自去 `which ffmpeg` 的话会出现「摘要说没有、实际探测跑起来了」。
     pub fn probe_backend_available() -> bool {
-        todo!("骨架：探测媒体探测依赖（ffmpeg 绑定）是否可用；不要写死返回值")
+        false
     }
 
     /// ★ 探测一个本地文件。
     ///
     /// 上游 `probe_file(cls, file_path) -> MediaMetadataProbeResult`。
     /// `pyav` 缺失时返回 [`MediaMetadataProbeResult::empty`]（**不报错**）。
+    ///
+    /// 当前恒为空结果，原因见 [`Self::probe_backend_available`]。
     pub async fn probe_file(file_path: &std::path::Path) -> MediaMetadataProbeResult {
+        // 参数不用是因为**后端不存在**，不是「还没接」—— 真接上时这里要读它。
+        // 保留 `let _` 是为了让签名与文档继续成立（clippy 也满意）。
         let _ = file_path;
         MediaMetadataProbeResult::empty()
     }

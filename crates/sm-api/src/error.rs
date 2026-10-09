@@ -131,6 +131,29 @@ fn body_rejection(detail: String) -> ErrorResponse {
     .with_details(details)
 }
 
+/// 请求**参数**校验失败 → 422 `validation_error`。
+///
+/// 与解析失败那条（`From<JsonRejection>` / `From<FormRejection>`）同一个信封
+/// 形状，但那个是**解析**失败（rejection 自动转），这个是**语义**失败（值解析得出但不合规则，例如空串、
+/// CSV 里出现 0）。上游两者都是 `RequestValidationError` → 422 + 信封，所以
+/// 这里也共用一套形状。
+///
+/// # 为什么单独公开一份
+///
+/// 上游的 `Query(min_length=1)` / `Field(min_length=1)` 是 **pydantic 的职责**，
+/// serde 不表达 —— 所以每个 handler 都得自己判一次。`movies.rs` 先写了一份
+/// 私有 helper，图搜这边也要，与其复制第二份不如公开它。
+pub fn validation_error(detail: &str) -> ErrorResponse {
+    let mut details = serde_json::Map::new();
+    details.insert("detail".to_owned(), serde_json::Value::from(detail));
+    ErrorResponse::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+        "Request validation failed",
+    )
+    .with_details(details)
+}
+
 impl From<FormRejection> for ErrorResponse {
     /// 表单解析失败 → 422 `validation_error`（同 `body_rejection`）。
     ///

@@ -601,13 +601,11 @@ fn validate_movie_numbers(values: &[String]) -> Result<(), ErrorResponse> {
 }
 
 /// 与 [`crate::extract::Json`] 的拒绝路径同一个信封形状。
+///
+/// 现在用的是 `crate::error` 里**公开**的那一份 —— 图搜的 `cursor` 校验也要它，
+/// 与其复制第二份不如共享。
 fn validation_error(detail: &str) -> ErrorResponse {
-    ErrorResponse::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "validation_error",
-        "Request validation failed",
-    )
-    .with_details(details_of("detail", detail))
+    crate::error::validation_error(detail)
 }
 
 async fn batch_subscribe_movies(

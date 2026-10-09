@@ -202,6 +202,22 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             state
         }
     };
+    // 图搜（检索侧）。**未启用就不挂**，端点据此返回 **409** 而不是空列表 ——
+    // 上游是 router 级依赖 `require_image_search()`，未启用时整组端点统一 409
+    // `feature_disabled`。返回空结果会让用户以为「搜过了、没有」。
+    let state = match build_image_search_services(&pool, &config_service) {
+        Ok(Some((image_search, plot_image_search))) => state
+            .with_image_search(image_search)
+            .with_plot_image_search(plot_image_search),
+        Ok(None) => state,
+        Err(error) => {
+            tracing::warn!(
+                code = error.code(),
+                "图搜检索服务不可用：图搜端点将返回 409 feature_disabled",
+            );
+            state
+        }
+    };
     let app = with_optional_slow_log(sm_api::router(state), config.slow_log.as_deref());
 
     // 6. 调度器。任务表 = 内建 + 插件（顺序无所谓，调度器按各自的 cron 判）。
@@ -426,6 +442,145 @@ fn build_similarity_store(
     let base = endpoint.url.trim_end_matches('/');
     MovieSimilarityStore::connect(base, endpoint.api_key.as_deref())
         .map(|store| Some(std::sync::Arc::new(store)))
+}
+
+/// 图检索索服务的共享句柄（组合根构造，注入 `AppState`）。
+///
+/// 两个都要：`GET /image-search/sessions/{}/results` 用前者，
+/// `/plot-sessions/{}/results` 用后者。上游把 `require_image_search()` 挂在
+/// **router 级**（`image_search.py:30`），所以这两个要么都挂、要么都不挂 ——
+/// 只挂一个会让同组端点里一半 409、一半 200，那比「整组不可用」更难解释。
+type ImageSearchServices = (
+    Arc<sm_service::discovery::image_search::ImageSearchService>,
+    Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>,
+);
+
+/// 构造图搜的两个检索服务。**没启用返回 `Ok(None)`（合法状态）。**
+///
+/// # 与 `build_similarity_store` 同一条降级口径
+///
+/// 建连失败**只 warn 不失败**，后果是图搜端点 409 —— 其余功能照常。这里的
+/// 取舍与相似度那侧一样：进程起得来比某个可选功能可用更重要。
+///
+/// # 与 worker 里 `build_image_search_service` 的差别
+///
+/// 那个是**索引**服务（`ImageSearchIndexService`，写侧），这个是**检索**服务
+/// （读侧）。两者都要 `EmbeddingClient` 与 Qdrant store，但装配出的类型不同 ——
+/// 所以各有一份，而不是共用。
+fn build_image_search_services(
+    db: &sm_db::Db,
+    config: &sm_service::system::config::ConfigService,
+) -> Result<Option<ImageSearchServices>, sm_service::error::ServiceError> {
+    use sm_service::discovery::embedding::EmbeddingClient;
+    use sm_service::discovery::image_search::{ImageSearchLimits, ImageSearchService};
+    use sm_service::discovery::image_search_space::ImageSearchIndexSpaceService;
+    use sm_service::discovery::plot_image_search::MoviePlotImageSearchService;
+    use sm_service::discovery::qdrant::dense::{
+        DenseStore, PLOT_IMAGE_COLLECTION, PLOT_IMAGE_PAYLOAD_INDEX, THUMBNAIL_COLLECTION,
+        THUMBNAIL_PAYLOAD_INDEX,
+    };
+    use sm_service::discovery::qdrant::plot_image::PlotImageVectorStore;
+    use sm_service::system::optional_services::image_search_enabled;
+
+    let snapshot = config.snapshot()?;
+    if !image_search_enabled(&snapshot) {
+        return Ok(None);
+    }
+    let endpoint = sm_scheduler::worker::QdrantEndpoint::from_snapshot(&snapshot);
+    if !endpoint.is_configured() {
+        tracing::warn!("image_search 已启用但 qdrant.url 为空：图搜端点将返回 409");
+        return Ok(None);
+    }
+    let base = endpoint.url.trim_end_matches('/');
+    let api_key = endpoint.api_key.as_deref();
+
+    // `ImageSearchLimits` 没有 `from_snapshot` —— 配置键都有默认值
+    // （`config_schema.rs:397-399`：`session_ttl_seconds` 600 /
+    // `default_page_size` 20 / `max_page_size` 100），所以这里逐键读、缺就回落。
+    //
+    // 用 `unwrap_or` 而不是 `ok_or`（配置坏了不让进程起不来）—— 与上面
+    // 「建连失败只 warn」同一条口径。
+    let section = snapshot.get("image_search");
+    let read_i64 = |key: &str, fallback: i64| -> i64 {
+        section
+            .and_then(|s| s.get(key))
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(fallback)
+            .max(1)
+    };
+    let limits = ImageSearchLimits {
+        default_page_size: read_i64("default_page_size", 20),
+        max_page_size: read_i64("max_page_size", 100),
+        session_ttl_seconds: read_i64("session_ttl_seconds", 600),
+    };
+
+    let inference_base_url = section
+        .and_then(|s| s.get("inference_base_url"))
+        .and_then(serde_json::Value::as_str);
+    let Some(inference_base_url) = inference_base_url.filter(|url| !url.trim().is_empty()) else {
+        // 推理服务地址是图搜的**唯一**依赖来源：没有它连「把查询图变成向量」
+        // 都做不到。照 worker 的口径 warn 后返回 None —— 端点因此 409，
+        // 而 401/503 会让人以为是鉴权或推理服务挂了。
+        tracing::warn!("image_search 已启用但 inference_base_url 为空：图搜端点将返回 409");
+        return Ok(None);
+    };
+    let inference_api_key = section
+        .and_then(|s| s.get("inference_api_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+
+    // 两个 collection **各自**建连：缩略图按 `movie_id` + `media_id` 过滤，
+    // 剧情图只有 `movie_id`（`dense.rs` 两个常量的差别）。
+    // 缩略图服务要的是 `Arc<DenseStore>`；剧情图服务要的是
+    // `Arc<PlotImageVectorStore>`（包了一层记录 → point 的映射）。所以前者
+    // 包 Arc、后者先建裸 store 再包 —— 形状由各自的签名决定，不是随手写的。
+    let thumbnail = Arc::new(DenseStore::connect(
+        base,
+        api_key,
+        THUMBNAIL_COLLECTION,
+        THUMBNAIL_PAYLOAD_INDEX,
+    )?);
+    let plot = DenseStore::connect(
+        base,
+        api_key,
+        PLOT_IMAGE_COLLECTION,
+        PLOT_IMAGE_PAYLOAD_INDEX,
+    )?;
+    let embedding = Arc::new(EmbeddingClient::new(
+        inference_base_url,
+        inference_api_key,
+        Duration::from_secs(120),
+        Duration::from_secs(10),
+    ));
+    // 会话表两个服务**共用**同一份：它是「一个会话查两次结果」要看到同一
+    // 状态的地方，各造一份会让过期清理的结果在两边不一致。
+    let sessions = sm_db::repo::discovery::ImageSearchSessionRepository::new(db.clone());
+    let links = sm_db::repo::discovery::PendingImageRepository::new(db.clone());
+    // `ImageSearchIndexSpaceService` **不 Clone**，所以各造一份。这没有一致性
+    // 问题：它只包一个 repository，而「当前空间号」的真相在**数据库**里 ——
+    // 两份实例读到的是同一行。
+    let space_state = || {
+        ImageSearchIndexSpaceService::new(
+            sm_db::repo::discovery::ImageSearchIndexStateRepository::new(db.clone()),
+        )
+    };
+
+    let image_search = ImageSearchService::new(
+        thumbnail,
+        embedding.clone(),
+        sessions.clone(),
+        space_state(),
+        limits,
+    );
+    let plot_image_search = MoviePlotImageSearchService::new(
+        Arc::new(PlotImageVectorStore::with_store(plot)),
+        embedding,
+        space_state(),
+        sessions,
+        links,
+        limits,
+    );
+    Ok(Some((Arc::new(image_search), Arc::new(plot_image_search))))
 }
 
 fn with_optional_slow_log(app: axum::Router, raw_env: Option<&str>) -> axum::Router {
