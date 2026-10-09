@@ -305,6 +305,22 @@ impl MediaPointRepository {
         &self.pool
     }
 
+    /// 按 id 查询一个时刻点。
+    ///
+    /// service 层校验「这个 point 存在吗」时需要它 —— 那是对
+    /// `media_point` 行的检查，而**不是**对 `moment_collection_item`
+    /// 行的检查（后者是关联表，它的行存在只说明关联存在）。
+    ///
+    /// 走主键索引。
+    pub async fn find_by_id(&self, id: i32) -> Result<Option<MediaPoint>, DbError> {
+        Ok(
+            sqlx::query_as::<_, MediaPoint>("SELECT * FROM media_point WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     /// 插入时刻点。
     ///
     /// `movie_number` / `video_item_id` 是**快照**（不建外键），所以
@@ -389,6 +405,22 @@ impl MediaClipRepository {
     /// 底层连接池。
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// 按 id 查询一个片段。
+    ///
+    /// service 层校验「这个 clip 存在吗」时需要它 —— 那是对 `media_clip`
+    /// 行的检查，而**不是**对 `clip_collection_item` 行的检查（后者是
+    /// 关联表，它的行存在只说明关联存在）。
+    ///
+    /// 走主键索引。
+    pub async fn find_by_id(&self, id: i32) -> Result<Option<MediaClip>, DbError> {
+        Ok(
+            sqlx::query_as::<_, MediaClip>("SELECT * FROM media_clip WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
     }
 
     /// 插入片段。
