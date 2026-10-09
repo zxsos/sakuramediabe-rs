@@ -22,7 +22,6 @@ pub enum RefreshTokenStatus {
 impl RefreshTokenStatus {
     /// 数据库中存储的字面量。
     pub const fn as_str(self) -> &'static str {
-
         match self {
             Self::Active => "active",
             Self::Revoked => "revoked",
@@ -51,7 +50,7 @@ impl std::fmt::Display for RefreshTokenStatus {
 /// `users` 表。
 #[derive(Debug, Clone, FromRow)]
 pub struct User {
-    pub id: i64,
+    pub id: i32,
     pub username: String,
     /// argon2 哈希。**永不返回给客户端**。
     pub password_hash: String,
@@ -66,7 +65,7 @@ pub struct User {
 /// `revoked_at` 记录吊销时刻，`client_ip` / `user_agent` 用于审计。
 #[derive(Debug, Clone, FromRow)]
 pub struct UserRefreshToken {
-    pub id: i64,
+    pub id: i32,
     /// 对外下发的令牌标识（非哈希值）。唯一。
     pub token_id: String,
     /// 令牌哈希。**永不返回给客户端**。
@@ -136,8 +135,11 @@ mod tests {
         // 关键：把未知状态降级成 Active 会让失效令牌被当成有效令牌。
         assert_eq!(RefreshTokenStatus::from_str_lossy("bogus"), None);
         assert_eq!(RefreshTokenStatus::from_str_lossy(""), None);
-        assert_eq!(RefreshTokenStatus::from_str_lossy("ACTIVE"), None,
-            "大小写敏感，与数据库字面量一致");
+        assert_eq!(
+            RefreshTokenStatus::from_str_lossy("ACTIVE"),
+            None,
+            "大小写敏感，与数据库字面量一致"
+        );
     }
 
     #[test]

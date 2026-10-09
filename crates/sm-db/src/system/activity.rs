@@ -42,11 +42,10 @@ pub mod task_state {
     }
 }
 
-
 /// `background_task_run` 表：后台任务台账兼队列。
 #[derive(Debug, Clone, FromRow)]
 pub struct BackgroundTaskRun {
-    pub id: i64,
+    pub id: i32,
     /// 任务类型键，与 `task_name` 配合定位处理器。
     pub task_key: String,
     /// 人类可读的任务名。
@@ -61,8 +60,8 @@ pub struct BackgroundTaskRun {
     /// 状态，默认 `pending`。
     pub state: String,
     /// 进度三件套。三者都可空 —— 不可量化的任务不填。
-    pub progress_current: Option<i64>,
-    pub progress_total: Option<i64>,
+    pub progress_current: Option<i32>,
+    pub progress_total: Option<i32>,
     pub progress_text: Option<String>,
     /// 结构化结果摘要，`JsonTextField`。
     pub result_summary: Option<String>,
@@ -89,10 +88,7 @@ impl BackgroundTaskRun {
     /// 对应队列查询 `state = 'pending' AND scheduled_at <= now`。
     /// `scheduled_at` 为 NULL 视为立即可领。
     pub fn is_claimable(&self, now: NaiveDateTime) -> bool {
-        self.state == task_state::PENDING
-            && self
-                .scheduled_at
-                .is_none_or(|at| at <= now)
+        self.state == task_state::PENDING && self.scheduled_at.is_none_or(|at| at <= now)
     }
 
     /// 是否持有租约。
@@ -149,7 +145,7 @@ pub mod notification_category {
 /// 新旧两套并存是过渡期的有意设计，合并会破坏现有 API 契约。
 #[derive(Debug, Clone, FromRow)]
 pub struct SystemNotification {
-    pub id: i64,
+    pub id: i32,
     /// 通知分类，有索引。
     pub category: String,
     pub title: String,
@@ -163,7 +159,7 @@ pub struct SystemNotification {
     /// 事件资源类型。新身份字段。
     pub resource_type: Option<String>,
     /// 事件资源 ID。新身份字段，与 `resource_type` 配对使用。
-    pub resource_id: Option<i64>,
+    pub resource_id: Option<i32>,
     pub is_read: bool,
     pub read_at: Option<NaiveDateTime>,
     /// 关联任务台账。删台账行只置空，通知保留。
@@ -171,7 +167,7 @@ pub struct SystemNotification {
     /// 遗留展示关联类型。
     pub related_resource_type: Option<String>,
     /// 遗留展示关联 ID。
-    pub related_resource_id: Option<i64>,
+    pub related_resource_id: Option<i32>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -209,10 +205,17 @@ mod tests {
     use chrono::NaiveDate;
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap()
+        NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
     }
 
-    fn run(state: &str, scheduled: Option<NaiveDateTime>, lease: Option<NaiveDateTime>) -> BackgroundTaskRun {
+    fn run(
+        state: &str,
+        scheduled: Option<NaiveDateTime>,
+        lease: Option<NaiveDateTime>,
+    ) -> BackgroundTaskRun {
         BackgroundTaskRun {
             id: 1,
             task_key: "probe".to_owned(),
@@ -341,7 +344,10 @@ mod tests {
     fn reports_read_flag_timestamp_mismatch() {
         let mut n = note();
         n.is_read = true;
-        assert!(n.read_state_inconsistent(), "先置标记再补时间是常见两步写法");
+        assert!(
+            n.read_state_inconsistent(),
+            "先置标记再补时间是常见两步写法"
+        );
         n.read_at = Some(at(2026, 10, 2, 12, 0));
         assert!(!n.read_state_inconsistent());
         n.is_read = false;

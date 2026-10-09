@@ -52,7 +52,7 @@ macro_rules! owned_collection {
         #[doc = $doc]
         #[derive(Debug, Clone, FromRow)]
         pub struct $name {
-            pub id: i64,
+            pub id: i32,
             /// 全局唯一。
             pub name: String,
             pub description: String,
@@ -142,7 +142,7 @@ pub fn is_system_playlist_kind(kind: &str) -> bool {
 /// **本表没有 `position` 字段** —— 唯一索引是 `(playlist, movie)`。
 #[derive(Debug, Clone, FromRow)]
 pub struct PlaylistMovie {
-    pub id: i64,
+    pub id: i32,
     pub playlist_id: i64,
     /// 指向 `Movie`（JAV 影片）。注意 `Movie` 有 `movie_number` 字段，
     /// 但这个外键指向的是它的 `id`。
@@ -156,7 +156,7 @@ impl PlaylistMovie {
     ///
     /// **本表没有 `position`**，顺序只能靠 `id` —— 即加入播放列表的先后。
     /// 这与 `MomentCollectionItem` / `ClipCollectionItem` 不同。
-    pub fn playback_order_key(&self) -> i64 {
+    pub fn playback_order_key(&self) -> i32 {
         self.id
     }
 }
@@ -167,7 +167,7 @@ macro_rules! ordered_collection_item {
         #[doc = $doc]
         #[derive(Debug, Clone, FromRow)]
         pub struct $name {
-            pub id: i64,
+            pub id: i32,
             pub collection_id: i64,
             pub $field: i64,
             /// 显式播放顺序。
@@ -181,7 +181,7 @@ macro_rules! ordered_collection_item {
             ///
             /// `id` 作为次级键是必要的 —— 删除后重排会让多条成员 `position`
             /// 相同，只按 `position` 排序时顺序不确定，会导致播放列表抖动。
-            pub fn playback_order_key(&self) -> (i32, i64) {
+            pub fn playback_order_key(&self) -> (i32, i32) {
                 (self.position, self.id)
             }
         }
@@ -236,7 +236,7 @@ mod tests {
             !is_system_playlist_kind(PLAYLIST_KIND_CUSTOM),
             "用户列表不是系统列表"
         );
-        assert!(playlist("custom", None, None).is_system() == false);
+        assert!(!playlist("custom", None, None).is_system());
         assert!(playlist("recently_played", None, None).is_system());
     }
 
@@ -318,10 +318,7 @@ mod tests {
             created_at: None,
             updated_at: None,
         };
-        let same_pos_later_id = MomentCollectionItem {
-            id: 6,
-            ..a.clone()
-        };
+        let same_pos_later_id = MomentCollectionItem { id: 6, ..a.clone() };
         let next_pos = MomentCollectionItem {
             id: 2,
             position: 2,
@@ -334,4 +331,94 @@ mod tests {
             "同位时按 id 兜底，避免删除重排后顺序抖动"
         );
     }
+}
+
+/// 宏生成类型的列名与表名清单。
+///
+/// 静态解析器（`parity/compare_schema.py`）读的是源码而非宏展开结果，
+/// 所以看不到这些类型的字段。显式导出 `COLUMNS` 与 `TABLE_NAME` 后，
+/// schema 对拍才能覆盖到它们 —— 缺了这一步，三张合集表会游离在
+/// 一致性检查之外。
+pub mod columns {
+    use super::{ClipCollection, ClipCollectionItem, MomentCollection, MomentCollectionItem};
+
+    macro_rules! declare {
+        ($ty:ty, $table:literal, $($col:literal),+ $(,)?) => {
+            impl $ty {
+                /// 对应的数据库表名。
+                pub const TABLE_NAME: &'static str = $table;
+                /// 列名清单，顺序与建表一致。
+                pub const COLUMNS: &'static [&'static str] = &[$($col),+];
+            }
+        };
+    }
+
+    declare!(
+        super::Playlist,
+        "playlist",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "kind",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        MomentCollection,
+        "moment_collection",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        ClipCollection,
+        "clip_collection",
+        "id",
+        "name",
+        "description",
+        "owner_plugin_id",
+        "plugin_key",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        MomentCollectionItem,
+        "moment_collection_item",
+        "id",
+        "collection_id",
+        "point_id",
+        "position",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        ClipCollectionItem,
+        "clip_collection_item",
+        "id",
+        "collection_id",
+        "clip_id",
+        "position",
+        "created_at",
+        "updated_at",
+    );
+
+    declare!(
+        super::PlaylistMovie,
+        "playlist_movie",
+        "id",
+        "playlist_id",
+        "movie_id",
+        "created_at",
+        "updated_at",
+    );
 }

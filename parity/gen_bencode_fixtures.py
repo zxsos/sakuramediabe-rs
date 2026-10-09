@@ -73,17 +73,34 @@ CASES: dict[str, bytes] = {
     "v1_only": encode({"info": {"length": 1, "name": "a", "pieces": PIECES20}}),
     # 嵌套 list + 负整数。
     "nested": encode([[[b"a", b"b", -3]]]),
-    # 畸形整数：前导零 / 负零 / 空。
+    # 畸形整数：前导零 / 负零 / 空 / 尾随垃圾。
+    # 这些是**故意构造的非法输入**，Rust 侧必须拒绝它们，所以自校验跳过。
     "int_leading_zero": b"i01e",
     "int_negative_zero": b"i-0e",
     "int_empty": b"ie",
     "int_garbage": b"i1x2e",
 }
 
+# 这些用例是故意畸形的。它们的存在意义是喂给 Rust 验证「必须拒绝」。
+#
+# 注意它们**不能**在这里做 Python 侧自校验：Python 的 int() 接受前导零与
+# 负零（int("01") == 1、int("-0") == 0），而 Rust 侧的 bencode 解析器按
+# libtorrent 的行为严格拒绝。这道语义差异本身正是对拍要验证的东西，
+# 在生成器里"修正"它等于把要测的差异抹掉。
+MALFORMED = {"int_leading_zero", "int_negative_zero", "int_empty", "int_garbage"}
+
 
 def main() -> None:
     for name, payload in CASES.items():
-        # 自校验：解回来必须消耗全部字节，否则长度前缀写错了。
+        if name in MALFORMED:
+            print(f"{name}")
+            print(f"  bytes  = {payload!r}")
+            print(f"  rust   = b\"{payload.decode('ascii')}\"")
+            print("  expect = 拒绝（不与 Python 对拍，语义故意不同）")
+            print()
+            continue
+
+        # 自校验：合法用例解回来必须消耗全部字节，否则长度前缀写错了。
         value, end = decode(payload)
         assert end == len(payload), f"{name}: 残留 {len(payload) - end} 字节"
         print(f"{name}")

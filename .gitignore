@@ -1,2 +1,6 @@
 target/
 Cargo.lock
+
+# Python bytecode from the parity tooling
+__pycache__/
+*.pyc

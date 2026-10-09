@@ -58,9 +58,7 @@ pub fn as_datetime(value: &Value) -> Option<chrono::DateTime<chrono::FixedOffset
     // 退而接受无时区的朴素格式；后端统一用 UTC。
     chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f")
         .ok()
-        .or_else(|| {
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok()
-        })
+        .or_else(|| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok())
         .map(|naive| {
             let offset = chrono::FixedOffset::east_opt(0).expect("UTC 偏移恒合法");
             chrono::DateTime::from_naive_utc_and_offset(naive, offset)
@@ -145,10 +143,16 @@ mod tests {
 
     #[test]
     fn string_trim_semantics() {
-        assert_eq!(as_string_or_null(&json!(" x "), false), Some(" x ".to_owned()));
+        assert_eq!(
+            as_string_or_null(&json!(" x "), false),
+            Some(" x ".to_owned())
+        );
         assert_eq!(as_string_or_null(&json!(" x "), true), Some("x".to_owned()));
         assert_eq!(as_string_or_null(&json!("  "), true), None);
-        assert_eq!(as_string_or_null(&json!("  "), false), Some("  ".to_owned()));
+        assert_eq!(
+            as_string_or_null(&json!("  "), false),
+            Some("  ".to_owned())
+        );
         assert_eq!(as_string_or_null(&json!(7), true), None);
     }
 

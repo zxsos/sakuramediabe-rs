@@ -1,0 +1,42 @@
+# 本地开发用的 PostgreSQL 16。生产环境由 sakuramediabe 自带的 compose 负责，
+# 这里只服务 Rust 侧的集成测试。
+#
+# 启动：
+#   docker compose up -d
+#   python parity/apply_ddl.py       # 建表
+#   cargo test -p sm-db              # 跑集成测试
+#
+# 为什么 timezone=UTC 不能省：
+# 上游全项目使用 naive datetime 与数据库交互，列类型是
+# `timestamp without time zone`。容器时区若不是 UTC，PG 写入/读取的
+# timestamp 值会整体偏移，而这种偏移不会报错，只会让时间字段静默错位。
+#
+# 端口用 5433 而不是 5432：避开本机可能已有的 PostgreSQL 实例。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sakuramedia-rs-pg
+    environment:
+      POSTGRES_USER: sakuramedia
+      POSTGRES_PASSWORD: sakuramedia
+      POSTGRES_DB: sakuramedia_test
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - timezone=UTC
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      # apply_ddl.py 与 cargo test 依赖「服务已接受连接」而非「容器已创建」
+      test: ["CMD-SHELL", "pg_isready -U sakuramedia -d sakuramedia_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

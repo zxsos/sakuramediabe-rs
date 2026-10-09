@@ -39,7 +39,13 @@ impl<T> Paginated<T> {
     /// 构造一页数据。`synced_at` 为 `None` 时序列化仍会输出该键（值为 `null`），
     /// 客户端能处理，且比省略键更利于排障。
     pub fn new(items: Vec<T>, page: i64, page_size: i64, total: i64) -> Self {
-        Self { items, page, page_size, total, synced_at: None }
+        Self {
+            items,
+            page,
+            page_size,
+            total,
+            synced_at: None,
+        }
     }
 
     /// 附加抓取时间。
@@ -77,7 +83,7 @@ impl<T> Paginated<T> {
             .map(|raw| {
                 raw.iter()
                     .filter(|item| item.is_object())
-                    .filter_map(|item| item_from_json(item))
+                    .filter_map(item_from_json)
                     .collect::<Vec<T>>()
             })
             .unwrap_or_default();
@@ -273,10 +279,7 @@ mod paging_tests {
     #[test]
     fn page_is_checked_before_page_size() {
         // 后端顺序是先 page 再 page_size，两个都非法时只报 page。
-        assert_eq!(
-            validate_page(0, 0),
-            Err(PageError::InvalidPage { page: 0 })
-        );
+        assert_eq!(validate_page(0, 0), Err(PageError::InvalidPage { page: 0 }));
     }
 
     #[test]

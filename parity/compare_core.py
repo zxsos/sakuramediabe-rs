@@ -19,14 +19,33 @@ import argparse
 import json
 import re
 import subprocess
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CLI = REPO_ROOT / "target" / "debug" / "core_parity.exe"
-if not CLI.exists():
-    CLI = REPO_ROOT / "target" / "debug" / "core_parity"
+
+
+def find_cli() -> Path | None:
+    """定位 core_parity 二进制。
+
+    本地开发通常是 `cargo build`（debug），CI 里为了快用 `--release`。
+    只认死 debug 路径会让 CI 报「找不到二进制」而看不出真正原因，所以两个
+    profile 都探测；也允许用环境变量或命令行显式指定。
+    """
+    override = os.environ.get("CORE_PARITY_BIN")
+    if override:
+        candidate = Path(override)
+        return candidate if candidate.exists() else None
+
+    name = "core_parity.exe" if os.name == "nt" else "core_parity"
+    for profile in ("debug", "release"):
+        candidate = REPO_ROOT / "target" / profile / name
+        if candidate.exists():
+            return candidate
+    return None
+
 
 # 客户端 Dart 的默认回��值
 DEFAULT_CODE = "unknown_error"
@@ -268,14 +287,23 @@ def py_auth_from_body(body):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug", "--verbose", dest="verbose", action="store_true")
     args = parser.parse_args()
 
-    if not CLI.exists():
-        print("找不到 core_parity，请先运行: cargo build -p sm-core --bin core_parity")
+    cli = find_cli()
+    if cli is None:
+        print(
+            "找不到 core_parity 二进制。请先运行："
+            "  cargo build -p sm-core --bin core_parity        # debug（默认）"
+            "  cargo build --release -p sm-core --bin core_parity   # release（CI）"
+            "或用 CORE_PARITY_BIN 环境变量 / --cli 显式指定路径。"
+        )
         return 2
 
-    parity = Parity(CLI, verbose=args.debug)
+    if args.verbose:
+        print(f"core_parity: {cli}")
+
+    parity = Parity(cli, verbose=args.verbose)
 
     print("== 错误信封 ApiError.from_body ==")
     for label, body in ERROR_CASES:

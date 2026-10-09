@@ -73,7 +73,10 @@ mod tests {
         // RFC 4231 用例 6：key 长度 131 > 64，必须先哈希。
         let key = [0xaau8; 131];
         assert_eq!(
-            hex(&hmac_sha256(&key, b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            hex(&hmac_sha256(
+                &key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }

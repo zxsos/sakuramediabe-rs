@@ -162,7 +162,11 @@ mod tests {
     #[test]
     fn plain_token_is_43_char_base64url() {
         let material = RefreshTokenMaterial::generate();
-        assert_eq!(material.plain_token.len(), 43, "base64url(32 字节) 无 padding");
+        assert_eq!(
+            material.plain_token.len(),
+            43,
+            "base64url(32 字节) 无 padding"
+        );
         let allowed = B64URL.as_bytes();
         assert!(
             material
@@ -177,7 +181,10 @@ mod tests {
     fn token_id_is_32_char_hex() {
         let material = RefreshTokenMaterial::generate();
         assert_eq!(material.token_id.len(), 32);
-        assert!(material.token_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(material
+            .token_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
     }
 
     #[test]

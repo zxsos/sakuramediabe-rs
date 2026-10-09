@@ -117,24 +117,15 @@ mod tests {
 
     #[test]
     fn sha1_matches_known_vectors() {
-        assert_eq!(
-            sha1_hex(b""),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
-        assert_eq!(
-            sha1_hex(b"abc"),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
+        assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
             sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
             "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
         );
         // 跨 64 字节块边界的长度扩展用例。
         let long = vec![b'a'; 1_000_000];
-        assert_eq!(
-            sha1_hex(&long),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
+        assert_eq!(sha1_hex(&long), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
     }
 
     #[test]

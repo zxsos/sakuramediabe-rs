@@ -388,7 +388,7 @@ mod tests {
     fn rejects_deep_nesting() {
         let depth = MAX_DEPTH + 8;
         let mut bytes = vec![b'l'; depth];
-        bytes.extend(std::iter::repeat(b'e').take(depth));
+        bytes.extend(std::iter::repeat_n(b'e', depth));
         assert!(matches!(
             validate(&bytes),
             Err(BencodeError::DepthLimitExceeded { .. })

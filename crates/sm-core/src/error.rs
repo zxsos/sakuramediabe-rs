@@ -31,7 +31,11 @@ pub struct ApiError {
 impl ApiError {
     /// 构造不带 details 的错误。
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into(), details: None }
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+        }
     }
 
     /// 附加 details（builder 风格）。
@@ -102,7 +106,10 @@ mod tests {
         // 客户端 toJson 的 `if (details != null)` 行为，序列化结果必须一致。
         let error = ApiError::new("invalid_credentials", "用户名或密码错误");
         let text = serde_json::to_string(&error).unwrap();
-        assert_eq!(text, r#"{"code":"invalid_credentials","message":"用户名或密码错误"}"#);
+        assert_eq!(
+            text,
+            r#"{"code":"invalid_credentials","message":"用户名或密码错误"}"#
+        );
         assert!(!text.contains("details"));
     }
 
@@ -139,13 +146,20 @@ mod tests {
         assert_eq!(error.message, "Unknown error");
 
         // details 非对象 -> 视为 null
-        let error = ApiError::from_body(&json!({"error": {"code":"x","message":"y","details":[1,2]}}));
+        let error =
+            ApiError::from_body(&json!({"error": {"code":"x","message":"y","details":[1,2]}}));
         assert!(error.details.is_none());
     }
 
     #[test]
     fn falls_back_when_envelope_shape_is_wrong() {
-        for body in [json!(null), json!({}), json!({"error": null}), json!([]), json!("text")] {
+        for body in [
+            json!(null),
+            json!({}),
+            json!({"error": null}),
+            json!([]),
+            json!("text"),
+        ] {
             let error = ApiError::from_body(&body);
             assert_eq!(error.code, "unknown_error");
             assert_eq!(error.message, "Unknown error");

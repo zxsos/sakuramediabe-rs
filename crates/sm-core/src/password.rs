@@ -23,15 +23,14 @@
 //! 因此实际需要迁移的账号极少。
 
 use argon2::password_hash::rand_core::OsRng;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::password_hash::Ident;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 
-
 /// 默认参数。
-//
-// 19 MiB / 2 次迭代 / 1 并行度，对应 OWASP 对 Argon2id 的最低推荐
-
+///
+/// 19 MiB / 2 次迭代 / 1 并行度，对应 OWASP 对 Argon2id 的最低推荐
+///
 // （m=19456 KiB, t=2, p=1）。NAS 场景下内存占用可接受。
 pub const DEFAULT_M_COST: u32 = 19 * 1024;
 /// 迭代次数。
@@ -80,8 +79,7 @@ pub fn hash_password_with(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<String, PasswordError> {
-    let params = Params::new(m_cost, t_cost, p_cost, None)
-        .map_err(|_| PasswordError::Hashing)?;
+    let params = Params::new(m_cost, t_cost, p_cost, None).map_err(|_| PasswordError::Hashing)?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let salt = SaltString::generate(&mut OsRng);
     let hash = argon2
@@ -145,7 +143,10 @@ mod tests {
         let (m, t, p) = FAST;
         let stored = hash_password_with("s3cret", m, t, p).unwrap();
         assert!(verify_password("s3cret", &stored).is_ok());
-        assert_eq!(verify_password("wrong", &stored), Err(PasswordError::Mismatch));
+        assert_eq!(
+            verify_password("wrong", &stored),
+            Err(PasswordError::Mismatch)
+        );
     }
 
     #[test]
@@ -174,7 +175,9 @@ mod tests {
     #[test]
     fn detects_bcrypt_hashes_for_migration() {
         for prefix in ["$2a$", "$2b$", "$2x$", "$2y$"] {
-            let legacy = format!("{prefix}10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+            let legacy = format!(
+                "{prefix}10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            );
             assert!(is_bcrypt(&legacy), "prefix={prefix}");
             assert!(needs_rehash(&legacy), "bcrypt 必须标记为需重算");
         }

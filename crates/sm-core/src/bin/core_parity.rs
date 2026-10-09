@@ -30,10 +30,16 @@ fn main() {
                 ("code", error.code.clone()),
                 ("message", error.message.clone()),
                 ("has_details", error.details.is_some().to_string()),
-                ("serialized", serde_json::to_string(&error).unwrap_or_default()),
+                (
+                    "serialized",
+                    serde_json::to_string(&error).unwrap_or_default(),
+                ),
             ];
             if let Some(details) = &error.details {
-                fields.push(("details", serde_json::to_string(details).unwrap_or_default()));
+                fields.push((
+                    "details",
+                    serde_json::to_string(details).unwrap_or_default(),
+                ));
             }
             emit(&fields);
         }
@@ -41,7 +47,10 @@ fn main() {
             let page: Paginated<serde_json::Value> =
                 Paginated::from_body(&body, |item| Some(item.clone()));
             emit(&[
-                ("items", serde_json::to_string(&page.items).unwrap_or_default()),
+                (
+                    "items",
+                    serde_json::to_string(&page.items).unwrap_or_default(),
+                ),
                 ("page", page.page.to_string()),
                 ("page_size", page.page_size.to_string()),
                 ("total", page.total.to_string()),
@@ -49,30 +58,40 @@ fn main() {
                 ("total_pages", page.total_pages().to_string()),
             ]);
         }
-        "auth-from-body" => {
-            match AuthTokens::from_body(&body) {
-                Ok(tokens) => {
-                    let json = tokens.to_client_json();
-                    emit(&[
-                        ("ok", "true".to_owned()),
-                        ("access_token", tokens.access_token.clone()),
-                        ("refresh_token", tokens.refresh_token.clone()),
-                        ("token_type", tokens.token_type.clone()),
-                        ("expires_in", tokens.expires_in.to_string()),
-                        ("expires_at", json["expires_at"].as_str().unwrap_or_default().to_owned()),
-                        ("refresh_expires_at", json["refresh_expires_at"].as_str().unwrap_or_default().to_owned()),
-                        ("username", tokens.user.username.clone()),
-                    ]);
-                }
-                Err(_) => {
-                    emit(&[
-                        ("ok", "false".to_owned()),
-                        ("code", sm_core::auth::INVALID_AUTH_RESPONSE.to_owned()),
-                        ("message", sm_core::auth::INVALID_AUTH_RESPONSE_MESSAGE.to_owned()),
-                    ]);
-                }
+        "auth-from-body" => match AuthTokens::from_body(&body) {
+            Ok(tokens) => {
+                let json = tokens.to_client_json();
+                emit(&[
+                    ("ok", "true".to_owned()),
+                    ("access_token", tokens.access_token.clone()),
+                    ("refresh_token", tokens.refresh_token.clone()),
+                    ("token_type", tokens.token_type.clone()),
+                    ("expires_in", tokens.expires_in.to_string()),
+                    (
+                        "expires_at",
+                        json["expires_at"].as_str().unwrap_or_default().to_owned(),
+                    ),
+                    (
+                        "refresh_expires_at",
+                        json["refresh_expires_at"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ),
+                    ("username", tokens.user.username.clone()),
+                ]);
             }
-        }
+            Err(_) => {
+                emit(&[
+                    ("ok", "false".to_owned()),
+                    ("code", sm_core::auth::INVALID_AUTH_RESPONSE.to_owned()),
+                    (
+                        "message",
+                        sm_core::auth::INVALID_AUTH_RESPONSE_MESSAGE.to_owned(),
+                    ),
+                ]);
+            }
+        },
         "validate-page" => {
             let page = body.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
             let size = body.get("page_size").and_then(|v| v.as_i64()).unwrap_or(20);
@@ -101,7 +120,14 @@ fn main() {
             }
             emit(&[
                 ("offset", page_offset(page.max(1), size.max(1)).to_string()),
-                ("last_page", last_page(body.get("total").and_then(|v| v.as_i64()).unwrap_or(0), size).to_string()),
+                (
+                    "last_page",
+                    last_page(
+                        body.get("total").and_then(|v| v.as_i64()).unwrap_or(0),
+                        size,
+                    )
+                    .to_string(),
+                ),
             ]);
         }
         "make-error" => {
@@ -115,7 +141,10 @@ fn main() {
                 let details = json!({"k": "v"}).as_object().cloned().unwrap_or_default();
                 error = error.with_details(details);
             }
-            emit(&[("serialized", serde_json::to_string(&error).unwrap_or_default())]);
+            emit(&[(
+                "serialized",
+                serde_json::to_string(&error).unwrap_or_default(),
+            )]);
         }
         other => {
             eprintln!("unknown command: {other}");

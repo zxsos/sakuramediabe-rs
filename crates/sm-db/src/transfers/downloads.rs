@@ -31,7 +31,7 @@ use sqlx::FromRow;
 /// `download_client` 表：下载器实例。
 #[derive(Debug, Clone, FromRow)]
 pub struct DownloadClient {
-    pub id: i64,
+    pub id: i32,
     /// 全局唯一。
     pub name: String,
     /// 不透明 JSON 文本，由 provider 解释。宿主只保存与原样回传。
@@ -70,7 +70,7 @@ pub mod indexer_kind {
 /// `indexer` 表：Torznab 索引器。
 #[derive(Debug, Clone, FromRow)]
 pub struct Indexer {
-    pub id: i64,
+    pub id: i32,
     /// 全局唯一。
     pub name: String,
     /// Torznab 搜索接口地址。
@@ -99,7 +99,7 @@ impl Indexer {
 /// 唯一索引 `(indexer, download_client)` —— 同一组合不重复绑定。
 #[derive(Debug, Clone, FromRow)]
 pub struct IndexerDownloadClient {
-    pub id: i64,
+    pub id: i32,
     pub indexer_id: i64,
     pub download_client_id: i64,
     pub created_at: Option<NaiveDateTime>,
@@ -148,8 +148,8 @@ pub mod import_status {
 /// 这是幂等提交的基础：重复提交同一资源会命中该约束而非产生第二条记录。
 #[derive(Debug, Clone, FromRow)]
 pub struct DownloadTask {
-    pub id: i64,
-    pub client_id: i64,
+    pub id: i32,
+    pub client_id: i32,
     /// 影片番号（**字符串，非外键**）。
     ///
     /// 注释：「影片番号不是 provider 身份，只是宿主业务投影，
@@ -193,8 +193,7 @@ impl DownloadTask {
     ///
     /// 只有把两个状态机分开建模，才能表达这个组合。
     pub fn is_stuck_after_download(&self) -> bool {
-        self.state == download_state::COMPLETED
-            && self.import_status == import_status::FAILED
+        self.state == download_state::COMPLETED && self.import_status == import_status::FAILED
     }
 }
 
@@ -205,7 +204,7 @@ impl DownloadTask {
 /// 所以这里不需要区分 hash 版本。
 #[derive(Debug, Clone, FromRow)]
 pub struct DownloadResourceBlacklist {
-    pub id: i64,
+    pub id: i32,
     /// 全局唯一。v1 info hash，小写 hex。
     pub info_hash: String,
     pub created_at: Option<NaiveDateTime>,
@@ -229,11 +228,11 @@ impl DownloadResourceBlacklist {
 /// 悬空整数，Rust 侧用 `Option<i64>` 表达，不能假设它指向存在的行。
 #[derive(Debug, Clone, FromRow)]
 pub struct DownloadSubmissionRecord {
-    pub id: i64,
+    pub id: i32,
     /// 裸整数，无外键约束。
-    pub client_id: i64,
+    pub client_id: i32,
     /// 裸整数，无外键约束。任务删除后成为悬空引用。
-    pub task_id: Option<i64>,
+    pub task_id: Option<i32>,
     pub movie_number: String,
     pub indexer_name: String,
     pub title: String,
@@ -301,7 +300,10 @@ mod tests {
     fn indexer_apikey_presence_is_protocol_level() {
         // Torznab 允许无鉴权索引器，此时请求不能带 apikey 参数。
         assert!(!indexer("bt", None).requires_apikey());
-        assert!(!indexer("bt", Some("   ")).requires_apikey(), "空白视同无 key");
+        assert!(
+            !indexer("bt", Some("   ")).requires_apikey(),
+            "空白视同无 key"
+        );
         assert!(indexer("bt", Some("k")).requires_apikey());
     }
 
@@ -354,7 +356,9 @@ mod tests {
             "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
         ));
         assert!(!DownloadResourceBlacklist::is_valid_info_hash("abc"));
-        assert!(!DownloadResourceBlacklist::is_valid_info_hash(&"z".repeat(40)));
+        assert!(!DownloadResourceBlacklist::is_valid_info_hash(
+            &"z".repeat(40)
+        ));
         assert!(
             !DownloadResourceBlacklist::is_valid_info_hash(&"a".repeat(64)),
             "v2 是 64 位 hex，本表存不下 —— svc-hash 上游已提前拒绝 v2-only"
