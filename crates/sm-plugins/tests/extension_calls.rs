@@ -26,9 +26,11 @@ use sm_plugin_api::v1::ranking_source_extension_service_server::{
 };
 use sm_plugin_api::v1::{
     FetchMovieRequest, FetchMovieResponse, FetchRankingRequest, FetchRankingResponse,
+    ResolveRankingPeriodsRequest, ResolveRankingPeriodsResponse,
 };
 use sm_plugins::extension_calls::{
-    fetch_movie, fetch_ranking, interpret_fetch_movie, ExtensionCallError, MovieLookup,
+    fetch_movie, fetch_ranking, interpret_fetch_movie, resolve_ranking_periods, ExtensionCallError,
+    MovieLookup,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -81,6 +83,28 @@ impl RankingSourceExtensionService for FakePlugin {
                 _ => Vec::new(),
             },
         }))
+    }
+
+    /// 假插件照 TOP250 那条规则回：`2026`（今年）永远抓，历史年份**已有条目
+    /// 就不抓** —— 这正是宿主递 `periods_with_items` 的用处。
+    async fn resolve_ranking_periods(
+        &self,
+        request: Request<ResolveRankingPeriodsRequest>,
+    ) -> Result<Response<ResolveRankingPeriodsResponse>, Status> {
+        if self.fail {
+            return Err(Status::internal("插件算周期时炸了"));
+        }
+        let request = request.into_inner();
+        if request.board_key != "top250" {
+            // 没有动态周期的榜单：声明里的静态周期就是全部，这里不必回。
+            return Ok(Response::new(ResolveRankingPeriodsResponse::default()));
+        }
+        let periods = ["2026", "2025", "2024"]
+            .into_iter()
+            .filter(|year| !request.periods_with_items.iter().any(|p| p == year))
+            .map(str::to_owned)
+            .collect();
+        Ok(Response::new(ResolveRankingPeriodsResponse { periods }))
     }
 }
 
@@ -204,4 +228,56 @@ async fn ranking_numbers_come_back_in_rank_order() {
     .await
     .expect("调用应当成功");
     assert!(response.movie_numbers.is_empty());
+}
+
+#[tokio::test]
+async fn the_host_tells_the_plugin_which_periods_already_have_items() {
+    // 上游 `should_fetch(period, has_items)`：宿主不知道插件的账号配置，插件
+    // 不知道库里的条目 —— 所以这条 rpc 把后者递过去，裁决权留在插件。
+    let mut client = ranking_client(spawn(false).await).await;
+    let response = resolve_ranking_periods(
+        &mut client,
+        ResolveRankingPeriodsRequest {
+            board_key: "top250".to_owned(),
+            // 2024 已经抓过了，今年（2026）没有。
+            periods_with_items: vec!["2024".to_owned()],
+        },
+        None,
+    )
+    .await
+    .expect("调用应当成功");
+    assert_eq!(
+        response.periods,
+        vec!["2026", "2025"],
+        "已有条目的周期不再抓"
+    );
+
+    // 空列表是「本次不抓」，是**正常结果**（如账号未配置），不是错误。
+    let response = resolve_ranking_periods(
+        &mut client,
+        ResolveRankingPeriodsRequest {
+            board_key: "playback_all".to_owned(),
+            periods_with_items: vec![],
+        },
+        None,
+    )
+    .await
+    .expect("没有动态周期的榜单回空列表也应当成功");
+    assert!(response.periods.is_empty());
+}
+
+#[tokio::test]
+async fn a_plugin_failure_while_resolving_periods_is_a_call_error() {
+    let mut client = ranking_client(spawn(true).await).await;
+    let error = resolve_ranking_periods(
+        &mut client,
+        ResolveRankingPeriodsRequest {
+            board_key: "top250".to_owned(),
+            periods_with_items: vec![],
+        },
+        None,
+    )
+    .await
+    .expect_err("插件报错应当成为 Err");
+    assert_eq!(error.code(), "extension_call_failed");
 }

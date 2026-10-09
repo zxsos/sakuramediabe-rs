@@ -3,8 +3,9 @@
 //! # 上游对应
 //!
 //! `MetadataSourceExtensionService.FetchMovie` 与
-//! `RankingSourceExtensionService.FetchRanking`。声明的收集与校验在
-//! [`crate::extensions`]，这里只管「发一次调用、把结果收敛成宿主能用的形状」。
+//! `RankingSourceExtensionService.{FetchRanking, ResolveRankingPeriods}`。声明的
+//! 收集与校验在 [`crate::extensions`]，这里只管「发一次调用、把结果收敛成宿主
+//! 能用的形状」。
 //!
 //! # 通道复用控制面那条
 //!
@@ -37,6 +38,7 @@ use sm_plugin_api::v1::metadata_source_extension_service_client::MetadataSourceE
 use sm_plugin_api::v1::ranking_source_extension_service_client::RankingSourceExtensionServiceClient;
 use sm_plugin_api::v1::{
     FetchMovieRequest, FetchMovieResponse, FetchRankingRequest, FetchRankingResponse,
+    ResolveRankingPeriodsRequest, ResolveRankingPeriodsResponse,
 };
 use tonic::transport::Channel;
 
@@ -82,6 +84,28 @@ pub fn interpret_fetch_movie(response: FetchMovieResponse) -> MovieLookup {
     }
 }
 
+/// 连到一个插件的**控制面**端点，拿一个排行扩展点客户端。
+///
+/// 与 [`crate::provider_calls::connect_storage`] 同一个端点约定：排行扩展点服务
+/// 跑在插件的控制面上 —— proto 里 `RankingSourceExtensionService` 与
+/// `MetadataSourceExtensionService` 是同一进程上的两个 service，只有**数据面**
+/// 才另有一个 `data_plane_endpoint`。
+///
+/// # 每次现连，不缓存
+///
+/// 端点会随插件重启变化（`supervisor` 每次向内核要新地址），缓存 channel 会在
+/// 重启后指向一个没人监听的端口。与 `connect_storage` 同样处理。
+pub async fn connect_ranking(
+    endpoint: &str,
+) -> Result<RankingSourceExtensionServiceClient<Channel>, ExtensionCallError> {
+    let channel = Channel::from_shared(endpoint.to_owned())
+        .map_err(|error| ExtensionCallError::Call(format!("端点 {endpoint} 不合法：{error}")))?
+        .connect()
+        .await
+        .map_err(|error| ExtensionCallError::Call(format!("连接 {endpoint} 失败：{error}")))?;
+    Ok(RankingSourceExtensionServiceClient::new(channel))
+}
+
 /// 向一个插件取一次元数据。
 pub async fn fetch_movie(
     client: &mut MetadataSourceExtensionServiceClient<Channel>,
@@ -111,6 +135,33 @@ pub async fn fetch_ranking(
     }
     client
         .fetch_ranking(request)
+        .await
+        .map(|response| response.into_inner())
+        .map_err(classify)
+}
+
+/// 问一个插件「这个榜此刻要抓哪些周期」。
+///
+/// # 为什么不是宿主自己算
+///
+/// 上游 `should_fetch(period, has_items)`（`ranking_service.py:36`）里混着
+/// **插件自己的配置**（TOP250 没配账号就不抓）与**宿主的库状态**（历史年份已有
+/// 条目就不重抓）。前者宿主不知道，所以裁决权在插件；宿主只负责把它知道的
+/// 「哪些周期已经有条目」递过去。
+///
+/// 返回**空列表是正常结果**（本次不抓），不是错误 —— 与 `FetchRanking` 的空榜单
+/// 同一取向。
+pub async fn resolve_ranking_periods(
+    client: &mut RankingSourceExtensionServiceClient<Channel>,
+    request: ResolveRankingPeriodsRequest,
+    deadline: Option<Duration>,
+) -> Result<ResolveRankingPeriodsResponse, ExtensionCallError> {
+    let mut request = tonic::Request::new(request);
+    if let Some(limit) = deadline {
+        request.set_timeout(limit);
+    }
+    client
+        .resolve_ranking_periods(request)
         .await
         .map(|response| response.into_inner())
         .map_err(classify)

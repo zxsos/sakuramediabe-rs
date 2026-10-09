@@ -223,6 +223,25 @@ pub fn serve_file(
     path: &std::path::Path,
     range_header: Option<&str>,
 ) -> Result<axum::response::Response, std::io::Error> {
+    // 片段串流的产物**恒为 mp4**（`media_clips` 那条路），写死没问题。
+    serve_file_as(path, range_header, "video/mp4")
+}
+
+/// 同 [`serve_file`]，但 `Content-Type` 由调用方给。
+///
+/// # 为什么必须能指定，而不是继续写死 `video/mp4`
+///
+/// 本地库那条路（`DeliveryTarget::LocalPath`）服务的是用户自己的文件：
+/// mkv / webm / avi 都在里头。一律回 `video/mp4` 会让浏览器按 mp4 去解容器，
+/// 解不开就**拒播** —— 而 HTTP 这一层看起来完全正常（200 / 206 都对）。
+/// 调用方按扩展名猜（`mime_guess`，上游 `mimetypes.guess_type` 的对位物，
+/// 见 `routes/files.rs` 的 `image_response`），provider 声明了 `content_type`
+/// 时优先用它。
+pub fn serve_file_as(
+    path: &std::path::Path,
+    range_header: Option<&str>,
+    content_type: &str,
+) -> Result<axum::response::Response, std::io::Error> {
     use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE};
     use axum::http::{HeaderName, StatusCode};
 
@@ -255,7 +274,7 @@ pub fn serve_file(
     let mut response = axum::response::Response::builder()
         .status(status)
         .header(ACCEPT_RANGES, "bytes")
-        .header(CONTENT_TYPE, "video/mp4");
+        .header(CONTENT_TYPE, content_type);
     for (name, value) in extra {
         response = response.header(name, value);
     }

@@ -145,6 +145,45 @@ impl ActorRepository {
         )
     }
 
+    /// 按 `id` 游标取一页，**升序**，且**排除墓碑**。
+    ///
+    /// 插件能力出口的 `ListActors` 用它（`crates/sm-server/src/plugin_host.rs`）。
+    /// 排除墓碑与上游一致（`context.py:76` 的 `Actor.merged_into.is_null()`）：被合并
+    /// 掉的演员不该再出现在「待补全」名单里 —— 它的资料已经并到保留记录上了，再抓一
+    /// 遍只会把结果写到隧道记录上。
+    ///
+    /// `limit` 语义同 `MovieRepository::list_page_after_id`（`repo/movie.rs`）：调用方
+    /// 多要一条来判「还有下一页」。
+    pub async fn list_page_after_id(
+        &self,
+        after_id: i32,
+        limit: i64,
+    ) -> Result<Vec<Actor>, DbError> {
+        Ok(sqlx::query_as::<_, Actor>(
+            "SELECT * FROM actor WHERE id > $1 AND merged_into_id IS NULL ORDER BY id LIMIT $2",
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按一组主键批量取。**返回顺序不保证**，调用方自己按 `id` 排。
+    ///
+    /// 影片快照要带上每部影片的演员（`MovieSnapshot.actors`），而一次 `ListMovies`
+    /// 可能涉及上千部影片 —— 逐部调 [`Self::find_by_id`] 就是 N+1。
+    pub async fn find_by_ids(&self, ids: &[i32]) -> Result<Vec<Actor>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            sqlx::query_as::<_, Actor>("SELECT * FROM actor WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     /// 按名字或别名查。
     ///
     /// 同时匹配 `name` 与 `alias_name` —— 用户搜「苍井空」应该命中

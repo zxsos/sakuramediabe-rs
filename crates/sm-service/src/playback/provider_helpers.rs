@@ -282,6 +282,15 @@ pub enum DeliveryTarget {
         /// （`storage.proto:37-38`）。
         headers: Vec<(String, String)>,
     },
+    /// ★ **宿主自己读本地文件**（本地库 / 挂载盘 / 与宿主同机的存储）。
+    ///
+    /// 前两种都是「字节在别处」（直连或转发），这一种是「字节就在宿主能直接
+    /// `open` 的路径上」。没有它，本地 provider 只能拼一个 `file://` URL 走 302
+    /// —— 客户端不认那种 scheme，于是「能播」被静默降级成「点了没反应」。
+    ///
+    /// `path` **原样**使用：proto 里就写明这里是路径不是 URL，provider 不做转义、
+    /// 宿主也不做反转义。所以宿主侧不要再塞进任何 URL 编解码。
+    LocalPath { path: String },
 }
 
 /// **客户端请求**的投递方式。上游 `Literal["proxy","redirect"] | None`。

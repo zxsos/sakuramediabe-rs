@@ -164,7 +164,7 @@ async fn browse_rejects_path_escape_and_missing_library() {
 // ── PlanPlayback（一元）──────────────────────────────────────────
 
 #[tokio::test]
-async fn plan_playback_returns_redirect_plan() {
+async fn plan_playback_returns_a_local_path_plan() {
     let (_root, mut client) = start().await;
 
     let response = client
@@ -190,13 +190,24 @@ async fn plan_playback_returns_redirect_plan() {
         Some(expected_size("b-movies/movie-01.mkv"))
     );
     assert_eq!(plan.content_type.as_deref(), Some("video/x-matroska"));
-    // local provider 只能把自己省掉的那部分退化成 file:// 伪直链。
     match plan.delivery.expect("必须给出投放方式") {
-        sm_plugin_api::v1::playback_plan::Delivery::Redirect(redirect) => {
-            assert!(redirect.url.starts_with("file://"));
-            assert!(redirect.url.ends_with("b-movies/movie-01.mkv"));
+        sm_plugin_api::v1::playback_plan::Delivery::LocalPath(local) => {
+            // ★ 是**路径**，不是 URL：没有 `file://` 前缀，也没有百分号转义。
+            // 宿主直接拿它 `open`。拼 URL 那条老路（`file://C:\dir\a.mkv`）客户端
+            // 不认，表现是「点播放没反应」而宿主侧看起来一切正常。
+            assert!(
+                !local.path.starts_with("file://"),
+                "给的是路径不是 URL：{}",
+                local.path
+            );
+            // 按**路径分量**比对，这样平台分隔符（`\` / `/`）都不影响。
+            assert!(
+                std::path::Path::new(&local.path).ends_with("b-movies/movie-01.mkv"),
+                "应当指向那个文件：{}",
+                local.path
+            );
         }
-        other => panic!("应当是 Redirect，实际是 {other:?}"),
+        other => panic!("应当是 LocalPath，实际是 {other:?}"),
     }
 }
 
@@ -226,25 +237,52 @@ async fn plan_playback_marks_missing_media_unavailable() {
     assert_eq!(plan.delivery, None);
 }
 
+/// ★ 请求里的 `delivery` **不影响答案** —— 本地文件的投递方式只有一种。
+///
+/// 上游 `local_provider.handle_playback` 就是这个语义：`context.delivery` 只影响
+/// 它拼出来的 URL（starlette 的事），最终一律自己读字节。
+///
+/// 反过来写（把 `proxy` 拒成 `unsupported`）会让客户端「换个投递方式重试」拿到
+/// 422 `provider_playback_delivery_unsupported` —— 而它其实没有第二种选择。
 #[tokio::test]
-async fn plan_playback_refuses_proxy_delivery() {
+async fn plan_playback_answers_local_path_for_any_requested_delivery() {
     let (_root, mut client) = start().await;
 
-    let error = client
-        .plan_playback(PlanPlaybackRequest {
-            media: Some(media_handle(
-                44,
-                library_handle(7),
-                "b-movies/movie-01.mkv",
-                120,
-            )),
-            resource_path: String::new(),
-            delivery: PlaybackDelivery::Proxy as i32,
-        })
-        .await
-        .expect_err("本地 provider 撑不起 proxy 投放");
+    for (index, requested) in [
+        PlaybackDelivery::Unspecified,
+        PlaybackDelivery::Proxy,
+        PlaybackDelivery::Redirect,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let media_id = 50 + i64::try_from(index).expect("小数字");
+        let plan = client
+            .plan_playback(PlanPlaybackRequest {
+                media: Some(media_handle(
+                    media_id,
+                    library_handle(7),
+                    "b-movies/movie-01.mkv",
+                    120,
+                )),
+                resource_path: String::new(),
+                delivery: requested as i32,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("delivery={requested:?} 不该报错：{error}"))
+            .into_inner()
+            .plan
+            .expect("plan");
 
-    assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert!(
+            matches!(
+                plan.delivery,
+                Some(sm_plugin_api::v1::playback_plan::Delivery::LocalPath(_))
+            ),
+            "delivery={requested:?} 也应当是 LocalPath，实际是 {:?}",
+            plan.delivery
+        );
+    }
 }
 
 // ── GenerateThumbnails（server streaming）────────────────────────

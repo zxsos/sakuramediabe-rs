@@ -268,9 +268,13 @@ impl RankingItemRepository {
 
     /// 删掉某个榜单的全部条目，返回删了几行。
     ///
-    /// 「重抓一个榜单」的正确做法是 `upsert` 逐条写入 —— 名次没变的条目
-    /// 保留 `created_at`，历史因此可追。这个方法给的是「这个榜单作废了」
-    /// 那种情况。
+    /// ⚠️ **重抓一个榜单时确实要先用它**（[`Self::delete_board_in`] 的事务内变体
+    /// 同理）：上游 `_replace_scope_items`（`ranking_service.py:357-373`）就是
+    /// 「删该 scope 全部条目 + 重新插入」。只逐条 `upsert` **删不掉「这次没有的
+    /// 名次」** —— 榜单从 100 条缩到 80 条，第 81..100 名会永远留在库里。
+    ///
+    /// 代价是名次没变的条目也会被删掉重建（`created_at` 因此重置）。上游接受
+    /// 这个代价，本仓照抄。
     pub async fn delete_board(
         &self,
         source_key: &str,
@@ -288,6 +292,55 @@ impl RankingItemRepository {
         .await
         .map_err(|e| DbError::from(e).with_entity(RANKING_ENTITY))?;
         Ok(result.rows_affected())
+    }
+
+    /// 事务内变体，供 [`Ctx`](crate::repo::Ctx) 编排时使用。
+    ///
+    /// 排行同步的「先删后插」必须两半同事务（见
+    /// `sm_service::discovery::ranking::RankingSyncService::replace_scope`）
+    /// —— 中间失败会留下一个空 scope。
+    pub async fn delete_board_in(
+        &self,
+        ctx: &mut crate::repo::Ctx<'_>,
+        source_key: &str,
+        board_key: &str,
+        period: &str,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM ranking_item \
+             WHERE source_key = $1 AND board_key = $2 AND period = $3",
+        )
+        .bind(source_key.trim())
+        .bind(board_key.trim())
+        .bind(period.trim())
+        .execute(ctx.conn().await?.as_conn())
+        .await
+        .map_err(|e| DbError::from(e).with_entity(RANKING_ENTITY))?;
+        Ok(result.rows_affected())
+    }
+
+    /// 某个榜单下**已经有条目的**周期列表（升序）。
+    ///
+    /// 给排行同步用的：上游 `_iter_sync_targets` 逐个周期调 `_scope_has_items`
+    /// （`ranking_service.py:464-474`）判断「这个周期已有数据没」，再把结果喂给
+    /// 插件的 `should_fetch(period, has_items)`。宿主这边一次查完整个榜更方便，
+    /// 语义相同。
+    ///
+    /// 返回里**可能出现空串** —— 单期榜（总榜）的周期就是空串。
+    pub async fn distinct_periods(
+        &self,
+        source_key: &str,
+        board_key: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT period FROM ranking_item \
+             WHERE source_key = $1 AND board_key = $2 ORDER BY period",
+        )
+        .bind(source_key.trim())
+        .bind(board_key.trim())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(period,)| period).collect())
     }
 
     /// 候选影片在各榜单上的名次行 `(movie_id, rank, period)`。**刻意不限榜单。**

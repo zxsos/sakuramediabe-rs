@@ -185,6 +185,28 @@ impl MovieActorRepository {
         )
     }
 
+    /// 一组影片的演员关联，`(movie_id, actor_id)`，**按 `(movie_id, actor_id)` 升序**。
+    ///
+    /// 影片快照要带上演员，而一次 `ListMovies` 可能涉及上千部影片 —— 逐部调
+    /// [`Self::actor_ids_for_movie`] 就是 N+1。排序与上游一致
+    /// （`context.py:122-127` 的 `.order_by(MovieActor.movie, MovieActor.actor)`），
+    /// 于是同一部影片的演员顺序在两条路径下相同。
+    pub async fn actor_ids_for_movies(
+        &self,
+        movie_ids: &[i32],
+    ) -> Result<Vec<(i32, i32)>, DbError> {
+        if movie_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, (i32, i32)>(
+            "SELECT movie_id, actor_id FROM movie_actor WHERE movie_id = ANY($1) \
+             ORDER BY movie_id, actor_id",
+        )
+        .bind(movie_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     paged_list! {
         /// 列出某位演员出演的全部影片。**分页。**
         ///

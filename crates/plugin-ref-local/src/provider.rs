@@ -15,14 +15,13 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::stream::BoxStream;
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_types::Struct;
 use sm_plugin_api::provider::StorageProviderExt;
 use sm_plugin_api::v1::{
     generate_thumbnails_response, playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType,
     GenerateThumbnailsRequest, GenerateThumbnailsResponse, ImportFile, ImportFileEntry,
-    LibraryHandle, MediaHandle, PlanPlaybackRequest, PlanPlaybackResponse, PlaybackDelivery,
-    PlaybackPlan, ProgressEvent, RedirectPlan, ScanImportSourceRequest, ThumbnailArtifact,
+    LibraryHandle, LocalPathPlan, MediaHandle, PlanPlaybackRequest, PlanPlaybackResponse,
+    PlaybackDelivery, PlaybackPlan, ProgressEvent, ScanImportSourceRequest, ThumbnailArtifact,
     ThumbnailGeneration,
 };
 use tokio::sync::mpsc;
@@ -54,9 +53,6 @@ const THUMBNAIL_INTERVAL_SECONDS: i64 = 10;
 const VIDEO_EXTENSIONS: [&str; 9] = [
     "mp4", "mkv", "webm", "mov", "avi", "m4v", "ts", "flv", "wmv",
 ];
-
-/// file:// URL 里需要转义的字符：控制字符之外补上路径里常见的几个。
-const FILE_URL_ESCAPE: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'%').add(b'?');
 
 /// 本地参考插件在注册阶段会声明的 provider key。
 pub const PROVIDER_KEY: &str = "local-ref";
@@ -234,17 +230,17 @@ impl StorageProviderExt for LocalRefProvider {
             self.check_library(library)?;
         }
 
-        // GAP: 本地 provider 最自然的答案是「给你一个本地路径，你自己读」，
-        // 但 PlaybackPlan 的 delivery 只有 redirect(url) / proxy(endpoint) 两种，
-        // 没有 local_path —— 而 OpenCoverSourceResponse 恰恰有 local_path。
-        // 这里只能退化成 file:// 的伪 redirect，宿主必须为此开一个特殊分支。
-        let delivery =
+        // ★ 请求里的 `delivery` **不看**：本地文件的投递方式没有第二种选择。
+        //
+        // 上游 `local_provider.handle_playback` 就是这个语义 —— `context.delivery`
+        // 只影响它拼出来的 URL（那是 starlette 的事），最终一律 `FileResponse`
+        // （自己读字节、自己算 Range）。所以在我们的契约里它一律答 `local_path`：
+        // 客户端要 `?delivery=proxy` 还是 `redirect`，拿到的都是同一个本地文件。
+        //
+        // 这里刻意**不**把 `proxy` / `redirect` 拒成 `unsupported`：那会让客户端一句
+        // 「换个投递方式重试」得到 422，而实际上只有一种投递方式是可能的。
+        let _ =
             PlaybackDelivery::try_from(payload.delivery).unwrap_or(PlaybackDelivery::Unspecified);
-        if matches!(delivery, PlaybackDelivery::Proxy) {
-            return Err(Status::unimplemented(
-                "本地 provider 不支持 proxy 投放：PlaybackPlan 缺少『宿主直接读本地文件』这一 delivery",
-            ));
-        }
         if !payload.resource_path.is_empty() {
             return Err(Status::invalid_argument("本地 provider 不支持子资源播放"));
         }
@@ -254,9 +250,11 @@ impl StorageProviderExt for LocalRefProvider {
 
         let plan = match metadata {
             Ok(info) if info.is_file() => PlaybackPlan {
-                delivery: Some(playback_plan::Delivery::Redirect(RedirectPlan {
-                    url: file_url(&path),
-                    headers: Default::default(),
+                // 给**路径**，不给 URL：宿主在本机直接 `open` 它。早先这里拼
+                // `file://` 走 302，客户端不认那种 scheme —— 表现是「点了没反应」，
+                // 而宿主侧一切正常。
+                delivery: Some(playback_plan::Delivery::LocalPath(LocalPathPlan {
+                    path: path.to_string_lossy().into_owned(),
                 })),
                 file_name: media.file_name.clone(),
                 size_bytes: Some(clamp_i64(info.len())),
@@ -580,31 +578,6 @@ fn thumbnail_count(duration_seconds: i64) -> i32 {
     let wanted = duration_seconds / THUMBNAIL_INTERVAL_SECONDS;
     let counted = wanted.clamp(THUMBNAIL_MIN, THUMBNAIL_MAX);
     i32::try_from(counted).unwrap_or(i32::MAX)
-}
-
-/// `file://` URL。路径里的空格等字符必须转义，否则宿主的 HTTP 客户端会解析出错。
-///
-/// # 分隔符必须转成 `/`
-///
-/// 和上面 `walk_and_emit` 里的 `relative_path` 是**同一个 bug 的第二处**：
-/// `Path` 的 `Display` 用平台分隔符，Windows 上是 `\`，而 URL 的路径部分是
-/// 由 `/` 分隔的。`file://C:\dir\a.mkv` 不是一个合法 URL —— 宿主拿去解析会
-/// 拿到错误的 host 或空的 path。
-///
-/// Windows 上还要多一个斜杠：`C:\dir\a.mkv` 的正确形态是
-/// `file:///C:/dir/a.mkv`（`file://` + 空 host + `/C:/...`）。直接用
-/// `path.to_string_lossy()` 得到的是 `C:\...`，拼出来是 `file://C:\...`
-/// —— 少一个斜杠，host 段会被解析成 `C:`。
-fn file_url(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
-    // 盘符绝对路径（`C:/...`）前面要补 `/` 才是合法的 file URL。
-    let needs_leading_slash = !raw.starts_with('/');
-    let body = if needs_leading_slash {
-        format!("/{raw}")
-    } else {
-        raw
-    };
-    format!("file://{}", utf8_percent_encode(&body, FILE_URL_ESCAPE))
 }
 
 /// 按扩展名猜 Content-Type。

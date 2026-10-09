@@ -14,9 +14,9 @@
 //! 打桩方式：`JavdbProvider::with_base_url`（生产用 `new(host)` 拼 `https://`）。
 //! 那个缝存在的理由见它的文档。
 
-use sm_service::catalog::javdb::{signature_at, JavdbProvider};
+use sm_service::catalog::javdb::{signature_at, JavdbAccount, JavdbProvider, JavdbRankError};
 use sm_service::catalog::metadata_source::{MetadataProvider, MetadataSourceError};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 搜索响应：`data.movies` 里的候选。
@@ -298,5 +298,150 @@ async fn actor_search_says_not_implemented_instead_of_returning_empty() {
             assert!(message.contains("尚未移植"), "{message}");
         }
         other => panic!("应当是 RequestFailed，实际 {other:?}"),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 榜单（`get_rank_numbers` / `get_playback_rank_numbers` / `get_top_numbers`）
+// ══════════════════════════════════════════════════════════════════
+//
+// 这几条同样只有真发请求才测得到：
+//
+// | 断言 | 抄错的后果 |
+// |---|---|
+// | `video_type` 挂在查询参数 **`type`** 上 | 参数名写错 → HTTP 200 的**空榜**，而它看起来像「今天没数据」|
+// | TOP250 先登录、每页带 `authorization: Bearer …` | 不带 token → JavDB 返回空榜 |
+// | 登录体是 form-urlencoded 且带**按账号派生的** `device_uuid` | 设备标识全网共用 → 触发风控 |
+// | 空页即到底 | 白跑 4 页；或把「不满 250」当成失败 |
+
+/// 榜单响应：`success` 包络 + `data.movies`（三种榜同构）。
+fn rank_body(numbers: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "success": 1,
+        "data": {
+            "movies": numbers
+                .iter()
+                .map(|number| serde_json::json!({ "number": number }))
+                .collect::<Vec<_>>(),
+        },
+    })
+}
+
+fn test_account() -> JavdbAccount {
+    JavdbAccount {
+        username: "sakura".to_owned(),
+        password: "pw".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn the_playback_rank_hits_its_own_endpoint_with_filter_and_period() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rankings/playback"))
+        .and(query_param("filter_by", "high_score"))
+        .and(query_param("period", "weekly"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rank_body(&["A-1", "A-2"])))
+        .mount(&server)
+        .await;
+
+    let numbers = provider_for(&server)
+        .playback_rank_numbers("high_score", "weekly")
+        .await
+        .expect("取播放榜");
+    // **顺序即排名**：不排序、不去重。
+    assert_eq!(numbers, vec!["A-1".to_owned(), "A-2".to_owned()]);
+}
+
+#[tokio::test]
+async fn the_video_type_rank_puts_the_type_on_the_type_parameter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/rankings"))
+        // ★ 上游把 `video_type` 放在查询参数 `type` 上（`javdb.py:810`）。写成
+        // `video_type=` 时 JavDB 不报错，只给一个空榜。
+        .and(query_param("type", "3"))
+        .and(query_param("period", "daily"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rank_body(&["FC2-1"])))
+        .mount(&server)
+        .await;
+
+    let numbers = provider_for(&server)
+        .rank_numbers("3", "daily")
+        .await
+        .expect("取 FC2 榜");
+    assert_eq!(numbers, vec!["FC2-1".to_owned()]);
+}
+
+#[tokio::test]
+async fn the_top250_logs_in_with_the_device_payload_and_authorizes_every_page() {
+    let server = MockServer::start().await;
+    // 登录：ua / content-type 换掉，实体是 form-urlencoded 且带按账号派生的
+    // `device_uuid`。这几个断言同时钉住了「用 POST」「换了 UA」「没漏设备指纹」。
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sessions"))
+        .and(header("user-agent", "Dart/3.5 (dart:io)"))
+        .and(header("content-type", "multipart/form-data"))
+        .and(body_string_contains("username=sakura"))
+        .and(body_string_contains(
+            // 同账号派生值：换派生方式（uuid4 / sha1 / 换命名空间）这里就红。
+            "device_uuid=01f1b765-45e0-55df-b2a9-253fb94cd452",
+        ))
+        .and(body_string_contains("device_name=meizu16sPro"))
+        .and(body_string_contains("app_version_number=1.9.29"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "data": { "token": "TOKEN-1" } })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/top"))
+        .and(query_param("start_rank", "1"))
+        .and(query_param("type", "all"))
+        .and(query_param("ignore_watched", "false"))
+        .and(query_param("page", "1"))
+        .and(query_param("limit", "50"))
+        // ★ 每一页都要带 token；漏了只会拿到 HTTP 200 的空榜。
+        .and(header("authorization", "Bearer TOKEN-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rank_body(&["T-1", "T-2"])))
+        .mount(&server)
+        .await;
+    // 第二页是空的 —— 上游 `if not movies: break`，也就是「到底了」。
+    Mock::given(method("GET"))
+        .and(path("/api/v1/movies/top"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(rank_body(&[])))
+        .mount(&server)
+        .await;
+    // ★ 第 3 页**没有**任何 mock：真去请求会 404 → 报错。所以「只跑了两页」这件事
+    // 由这条用例本身就断言了（默认页数是 5）。
+    let numbers = provider_for(&server)
+        .top_numbers(&test_account(), "all", "", None)
+        .await
+        .expect("取 TOP250");
+    assert_eq!(numbers, vec!["T-1".to_owned(), "T-2".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_login_without_a_token_is_reported_as_an_auth_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/sessions"))
+        // 没有 `data.token`，但有服务端给的原因 —— 那句话要原样带出去。
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "message": "帳號或密碼錯誤" })),
+        )
+        .mount(&server)
+        .await;
+
+    match provider_for(&server)
+        .top_numbers(&test_account(), "all", "", None)
+        .await
+        .expect_err("登录该失败")
+    {
+        JavdbRankError::Auth(detail) => assert!(detail.contains("帳號或密碼錯誤"), "{detail}"),
+        other => panic!("应当是 Auth，实际 {other:?}"),
     }
 }

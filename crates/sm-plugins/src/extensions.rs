@@ -61,23 +61,44 @@ pub struct MetadataSourceRegistration {
 pub struct RankingBoardRegistration {
     pub board_key: String,
     pub display_name: String,
+    /// **静态**周期集合。空数组 = 「只有总榜」。
+    pub supported_periods: Vec<String>,
+    /// 未指定周期时用哪个。见 proto 的 `RankingBoard.default_period`。
+    pub default_period: String,
+    /// 周期要不要问 `ResolveRankingPeriods` 才知道（对应上游
+    /// `supported_periods_provider is not None`）。
+    pub dynamic_periods: bool,
 }
 
 /// 一个排行榜来源（`discovery.ranking_source`）。
 ///
-/// # 为什么没有 `name`
+/// # 来源级的名字在协议里**没有**
 ///
-/// 上游 `RankingSourceDefinition.name` 来自 `PluginRankingSource.name`，而
-/// gRPC 的 `RankingSourceExtension` **只有** `source_key` 与 `boards` ——
-/// 没有来源级的名字。缺字段就不补：调用方要用名字就取 `source_key`，
-/// 另起一个字段等于发明协议。
+/// 上游 `RankingSourceDefinition.name` 来自 `PluginRankingSource.name`
+/// （`source_key="javdb"` / `name="JavDB"`），而 gRPC 的
+/// `RankingSourceExtension` **只有** `source_key` 与 `boards`。
+///
+/// 所以这里存的是**插件自己的** `display_name`（`RegisterResponse.display_name`，
+/// 与 [`MetadataSourceRegistration::display_name`] 同一个来源），它是最接近的东西
+/// —— 但**不等于**上游那个来源名（插件名是「SakuraMedia JavDB 排行榜」，
+/// 来源名是「JavDB」）。要精确对齐得给 proto 加字段，本轮不做：读侧展示用得上
+/// 一个名字，而 `source_key` 作为标题太难看。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankingSourceRegistration {
     /// 全局唯一。
     pub source_key: String,
+    /// 插件声明的名字。见上面的说明 —— 是插件名，不是上游那个来源名。
+    pub display_name: String,
     pub boards: Vec<RankingBoardRegistration>,
     /// 提供它的插件 id —— 调用时要知道去连哪个插件。
     pub plugin_id: String,
+    /// 那个插件的**控制面**端点。与 `ProviderRegistration::plugin_endpoint` 同一个
+    /// 东西，理由也一样：扩展点服务跑在插件进程里，没有端点就「查得到声明、
+    /// 打不出去」。
+    ///
+    /// ⚠️ 与端点一样是**活的** —— 插件重启会换端口，所以调用方每次都要从注册表
+    /// 现取（见 `Plugins::provider_registry` 的注释）。
+    pub plugin_endpoint: String,
 }
 
 impl RankingSourceRegistration {
@@ -187,6 +208,18 @@ impl ExtensionRegistry {
         self.metadata.is_empty() && self.ranking.is_empty()
     }
 
+    /// 清空全部条目，**保留对象本身**。
+    ///
+    /// 组合根在插件重启后整体重建注册表（增量合并会留下已经不存在的东西）。
+    /// 而句柄是共享的（`Arc<Mutex<..>>`，排行榜写侧指着它），所以必须原地清空
+    /// 而不是换一个新对象 —— 换掉等于让调用方抱着一份「永远空」的旧表。
+    pub fn clear(&mut self) {
+        self.metadata_order.clear();
+        self.metadata.clear();
+        self.ranking_order.clear();
+        self.ranking.clear();
+    }
+
     /// 收一个元数据来源。**同 `plugin_id` 后注册者覆盖前者，但不改顺序** ——
     /// 与 [`crate::registry::ProviderRegistry::insert`] 同一个理由：顺序表达
     /// `plugins.enabled` 的优先级，不该被覆盖动作打乱。
@@ -212,6 +245,7 @@ impl ExtensionRegistry {
 pub fn collect_extensions(
     registry: &mut ExtensionRegistry,
     response: &RegisterResponse,
+    endpoint: &str,
 ) -> Vec<ExtensionProblem> {
     let mut problems = Vec::new();
     // 排行榜来源一旦冲突就是整插件拒绝：后面的同 key 扩展点也不再收。
@@ -230,7 +264,7 @@ pub fn collect_extensions(
                     continue;
                 };
                 ranking_rejected =
-                    collect_ranking_source(registry, response, bundle, &mut problems);
+                    collect_ranking_source(registry, response, bundle, endpoint, &mut problems);
             }
             // `media.provider` 与未知 key：各有各的去处，这里显式忽略。
             _ => {}
@@ -266,6 +300,7 @@ fn collect_ranking_source(
     registry: &mut ExtensionRegistry,
     response: &RegisterResponse,
     bundle: &RankingSourceExtension,
+    endpoint: &str,
     problems: &mut Vec<ExtensionProblem>,
 ) -> bool {
     let plugin_id = response.plugin_id.clone();
@@ -316,6 +351,9 @@ fn collect_ranking_source(
         boards.push(RankingBoardRegistration {
             board_key: board.board_key.clone(),
             display_name: board.display_name.clone(),
+            supported_periods: board.supported_periods.clone(),
+            default_period: board.default_period.clone(),
+            dynamic_periods: board.dynamic_periods,
         });
     }
 
@@ -329,8 +367,10 @@ fn collect_ranking_source(
 
     registry.insert_ranking(RankingSourceRegistration {
         source_key: bundle.source_key.clone(),
+        display_name: response.display_name.clone(),
         boards,
         plugin_id,
+        plugin_endpoint: endpoint.to_owned(),
     });
     false
 }
@@ -366,6 +406,18 @@ mod tests {
         }
     }
 
+    /// 测试用的插件控制面端点。断言「端点真的被存下来了」要用它。
+    const ENDPOINT: &str = "http://127.0.0.1:50051";
+
+    /// `collect_extensions` 的薄包装：这些用例都只关心「收了什么」，
+    /// 不关心端点，所以固定传一个。
+    fn collect(
+        registry: &mut ExtensionRegistry,
+        response: &RegisterResponse,
+    ) -> Vec<ExtensionProblem> {
+        collect_extensions(registry, response, ENDPOINT)
+    }
+
     fn ranking_extension(source_key: &str, boards: &[(&str, &str)]) -> Extension {
         Extension {
             key: RANKING_SOURCE.to_owned(),
@@ -376,6 +428,7 @@ mod tests {
                     .map(|(key, name)| RankingBoard {
                         board_key: (*key).to_owned(),
                         display_name: (*name).to_owned(),
+                        ..Default::default()
                     })
                     .collect(),
             })),
@@ -392,7 +445,7 @@ mod tests {
     #[test]
     fn a_metadata_source_is_registered_with_its_plugin_display_name() {
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "javdb",
@@ -414,7 +467,7 @@ mod tests {
         // proto 的原话：「仅在声明对应 capability 时才会被调用」——
         // 收进来也是一个永远不会被调到条目。
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response("javdb", vec![], vec![metadata_extension()]),
         );
@@ -432,7 +485,7 @@ mod tests {
     #[test]
     fn ranking_boards_are_kept_in_order_and_reachable_by_key() {
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "weekly",
@@ -452,13 +505,74 @@ mod tests {
         assert!(source.board("monthly").is_none());
     }
 
+    /// ★ 榜单定义要**整份**存下来（不只是 key 与名字），端点也要。
+    ///
+    /// 这条挡的是两种「接口成功但没数据」的退化：榜单定义丢了 → 读侧
+    /// `list_boards` 只能报缺口；端点丢了 → 同步时「查得到声明、打不出去」。
+    #[test]
+    fn a_board_definition_carries_its_periods_and_the_live_endpoint() {
+        let mut registry = ExtensionRegistry::new();
+        let problems = collect(
+            &mut registry,
+            &response(
+                "weekly",
+                vec![capability::EXTENSION_RANKING_SOURCE],
+                vec![Extension {
+                    key: RANKING_SOURCE.to_owned(),
+                    data: Some(Data::RankingSource(RankingSourceExtension {
+                        source_key: "dmm".to_owned(),
+                        boards: vec![
+                            RankingBoard {
+                                board_key: "playback_all".to_owned(),
+                                display_name: "热播".to_owned(),
+                                supported_periods: vec!["daily".to_owned(), "weekly".to_owned()],
+                                default_period: "daily".to_owned(),
+                                dynamic_periods: false,
+                            },
+                            RankingBoard {
+                                board_key: "top250".to_owned(),
+                                display_name: "TOP250".to_owned(),
+                                supported_periods: vec![],
+                                default_period: "all".to_owned(),
+                                dynamic_periods: true,
+                            },
+                        ],
+                    })),
+                }],
+            ),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let source = registry.ranking_source("dmm").expect("应当收进去");
+        assert_eq!(
+            source.plugin_endpoint, ENDPOINT,
+            "端点要存下来 —— 与 provider 那边同一个理由（否则打不出去）"
+        );
+
+        let playback = source.board("playback_all").expect("静态周期的榜单");
+        assert_eq!(playback.supported_periods, ["daily", "weekly"]);
+        assert_eq!(playback.default_period, "daily");
+        assert!(!playback.dynamic_periods);
+
+        let top250 = source.board("top250").expect("动态周期的榜单");
+        assert!(
+            top250.supported_periods.is_empty(),
+            "动态周期**不在**载荷里（它随年份滚动）"
+        );
+        assert_eq!(top250.default_period, "all", "代表值仍要给");
+        assert!(
+            top250.dynamic_periods,
+            "TOP250 的周期要问 ResolveRankingPeriods 才知道"
+        );
+    }
+
     #[test]
     fn source_keys_must_be_slugs() {
         // 上游 `^[a-z][a-z0-9_]*$`；这类 key 会进 URL 与配置键，形状不对
         // 必须拦在加载期。
         let mut registry = ExtensionRegistry::new();
         for bad in ["", "DMM", "dmm-ranking", "1st", "dmm ranking"] {
-            let problems = collect_extensions(
+            let problems = collect(
                 &mut registry,
                 &response(
                     "p",
@@ -481,7 +595,7 @@ mod tests {
     #[test]
     fn a_source_without_boards_is_rejected() {
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "p",
@@ -502,7 +616,7 @@ mod tests {
     #[test]
     fn duplicate_board_keys_inside_one_source_are_rejected() {
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "p",
@@ -529,7 +643,7 @@ mod tests {
         // 上游 `apply_plugin_ranking_sources`：冲突时整插件拒绝，于是它后面
         // 那个（本来合法的）来源也不该进来。
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "first",
@@ -539,7 +653,7 @@ mod tests {
         );
         assert!(problems.is_empty(), "{problems:?}");
 
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "second",
@@ -574,7 +688,7 @@ mod tests {
                 vec![metadata_extension()],
             );
             response.display_name = name.to_owned();
-            let problems = collect_extensions(&mut registry, &response);
+            let problems = collect(&mut registry, &response);
             assert!(problems.is_empty(), "{problems:?}");
         }
         let sources = registry.metadata_sources();
@@ -587,7 +701,7 @@ mod tests {
         // `media.provider` 归 loader 收；不认识的 key 显式忽略，不报错 ——
         // 宿主比插件旧时这是常态。
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "p",
@@ -611,7 +725,7 @@ mod tests {
     #[test]
     fn a_ranking_extension_without_its_payload_is_reported() {
         let mut registry = ExtensionRegistry::new();
-        let problems = collect_extensions(
+        let problems = collect(
             &mut registry,
             &response(
                 "p",
@@ -637,7 +751,7 @@ mod tests {
         // 兜底链路（JavDB 未收录时依次尝试）靠这个顺序决定先问谁。
         let mut registry = ExtensionRegistry::new();
         for (plugin, source) in [("b_plugin", "b"), ("a_plugin", "a")] {
-            let problems = collect_extensions(
+            let problems = collect(
                 &mut registry,
                 &response(
                     plugin,

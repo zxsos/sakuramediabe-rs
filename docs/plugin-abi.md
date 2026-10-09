@@ -55,6 +55,38 @@
 `code` 只有 7 个取值（另有 `UNSPECIFIED` 兜底）；`retryable` 是**独立字段**，
 不是从 `code` 推出来的。
 
+## 字节怎么过线：三种投递
+
+大文件**不走 gRPC 消息**，只走数据面。插件在 `Register` 里声明
+`data_plane_endpoint`（`proto/plugin.proto:63`）—— 那是它自己起的 HTTP 服务，与
+gRPC 控制面端口**是两个**。宿主按插件的 `PlaybackPlan`（`proto/storage.proto`）里
+那三种 `oneof delivery` 选一种：
+
+| 计划 | 谁持有字节 | 宿主做什么 | 什么时候用 |
+|---|---|---|---|
+| `redirect(url)` | 远端存储 | 302 + 计划自带的头 | 支持直链的网盘（115 的直链） |
+| `proxy(endpoint, path_prefix)` | 远端 HTTP 源（经插件） | 转发到插件的 HTTP 端点，`Range` 原样透传 | 存储不给自己签直链 |
+| `local_path(path)` | **宿主本机的文件系统** | 宿主自己 `open` 这个路径、自己算 206/416、自己定 `Content-Type`（provider 声明了就用它的） | 本地库 / 挂载盘 / 与宿主同机 |
+
+`local_path` 给的是**路径不是 URL**：provider 不做 URL 转义，宿主也不做反转义，
+路径一个字节都别改。拼一个 `file://` 交给客户端是错的 —— 浏览器不认那种 scheme，
+表现是「点了没反应」，而宿主侧看起来一切正常。
+
+### ★ 字节搬运必须走 `data_plane_endpoint`
+
+反例（会静默丢功能）：把文件内容塞进某个 rpc 的 `bytes` 字段。它与本 ABI 的三条
+前提同时冲突：
+
+1. gRPC 默认消息上限 4 MiB，而一部片子是 GB 级 —— 要么抬上限（一次无上限的内存
+   分配），要么自己分块（那就是手搓一个更差的 HTTP）；
+2. 控制面是一问一答、没有背压的：拖进度条要能随时掐断，塞在 `bytes` 里做不到
+   「客户端断开就停」；
+3. `Accept-Ranges` / `Content-Range` / `206` 这套语义过一遍 gRPC 全丢了，宿主还得
+   重算一遍 —— 而 Range 在本仓只在 `sm-api/src/range.rs` 写了一次。
+
+所以：**小产物**（缩略图写进宿主给的 workspace、图片走交付目录）走文件系统；
+**影片字节**一律走 302 或数据面。
+
 ## 元数据交付
 
 插件把图片放进 `<data_dir>/metadata-tmp/<请求目录>/`，宿主从
@@ -70,9 +102,11 @@
 
 ## 已知缺口（贡献前请先看）
 
-- `PluginHost`（`proto/host.proto`）36 个 rpc 里**接了 6 个**
-  （`GetMovie` / `FindMoviesByNumbers` / `GetActor` / `ListMovies` /
-  `PatchMovie` / `ImportSubtitle`），其余返回 `Unimplemented`。缺口表见
+- `PluginHost`（`proto/host.proto`）37 个 rpc 里**接了 11 个**
+  （`GetMovie` / `FindMoviesByNumbers` / `ListMovies` / `PatchMovie` /
+  `GetActor` / `ListActors` / `PatchActor` / `ImportSubtitle` /
+  `GetJavdbRankNumbers` / `SyncRankingSources` / `SyncRankingBoard`），
+  其余返回 `Unimplemented`。缺口表见
   `crates/sm-server/src/plugin_host.rs` 模块文档。
 - 注册期**不**校验「声明的能力 ↔ 是否 serve 了对应 service」——
   所以**虚报能力不会被发现**，请勿声明没实现的东西。

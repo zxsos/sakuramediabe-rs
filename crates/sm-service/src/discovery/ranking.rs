@@ -2,38 +2,45 @@
 //!
 //! **纯 PostgreSQL + 插件注册表**，无 Qdrant、无推理服务。
 //!
-//! # 读侧现在就能用；写侧要等真有插件
+//! # 读侧与写侧都已落地
 //!
 //! | | 依赖 | 现状 |
 //! |---|---|---|
-//! | `list_movie_rankings` | [`RankingItemRepository::list_by_movie`] | ✅ **可写** |
-//! | `list_board_items` | [`RankingItemRepository::list_by_board`] / `top_by_board` | ✅ **可写** |
-//! | `list_sources` | `ProviderRegistry::providers_with(EXTENSION_RANKING_SOURCE)` | ✅ **可写**（无插件时返回空列表）|
-//! | `list_boards` | **榜单定义的存放处** | ❌ **缺口**，见下 |
-//! | `RankingSyncService::*` | `extension_calls::fetch_ranking` + 插件 channel | ❌ 要等真有 provider 插件 |
+//! | `list_movie_rankings` | [`RankingItemRepository::list_by_movie`] | ✅ 可写 |
+//! | `list_board_items` | [`RankingItemRepository::list_by_board`] / `top_by_board` | ✅ 可写 |
+//! | `list_sources` | 组合根注入的 [`RankingSourceCatalog`] | ✅ 可写（无插件时返回空列表）|
+//! | `list_boards` | 同上（榜单定义跟着源一起来）| ✅ 可写 |
+//! | `RankingSyncService::*` | [`RankingGateway`] + `sm-db` 仓储 | ✅ 可写 |
 //!
-//! ## `list_boards` 的缺口是真的，不是「还没写」
+//! ## 榜单定义从哪来：**插件注册载荷**，不是数据库
 //!
-//! 榜单定义（`title` / `supported_periods` / `default_period` / `descending`）
-//! **在 Rust 侧无处存放**。已确认：
+//! 上游的定义来自插件加载时的
+//! `register_plugin_ranking_sources(accepted, owners)`（`ranking_plugin_adapter.py:109`）
+//! —— 也就是说「有哪些源、每个源有哪些榜、榜单支持哪些周期」全在**插件的注册
+//! 载荷**里，库里只有条目（`ranking_item`）。
 //!
-//! - `sm_db::discovery::RankingItem` 只有条目（`source_key` / `board_key` /
-//!   `period` / `rank` / `movie_number` / `movie_id`），没有定义字段
-//! - `sm_db::repo::RankingItemRepository::list_boards` 返回
-//!   `Page<(String, String, String)>` —— 是 `(board_key, period, source_key)`
-//!   **元组**，不是带标题的定义
-//! - `sm_plugins::registry::ProviderRegistration` 只有 `provider_key` /
-//!   `display_name` / `plugin_id` / `capabilities` / `data_plane_endpoint`
-//!   —— **没有 boards 列表**
+//! Rust 侧对应的存放处是 `sm_plugins::extensions::ExtensionRegistry` 里的
+//! `RankingSourceRegistration`（含 `boards`），由组合根读出来转成
+//! [`RankingSourceCatalog`] 注入。骨架期这条链断了两次：`Plugins::ranking_sources()`
+//! 读的是 `ProviderRegistry`（那里**没有** boards）并硬写空数组，而载荷里的
+//! `RankingBoard` 又**只有** `board_key` + `display_name`（没有周期字段）。
+//! 两处都已补齐。
 //!
-//! 上游的定义来自插件注册时的 `register_plugin_ranking_sources(accepted, owners)`
-//! （`ranking_plugin_adapter.py:109`），也就是**加载期**从插件的注册载荷里取。
-//! Rust 侧的 `sm-plugins` 还没接住那份载荷。
+//! ## 写侧的取数靠**依赖倒置**
 //!
-//! **所以 `list_boards` 不能靠猜字段填。** 要么给 `ProviderRegistration` 加
-//! 榜单定义（改插件 ABI 层），要么新增一张榜单定义表。**两者都不是路由层能
-//! 决定的**，所以这里留 `todo!()` 并把缺口写清 —— 写一个「看起来能跑」的
-//! 版本只会让 `supported_periods` 永远是空数组。
+//! 插件在另一个进程里，调用要过 gRPC。但 `sm-plugins` 依赖 `sm-scheduler`、
+//! `sm-scheduler` 依赖 `sm-service` —— 所以 `sm-service` **不能**依赖
+//! `sm-plugins`。取向与 `StorageGateway` / `MovieMetadataImporter` 一致：
+//! 这里只定义窄接口 [`RankingGateway`]，实现（连插件的 channel）在组合根。
+//!
+//! ## ⚠️ 与上游的**已知差异**：番号不在库里时不会导入
+//!
+//! 上游 `sync_board_period`（`ranking_service.py:405-445`）对「本地没有的番号」
+//! 会拉 JavDB 详情并 `import_movie_if_missing` 入库。本仓的 JavDB **详情**接口
+//! 还没落地（[`crate::catalog::movie_javdb_backfill::JavdbProvider`] 是个未实现
+//! 的 trait），所以那些番号落进上游的**失败分支**：计 `skipped_movies` + warn。
+//! 结果就是**库里没有的影片不会因为上了榜而被自动收录** —— 其余语义（复用已有
+//! 影片、整榜替换、周期解析）都一致。补上详情接口后把那个 `continue` 换成导入即可。
 //!
 //! # `period` 用**空串**表示「不限定周期」，不是 `Option::None`
 //!
@@ -54,11 +61,12 @@
 //!
 //! 第二处是**真实的形状冲突**，不是笔误，处理方式写在方法注释里。
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sm_db::common::page::PageRequest;
 use sm_db::repo::discovery::{NewRankingItem, RankingItemRepository};
+use sm_db::repo::{commit_or_rollback, Ctx, MovieRepository};
 // `sm_db` 没有公开导出 `PgPool`（它是 `sqlx::PgPool` 的私有别名），
 // 直接引 `sqlx` —— 本 crate 本来就依赖它。
 use sqlx::PgPool;
@@ -66,16 +74,31 @@ use sqlx::PgPool;
 use crate::error::ServiceError;
 
 /// 榜单定义（冻结）。
+///
+/// 整份来自插件**加载期**的注册载荷（`RankingBoardRegistration`）—— 库里只有
+/// 条目，没有定义。骨架期这里还有一个 `descending`，**上游没有这个字段**，
+/// 载荷里也没有它的来源，所以删掉而不是填一个想当然的值。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankingBoardDefinition {
     pub board_key: String,
     pub title: String,
-    /// 该榜单支持哪些周期。**空数组意味着「只有总榜」**，不是「未知」。
+    /// 该榜单**静态**声明支持的周期。**空数组意味着「只有总榜」**，不是「未知」。
+    ///
+    /// 动态周期的榜单（见 [`Self::dynamic_periods`]）这里也是空 —— 它的周期随
+    /// 年份滚动，注册期给不出来。
     pub supported_periods: Vec<String>,
-    /// 未指定周期时用哪个。**必须**是 `supported_periods` 之一。
+    /// 未指定周期时用哪个。
+    ///
+    /// 上游的约束是「必须是 `supported_periods` 之一」；动态周期的榜单不适用
+    /// （它给的是代表值，如 TOP250 的 `all`）—— 所以**加载期只校验非空**，
+    /// 不做「属于列表」的判定。
     pub default_period: String,
-    /// 条目是否按分数降序。为 `false` 时按名次升序（名次小在前）。
-    pub descending: bool,
+    /// 周期要不要问插件的 `ResolveRankingPeriods` 才知道。
+    ///
+    /// 上游判据是 `supported_periods_provider is not None`。为 `true` 时
+    /// [`RankingCatalogService::board_supports_period`] 会**放行任意非空周期**
+    /// —— 否则历史年份（`"2019"`）会被判成不支持，而插件其实抓得动。
+    pub dynamic_periods: bool,
 }
 
 /// 排行源定义（冻结）。
@@ -84,6 +107,17 @@ pub struct RankingSourceDefinition {
     pub source_key: String,
     pub title: String,
     pub boards: Vec<RankingBoardDefinition>,
+    /// ★ **归属**：声明这个源的那个插件。
+    ///
+    /// 上游把它单独放在 `RANKING_SOURCE_OWNERS`（`source_key -> plugin_id`，
+    /// `ranking_service.py:68`），因为那份注册表是**和插件共享**的类型，插件
+    /// 不该看到「谁拥有谁」。本仓的 [`RankingSourceDefinition`] 只在宿主内部
+    /// 流通（给 API 的是投影 [`RankingSourceResource`]），所以直接带上更省事
+    /// —— 省掉一条要单独传递的表。
+    ///
+    /// 用途是**授权**，不是展示：插件只能同步自己声明的源
+    /// （上游 `context.py:1476-1503`，越界直接 `ValueError`）。
+    pub owner_plugin_id: String,
 }
 
 /// 排行源响应。
@@ -98,8 +132,14 @@ pub struct RankingSourceResource {
 pub struct RankingBoardResource {
     pub board_key: String,
     pub title: String,
+    /// **静态**周期。动态周期的榜单这里是空的，见 [`Self::dynamic_periods`]。
     pub supported_periods: Vec<String>,
     pub default_period: String,
+    /// 这个榜还有「随年份滚动」的周期，清单要问插件。
+    ///
+    /// 加这个标志而不是去读路径调插件：插件不在线时榜单目录也要能列出来
+    /// （上游是同进程回调，不存在这个失败面）。
+    pub dynamic_periods: bool,
 }
 
 /// 单个榜单条目响应。
@@ -164,34 +204,90 @@ impl RankingCatalogService {
     }
 
     /// 榜单是否支持某周期。
+    ///
+    /// 两种放行：空周期（总榜，任何榜单都支持），以及**动态周期的榜单**
+    /// （它的周期清单在插件那边，宿主无从校验，只能交给插件裁决）。
     pub fn board_supports_period(board: &RankingBoardDefinition, period: &str) -> bool {
-        // 空周期 = 总榜，**任何榜单都支持**。
-        period.is_empty() || board.supported_periods.iter().any(|p| p == period)
+        period.is_empty()
+            || board.dynamic_periods
+            || board.supported_periods.iter().any(|p| p == period)
     }
 
-    /// 解析周期：`None` → 榜单默认周期。
+    /// 解析周期。**照抄上游 `_resolve_period`**（`ranking_service.py:112-142`）。
     ///
-    /// **给了但不支持 → 422**（`ServiceError::validation`），**不静默回退**。
-    /// 静默回退会让调用方以为拿到的是周榜，实际是日榜 —— 榜单位次差得很远，
-    /// 这个错误在界面上看不出来。
+    /// # `default_period` 是给客户端的提示，**不是**服务端的回退值
+    ///
+    /// 骨架期这里写的是「`None` → 榜单默认周期」，那是**错的**：上游对有周期
+    /// 集合的榜单**必须**显式给周期，空周期直接 422 `period is required`。
+    /// `default_period` 只出现在响应里（`RankingBoardResource.default_period`），
+    /// 服务端一次都没拿它做过回退。
+    ///
+    /// 四档语义（与上游逐条对应）：
+    ///
+    /// | 榜单 | 给了周期 | 结果 |
+    /// |---|---|---|
+    /// | 有周期（静态或动态） | 空 | 422 `invalid_ranking_period`（`period is required`）|
+    /// | 有静态周期 | 不在集合里 | 422 `invalid_ranking_period` |
+    /// | 有动态周期 | 任意非空 | **放行** —— 清单在插件那边，宿主无从校验 |
+    /// | 单期榜（无任何周期） | 空 | `""`（表示「不限定周期」）|
+    /// | 单期榜 | 非空 | 422 `invalid_ranking_period` |
+    ///
+    /// 周期**先 `trim` 再 `to_lowercase`**（上游 `(period or "").strip().lower()`）。
+    /// 少了归一化，`"Daily"` 会被判成不支持 —— 而它指的就是 `"daily"`。
     pub fn resolve_period(
         board: &RankingBoardDefinition,
         period: Option<&str>,
     ) -> Result<String, ServiceError> {
-        let requested = Self::period_or_all(period);
-        if requested.is_empty() {
-            return Ok(board.default_period.clone());
+        let requested = period.unwrap_or("").trim().to_lowercase();
+        // 「有周期集合」= 静态非空**或**动态。两类都不接受空周期。
+        let has_periods = board.dynamic_periods || !board.supported_periods.is_empty();
+        if has_periods {
+            if requested.is_empty() {
+                return Err(Self::invalid_period(
+                    board,
+                    "",
+                    "period is required for this board",
+                ));
+            }
+            if Self::board_supports_period(board, &requested) {
+                return Ok(requested);
+            }
+            return Err(Self::invalid_period(
+                board,
+                &requested,
+                "period is not supported",
+            ));
         }
-        if Self::board_supports_period(board, requested) {
-            return Ok(requested.to_owned());
+        // 单期榜：只接受空周期。
+        if !requested.is_empty() {
+            return Err(Self::invalid_period(
+                board,
+                &requested,
+                "period is not supported for this board",
+            ));
         }
-        Err(ServiceError::validation(
-            "ranking_period_unsupported",
+        Ok(String::new())
+    }
+
+    /// `invalid_ranking_period` 的构造（上游三种情况**同一个码**）。
+    fn invalid_period(
+        board: &RankingBoardDefinition,
+        requested: &str,
+        reason: &str,
+    ) -> ServiceError {
+        ServiceError::validation(
+            "invalid_ranking_period",
             format!(
-                "榜单 {} 不支持周期 {}，支持的周期是 {:?}",
-                board.board_key, requested, board.supported_periods
+                "{reason}：榜单 {} 收到周期 {requested:?}，静态支持 {:?}{}",
+                board.board_key,
+                board.supported_periods,
+                if board.dynamic_periods {
+                    "（另有随年份滚动的动态周期）"
+                } else {
+                    ""
+                }
             ),
-        ))
+        )
     }
 
     /// 某影片在各榜单上的排名。
@@ -299,130 +395,396 @@ impl RankingCatalogService {
 
     /// 某源下的榜单列表。
     ///
-    /// # ❌ 缺口：榜单定义在 Rust 侧无处存放
+    /// 定义来自**组合根注入的快照**（[`RankingSourceCatalog`]），与
+    /// [`Self::list_sources`] 同源 —— 库里只有条目，没有定义。
     ///
-    /// 见模块文档的详细分析。**能做的只有**从 `ranking_item` 反推
-    /// 「有哪些 (board_key, period) 组合」—— 但那给不出 `title` /
-    /// `supported_periods` / `default_period`。
+    /// 源不存在 → **404**（`ranking_source_not_found`），与上游
+    /// `_require_source` 一致。源存在但没有榜单 → 空列表（不是错误）。
     ///
-    /// **不写「返回空数组」的假实现** —— 那会让接口「成功」但永远没数据，
-    /// 比报缺口更难查。
+    /// # `supported_periods` 只给**静态**那一半
+    ///
+    /// 动态周期的榜单（TOP250）在快照里是空数组 + `dynamic_periods = true`
+    /// —— 精确的那份清单要问插件（`ResolveRankingPeriods`），而**读路径不该
+    /// 依赖插件在线**：插件没起来时榜单列表也要能看。所以这里如实返回快照，
+    /// 由 [`RankingBoardResource`] 上的标志告诉调用方「这个榜的周期不止这些」。
     pub async fn list_boards(
         &self,
-        _source_key: &str,
+        source_key: &str,
     ) -> Result<Vec<RankingBoardResource>, ServiceError> {
-        Err(ServiceError::not_found_with(
-            "ranking_board_definitions_unavailable",
-            "榜单定义尚未接入：插件注册载荷里的榜单定义还没有 Rust 侧的存放处",
-            [("source_key".to_owned(), serde_json::json!(_source_key))]
-                .into_iter()
-                .collect(),
-        ))
+        let definition = self.sources.require_definition(source_key)?;
+        Ok(definition
+            .boards
+            .iter()
+            .map(|board| RankingBoardResource {
+                board_key: board.board_key.clone(),
+                title: board.title.clone(),
+                supported_periods: board.supported_periods.clone(),
+                default_period: board.default_period.clone(),
+                dynamic_periods: board.dynamic_periods,
+            })
+            .collect())
     }
 }
-/// 写侧：从 provider 拉榜单并覆盖式写回。
+/// 向排行榜插件取数的能力。**窄接口在 sm-service，实现由组合根注入。**
 ///
-/// # 现在**完全不可用**，且原因是结构性的
+/// # 为什么不直接调 `sm_plugins::extension_calls`
 ///
-/// 上游 `_replace_scope_items`（`:357`）是「先删该 scope 全部条目，再逐条
-/// 写入」。这个语义需要：
+/// `sm-plugins` 依赖 `sm-scheduler`，而 `sm-scheduler` 依赖 `sm-service`
+/// —— `sm-service` 依赖 `sm-plugins` 就成环。取向与
+/// `StorageGateway` / `MovieMetadataImporter` 完全一致。
 ///
-/// 1. `RankingItemRepository::delete_board(source_key, board_key, period)`
-/// 2. `RankingItemRepository::upsert_in(...)`（事务内变体）
-/// 3. `RankingItemRepository::upsert(...)`
+/// # ★「空结果」不是失败，两者处理相反
 ///
-/// —— 这三个**仓储方法都已存在**。缺的是第 4 步：**从插件拿数据**。
+/// - 插件回空番号列表 → `Ok(vec![])`：榜单**真的**空了，要照常替换（清空）。
+/// - 连不上 / 插件报错 / 超时 → `Err`：**绝不能碰库**，旧榜单留着。
 ///
-/// `sm_plugins::extension_calls::fetch_ranking`（`:103`）已经存在，签名是
-/// `(&mut RankingSourceExtensionServiceClient<Channel>, FetchRankingRequest,
-/// Option<Duration>)` —— 但它要一个**已建立的 gRPC channel**，而
-/// `ProviderRegistration` 只有 `data_plane_endpoint: Option<String>`
-/// （**可能为 `None`**，注释说「只有控制面能力的 provider 不一定有」）。
-///
-/// # 所以这里不做「半个实现」
-///
-/// 写一个「先删后写但拿不到数据」的 `sync_board_period` 毫无意义 ——
-/// 它只会把「还没接通插件」伪装成「同步过了但榜单是空的」。
-/// **清空数据比不同步更糟**：线上榜单会从有内容变成空。
-pub struct RankingSyncService {
-    _private: (),
+/// 把两者混起来（比如把空榜也当错误）会让「榜单下架」永远同步不掉；
+/// 反过来（把失败当空榜）会**把线上榜单清空**。
+pub trait RankingGateway: Send + Sync {
+    /// 拉某个榜某周期的番号，**顺序即排名**（第 1 个就是第 1 名）。
+    fn fetch_ranking<'a>(
+        &'a self,
+        source_key: &'a str,
+        board_key: &'a str,
+        period: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<String>, RankingCallError>>;
+
+    /// 问插件「这个榜此刻要抓哪些周期」。
+    ///
+    /// 上游 `should_fetch(period, has_items)`（`ranking_service.py:36`）里
+    /// `has_items` 那一半由宿主递（`periods_with_items`），另一半点
+    /// （账号配了没、历史年份跳过规则）只有插件知道 —— 所以裁决在插件。
+    ///
+    /// 返回的周期会被**原样**交给 [`RankingGateway::fetch_ranking`]，
+    /// 其中**空串表示总榜**（单期榜的周期就是空串）。宿主不做回退或补全
+    /// —— 想要总榜就返回 `[""]`，不想抓就返回 `[]`。
+    fn resolve_periods<'a>(
+        &'a self,
+        source_key: &'a str,
+        board_key: &'a str,
+        periods_with_items: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<String>, RankingCallError>>;
 }
 
-/// 同步结果计数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SyncOutcome {
-    /// 删除的旧条目数。
-    pub removed: u32,
-    /// 写入的新条目数。
-    pub written: u32,
-    /// 跳过的条目数（番号在库里查不到 `movie_id`）。
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// 一次插件调用失败（只用于 `Err` 侧）。空结果走 `Ok`，见 [`RankingGateway`]。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankingCallError {
+    /// 稳定的机读码（`extension_call_failed` / `extension_call_timeout` /
+    /// `ranking_source_not_found` …）。**判断用 `code`，不要匹配 `message`。**
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl RankingCallError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RankingCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+/// 单榜同步的统计。**键名与上游 `sync_board_period` 返回的 dict 逐字一致**
+/// （`ranking_service.py:453-462`）—— 它会直接进 `SyncRankingBoardResponse`。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoardSyncStats {
+    pub source_key: String,
+    pub board_key: String,
+    /// **规整后**的周期（`trim` + 小写，见
+    /// [`RankingCatalogService::resolve_period`]）。
+    pub period: String,
+    /// 插件回的番号数。**不是**写入的条目数（两者在跳过时不等）。
+    pub fetched_numbers: i64,
+    /// 番号不在库里、由本次同步**新建**的影片数。
     ///
-    /// `NewRankingItem::movie_id` 是**必填**的（类型文档：「指向 `Movie.id`。
-    /// **必填**」）—— 库里没有这个番号的影片时，条目**写不进去**。
-    /// 上游 `_get_movie_detail`（`:349`）就是干这个解析的。
-    pub skipped: u32,
+    /// ⚠️ **本仓恒为 0**：上游这里拉 JavDB 详情导入（`:408-424`），而宿主的
+    /// JavDB 详情接口还没落地，那些番号走了上游的**失败分支**（见模块文档）。
+    pub imported_movies: i64,
+    /// 番号在库里已有影片、直接复用的条数。
+    pub local_hit_movies: i64,
+    /// 番号既不在库里、也导入不了的条数。
+    pub skipped_movies: i64,
+    /// **实际写入**的条目数（替换后该 scope 的行数）。
+    pub stored_items: i64,
+}
+
+/// 全量同步的统计。**键名与上游 `sync_all_rankings` 返回的 dict 逐字一致**
+/// （`ranking_service.py:507-516`）。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AllRankingsStats {
+    /// 本次收敛出的目标总数（一个目标 = 一个 榜单 × 周期）。
+    pub total_targets: i64,
+    /// 成功同步的目标数（对应 proto 的 `synced_count`）。
+    pub success_targets: i64,
+    /// 失败的目标数 —— 单个目标失败**不中断**整批。
+    pub failed_targets: i64,
+    pub fetched_numbers: i64,
+    pub imported_movies: i64,
+    pub local_hit_movies: i64,
+    pub skipped_movies: i64,
+    pub stored_items: i64,
+}
+
+/// 写侧：从插件拉榜单并**覆盖式**写回。
+///
+/// 上游 `ranking_service.py:322-565`。
+///
+/// # 依赖是注入的
+///
+/// `sources` 是组合根给的快照（榜单定义在插件注册载荷里），`gateway` 是组合根
+/// 给的取数实现（连插件的 channel）。**网关可缺** —— 没注入时同步明确失败
+/// （`ranking_gateway_missing`），而不是静默返回「同步成功、0 条」。
+pub struct RankingSyncService {
+    pool: PgPool,
+    movies: MovieRepository,
+    rankings: RankingItemRepository,
+    sources: RankingSourceCatalog,
+    gateway: Option<Arc<dyn RankingGateway>>,
 }
 
 impl RankingSyncService {
-    /// 尚未接通 provider 插件。**恒返回 Err。**
+    /// 构造。`gateway` 稍后用 [`Self::with_gateway`] 注入。
+    pub fn new(pool: PgPool, sources: RankingSourceCatalog) -> Self {
+        Self {
+            movies: MovieRepository::new(pool.clone()),
+            rankings: RankingItemRepository::new(pool.clone()),
+            pool,
+            sources,
+            gateway: None,
+        }
+    }
+
+    /// 注入取数能力。组合根在插件注册表就绪后调用。
+    pub fn with_gateway(mut self, gateway: Arc<dyn RankingGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
+    }
+
+    /// 注入过的源快照（只读）。
+    pub fn sources(&self) -> &RankingSourceCatalog {
+        &self.sources
+    }
+
+    fn gateway(&self) -> Result<&Arc<dyn RankingGateway>, ServiceError> {
+        self.gateway.as_ref().ok_or_else(|| {
+            ServiceError::unavailable(
+                "ranking_gateway_missing",
+                "排行同步不可用：宿主的插件取数能力还没注入",
+            )
+        })
+    }
+
+    /// ★ 同步一个「榜单 × 周期」。照抄上游 `sync_board_period`
+    /// （`ranking_service.py:375-462`）。
     ///
-    /// # 为什么保留这个函数而不是删掉
+    /// # 顺序不能换：先取数，**最后**才在一个事务里替换
     ///
-    /// 它是 `rankings.rs` 顶层文档那张表里「写侧要等真有插件」那行的**代码
-    /// 化身**。删掉的话后来人只会看到读侧齐全，以为这功能完整。
-    /// 留着并让它明确失败，比留一个静默成功的空实现安全。
+    /// 取数失败（插件没起 / 超时）时绝不能碰库 —— 旧榜单要留着。上游也是这个
+    /// 次序：`_get_rank_numbers` 在最前面，`_replace_scope_items` 在最后且自带
+    /// `atomic()`。
+    ///
+    /// # 空榜会**清空**这个 scope
+    ///
+    /// 插件回 `[]` 是「这个榜此刻没有条目」，是**成功**：删空旧条目、一行不写
+    /// （上游 `:370-371` 的 `if not rows: return 0`）。把空榜当错误，会让
+    /// 「榜单下架」永远同步不掉。
     pub async fn sync_board_period(
-        &self,
-        _source_key: &str,
-        _board_key: &str,
-        _period: &str,
-    ) -> Result<SyncOutcome, ServiceError> {
-        Err(ServiceError::unavailable(
-            "ranking_sync_unavailable",
-            "排行同步尚不可用：还没有任何 provider 插件提供排行源，\
-             且 provider 可能没有 data_plane_endpoint",
-        ))
-    }
-
-    /// 尚未接通 provider 插件。**恒返回 Err**（理由同 [`Self::sync_board_period`]）。
-    pub async fn sync_all_rankings(&self) -> Result<HashMap<String, SyncOutcome>, ServiceError> {
-        Err(ServiceError::unavailable(
-            "ranking_sync_unavailable",
-            "排行同步尚不可用：还没有任何 provider 插件提供排行源",
-        ))
-    }
-
-    /// 把插件返回的一条目映射成待写入的 `NewRankingItem`。
-    ///
-    /// # `movie_id` 是必填的，所以这一层**必然可能失败**
-    ///
-    /// 插件给的是 `movie_number`（它只认番号），而 `NewRankingItem::movie_id`
-    /// 必填 —— 中间必须有一次「番号 -> 影片」解析（上游 `_get_movie_detail`，
-    /// `:349`）。查不到就**跳过这一条**并计入 `skipped`，
-    /// **不要**用 0 或 -1 之类占位 —— 那会让条目指向不存在的影片。
-    pub fn to_new_item(
         &self,
         source_key: &str,
         board_key: &str,
         period: &str,
-        rank: i32,
-        movie_number: &str,
-        movie_id: Option<i32>,
-    ) -> Result<NewRankingItem, ServiceError> {
-        let Some(movie_id) = movie_id else {
-            return Err(ServiceError::validation(
-                "ranking_item_movie_unresolved",
-                format!("番号 {movie_number} 在库里没有对应影片，无法写入榜单条目"),
-            ));
-        };
-        Ok(NewRankingItem {
+    ) -> Result<BoardSyncStats, ServiceError> {
+        let (_, board) = self
+            .sources
+            .require_source_and_board(source_key, board_key)?;
+        // 周期校验与读侧共用（上游 `_resolve_period` 也是同一个函数）——
+        // 于是「同步能跑但接口查不到」不会发生。
+        let period = RankingCatalogService::resolve_period(board, Some(period))?;
+        let gateway = self.gateway()?;
+        let numbers = gateway
+            .fetch_ranking(source_key, board_key, &period)
+            .await
+            .map_err(|error| ServiceError::unavailable(error.code, error.message))?;
+
+        // 批量查本地影片（上游 `:389-399`）：榜单上大多数番号都已入库，命中就
+        // 直接复用 `Movie.id`，避免逐部去拉详情。
+        let existing = self.movies.find_by_numbers(&numbers).await?;
+
+        let mut local_hit_movies: i64 = 0;
+        let mut skipped_movies: i64 = 0;
+        let mut items: Vec<NewRankingItem> = Vec::with_capacity(numbers.len());
+        for (index, number) in numbers.iter().enumerate() {
+            // 上游 `enumerate(movie_numbers, start=1)` —— 名次从 1 开始。
+            let rank = index as i32 + 1;
+            let Some(movie) = existing.get(number) else {
+                // ⚠️ 上游在这里拉 JavDB 详情导入（`:408-424`）。本仓没有详情接口，
+                // 于是落进**上游的失败分支**：计 skipped + warn。补上详情接口后
+                // 把这里换成 import_movie_if_missing。
+                skipped_movies += 1;
+                tracing::warn!(
+                    source_key,
+                    board_key,
+                    period,
+                    rank,
+                    movie_number = %number,
+                    "榜单条目跳过：番号不在库里，且 JavDB 详情导入尚未接通"
+                );
+                continue;
+            };
+            local_hit_movies += 1;
+            items.push(NewRankingItem {
+                source_key: source_key.to_owned(),
+                board_key: board_key.to_owned(),
+                period: period.clone(),
+                rank,
+                movie_number: number.clone(),
+                movie_id: movie.id,
+            });
+        }
+
+        let stored_items = self
+            .replace_scope(source_key, board_key, &period, &items)
+            .await?;
+        Ok(BoardSyncStats {
             source_key: source_key.to_owned(),
             board_key: board_key.to_owned(),
-            period: period.to_owned(),
-            rank,
-            movie_number: movie_number.to_owned(),
-            movie_id,
+            period,
+            fetched_numbers: numbers.len() as i64,
+            imported_movies: 0,
+            local_hit_movies,
+            skipped_movies,
+            stored_items,
         })
+    }
+
+    /// ★ 替换一个 scope 的全部条目：**先删后插，同一个事务**（上游
+    /// `_replace_scope_items`，`:357-373`）。
+    ///
+    /// # 为什么不是逐条 `upsert`
+    ///
+    /// `upsert` 按 `(source_key, board_key, period, rank)` 幂等，**删不掉
+    /// 「这次没有的名次」**：榜单从 100 条缩到 80 条时，第 81..100 名会永远
+    /// 留在库里，于是推荐打分读到一批幽灵条目。上游用替换正是为了这个。
+    ///
+    /// 两半必须在**同一个事务**里：中间失败会留下一个空 scope（先删成功了），
+    /// 那正是「清空数据比不同步更糟」。
+    async fn replace_scope(
+        &self,
+        source_key: &str,
+        board_key: &str,
+        period: &str,
+        items: &[NewRankingItem],
+    ) -> Result<i64, ServiceError> {
+        let mut tx = self.pool.begin().await?;
+        let outcome = async {
+            let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
+            self.rankings
+                .delete_board_in(&mut ctx, source_key, board_key, period)
+                .await?;
+            for item in items {
+                self.rankings.upsert_in(&mut ctx, item).await?;
+            }
+            Ok::<i64, ServiceError>(items.len() as i64)
+        }
+        .await;
+        commit_or_rollback(tx, outcome).await
+    }
+
+    /// ★ 同步**指定的**排行源（`None` = 全部）。照抄上游 `sync_all_rankings`
+    /// （`ranking_service.py:501-565`）。
+    ///
+    /// # 为什么要 `source_keys` 过滤
+    ///
+    /// 插件只能同步**自己**声明的源：上游 `PluginContext.sync_ranking_sources`
+    /// （`context.py:1476-1486`）先用 `RANKING_SOURCE_OWNERS` 过滤出归属自己的
+    /// `source_keys` 再传进来。归属判断需要注册表，只有组合根有 —— 所以过滤在
+    /// 调用方做，这里只按 key 收窄。
+    ///
+    /// # 两处与上游的形状差异（都是刻意的）
+    ///
+    /// **① 目标收敛挪到插件里**。上游 `_iter_sync_targets` 自己枚举
+    /// `board_supported_periods(board)` 再按 `should_fetch` 过滤；本仓把
+    /// 「哪些周期要抓」整段交给插件的 `ResolveRankingPeriods`（静态周期、
+    /// 动态年份、账号未配，一次算完）。
+    ///
+    /// **② 收敛阶段失败 → 整批失败**（不吞）。上游那一步是纯本地计算，不可能
+    /// 失败；这里是一次 rpc。吞掉它会让「插件挂了」表现成「同步成功、0 个目标」
+    /// —— 那是最难查的一种故障。**单个目标同步失败仍然不中断整批**（照抄上游
+    /// 的 per-target `try/except`）。
+    pub async fn sync_all_rankings(
+        &self,
+        source_keys: Option<&[String]>,
+    ) -> Result<AllRankingsStats, ServiceError> {
+        let gateway = self.gateway()?;
+
+        let mut targets: Vec<(String, String, String)> = Vec::new();
+        for source in self.sources.definitions() {
+            if let Some(only) = source_keys {
+                if !only.iter().any(|key| key == &source.source_key) {
+                    continue;
+                }
+            }
+            for board in &source.boards {
+                // 宿主知道的「这个榜这些周期已经有条目了」—— 递给插件，由它
+                // 按自己的规则（账号配置 / 历史年份）裁掉一部分。
+                let with_items = self
+                    .rankings
+                    .distinct_periods(&source.source_key, &board.board_key)
+                    .await?;
+                let periods = gateway
+                    .resolve_periods(&source.source_key, &board.board_key, &with_items)
+                    .await
+                    .map_err(|error| ServiceError::unavailable(error.code, error.message))?;
+                for period in periods {
+                    targets.push((source.source_key.clone(), board.board_key.clone(), period));
+                }
+            }
+        }
+
+        let mut stats = AllRankingsStats {
+            total_targets: targets.len() as i64,
+            ..Default::default()
+        };
+        // 上游在开始处 emit 一次进度（`:519-525`）。这里没有进度通道
+        // （`SyncRankingSourcesRequest` 是空的），改成一条 info ——「这次算出
+        // 多少个目标」是运维判断「跑了个空转」的唯一线索。
+        tracing::info!(total_targets = stats.total_targets, "排行榜同步开始");
+
+        for (source_key, board_key, period) in &targets {
+            match self.sync_board_period(source_key, board_key, period).await {
+                Ok(board) => {
+                    stats.success_targets += 1;
+                    stats.fetched_numbers += board.fetched_numbers;
+                    stats.imported_movies += board.imported_movies;
+                    stats.local_hit_movies += board.local_hit_movies;
+                    stats.skipped_movies += board.skipped_movies;
+                    stats.stored_items += board.stored_items;
+                }
+                Err(error) => {
+                    stats.failed_targets += 1;
+                    // 上游 `logger.warning`（`:535-541`）。一个榜挂了（JavDB 抽风
+                    // 之类）不该让后面 20 个榜都不跑，但必须留痕 —— 否则「同步
+                    // 跑过了」会掩盖「有几个榜没更新」。
+                    tracing::warn!(
+                        source_key,
+                        board_key,
+                        period,
+                        // `?` 是 `Debug`：`ServiceError` 没实现 `Display`。
+                        detail = ?error,
+                        "排行榜同步目标失败"
+                    );
+                }
+            }
+        }
+        Ok(stats)
     }
 }
 /// 排行源目录 —— **组合根注入的快照**。
@@ -456,7 +818,26 @@ impl RankingSourceCatalog {
         Self { entries }
     }
 
-    /// 全部源定义。
+    /// 全部源定义（**完整**那份，不是给 API 的投影）。
+    ///
+    /// 排行同步要按它遍历 `source → boards` 收敛目标，所以需要带 `boards`
+    /// 与周期字段的定义；[`Self::entries`] 是同一个列表的**响应投影**，
+    /// 没有 `boards`。
+    pub fn definitions(&self) -> &[RankingSourceDefinition] {
+        &self.entries
+    }
+
+    /// 某个插件**声明**的源 key。插件的同步入口据此收窄范围
+    /// （上游 `PluginContext.sync_ranking_sources`，`context.py:1476-1480`）。
+    pub fn source_keys_owned_by(&self, plugin_id: &str) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|definition| definition.owner_plugin_id == plugin_id)
+            .map(|definition| definition.source_key.clone())
+            .collect()
+    }
+
+    /// 全部源定义（响应投影：只有 key 与标题）。
     pub fn entries(&self) -> Vec<RankingSourceResource> {
         self.entries
             .iter()

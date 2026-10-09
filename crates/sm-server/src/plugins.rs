@@ -177,6 +177,48 @@ fn lock_providers(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 把扩展点注册表里的排行源转成 `sm-service` 的快照类型。
+///
+/// 抽成自由函数（而不只是 `Plugins` 的方法）是为了跨仓冒烟能走**同一条**转换：
+/// 那个用例自己 `collect_extensions` 建注册表，不经过 `Plugins`（`Plugins` 把进程
+/// 句柄收在私有字段里，拿不到控制面端点去跑任务）。如果各写一份转换，「读侧拿到
+/// 的榜单定义」与「写侧用的清单」就有两处可以各自漂移。
+pub fn ranking_catalog(
+    registry: &ExtensionRegistry,
+) -> sm_service::discovery::ranking::RankingSourceCatalog {
+    use sm_service::discovery::ranking::{RankingBoardDefinition, RankingSourceDefinition};
+    let entries = registry
+        .ranking_sources()
+        .into_iter()
+        .map(|source| RankingSourceDefinition {
+            source_key: source.source_key.clone(),
+            title: source.display_name.clone(),
+            owner_plugin_id: source.plugin_id.clone(),
+            boards: source
+                .boards
+                .iter()
+                .map(|board| RankingBoardDefinition {
+                    board_key: board.board_key.clone(),
+                    title: board.display_name.clone(),
+                    supported_periods: board.supported_periods.clone(),
+                    default_period: board.default_period.clone(),
+                    dynamic_periods: board.dynamic_periods,
+                })
+                .collect(),
+        })
+        .collect();
+    sm_service::discovery::ranking::RankingSourceCatalog::new(entries)
+}
+
+/// 取扩展点注册表的写锁，**容忍中毒**（理由同 [`lock_providers`]：重建即修好）。
+fn lock_extensions(
+    extensions: &std::sync::Mutex<ExtensionRegistry>,
+) -> std::sync::MutexGuard<'_, ExtensionRegistry> {
+    extensions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 一个已加载的插件。
 #[derive(Debug)]
 pub struct LoadedPlugin {
@@ -206,7 +248,15 @@ pub struct Plugins {
     /// 临界区只有一次 `HashMap` 查表，很快就出来。
     providers: Arc<std::sync::Mutex<ProviderRegistry>>,
     jobs: JobRegistry,
-    extensions: ExtensionRegistry,
+    /// 扩展点注册表（元数据来源 + 排行榜来源）。**共享的理由与 `providers` 完全
+    /// 相同**：排行榜写侧要按 `source_key` 找插件的 `plugin_endpoint` 去发 rpc，
+    /// 而插件重启会换端口 —— 拿快照就会带着旧端点（表现为同步忽然全部失败，
+    /// 而注册表看起来一切正常）。
+    ///
+    /// 读侧那条（`ranking_sources()` → `RankingSourceCatalog`）走快照是**刻意
+    /// 的**：`sm-api` 不能依赖 `sm-plugins`，它拿不到这个句柄。两者不冲突 ——
+    /// 快照供展示，句柄供调用。
+    extensions: Arc<std::sync::Mutex<ExtensionRegistry>>,
 }
 
 impl Plugins {
@@ -222,7 +272,7 @@ impl Plugins {
             loaded: Vec::new(),
             providers: Arc::new(std::sync::Mutex::new(ProviderRegistry::new())),
             jobs: JobRegistry::with_builtin(builtin_task_keys),
-            extensions: ExtensionRegistry::new(),
+            extensions: Arc::new(std::sync::Mutex::new(ExtensionRegistry::new())),
         };
         // `enabled` 的顺序就是优先级，不能并发拉起来打乱它。
         for plugin_id in plugins.config.enabled.clone() {
@@ -256,7 +306,7 @@ impl Plugins {
         for entry in collect_providers(&registration, &endpoint).entries() {
             lock_providers(&self.providers).insert(entry.clone());
         }
-        self.collect(&registration);
+        self.collect(&registration, &endpoint);
         self.loaded.push(LoadedPlugin {
             plugin_id,
             registration,
@@ -266,7 +316,10 @@ impl Plugins {
     }
 
     /// 把一个注册响应里的任务与扩展点收进注册表。
-    fn collect(&mut self, registration: &RegisterResponse) {
+    ///
+    /// `endpoint` 是那个插件的**控制面**端点 —— 收扩展点时连同它一起存下来，
+    /// 否则排行榜写侧「查得到声明、打不出去」（与 `collect_providers` 同一个理由）。
+    fn collect(&mut self, registration: &RegisterResponse, endpoint: &str) {
         for problem in collect_jobs(
             &mut self.jobs,
             &registration.plugin_id,
@@ -275,7 +328,12 @@ impl Plugins {
         ) {
             self.warn_job_problem(&problem);
         }
-        for problem in collect_extensions(&mut self.extensions, registration) {
+        // 锁在**一个语句里**取完就放：收扩展点只碰注册表，不该拦着别人读。
+        let problems = {
+            let mut registry = lock_extensions(&self.extensions);
+            collect_extensions(&mut registry, registration, endpoint)
+        };
+        for problem in problems {
             tracing::warn!(
                 plugin_id = registration.plugin_id.as_str(),
                 code = problem.code(),
@@ -362,37 +420,20 @@ impl Plugins {
     /// 这与 `catalog()`（`JobRegistry` -> `JobCatalog`）是**同一个模式**，
     /// 不是新发明 —— `AppState::jobs` 就是这么来的。
     ///
-    /// # 只取 `source_key` 与 `title`，**榜单定义是空的**
+    /// # 来源是**扩展点注册表**，不是 provider 注册表
     ///
-    /// 榜单定义（`supported_periods` / `default_period` / `descending`）来自
-    /// 插件**加载期**的注册载荷（上游
-    /// `register_plugin_ranking_sources(accepted, owners)`，
-    /// `ranking_plugin_adapter.py:109`）。而
-    /// `ProviderRegistration` 只有 `provider_key` / `display_name` /
-    /// `plugin_id` / `capabilities` / `data_plane_endpoint` —— **没有 boards**。
+    /// 两者容易搞混：`provider_registry` 里那份是**能力声明**
+    /// （`ProviderRegistration` 只有 `provider_key` / `display_name` /
+    /// `plugin_id` / `capabilities` / `data_plane_endpoint`），**没有 boards**。
+    /// 真正的榜单定义在 `ExtensionRegistry` 的 `RankingSourceRegistration` 里
+    /// （加载期从注册载荷收下，见 `sm_plugins::extensions::collect_extensions`）。
     ///
-    /// 所以这里产出的是**空 boards**。后果是
-    /// `GET /ranking-sources/{key}/boards` 会返回 404
-    /// `ranking_board_definitions_unavailable`（service 层显式报错，不是空数组）。
-    ///
-    /// **不填一个假的 boards 列表** —— 那会让接口「成功」但周期校验永远失败，
-    /// 比报缺口更难查。两条修法记在
-    /// `sm_service::discovery::ranking::RankingSourceCatalog` 的文档里。
+    /// 骨架期这里读的是 provider 注册表并**硬写 `boards: Vec::new()`**，于是
+    /// `GET /ranking-sources/{key}/boards` 永远返回「榜单定义尚未接入」。
+    /// 现在整份搬过来：`boards` 连同 `supported_periods` / `default_period` /
+    /// `dynamic_periods` 一起，还有**归属**（写侧授权要用）。
     pub fn ranking_sources(&self) -> sm_service::discovery::ranking::RankingSourceCatalog {
-        use sm_plugins::registration::capability::EXTENSION_RANKING_SOURCE;
-        let providers = lock_providers(&self.providers);
-        let entries = providers
-            .providers_with(EXTENSION_RANKING_SOURCE)
-            .into_iter()
-            .map(
-                |provider| sm_service::discovery::ranking::RankingSourceDefinition {
-                    source_key: provider.provider_key.clone(),
-                    title: provider.display_name.clone(),
-                    boards: Vec::new(),
-                },
-            )
-            .collect();
-        sm_service::discovery::ranking::RankingSourceCatalog::new(entries)
+        ranking_catalog(&lock_extensions(&self.extensions))
     }
 
     /// 数据面调用方要用的那一份注册表句柄。
@@ -401,6 +442,13 @@ impl Plugins {
     /// 活的**：插件重启会换端点，快照会过期。
     pub fn provider_registry(&self) -> Arc<std::sync::Mutex<ProviderRegistry>> {
         Arc::clone(&self.providers)
+    }
+
+    /// 扩展点注册表句柄。组合根交给排行取数网关
+    /// （[`crate::ranking_gateway`]）—— 理由同 [`Self::provider_registry`]：
+    /// 要按 `source_key` 现取插件的 `plugin_endpoint`，快照会带着旧端口。
+    pub fn extension_registry(&self) -> Arc<std::sync::Mutex<ExtensionRegistry>> {
+        Arc::clone(&self.extensions)
     }
 
     /// 已加载插件的 `{id, version}` 快照，供匿名遥测心跳用。
@@ -435,15 +483,17 @@ impl Plugins {
         // 「永远空」的旧注册表 —— 插件重启之后所有 provider 都查不到。
         *lock_providers(&self.providers) = ProviderRegistry::new();
         self.jobs = JobRegistry::with_builtin(builtin_task_keys);
-        self.extensions = ExtensionRegistry::new();
-        // 先拷出声明再收：`collect` 要可变借用 `self`，而遍历也在借 `self`。
-        let registrations: Vec<RegisterResponse> = self
+        // 同 `providers`：**清空而不是换一个新对象** —— 句柄是共享的，排行榜
+        // 写侧正指着这一个。
+        lock_extensions(&self.extensions).clear();
+        // 先拷出（声明, 端点）再收：`collect` 要可变借用 `self`，而遍历也在借 `self`。
+        let registrations: Vec<(RegisterResponse, String)> = self
             .loaded
             .iter()
-            .map(|plugin| plugin.registration.clone())
+            .map(|plugin| (plugin.registration.clone(), plugin.process.endpoint()))
             .collect();
-        for registration in &registrations {
-            self.collect(registration);
+        for (registration, endpoint) in &registrations {
+            self.collect(registration, endpoint);
         }
     }
 }

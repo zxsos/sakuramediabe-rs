@@ -44,6 +44,14 @@ use crate::catalog::metadata_source::{MetadataProvider, MetadataSourceError};
 pub const API_PATH_SEARCH: &str = "/api/v2/search";
 /// 影片详情（上游 `API_PATH_MOVIE_DETAIL`）。
 pub const API_PATH_MOVIE_DETAIL: &str = "/api/v4/movies/{javdb_id}";
+/// 有码 / 无码 / FC2 榜单（上游 `API_PATH_RANKINGS`）。
+pub const API_PATH_RANKINGS: &str = "/api/v1/rankings";
+/// 播放榜（上游 `API_PATH_RANKINGS_PLAYBACK`）。
+pub const API_PATH_RANKINGS_PLAYBACK: &str = "/api/v1/rankings/playback";
+/// TOP250（上游 `API_PATH_MOVIES_TOP`）。**需登录**。
+pub const API_PATH_MOVIES_TOP: &str = "/api/v1/movies/top";
+/// 登录换 token（上游 `API_PATH_SESSIONS`）。
+pub const API_PATH_SESSIONS: &str = "/api/v1/sessions";
 
 /// 搜索的固定查询参数（上游 `API_PARAMS_MOVIE_SEARCH`）。
 ///
@@ -107,6 +115,116 @@ pub fn signature_at(timestamp: i64) -> String {
     let sign = hashing::md5_hex(format!("{timestamp}{SIGN_SECRET}").as_bytes());
     format!("{timestamp}.{SIGN_SUFFIX}.{sign}")
 }
+
+/// 有码 / 无码 / FC2 的 `video_type`（上游 `SUPPORTED_RANK_VIDEO_TYPES`）。
+///
+/// 上游是 `set`，这里用数组 —— 只有三个成员，线性查找比建集合更便宜，且**顺序
+/// 无关**（判的是成员资格，不依赖迭代序）。
+pub const SUPPORTED_RANK_VIDEO_TYPES: [&str; 3] = ["0", "1", "3"];
+/// 榜单周期（上游 `SUPPORTED_RANK_PERIODS`）。
+pub const SUPPORTED_RANK_PERIODS: [&str; 3] = ["daily", "weekly", "monthly"];
+/// 播放榜筛选（上游 `SUPPORTED_PLAYBACK_FILTERS`）：`all`=热播，`high_score`=高评分。
+pub const SUPPORTED_PLAYBACK_FILTERS: [&str; 2] = ["all", "high_score"];
+/// TOP250 的 `top_type`（上游 `SUPPORTED_TOP_TYPES`）。
+pub const SUPPORTED_TOP_TYPES: [&str; 3] = ["all", "year", "video_type"];
+/// TOP250 每页条数（上游 `TOP250_PAGE_LIMIT`）。
+pub const TOP250_PAGE_LIMIT: i64 = 50;
+/// TOP250 默认抓几页（上游 `TOP250_MAX_PAGES`）：5 页 × 50 条 = 满 250。
+pub const TOP250_MAX_PAGES: i64 = 5;
+
+/// 登录用的固定设备指纹（上游 `DEVICE`，`javdb.py:55-63`）。
+///
+/// ⚠️ **与官方 App 抓包一致，不要改动**。它不进任何配置项 —— 改一个字符就换了
+/// 一个「设备」，而 JavDB 的风控是按设备认人的。
+const DEVICE: [(&str, &str); 7] = [
+    ("device_name", "meizu16sPro"),
+    ("device_model", "meizu/16s Pro"),
+    ("platform", "android"),
+    ("system_version", "9"),
+    ("app_channel", "official"),
+    ("app_version", "official"),
+    ("app_version_number", "1.9.29"),
+];
+
+/// 派生 `device_uuid` 的固定命名空间（上游 `DEVICE_UUID_NAMESPACE`，
+/// `javdb.py:66` 的 `5374dc5e-0f98-5235-9845-76cbc0ced71f`）。
+///
+/// 上游注释写明它「沿用原硬编码值作为种子」—— 也就是说这个 UUID 本身没有语义，
+/// 唯一的要求是**永远不变**：变了就等于所有账号换了一台设备。
+const DEVICE_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x53, 0x74, 0xdc, 0x5e, 0x0f, 0x98, 0x52, 0x35, 0x98, 0x45, 0x76, 0xcb, 0xc0, 0xce, 0xd7, 0x1f,
+]);
+
+/// JavDB 账号（上游 `JavdbProvider.__init__` 的 `username` / `password`，
+/// `javdb.py:105-118`）。
+///
+/// 宿主**不保管**账号：它是插件配置里的东西，每次 rpc 由插件透传进来 —— 所以
+/// 这个类型只在一次调用里活着，没有「记住 token」的位置。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JavdbAccount {
+    pub username: String,
+    pub password: String,
+}
+
+impl JavdbAccount {
+    /// 「配了账号」的判据（上游 `_ensure_logged_in` 的
+    /// `if not (self.username and self.password)`，`:514`）：**两个都非空**。
+    ///
+    /// 空串与缺省在这个判据下等价 —— 上游此刻是 `None` 或 `""` 都一样，
+    /// 所以这里把空缺统一成空串，不再带一层 `Option`。
+    pub fn is_configured(&self) -> bool {
+        !self.username.is_empty() && !self.password.is_empty()
+    }
+
+    /// 登录载荷里的 `device_uuid`（上游 `_device_payload`，`:503-506`）：
+    /// 按账号做 uuid5 派生，于是**同账号每次登录都是同一个设备**、不同账号互不
+    /// 相同。全网共用一个设备标识是上游明确要避免的事。
+    ///
+    /// 未配账号时用**空串**派生 —— 上游 `self.username or ""` 同样如此。不过那
+    /// 条路径到不了这里：`is_configured()` 会先拦下来。
+    fn device_uuid(&self) -> String {
+        uuid::Uuid::new_v5(&DEVICE_UUID_NAMESPACE, self.username.as_bytes()).to_string()
+    }
+}
+
+/// 榜单取数失败。
+///
+/// # 为什么不复用 [`MetadataSourceError`]
+///
+/// 那一套是**元数据 provider** 的语义（`NotFound` / `InvalidDelivery` /
+/// `Disabled`），而榜单只有「参数不在白名单 / 账号没配 / 登录被拒 / 请求失败」
+/// 四种，且**没有 `NotFound`** —— 一个空榜单是**成功**（上游返回 `[]`），不是
+/// 「没找到」。混用会让调用方分不清「这个榜今天没数据」与「JavDB 没收录」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JavdbRankError {
+    /// 参数不在上游白名单里（上游 `ValueError`，`:484-487` 等）。
+    ///
+    /// 这是**调用方的 bug**，不是 JavDB 的问题 —— 所以它该映射成
+    /// `INVALID_ARGUMENT`，而不是「服务不可用」。
+    Unsupported(String),
+    /// 这个榜需要登录，而账号没配（上游 `JavdbAuthError("javdb account is not
+    /// configured")`，`:516`）。
+    AccountRequired,
+    /// 账号配了但没换成 token（上游 `JavdbAuthError`，`:533` / `:540`）。
+    Auth(String),
+    /// 请求失败：网络、非 2xx、`success != 1`、响应缺 `data.movies`。
+    Request(String),
+}
+
+impl std::fmt::Display for JavdbRankError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(detail) => write!(formatter, "榜单参数不受支持：{detail}"),
+            Self::AccountRequired => {
+                write!(formatter, "该榜单需要登录，而 JavDB 账号没有配置")
+            }
+            Self::Auth(detail) => write!(formatter, "JavDB 登录失败：{detail}"),
+            Self::Request(detail) => write!(formatter, "JavDB 榜单请求失败：{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for JavdbRankError {}
 
 /// JavDB provider。
 #[derive(Debug, Clone)]
@@ -175,6 +293,87 @@ impl JavdbProvider {
         format!("{base}?{}", encoded.join("&"))
     }
 
+    /// 每次请求都要带的两个头（上游 `JavdbProvider.build_request_headers`，
+    /// `javdb.py:661-667`）。
+    ///
+    /// ★ `jdsignature` 必须**当场算**，不能缓存：`signature_at` 的参数是 Unix
+    /// 秒，服务端据此判新鲜度 —— 复用一个旧签名会拿到 HTTP **200** 的
+    /// `{"success":0,"action":"ParameterInvalid"}`（见 [`signature_at`]）。
+    ///
+    /// 上游那份头里还有 `connection` 与 `host`，本函数**不搬**（理由见
+    /// [`Self::request_json`] 的文档）：它们由客户端托管，显式设置会与连接复用打架。
+    fn common_headers(&self) -> Result<reqwest::header::HeaderMap, MetadataSourceError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("zh-TW"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("jdsignature"),
+            reqwest::header::HeaderValue::from_str(&signature_at(chrono::Utc::now().timestamp()))
+                .map_err(|error| {
+                MetadataSourceError::RequestFailed(format!("构造 JavDB 签名头失败：{error}"))
+            })?,
+        );
+        Ok(headers)
+    }
+
+    /// 发一次请求并解析 JSON；`extra` 里的头**覆盖**默认头。
+    ///
+    /// 上游 `MetadataRequestClient._request`（`http_client.py:44-46`）先在
+    /// `build_request_headers()` 之后 `update(headers)` —— 所以登录那次的
+    /// `user-agent` 会盖掉客户端的浏览器 UA，而 `jdsignature` 仍在。顺序照抄。
+    ///
+    /// # 单次尝试，不重试
+    ///
+    /// 上游最多重试 4 次（`http_client.py:48`：408/429/500/502/503/504 与网络
+    /// 错误，退避 `backoff_delay`）。本仓的 JavDB 客户端**一直**是单次（既有的
+    /// 搜索 / 详情路径亦然），这里不为榜单单独加一层 —— 榜单是定时任务，一次
+    /// 失败留到下一轮比在这里占住 worker 更合适。要改就连同既有路径一起改。
+    async fn send_json(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<String>,
+        extra: &[(&str, &str)],
+    ) -> Result<Value, MetadataSourceError> {
+        let mut headers = self.common_headers()?;
+        for (name, value) in extra {
+            let header_name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    MetadataSourceError::RequestFailed(format!(
+                        "构造 JavDB 请求头 {name} 失败：{error}"
+                    ))
+                })?;
+            let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                MetadataSourceError::RequestFailed(format!(
+                    "构造 JavDB 请求头 {name} 失败：{error}"
+                ))
+            })?;
+            headers.insert(header_name, header_value);
+        }
+        let mut request = self.client.request(method, url).headers(headers);
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        let response = request.send().await.map_err(|error| {
+            MetadataSourceError::RequestFailed(format!("请求 JavDB 失败 {url}: {error}"))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            MetadataSourceError::RequestFailed(format!("读 JavDB 响应失败 {url}: {error}"))
+        })?;
+        if !status.is_success() {
+            return Err(MetadataSourceError::RequestFailed(format!(
+                "JavDB 返回 {status}：{}",
+                truncate(&body)
+            )));
+        }
+        serde_json::from_str(&body).map_err(|error| {
+            MetadataSourceError::RequestFailed(format!("JavDB 响应不是 JSON：{error}"))
+        })
+    }
+
     /// 发一次 GET 并解析 JSON。上游 `request_json`（`http_client.py:37-44`）。
     ///
     /// # 每个请求都必须带 `jdsignature`
@@ -195,40 +394,7 @@ impl JavdbProvider {
     /// 托管的 —— HTTP/1.1 默认即 keep-alive，`Host` 由 hyper 按 URL 自动填，
     /// 显式设置反而会与连接复用打架。只搬真正承载语义的那两个。
     async fn request_json(&self, url: &str) -> Result<Value, MetadataSourceError> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::ACCEPT_LANGUAGE,
-            reqwest::header::HeaderValue::from_static("zh-TW"),
-        );
-        headers.insert(
-            reqwest::header::HeaderName::from_static("jdsignature"),
-            reqwest::header::HeaderValue::from_str(&signature_at(chrono::Utc::now().timestamp()))
-                .map_err(|error| {
-                MetadataSourceError::RequestFailed(format!("构造 JavDB 签名头失败：{error}"))
-            })?,
-        );
-        let response = self
-            .client
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|error| {
-                MetadataSourceError::RequestFailed(format!("请求 JavDB 失败 {url}: {error}"))
-            })?;
-        let status = response.status();
-        let body = response.text().await.map_err(|error| {
-            MetadataSourceError::RequestFailed(format!("读 JavDB 响应失败 {url}: {error}"))
-        })?;
-        if !status.is_success() {
-            return Err(MetadataSourceError::RequestFailed(format!(
-                "JavDB 返回 {status}：{}",
-                truncate(&body)
-            )));
-        }
-        serde_json::from_str(&body).map_err(|error| {
-            MetadataSourceError::RequestFailed(format!("JavDB 响应不是 JSON：{error}"))
-        })
+        self.send_json(reqwest::Method::GET, url, None, &[]).await
     }
 
     /// 按番号搜候选（上游 `_search_movie`，`:386-414`）。
@@ -294,6 +460,187 @@ impl JavdbProvider {
             .filter(|movie| !movie.is_null())
             .cloned()
             .ok_or(MetadataSourceError::NotFound)
+    }
+
+    /// 播放榜番号（上游 `get_playback_rank_numbers`，`:611-659`）。
+    ///
+    /// `filter_by` = `all`（热播）/ `high_score`（高评分）；`period` =
+    /// `daily` / `weekly` / `monthly`。**不需要登录** —— 上游这个方法直接
+    /// `request_json`，不碰 `_ensure_logged_in`。
+    pub async fn playback_rank_numbers(
+        &self,
+        filter_by: &str,
+        period: &str,
+    ) -> Result<Vec<String>, JavdbRankError> {
+        if !SUPPORTED_PLAYBACK_FILTERS.contains(&filter_by) {
+            return Err(JavdbRankError::Unsupported(format!(
+                "不支持的 filter_by：{filter_by}"
+            )));
+        }
+        if !SUPPORTED_RANK_PERIODS.contains(&period) {
+            return Err(JavdbRankError::Unsupported(format!(
+                "不支持的 period：{period}"
+            )));
+        }
+        let url = self.api_url(
+            API_PATH_RANKINGS_PLAYBACK,
+            &[
+                ("filter_by", filter_by.to_owned()),
+                ("period", period.to_owned()),
+            ],
+        );
+        let payload = self
+            .send_json(reqwest::Method::GET, &url, None, &[])
+            .await
+            .map_err(rank_request_error)?;
+        rank_numbers_from(&payload)
+    }
+
+    /// 有码 / 无码 / FC2 榜番号（上游 `get_rank_numbers`，`:483-501`）。
+    ///
+    /// `video_type` = `0`（有码）/ `1`（无码）/ `3`（FC2）。同样是免费榜，
+    /// 不需要登录。注意上游把 `video_type` 放在查询参数 **`type`** 上（`:810`），
+    /// 不是 `video_type` —— 写错参数名会拿到一个 HTTP 200 的空榜。
+    pub async fn rank_numbers(
+        &self,
+        video_type: &str,
+        period: &str,
+    ) -> Result<Vec<String>, JavdbRankError> {
+        if !SUPPORTED_RANK_VIDEO_TYPES.contains(&video_type) {
+            return Err(JavdbRankError::Unsupported(format!(
+                "不支持的 video_type：{video_type}"
+            )));
+        }
+        if !SUPPORTED_RANK_PERIODS.contains(&period) {
+            return Err(JavdbRankError::Unsupported(format!(
+                "不支持的 period：{period}"
+            )));
+        }
+        let url = self.api_url(
+            API_PATH_RANKINGS,
+            &[
+                ("type", video_type.to_owned()),
+                ("period", period.to_owned()),
+            ],
+        );
+        let payload = self
+            .send_json(reqwest::Method::GET, &url, None, &[])
+            .await
+            .map_err(rank_request_error)?;
+        rank_numbers_from(&payload)
+    }
+
+    /// TOP250 番号（上游 `get_top_numbers`，`:546-609`）。**需登录**。
+    ///
+    /// `top_type` = `all` / `year` / `video_type`；`type_value` 在 `year` 下是
+    /// 年份、在 `video_type` 下是 `0`/`1`/`3`、`all` 下是空串。逐页抓到
+    /// `max_pages`（缺省 [`TOP250_MAX_PAGES`]），**空页即到底**并提前停
+    /// （上游 `if not movies: break`，`:596-598`）—— 所以数据不满 250 的历史
+    /// 年份不会白跑后面几页。
+    pub async fn top_numbers(
+        &self,
+        account: &JavdbAccount,
+        top_type: &str,
+        type_value: &str,
+        max_pages: Option<i32>,
+    ) -> Result<Vec<String>, JavdbRankError> {
+        if !SUPPORTED_TOP_TYPES.contains(&top_type) {
+            return Err(JavdbRankError::Unsupported(format!(
+                "不支持的 top_type：{top_type}"
+            )));
+        }
+        let page_count = max_pages.map_or(TOP250_MAX_PAGES, i64::from);
+        // 登录**先于**翻页：`max_pages = 0` 时上游也先登录（`_ensure_logged_in`
+        // 在循环之前），于是一个「账号不对」的调用会以登录错误收场，而不是
+        // 静悄悄返回空榜。
+        let token = self.login_token(account).await?;
+        let authorization = format!("Bearer {token}");
+
+        let mut numbers: Vec<String> = Vec::new();
+        for page in 1..=page_count {
+            let url = self.api_url(
+                API_PATH_MOVIES_TOP,
+                &[
+                    ("start_rank", "1".to_owned()),
+                    ("type", top_type.to_owned()),
+                    ("type_value", type_value.to_owned()),
+                    ("ignore_watched", "false".to_owned()),
+                    ("page", page.to_string()),
+                    ("limit", TOP250_PAGE_LIMIT.to_string()),
+                ],
+            );
+            let payload = self
+                .send_json(
+                    reqwest::Method::GET,
+                    &url,
+                    None,
+                    &[("authorization", authorization.as_str())],
+                )
+                .await
+                .map_err(rank_request_error)?;
+            let page_numbers = rank_numbers_from(&payload)?;
+            if page_numbers.is_empty() {
+                break;
+            }
+            numbers.extend(page_numbers);
+        }
+        Ok(numbers)
+    }
+
+    /// 换一个登录 token（上游 `_ensure_logged_in`，`:508-544`）。
+    ///
+    /// # 为什么这里没有「记住 token」与「失败后不再重试」
+    ///
+    /// 上游把 token 缓存在**实例**上（`self._token` / `self._login_failed`），
+    /// 两者的前提都是「一个 provider 跨多次抓取存活」——`per_run_provider_holder`
+    /// 正是为这个前提写的。本仓的 provider 是**按 rpc 调用就地构造**的（宿主不
+    /// 保管账号），登录与使用在同一次调用里，所以那两个状态位没有存在的意义；
+    /// 「一次失败不再重试」由调用方在下一轮重新登录自然满足。
+    async fn login_token(&self, account: &JavdbAccount) -> Result<String, JavdbRankError> {
+        if !account.is_configured() {
+            return Err(JavdbRankError::AccountRequired);
+        }
+        let url = self.api_url(API_PATH_SESSIONS, &[]);
+        // 字段顺序照抄上游 `{"username", "password", **device_payload}`（`:519-523`）。
+        let mut fields: Vec<(String, String)> = vec![
+            ("username".to_owned(), account.username.clone()),
+            ("password".to_owned(), account.password.clone()),
+            ("device_uuid".to_owned(), account.device_uuid()),
+        ];
+        for (key, value) in DEVICE {
+            fields.push((key.to_owned(), value.to_owned()));
+        }
+        let payload = self
+            .send_json(
+                reqwest::Method::POST,
+                &url,
+                Some(encode_form(&fields)),
+                // 上游登录额外头（`:524-528`）。★ 两处「看起来不对但服务端就认它」：
+                // UA 换成 `Dart/3.5`，`Content-Type` 声明 multipart 而**实体是
+                // form-urlencoded**（上游注释原话：「服务端虽声明 multipart，但
+                // 接受 form-urlencoded 提交」）。照抄，别改。
+                &[
+                    ("user-agent", LOGIN_USER_AGENT),
+                    ("content-type", LOGIN_CONTENT_TYPE),
+                ],
+            )
+            .await
+            .map_err(|error| JavdbRankError::Auth(request_detail(error)))?;
+        payload
+            .get("data")
+            .and_then(|data| data.get("token"))
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                // 上游 `body.get("message") or "login response missing token"`（`:538`）
+                // —— 服务端给了原因就用原因，没给才是这句兜底。
+                let detail = payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("login response missing token");
+                JavdbRankError::Auth(detail.to_owned())
+            })
     }
 }
 
@@ -371,6 +718,100 @@ fn truncate(body: &str) -> String {
     }
     let head: String = body.chars().take(LIMIT).collect();
     format!("{head}…")
+}
+
+/// 登录请求的 UA（上游 `:526` 硬编码 `Dart/3.5 (dart:io)`）。
+const LOGIN_USER_AGENT: &str = "Dart/3.5 (dart:io)";
+/// 登录请求声明的 `Content-Type`（上游 `:527`）。**实体其实是
+/// form-urlencoded** —— 见 [`JavdbProvider::login_token`] 里的说明。
+const LOGIN_CONTENT_TYPE: &str = "multipart/form-data";
+
+/// 从榜单响应里取番号。
+///
+/// 上游三处是**同一段循环**（`:489-494` / `:599-602` / `:648-652`），所以这里
+/// 收成一个函数；三种响应的信封也一致（播放榜的注释原话：「playback 响应与
+/// `/api/v1/rankings` 同构，带 `success` 包络」）。
+///
+/// 三件事照抄上游：
+/// 1. `success != 1` 是**请求失败**（HTTP 仍是 200），不是「这个榜是空的」；
+/// 2. 缺 `data.movies`（或它不是数组）同样是失败（上游 `isinstance(movies, list)`）；
+/// 3. **空数组不是失败** —— 它表示这个榜此刻没有条目，TOP250 的历史年份就会这样。
+///
+/// 一处刻意收窄：上游 `if number:` 收**任意非空真值**，本函数只认字符串
+/// （JavDB 的 `number` 要么是字符串要么是 `null`；其余类型按「没有这个字段」处理）。
+fn rank_numbers_from(payload: &Value) -> Result<Vec<String>, JavdbRankError> {
+    if payload.get("success").and_then(Value::as_i64) != Some(1) {
+        let detail = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unexpected success");
+        return Err(JavdbRankError::Request(format!(
+            "榜单请求返回失败：{detail}"
+        )));
+    }
+    let movies = payload
+        .get("data")
+        .and_then(|data| data.get("movies"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| JavdbRankError::Request("榜单响应缺 data.movies".to_owned()))?;
+    Ok(movies
+        .iter()
+        .filter_map(|movie| movie.get("number").and_then(Value::as_str))
+        .filter(|number| !number.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `send_json` 的错误细节。
+///
+/// 它只会产出 `RequestFailed`（唯一的失败形态），所以这里取那一支的串；
+/// 其余分支在当前实现下不可达，兜底给 `Debug` 而不是 `unreachable!()` ——
+/// 多一个错误分支不会崩，少一个 `panic` 却可能让一次同步整批失败。
+fn request_detail(error: MetadataSourceError) -> String {
+    match error {
+        MetadataSourceError::RequestFailed(detail) => detail,
+        other => format!("{other:?}"),
+    }
+}
+
+/// 榜单路径上的传输错误：细节串原样带过去（见 [`request_detail`]）。
+fn rank_request_error(error: MetadataSourceError) -> JavdbRankError {
+    JavdbRankError::Request(request_detail(error))
+}
+
+/// `application/x-www-form-urlencoded` 的实体编码。
+///
+/// httpx 传 `data=dict` 时走 `urlencode` → `quote_plus`：**空格编成 `+`**、
+/// 安全集是 `_.-~`（不含查询串里保留的 `:`）。这跟 [`encode_component`] 的
+/// 规则**不同**（那边 `:` 与 `-` 都保留，是给番号用的），所以两个函数不能合并
+/// —— 合并任一个都会在另一处编错。
+fn encode_form(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                encode_form_component(key),
+                encode_form_component(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// 表单串里的单个分量（`quote_plus` 的规则）。
+fn encode_form_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -494,5 +935,197 @@ mod tests {
         assert!(short.chars().count() <= 201, "不该把整个响应体塞进错误消息");
         assert!(short.ends_with('…'));
         assert_eq!(truncate("short"), "short");
+    }
+
+    #[test]
+    fn an_account_counts_as_configured_only_when_both_fields_are_set() {
+        // 上游 `if not (self.username and self.password)`（`:514`）—— 只看「非空」，
+        // 空串与缺省等价。
+        assert!(JavdbAccount {
+            username: "u".to_owned(),
+            password: "p".to_owned(),
+        }
+        .is_configured());
+        assert!(!JavdbAccount::default().is_configured());
+        assert!(!JavdbAccount {
+            username: "u".to_owned(),
+            password: String::new(),
+        }
+        .is_configured());
+        assert!(!JavdbAccount {
+            username: String::new(),
+            password: "p".to_owned(),
+        }
+        .is_configured());
+    }
+
+    #[test]
+    fn the_device_uuid_is_derived_per_account_and_stable() {
+        // ★ 期望值来自**另一实现**（Python `uuid.uuid5(NAMESPACE, name)`），所以
+        // 这一条同时抓「命名空间抄错」与「用了 uuid4 / 自己拼 sha1」—— 用自己的
+        // 实现验自己的实现会漏掉后者。
+        let account = JavdbAccount {
+            username: "sakura".to_owned(),
+            password: "x".to_owned(),
+        };
+        assert_eq!(
+            account.device_uuid(),
+            "01f1b765-45e0-55df-b2a9-253fb94cd452"
+        );
+        // 同账号每次必须一样：变了就等于每次登录都换一台设备。
+        assert_eq!(account.device_uuid(), account.device_uuid());
+        // 不同账号必须不同（上游 `:64-66`：「避免全网共用一个设备标识」）。
+        let other = JavdbAccount {
+            username: "other".to_owned(),
+            password: "x".to_owned(),
+        };
+        assert_ne!(other.device_uuid(), account.device_uuid());
+        // 账号名真的参与派生，而不是「所有账号同一个 uuid」。
+        assert_eq!(
+            JavdbAccount::default().device_uuid(),
+            "734f0a92-5541-5a78-92b2-59649355e896"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_rank_arguments_are_refused_before_any_request() {
+        // 域名是个**不存在的地址**：真发请求会是超时/连接错误，所以「立刻返回
+        // Unsupported」本身就证明校验在发请求之前。
+        let provider = JavdbProvider::new("javdb.invalid").expect("构造");
+        let cases = [
+            provider.rank_numbers("2", "daily").await,
+            provider.rank_numbers("0", "yearly").await,
+            provider.playback_rank_numbers("recent", "daily").await,
+            provider.playback_rank_numbers("all", "yearly").await,
+            provider
+                .top_numbers(&JavdbAccount::default(), "decade", "", None)
+                .await,
+        ];
+        for result in cases {
+            let error = result.expect_err("不在白名单里的参数该被拒");
+            assert!(matches!(error, JavdbRankError::Unsupported(_)), "{error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn top250_without_an_account_fails_instead_of_returning_an_empty_board() {
+        let provider = JavdbProvider::new("javdb.invalid").expect("构造");
+        let error = provider
+            .top_numbers(&JavdbAccount::default(), "all", "", None)
+            .await
+            .expect_err("没配账号该拒");
+        // ★ 不能返回空列表：那会让 TOP250 显示成「同步成功但一条都没有」。
+        assert_eq!(error, JavdbRankError::AccountRequired);
+    }
+
+    #[test]
+    fn a_rank_payload_yields_numbers_in_order_and_skips_blanks() {
+        let payload = serde_json::json!({
+            "success": 1,
+            "data": { "movies": [
+                { "number": "ABC-001" },
+                { "number": "" },
+                { "id": "no-number-field" },
+                { "number": null },
+                { "number": "ABC-002" },
+            ]},
+        });
+        // 顺序即排名：不能排序、不能去重后重排。
+        assert_eq!(
+            rank_numbers_from(&payload).expect("解析"),
+            vec!["ABC-001".to_owned(), "ABC-002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_rank_board_is_a_success_not_a_failure() {
+        // TOP250 的历史年份、以及任何当日无数据的榜都会这样。判成失败会把它变成
+        // 一个每天重试却永远好不了的错误。
+        let payload = serde_json::json!({ "success": 1, "data": { "movies": [] } });
+        assert_eq!(
+            rank_numbers_from(&payload).expect("空榜单是成功"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn success_other_than_one_and_a_missing_movies_key_are_request_failures() {
+        // HTTP 200 + `success: 0` 是 JavDB 的「业务失败」。不看它 = 把服务端拒绝
+        // 当成「这个榜是空的」。
+        let refused = serde_json::json!({ "success": 0, "message": "ParameterInvalid" });
+        match rank_numbers_from(&refused).expect_err("success=0 该报错") {
+            JavdbRankError::Request(detail) => {
+                assert!(detail.contains("ParameterInvalid"), "{detail}");
+            }
+            other => panic!("应当是 Request，实际 {other:?}"),
+        }
+        let envelope_only = serde_json::json!({ "success": 1, "data": {} });
+        assert!(
+            matches!(
+                rank_numbers_from(&envelope_only).expect_err("缺 data.movies 该报错"),
+                JavdbRankError::Request(_)
+            ),
+            "缺 data.movies 是请求失败，不是空榜单"
+        );
+    }
+
+    #[test]
+    fn the_rank_urls_carry_the_upstream_parameter_names() {
+        let provider = JavdbProvider::new("javdb.com").expect("构造");
+        // ★ `video_type` 挂在查询参数 **`type`** 上（上游 `:810`），不是 `video_type`
+        // —— 写错参数名会拿到一个 HTTP 200 的空榜。
+        assert_eq!(
+            provider.api_url(
+                API_PATH_RANKINGS,
+                &[("type", "0".to_owned()), ("period", "daily".to_owned())]
+            ),
+            "https://javdb.com/api/v1/rankings?type=0&period=daily"
+        );
+        assert_eq!(
+            provider.api_url(
+                API_PATH_RANKINGS_PLAYBACK,
+                &[
+                    ("filter_by", "high_score".to_owned()),
+                    ("period", "weekly".to_owned())
+                ]
+            ),
+            "https://javdb.com/api/v1/rankings/playback?filter_by=high_score&period=weekly"
+        );
+        // TOP250 的六个参数与顺序照抄上游 `:562-569`。
+        assert_eq!(
+            provider.api_url(
+                API_PATH_MOVIES_TOP,
+                &[
+                    ("start_rank", "1".to_owned()),
+                    ("type", "year".to_owned()),
+                    ("type_value", "2024".to_owned()),
+                    ("ignore_watched", "false".to_owned()),
+                    ("page", "2".to_owned()),
+                    ("limit", TOP250_PAGE_LIMIT.to_string()),
+                ]
+            ),
+            "https://javdb.com/api/v1/movies/top?start_rank=1&type=year&type_value=2024\
+             &ignore_watched=false&page=2&limit=50"
+        );
+    }
+
+    #[test]
+    fn form_encoding_and_query_encoding_are_different_rules() {
+        // 表单体是 `quote_plus`：空格编成 `+`。
+        assert_eq!(encode_form_component("a b"), "a+b");
+        // ★ 与查询串**相反**：那边 `:` 是安全字符（番号与带冒号的值不能被编码），
+        // 这边必须编码成 `%3A`。合并这两个函数必然在某一处编错。
+        assert_eq!(encode_form_component("a:b"), "a%3Ab");
+        assert_eq!(encode_component("a:b"), "a:b");
+        assert_eq!(
+            encode_form(&[
+                ("username".to_owned(), "sa kura".to_owned()),
+                (
+                    "device_uuid".to_owned(),
+                    "01f1b765-45e0-55df-b2a9-253fb94cd452".to_owned()
+                ),
+            ]),
+            "username=sa+kura&device_uuid=01f1b765-45e0-55df-b2a9-253fb94cd452"
+        );
     }
 }

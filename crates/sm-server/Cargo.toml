@@ -32,6 +32,9 @@ anyhow = { workspace = true }
 # 环境变量那层由 `ServerConfig::load` 自己处理（键名是既有部署契约，不能动）。
 toml = { workspace = true }
 sqlx = { workspace = true }
+# 演员快照里的生日：`actor_values` 要把它格式化成 `YYYY-MM-DD`，而 `patch_actor`
+# 要把它解析回来（`FieldPatch::date` 收的就是 `NaiveDate`）。
+chrono = { workspace = true }
 # 插件宿主：拉起插件进程、收三张注册表、把插件任务的 cron 并进调度表。
 # 之前刻意不加（进程侧没落地，而一个不引用的依赖就是 ADR §6 说的幽灵配置——
 # 它会让「插件已接上」看起来成立）。现在拉起与看门狗都有了，加回来。

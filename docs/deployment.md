@@ -220,7 +220,7 @@ def _parse_torrent_hash(payload: bytes) -> str:
 | `sakuramedia_judge_collecttion_movie` | 5.7 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-judge-collecttion-movie`）| — |
 | `sakuramedia_javdb_ranking` | 10 KB | ⬜ | 小 |
 | `sakuramedia_subtitlecat` | 23 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-subtitlecat`）| — |
-| `sakuramedia-actor-metadata` | 30 KB | ⬜ | 中 |
+| `sakuramedia-actor-metadata` | 30 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-actor-metadata`）| — |
 | `sakuramedia_local_provider` | **172 KB** | ⬜ | **难 —— 分水岭** |
 | `sakuramedia_115_provider` | **251 KB** | ⬜ | **最难 —— 最后一关** |
 
@@ -253,8 +253,9 @@ def _parse_torrent_hash(payload: bytes) -> str:
   宿主拉起二进制 → 插件去假站点抓 → 回调 `ImportSubtitle` → 库里多一行字幕、文件落在
   图片根下面。
 
-剩两个各有前提：`actor-metadata` 要演员那组 rpc（与影片侧同构），`javdb_ranking`
-要宿主提供的 JavDB 客户端（或把抓取整段搬进插件）。逐条清单见
+**只剩一个**：`javdb_ranking` 要宿主提供的 JavDB 客户端（或把抓取整段搬进插件）——
+`actor-metadata` 那组演员 rpc（`ListActors` / `PatchActor`）与影片快照的 `actors` 都已
+接线。逐条清单见
 [`handoff.md`](handoff.md) §8.2 表后的块。
 
 ### 阶段 B · **入库路径**（让插件产出真的有用）

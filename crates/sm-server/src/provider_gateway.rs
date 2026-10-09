@@ -274,6 +274,9 @@ fn playback_plan_from_proto(plan: sm_plugin_api::v1::PlaybackPlan) -> PlaybackPl
             path_prefix: proxy.path_prefix,
             headers: sorted_headers(proxy.headers),
         },
+        // **原样**：proto 里写明这里是路径不是 URL，宿主不做反转义（做了就会
+        // 把「文件名里恰好带 `%20`」这种真实路径改坏）。
+        ProtoDelivery::LocalPath(local) => DeliveryTarget::LocalPath { path: local.path },
     });
 
     if delivery.is_none() && !plan.unavailable {
@@ -321,7 +324,7 @@ fn sorted_headers(headers: std::collections::HashMap<String, String>) -> Vec<(St
 mod playback_plan_conversion_tests {
     use super::*;
     use sm_plugin_api::v1::playback_plan::Delivery as ProtoDelivery;
-    use sm_plugin_api::v1::{PlaybackPlan as ProtoPlan, ProxyPlan, RedirectPlan};
+    use sm_plugin_api::v1::{LocalPathPlan, PlaybackPlan as ProtoPlan, ProxyPlan, RedirectPlan};
 
     fn headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
         pairs
@@ -384,6 +387,29 @@ mod playback_plan_conversion_tests {
                 path_prefix: "/v1/media".to_owned(),
                 headers: vec![("x-token".to_owned(), "t".to_owned())],
             })
+        );
+    }
+
+    /// ★ `local_path` 分支：路径**原样**带出，不做 URL 反转义。
+    ///
+    /// 反解 `%20` / `%2F` 看起来「更规范」，实际会把真实路径改坏：本地库里一个
+    /// 真叫 `100% legit/ep 1.mkv` 的文件，路径里本来就长这样 —— 解一轮会得到一个
+    /// 不存在的名字，而错误指向的是「文件没了」。
+    ///
+    /// （拼 URL 的那条老路必须转义，因为它要过 URL；这里给的是路径，不过 URL。）
+    #[test]
+    fn a_local_path_plan_carries_the_path_verbatim() {
+        let plan =
+            playback_plan_from_proto(plan_with(Some(ProtoDelivery::LocalPath(LocalPathPlan {
+                path: r"C:\media\100% legit\ep 1.mkv".to_owned(),
+            }))));
+
+        assert_eq!(
+            plan.delivery,
+            Some(DeliveryTarget::LocalPath {
+                path: r"C:\media\100% legit\ep 1.mkv".to_owned(),
+            }),
+            "路径要一个字节都不变"
         );
     }
 

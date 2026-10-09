@@ -73,6 +73,22 @@ message MetadataSourceExtension {
 message RankingBoard {
   string board_key = 1;
   string display_name = 2;
+  // **静态**周期集合（如 daily / weekly / monthly）。空数组意味着「只有总榜」，
+  // 不是「未知」—— 与宿主的 `RankingBoardDefinition::supported_periods` 同语义。
+  //
+  // 动态周期（TOP250 的年份逐年滚动）**不在这里**：它随年份变化、且还要看账号
+  // 是否配置，注册期给不出来。那种榜单把本字段留空并置 `dynamic_periods = true`，
+  // 周期由 `ResolveRankingPeriods` 在同步时（或读侧要展示时）现算。
+  repeated string supported_periods = 3;
+  // 未指定周期时用哪个。上游 `RankingBoardDefinition.default_period`。
+  // 有静态周期时**必须**是其中之一；动态周期的榜单给它的代表值（如 TOP250 的 "all"）。
+  string default_period = 4;
+  // 周期是否需要问 `ResolveRankingPeriods` 才知道。
+  //
+  // 上游的判据是「`supported_periods_provider is not None`」—— 本字段就是它的
+  // 对等物。为 `true` 时宿主**不能**只按 `supported_periods` 判周期合法性
+  // （那会把历史年份判成不支持），要放行任意非空周期并交给插件裁决。
+  bool dynamic_periods = 5;
 }
 
 message RankingSourceExtension {
@@ -221,6 +237,25 @@ message FetchRankingResponse {
   repeated string movie_numbers = 1;
 }
 
+// 周期解析：把「这个榜此刻要抓哪些周期」这件事**留给插件**。
+//
+// 上游是 `should_fetch(period, has_items)` 回调（`ranking_service.py:36`），
+// 判据里既有插件自己的配置（TOP250 没配账号就不抓），也有宿主的库状态
+// （历史年份已有条目就不重抓 —— 否则 TOP250 每天要重拉 20×250 条）。
+// 回调过不了 gRPC，所以把它拆成「宿主提供 has_items，插件给最终列表」。
+message ResolveRankingPeriodsRequest {
+  // 服务实例已绑插件，board_key 在插件内唯一 —— 与 FetchRanking 同一条约定。
+  string board_key = 1;
+  // 宿主已知的「该榜这些周期已经有条目了」，供插件做历史周期判断。
+  repeated string periods_with_items = 2;
+}
+
+message ResolveRankingPeriodsResponse {
+  // 本次**真正要抓**的周期，顺序即抓取顺序。
+  // 空数组 = 本次不抓（如账号未配置），是正常结果不是错误。
+  repeated string periods = 1;
+}
+
 // ══════════════════════════════════════════════════════════════════
 // Service 定义（由插件实现）
 // ══════════════════════════════════════════════════════════════════
@@ -246,5 +281,9 @@ service MetadataSourceExtensionService {
 // discovery.ranking_source 扩展点。
 service RankingSourceExtensionService {
   rpc FetchRanking(FetchRankingRequest) returns (FetchRankingResponse);
+
+  // 问插件「这个榜此刻要抓哪些周期」。宿主在同步前逐个榜调用。
+  rpc ResolveRankingPeriods(ResolveRankingPeriodsRequest)
+      returns (ResolveRankingPeriodsResponse);
 }
 

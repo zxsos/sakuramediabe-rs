@@ -38,10 +38,31 @@ message ProxyPlan {
   map<string, string> headers = 3;
 }
 
+// 宿主**自己读本地文件**（本地库 / 挂载盘 / 与宿主同机的存储）。
+//
+// 与 RedirectPlan / ProxyPlan 并列的第三种：那两种都是「字节在别处」，这一种是
+// 「字节就在宿主能直接 open 的路径上」。缺了它，本地 provider 只剩两个选择 ——
+// 拼一个 `file://` URL 走 302（客户端不认这种 scheme），或让插件自己起一个 HTTP
+// 服务端（把宿主的 HTTP 职责外移，正是本契约要消除的东西）。
+//
+// 与 OpenCoverSourceResponse.local_path 是**同一套语义**：同一个 proto 里不该有
+// 两种「本地文件在哪」的写法。
+message LocalPathPlan {
+  // 宿主能直接 open 的路径。**原样**传递 —— 这里是路径不是 URL，provider 不要做
+  // URL 转义，宿主也不做反转义（上游 local_provider 就是这个语义）。
+  string path = 1;
+}
+
 message PlaybackPlan {
   oneof delivery {
     RedirectPlan redirect = 1;
     ProxyPlan proxy = 2;
+    // 宿主自己读本地文件。**provider 声明了 content_type 时以它为准**：本地库里
+    // mkv / webm 很常见，宿主按扩展名猜不到编码细节。
+    //
+    // 字段号是 7 而不是 3：同一个消息里 oneof 与普通字段**共用编号空间**，
+    // 3~6 已经被 file_name / size_bytes / content_type / unavailable 占着。
+    LocalPathPlan local_path = 7;
   }
   // 供宿主与客户端展示的文件名。
   string file_name = 3;

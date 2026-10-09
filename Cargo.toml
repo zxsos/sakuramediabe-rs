@@ -88,7 +88,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 
 # 时间与标识
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+# `v5`：JavDB 登录的设备指纹 `device_uuid` 是 `uuid5(固定命名空间, 账号名)`
+# （上游 `_device_payload`，`javdb.py:503-506`）—— 同账号每次登录必须是同一个
+# 设备标识，自己拼 sha1 会有抄错版本位/变体位而「看起来像但不相等」的风险。
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # 认证（替代 python-jose + bcrypt）
 #

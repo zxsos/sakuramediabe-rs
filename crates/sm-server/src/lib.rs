@@ -42,6 +42,9 @@ pub mod plugins;
 // provider 数据面的**实现**只能在这里：`sm-service` 不能依赖 `sm-plugins`
 // （依赖方向会成环），而 `sm-server` 同时看得见两边。见模块文档。
 pub mod provider_gateway;
+// 排行取数网关 + 同步服务的延迟填槽。理由同 `provider_gateway`（依赖倒置），
+// 另加一条时序约束：端点起得比排行源目录早。
+pub mod ranking_gateway;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,10 +150,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     //     **每个启用的插件各起一个**：那个端点定义了写操作的 owner
     //     （`plugin_host` 模块文档的「身份由宿主分配」）。只给 `enabled` 里的
     //     插件起 —— 没被启用的插件根本不会被拉起，多一个监听只是白占端口。
+    //
+    //     排行同步服务此刻还没有 —— 它要等 4b 加载完插件才知道有哪些源。所以
+    //     给它一个**空槽**（`RankingSyncSlot`），4b 之后填。直接传一个空目录
+    //     会让 `sync_ranking_sources` 永远算出「0 个目标」并返回成功。
+    let ranking_slot = ranking_gateway::RankingSyncSlot::new();
     for plugin_id in plugin_config.enabled.clone() {
         // `&config_service`：能力出口里几件事要看配置 —— 现在是字幕落盘的位置
         // （`media.import_image_root_path` 下面的 `<图片根>/movies/<shard>/<番号>/subtitles`）。
-        match plugin_host::serve_for(&pool, &config_service, &plugin_id).await {
+        match plugin_host::serve_for(&pool, &config_service, &plugin_id, ranking_slot.clone()).await
+        {
             Ok(endpoint) => {
                 plugin_config
                     .host_endpoints
@@ -181,6 +190,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // 不是加载期的快照。
     let gateway = std::sync::Arc::new(provider_gateway::ProviderGateway::new(
         loaded_plugins.provider_registry(),
+    ));
+    // 排行同步（写侧）：目录（4b 才有的快照）+ 取数网关（每次现取插件的控制面
+    // 端点，所以给的是**活的注册表句柄**）。填进 4a 建的那个槽。
+    ranking_slot.fill(std::sync::Arc::new(
+        sm_service::discovery::ranking::RankingSyncService::new(
+            pool.clone(),
+            loaded_plugins.ranking_sources(),
+        )
+        .with_gateway(std::sync::Arc::new(
+            ranking_gateway::RankingPluginGateway::new(loaded_plugins.extension_registry()),
+        )),
     ));
 
     // 5. 路由。`config_service` 传 clone —— 下面第 6b 步的 worker 还要用它读

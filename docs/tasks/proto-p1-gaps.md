@@ -18,7 +18,7 @@
 | 契约仓 tag `v0.2.0` | ✅ **已推送**（GitHub，指向 `1b1edbf`） |
 | 防漂移门禁 `parity/check_contract_sync.py`（接进 `verify.ps1`） | ✅ 已做（人为制造两种漂移验证过会红） |
 | 插件改 `tag = "v0.2.0"` + `plugin-ref-local` 补 `done` 帧 | ✅ **已做**（两插件在 `v0.2.0` 下 `cargo test` 绿） |
-| P1-2 决策 | ⬜ 待拍板（§三 已给精确 diff） |
+| P1-2 决策 | ✅ **已落**（2026-10-09，方案 A，契约 **v0.2.3**；§三 的字段号更正见下）|
 
 > **推送已解决（2026-10-08）**：契约仓改放到 **GitHub** ——
 > [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)
@@ -37,12 +37,15 @@
 | 缺口 | 状态 | 证据 |
 |---|---|---|
 | **P1-1** `GenerateThumbnails` 产物清单没通道 | ✅ **本仓已落地**（提交 `99671f1`） | `proto/storage.proto`：rpc 改为 `returns (stream GenerateThumbnailsResponse)`，消息含 `oneof payload { progress = 1; done = 2; }`；`crates/sm-plugin-api/src/provider.rs:154-165` 默认体返回 `GenerateThumbnailsResponse` 流；`crates/sm-plugins/src/provider_calls.rs:551-618` 宿主侧消费并**把「收不到 `done`」判为 provider 违约** |
-| **P1-2** `PlaybackPlan` 缺本地路径 delivery | ❌ **未做** | `proto/storage.proto:41-52` 的 `oneof delivery` 仍只有 `redirect = 1` / `proxy = 2`（**编号 3 空闲**）；对照同文件 `OpenCoverSourceResponse` 却有 `oneof { local_path, url }` |
+| **P1-2** `PlaybackPlan` 缺本地路径 delivery | ✅ **已落地**（2026-10-09，契约 v0.2.3） | `proto/storage.proto`：新增 `LocalPathPlan`，`oneof delivery` 加 `local_path = 7`（**不是 3** —— 见 §3.3 的更正文）；宿主三处：`sm-service` 的 `DeliveryTarget::LocalPath`、`sm-server` 的 `playback_plan_from_proto`、`sm-api` 的 `deliver` 走 `range::serve_file_as`；`plugin-ref-local` 不再拼 `file://` |
 | **P1-3** 失败只有一个布尔位 | ✅ **本仓已落地**（方案 A） | `crates/sm-plugin-api/src/error.rs`：`to_status` / `from_status` 把 `ProviderError` 编进 `Status::details`（含往返无损单测）；`crates/sm-plugins/src/provider_calls.rs:14-44` 模块文档标题即「✅ 已闭合的 ABI 缺口」；`classify_status` 先解结构、解不出按 gRPC 码猜 |
 | **P1-4** tonic 不生成默认方法体 | ✅ **已落地** | `StorageProviderExt` / `DownloadProviderExt`（`sm-plugin-api/src/provider.rs`），`plugin-ref-local` 已迁移（少约 170 行 stub） |
 
 > 所以报告 §5「给主线的下一步建议」里的四条，实际只剩第 1 条的一半（P1-2）
 > 与第 4 条（`data_plane_endpoint` 写成硬性要求）没做。
+>
+> ✅ **2026-10-09：这两条都落了**（P1-2 见上表；`data_plane_endpoint` 的硬性要求写进
+> `docs/plugin-abi.md` 的「字节怎么过线：三种投递」）。报告 §5 的四条到此清空。
 
 ---
 
@@ -220,16 +223,28 @@ message LocalPathPlan {
 }
 ```
 
-**编号 3 是安全的**：它当前没被 `PlaybackPlan` 的任何字段占用
-（`1`/`2` 在 `oneof` 内，`4`/`5`/`6` 在外，`3` 空着）。
+> ⚠️ **更正（落地时才发现）**：上面写 `local_path = 3` 是**错的**，`protoc` 会拒：
+>
+> ```text
+> storage.proto: PlaybackPlan: Field number 3 has already been used
+> by field "file_name". Next available field number is 7.
+> ```
+>
+> `oneof` 与普通字段**共用同一个编号空间**，而 `PlaybackPlan` 的 `file_name` 就是 `3`
+> —— 不是「`1`/`2` 在 `oneof` 内所以 `3` 空着」。实际用的是 **`local_path = 7`**
+> （`3`~`6` 分别被 `file_name` / `size_bytes` / `content_type` / `unavailable` 占着）。
+> 教训：**字段号要对着文件数，别对着消息的一部分数** —— 提案里那种「哪些号空着」的
+> 推断，落地前必须让 `protoc` 说一句。
 
 ### 3.4 影响面
 
 | 位置 | 改什么 |
 |---|---|
-| 契约（proto + `sm-plugin-api`） | 新消息 + `oneof` 加一支；重生成 |
-| `crates/sm-plugins/src/provider_calls.rs` | `plan_playback` 的返回处理加一支（**注意**：`PlaybackPlan` 还有 `unavailable: bool`，两支失败语义要理清 —— 这也是 P1-3 落地的那个通道该用起来的地方） |
-| `plugin-ref-local/src/provider.rs` | 不再拼 `file://`；它的 `plan_playback_refuses_proxy_delivery` 测试正好覆盖「不支持 proxy 时明确报错」这条，可保留 |
+| 契约（proto + `sm-plugin-api`） | 新消息 + `oneof` 加一支；重生成（**字段号 7**，见上） |
+| `sm-service` 的 `DeliveryTarget` | 加 `LocalPath { path }` 一支 |
+| `sm-server/src/provider_gateway.rs` | `playback_plan_from_proto` 加一支（**不是** `sm-plugins/src/provider_calls.rs`：那里只搬运 proto 结构体，转换在组合根这层） |
+| `sm-api/src/routes/media_playback.rs` + `range.rs` | `deliver` 加一支，走 `range::serve_file_as`（`serve_file` 原来写死 `video/mp4`，本地库有 mkv/webm —— 见 §3.4 表下那条） |
+| `plugin-ref-local/src/provider.rs` | 不再拼 `file://`（`file_url` + `percent-encoding` 依赖一并删掉）。⭐ **实际做法与提案相反**：`plan_playback_refuses_proxy_delivery` 那条测试**改了语义** —— 本地文件的投递方式只有一种，上游 `local_provider.handle_playback` 也不看 `context.delivery`（一律 `FileResponse`），所以它对任何 `delivery` 都答 `local_path`。把它拒成 `unsupported` 会让客户端「换个投递方式重试」拿到 422，而它并没有第二种选择 |
 | 未来的 `local_provider`（`deployment.md` §六 阶段 D） | 直接返回路径，不必再想 URL 编码 |
 
 > **P1-2 与阶段 D 有先后关系**：`local_provider` 是第一个真正会用到它的插件。
@@ -253,10 +268,12 @@ message LocalPathPlan {
   - [ ] **推送契约仓 + tag `v0.2.0`**（需要凭据）
   - [ ] 两个插件改 `tag = "v0.2.0"` 且 `cargo test` 绿
   - [ ] `plugin-ref-local` 的 `generate_thumbnails` 以 `done` 收尾（`GAP:` 注释删掉）
-- **②** 完成：`PlaybackPlan` 有 `local_path`；`docs/plugin-abi.md` 写明三种 delivery
-  各自的适用场景；`sm-plugin-api` 重生成后两个插件都能编译。
-- **③** 完成：`plugin-abi.md` 明确写「**字节搬运必须走 `data_plane_endpoint`**」，
-  并给出反面例子（`StageImportFile` / `ReadTransferSource` 走控制面会撞 4MB 上限）。
+- **②** ✅ **完成（2026-10-09）**：`PlaybackPlan` 有 `local_path`（字段号 7）；
+  `docs/plugin-abi.md` 写明了三种 delivery 各自的适用场景；`sm-plugin-api` 重生成后
+  `plugin-ref-local` 编译并测试绿（12 项）。
+- **③** ✅ **完成（2026-10-09）**：`plugin-abi.md` 的「字节怎么过线」一节写明
+  「**字节搬运必须走 `data_plane_endpoint`**」，并给出反例的三条理由（4 MiB 上限、
+  控制面无背压、Range 语义过一遍 gRPC 全丢）。
 
 ---
 

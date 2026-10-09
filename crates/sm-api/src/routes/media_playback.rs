@@ -306,6 +306,33 @@ async fn deliver(
                 .await?;
             Ok((proxy_response(proxied), "proxy"))
         }
+        DeliveryTarget::LocalPath { path } => {
+            // 第三支：**宿主自己读文件**。既不 302（客户端不认 `file://`），也不转发
+            // （没有远端可转）。Range 归这里算 —— 与代理那条「转发层不解析 Range」
+            // 相反：字节在本地，算的人就是持有字节的那一侧。
+            //
+            // `Content-Type` 先看 provider 声明的，再按扩展名猜：本地库里
+            // mkv / webm 很常见，一律报 `video/mp4` 会让浏览器拒播。
+            let content_type = plan.content_type.clone().unwrap_or_else(|| {
+                mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string()
+            });
+            let served =
+                crate::range::serve_file_as(std::path::Path::new(path), range, &content_type)
+                    .map_err(|error| {
+                        // 验签之后文件被删 / 权限没了 / 路径本就是个目录：资源没了，
+                        // 不是我们坏了 —— 404 `media_unavailable`，与上面
+                        // `plan.unavailable` 同一码同一状态。
+                        tracing::warn!(path = %path, error = %error, "本地媒体读取失败");
+                        ErrorResponse::new(
+                            StatusCode::NOT_FOUND,
+                            "media_unavailable",
+                            "媒体文件不可用",
+                        )
+                    })?;
+            Ok((served, "local_path"))
+        }
     }
 }
 
@@ -550,6 +577,166 @@ mod tests {
             actual, "redirect",
             "回报给 playback-attempts 的必须是实际选定的"
         );
+    }
+
+    /// ★ 本地文件那一支：**宿主自己读**，200 + 文件自己的 `Content-Type`。
+    ///
+    /// 这条钉的是「别把它也写成 `video/mp4`」：本地库里 mkv / webm 很常见，一律回
+    /// mp4 会让浏览器按 mp4 去解容器，**拒播** —— 而 HTTP 这一层看起来完全正常
+    /// （200 / `Accept-Ranges` 都对）。
+    ///
+    /// 回报的投递方式是 `local_path`：它不是 `proxy`（没有转发），也不是
+    /// `redirect`（没有 302）。`playback_mode` 那边照上游的 `if/else` 会把它记成
+    /// `proxy` —— 那是**上游的行为**（`media.py:83` + 本地 provider 只声明
+    /// `proxy`），不是这里漏了映射。
+    #[tokio::test]
+    async fn a_local_path_plan_is_served_by_the_host() {
+        let file = temp_file("serve.mkv", &[7u8; 32]);
+
+        let (response, actual) = deliver(
+            &plan_with(
+                Some(DeliveryTarget::LocalPath {
+                    path: file.to_string_lossy().into_owned(),
+                }),
+                false,
+            ),
+            "",
+            None,
+        )
+        .await
+        .expect("本地文件读得到");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCEPT_RANGES)
+                .expect("要能拖进度条"),
+            "bytes"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("必须有 Content-Type"),
+            "video/x-matroska",
+            "按扩展名猜，别写死 video/mp4"
+        );
+        assert_eq!(body_of(response).await.len(), 32);
+        assert_eq!(actual, "local_path");
+    }
+
+    /// 区间请求 → 206 + `Content-Range`。本地文件的 Range 由**宿主**算（字节在
+    /// 本地，算的人就是持有字节的那一侧）。
+    #[tokio::test]
+    async fn a_local_path_range_is_a_206() {
+        let file = temp_file("range.mp4", &[1u8; 100]);
+
+        let (response, _) = deliver(
+            &plan_with(
+                Some(DeliveryTarget::LocalPath {
+                    path: file.to_string_lossy().into_owned(),
+                }),
+                false,
+            ),
+            "",
+            Some("bytes=10-19"),
+        )
+        .await
+        .expect("区间可满足");
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .expect("必须带"),
+            "bytes 10-19/100"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .expect("必须是区间长度"),
+            "10"
+        );
+    }
+
+    /// provider 自己声明了 `content_type` 时**以它为准** —— 它比扩展名知道得多
+    /// （`movie.mkv` 里到底是什么编码，只有 provider 解得开）。
+    #[tokio::test]
+    async fn a_provider_declared_content_type_wins() {
+        let file = temp_file("declared.mkv", &[1u8; 8]);
+
+        let (response, _) = deliver(
+            &PlaybackPlan {
+                delivery: Some(DeliveryTarget::LocalPath {
+                    path: file.to_string_lossy().into_owned(),
+                }),
+                file_name: "m.mkv".to_owned(),
+                size_bytes: Some(8),
+                content_type: Some("video/mp4".to_owned()),
+                unavailable: false,
+            },
+            "",
+            None,
+        )
+        .await
+        .expect("读得到");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("必须有"),
+            "video/mp4",
+            "provider 说了就听它的，别拿扩展名盖掉"
+        );
+    }
+
+    /// 文件没了（验签之后被删 / 权限没了 / 路径其实是目录）→ 404
+    /// `media_unavailable`，**不是 500**：资源没了不是我们坏了。
+    #[tokio::test]
+    async fn a_missing_local_file_is_a_404_media_unavailable() {
+        let missing = std::env::temp_dir().join(format!(
+            "sm-playback-{}-does-not-exist.mkv",
+            std::process::id()
+        ));
+
+        let error = deliver(
+            &plan_with(
+                Some(DeliveryTarget::LocalPath {
+                    path: missing.to_string_lossy().into_owned(),
+                }),
+                false,
+            ),
+            "",
+            None,
+        )
+        .await
+        .expect_err("文件不在");
+
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.error.code, "media_unavailable");
+    }
+
+    /// 一次性临时文件。名字里带进程号与用例名，避免并行用例互相踩。
+    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("sm-playback-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).expect("写临时文件");
+        path
+    }
+
+    /// 收完响应体。
+    async fn body_of(response: Response) -> Vec<u8> {
+        use http_body_util::BodyExt as _;
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("读响应体")
+            .to_bytes()
+            .to_vec()
     }
 
     /// `require_signed_params`：**空串也算没给**。

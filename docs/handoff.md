@@ -1319,6 +1319,14 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 > ⚠️ `RankingSourceCatalog` 只解决了**声明**那半边；`fetch_ranking` 的调用至今
 > 也只有测试在调。缩略图这条现在是**第一个真正打通 provider 调用**的路径，
 > `ranking` 那边可以按同一个 trait 注入模式抄。
+>
+> ✅ 2026-10-09：`ranking` 那边按同一个模式抄完了 —— `RankingSyncGateway` 是
+> `sm-service` 里的那个 trait（不含 proto 形状），组合根注入
+> `RankingPluginGateway`（把 `source_key` 翻成 `plugin_endpoint` 再发 rpc）。两处
+> 与缩略图不同，值得记住：**端点是每次现取的**（插件重启会换端口，缓存的端点会让
+> 「注册表看着正常、调用全失败」），以及**源不在注册表时是错误**（
+> `RankingCallError` 的 `ranking_source_not_found`）而不是「当成空榜」。后者会让
+> 整榜替换把已有的条目清空 —— 「没有这个源」和「这个源此刻没有条目」是两件事。
 
 #### 补的三个 sm-db 方法（此前都缺）
 
@@ -1441,6 +1449,7 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 2. **三个扩展点的调用面**：`media.provider`（已有注册表）/ `catalog.metadata_source` / `discovery.ranking_source`。
    **已完成**（`extensions.rs` + `extension_calls.rs`）：两个扩展点的载荷校验、`source_key` / `board_key` 形状、缺 capability 不收、排行榜 `source_key` 冲突时该插件的榜单全部不收（对齐 `apply_plugin_ranking_sources`）；调用面真发 rpc，并把「未收录」（`found=false`）与「调用失败」分成两类结果。
    **交付校验已补**（`movie_delivery.rs`）：图片必须落在 `FetchMovieRequest.delivery_dir` 内、是普通文件、再深一层且同一请求目录；`release_date` 严格 `YYYY-MM-DD`、`duration > 0`；用完 `cleanup_delivery`。判据是 proto 给的，不依赖 `plugins.root_dir`。
+   **排行榜写侧也已落地**（2026-10-09）：`SyncRankingSources` / `SyncRankingBoard` 不再是 `unwired!`，`RankingSyncService::sync_board_period` 真调插件的 `FetchRanking` 并整榜替换入库。两处**读侧**的旧缺口一并修掉：`Plugins::ranking_sources()` 原先读 provider 注册表并**硬写 `boards: Vec::new()`**（榜单定义其实早在 `ExtensionRegistry` 里，读侧因此永远回「榜单定义尚未接入」），现在走同一条收集函数的快照；`ranking.rs` 里「provider 可能没有 `data_plane_endpoint`」那段推断是错的 —— 扩展点走控制面 `plugin_endpoint`。
    两处**还没做**：一是「冲突时连该插件的任务一起不注册」—— 要等加载器把任务表与扩展点表串起来；二是**番号一致性**不在这一层判（`normalize_movie_number` 住在 `sm-service`，那条依赖边将来会成环），由导入方比；三是**入库路径**还没有（catalog 域缺插件导入服务，拿到校验过的结果也没处写）。
 3. **进程生命周期**：拉起进程、握端口、重启看门狗（`loader.rs` 刻意没做）。
    **已完成大半**（`supervisor.rs` + 参考插件可执行文件）：宿主分配端口并经 `SAKURAMEDIA_PLUGIN_GRPC_ADDR` / `SAKURAMEDIA_PLUGIN_ID` 注入 → 拉起 → 用 `Register` 探活 → `wait()` 发现崩溃 → `restart_backoff` 给退避。协议是自定的（上游是进程内 import，proto 无此约定），依据见 `docs/adr/2026-10-05-plugin-lifecycle.md`。
@@ -2404,7 +2413,7 @@ provider 插件上**。剩下 18 条各自有独立卡点。
 | # | 做什么 | 为什么先它 | 完成判据 |
 |---|---|---|---|
 | ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ✅ **已做完**（2026-10-08）。契约仓改放 GitHub [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)（public；`main` + `v0.1.0` + `v0.2.0`；本地 `cnb.cool` 远端**已删除**，发布源改指 GitHub）→ 两个插件改指 `v0.2.0` → `plugin-ref-local` 的 `done` 帧按**宿主内置副本**镜像过去（宿主侧早已实现，`GAP:` 注释删掉）。判据：两插件 `cargo test` 绿（`ref-local` 13 项 / `javbus` 33 项）、`parity/check_contract_sync.py` 报 9 个受管文件一致。详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md) §零 |
-| ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有两个 | ⚠️ **2/4 已完成**（2026-10-08）。`judge_collecttion_movie` → 新仓 `sakuramedia-judge-collecttion-movie`（`9726828`，46 项测试绿，宿主侧两个 rpc 已接）；`subtitlecat` → 新仓 `sakuramedia-subtitlecat`（`b7131db`，49 项测试绿，两个任务与本地假站点/假宿主全跑通）。两个都是「只有后台任务、没有扩展点」，且两条都已在跨仓冒烟里对着**真宿主 + 真库**跑通（`plugin_launch_smoke`）。**另两个各有 ABI 前提没齐**，别照前两个的样子硬套 —— 逐条见下表后的块 |
+| ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有三个 | ⚠️ **3/4 已完成**（2026-10-08）。`judge_collecttion_movie` → 新仓 `sakuramedia-judge-collecttion-movie`（`9726828`，46 项测试绿）；`subtitlecat` → `sakuramedia-subtitlecat`（`b7131db`，49 项测试绿）；`actor-metadata` → `sakuramedia-actor-metadata`（`17b0936`，69 项测试绿）。三个都是「只有后台任务、没有扩展点」，宿主侧缺的 rpc 也都补上了（`ListMovies`/`PatchMovie`/`ImportSubtitle`/`ListActors`/`PatchActor` + 影片快照的 `actors`）。**只剩 `javdb_ranking` 的 ABI 前提没齐** —— 见下表后的块 |
 | ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | ⚠️ **第一段已通**（`aeff054`）：`import_by_number` + 窄接口补 `find_movie_id` / `import_plugin_movie` + 4 单测 + 3 个真库测试。**剩 `impl MovieMetadataImporter`** —— 卡在接口冲突（那个 trait 的方法签名**没有 config**，而 `fetch` / `fetch_plugin` 要看 `plugins.enabled` 的顺序），两条走法待拍板 |
 | ④ | **P1-2 决策**：`PlaybackPlan` 加 `local_path` delivery | 同域反证：`OpenCoverSourceResponse` 早有 `oneof { local_path, url }`，唯独播放计划没有。**必须在阶段 ⑤ 之前定**，否则 `local_provider` 要先按 `file://` 写一遍再改 | `PlaybackPlan.oneof delivery` 有 `LocalPathPlan local_path = 3`；`docs/plugin-abi.md` 写明三种 delivery 的适用场景 |
 | ⑤ | **`svc-probe`（ffprobe）** | 解锁 4 个文件（`media_metadata_probe` 338 / `media_video_info_backfill` 232 / `thumbnails/artifacts` 204 / `video_cover`）。上游对 PyAV 缺失是**降级**，所以它不阻塞「能用」但阻塞「完整」 | 上述文件的 `todo!()` 清零；媒体时长/分辨率被真写入 |
@@ -2416,9 +2425,9 @@ provider 插件上**。剩下 18 条各自有独立卡点。
 > | 插件 | 它要的宿主能力 | 现状 |
 > |---|---|---|
 > | `judge_collecttion_movie` | `ListMovies` / `PatchMovie`，且快照要带 `is_collection` | ✅ **已接**（2026-10-08）：两个 rpc 落地（游标分页 / 主权网关）+ 快照补上全部 6 个可写字段；真库测试 `sm-server/tests/plugin_host_integration.rs` |
-> | `javdb_ranking` | 上游 `context.build_javdb_provider(username, password)` —— **宿主提供的 JavDB 客户端**；另有单榜同步入口 | 前者 ABI 里**没有对等物**：要么给一条宿主 API，要么把 JavDB 抓取整段搬进插件（那就不再是「小插件」）。后者 `host.proto` 只有 `SyncRankingSources`（批量），没有单榜那条 |
+> | `javdb_ranking` | 上游 `context.build_javdb_provider(username, password)` —— **宿主提供的 JavDB 客户端**；另有单榜同步入口 | ✅ **已接**（2026-10-09）：前者落成只读 rpc `GetJavdbRankNumbers`（账号由插件每次调用透传，宿主不保管；`oneof` 表达播放榜 / 有码无码FC2 / TOP250 三种形状 —— 它们打三个不同端点、参数名也不同），后者补了 `SyncRankingBoard`，并新增 `ResolveRankingPeriods` 承接上游那个「既看插件配置又看宿主库状态」的 `should_fetch` 回调。契约 v0.2.2；插件 `sakuramedia-javdb-ranking` 已移植并在宿主仓跨仓冒烟里跑通整条链路 |
 > | `subtitlecat` | `ImportSubtitle`（**不是** `ListSubtitles` —— 读过源码订正过：它抓回字幕直接导入，不查已有字幕）| ✅ **已接**：宿主侧只是转发 `SubtitleAssetService::import_subtitle_content`（上游逐行对拍的那份），四个状态是**结果**不是错误；真库测试 `import_subtitle_*` 四例 + 跨仓冒烟里跑完整条链路 |
-> | `actor-metadata` | `ListActors` / `PatchActor` | 同为 `unwired!`。注意它 manifest 里的 `host_api_version: 6` 是 **Python 侧**的版本号，别当 ABI 用 |
+> | `actor-metadata` | `ListActors` / `PatchActor`，**以及影片快照里的 `actors`** | ✅ **已接**，插件侧也已移植（`sakuramedia-actor-metadata`，`17b0936`，69 项测试绿）。三处与影片侧不同的语义都写在 `plugin_host.rs` 的模块文档里：演员白名单只有九个资料字段（`name`/`javdb_id`/`is_subscribed` 不可写）、`None` 允许清空（`gender` 除外）、`GetActor`/`PatchActor` 要先解析墓碑。⚠️ `actors` 原来是空数组 —— 上游靠它算「关联的非合集影片数」，缺了会让优先级**静默失效**；现在按 `(movie_id, actor_id)` 批量填。注意它 manifest 里的 `host_api_version: 6` 是 **Python 侧**的版本号，别当 ABI 用 |
 >
 > **两个新发现的契约缺口**（都不在 `tasks/proto-p1-gaps.md` 的 P1 清单里）：
 >

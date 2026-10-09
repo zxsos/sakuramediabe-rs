@@ -21,7 +21,6 @@ tokio = { workspace = true }
 # net：一把 help 我们自己建起 server 用的 TcpListenerStream（起真实 server 需要内核分配的端口）。
 tokio-stream = { workspace = true, features = ["net"] }
 chrono = { workspace = true }
-percent-encoding = { workspace = true }
 # 读宿主写好的配置文件（`SAKURAMEDIA_PLUGIN_SETTINGS_FILE`）。
 serde_json = { workspace = true }
 
