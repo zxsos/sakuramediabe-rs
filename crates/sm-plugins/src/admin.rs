@@ -308,13 +308,17 @@ impl PluginAdmin for PluginAdminService {
             .root_dir()?
             .join(installer::STAGING_DIR_NAME)
             .join(UPLOAD_SUBDIR);
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            ServiceError::from_status(
-                500,
-                "internal_error",
-                format!("创建上传暂存目录失败 {}: {error}", dir.display()),
-            )
-        })?;
+        // 如果目录已存在且可写，直接用；只有不存在时才创建
+        // 避免 create_dir_all 在某些环境下对已存在目录误报权限错误
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir).map_err(|error| {
+                ServiceError::from_status(
+                    500,
+                    "internal_error",
+                    format!("创建上传暂存目录失败 {}: {error}", dir.display()),
+                )
+            })?;
+        }
         prune_stale_uploads(&dir);
         // 上游用 `uuid.uuid4().hex` —— 并发上传必须互不撞名。
         Ok(dir.join(format!("{}.zip", uuid::Uuid::new_v4().simple())))

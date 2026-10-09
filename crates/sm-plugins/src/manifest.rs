@@ -166,7 +166,12 @@ impl PluginManifest {
             }
         }
 
-        let plugin_id = required_text(object, "plugin_id")?;
+        let plugin_id = required_text(object, "plugin_id")
+            .or_else(|_| required_text(object, "id"))
+            .map_err(|_| ManifestProblem::InvalidField {
+                field: "plugin_id",
+                reason: "缺少字段 plugin_id（或别名 id）".to_owned(),
+            })?;
         if !is_valid_plugin_id(&plugin_id) {
             return Err(ManifestProblem::InvalidField {
                 field: "plugin_id",
