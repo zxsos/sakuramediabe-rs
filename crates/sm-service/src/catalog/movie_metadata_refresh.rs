@@ -424,7 +424,23 @@ impl MovieMetadataRefreshService {
         // 跳过不更新）；插件命中走 import_plugin_movie。
         let import_result = match (&delivery.source, &delivery.javdb_detail) {
             (DeliverySource::Javdb, Some(detail)) => {
-                self.import.import_movie_if_missing(detail, false).await
+                // JavDB 详情可能缺 movie_number（null/缺失/空串），用搜索的归一番号补上，
+                // 否则 import_movie_if_missing 会因缺少 movie_number 入库失败。
+                let mut detail = detail.clone();
+                if detail
+                    .get("movie_number")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    if let Some(obj) = detail.as_object_mut() {
+                        obj.insert(
+                            "movie_number".to_owned(),
+                            serde_json::Value::String(normalized.clone()),
+                        );
+                    }
+                }
+                self.import.import_movie_if_missing(&detail, false).await
             }
             (DeliverySource::Javdb, None) => Err(ServiceError::from_status(
                 500,
@@ -1022,5 +1038,37 @@ mod tests {
             error.api.details.as_ref().unwrap()["normalized_movie_number"],
             "ABC-123"
         );
+    }
+
+    /// ★ JavDB 详情缺 movie_number 时，入库前必须用搜索番号补上。
+    ///
+    /// 回归测试：SSNI-888 搜索能命中、SSE 全流程正常，但 JavDB 返回的 detail
+    /// 里 movie_number 为 null，导致 import_movie_if_missing 报
+    /// "元数据缺少 movie_number" 入库失败。修复是在 JavDB 分支 clone detail
+    /// 并补番号 —— 这里锁住「缺番号判定」的三种形态。
+    #[test]
+    fn javdb_detail_missing_number_needs_fallback() {
+        // 缺失 / null / 空串 / 空白 都算缺，都该触发 fallback。
+        for detail in [
+            serde_json::json!({ "title": "x" }),
+            serde_json::json!({ "movie_number": null, "title": "x" }),
+            serde_json::json!({ "movie_number": "", "title": "x" }),
+            serde_json::json!({ "movie_number": "   ", "title": "x" }),
+        ] {
+            let missing = detail
+                .get("movie_number")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            assert!(missing, "缺番号判定要命中: {detail}");
+        }
+        // 正常番号不触发。
+        let ok = serde_json::json!({ "movie_number": "SSNI-888" });
+        let missing = ok
+            .get("movie_number")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+        assert!(!missing, "有番号时不该补");
     }
 }
