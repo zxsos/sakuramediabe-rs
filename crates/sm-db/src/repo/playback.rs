@@ -19,7 +19,10 @@
 //! 所以本文件**不提供** `media_thumbnail` 与 `media_progress` 的裸
 //! `insert`：那会撞唯一约束，而「撞了再改」比 upsert 更难推理。
 
-use sqlx::PgPool;
+// `Arguments` 是 trait 而非类型 —— sqlx 0.9 里 `sqlx::Arguments` 只是契约，
+// Postgres 的具体类型是 `sqlx::postgres::PgArguments`。它的 `add`/`len` 都只在
+// trait 里可见，所以这个导入是必需的，不是冗余。
+use sqlx::{Arguments as _, PgPool};
 
 use super::ctx::Ctx;
 use crate::common::page::{Page, PageRequest};
@@ -140,6 +143,72 @@ impl MediaThumbnailRepository {
             items = "SELECT * FROM media_thumbnail WHERE media_id = $1 \
                      ORDER BY \"offset\" LIMIT $2 OFFSET $3",
         }
+    }
+
+    /// 批量取「若干条 Media 在若干个时刻」的缩略图。
+    ///
+    /// 对应上游 `MediaClipService.load_cover_map` 的两次 `in_` 查询。片段封面
+    /// 是**区间首帧**的缩略图，即 `(media_id, start_offset_seconds)` 那一条。
+    ///
+    /// # 会多取，调用方必须按精确 `(media_id, offset)` 回填
+    ///
+    /// `media_id = ANY(..) AND offset = ANY(..)` 是**笛卡尔积**上的筛选：
+    /// 要 `(1, 100)` 与 `(2, 200)` 两张封面时，只要库里存在 `(1, 200)`，
+    /// 它也会被取出来。上游注释写了同样的话（「`in_` 组合可能多取」）。
+    ///
+    /// 所以调用方要按 `(media_id, offset)` 精确配对，不能按行序。多取的行
+    /// 数量是 `|media_ids| x |offsets|` 里实际存在的部分，实践中远小于全表。
+    ///
+    /// `"offset"` 加引号：它是 PostgreSQL 的保留字。
+    ///
+    /// # 空输入直接返回空，不发查询
+    ///
+    /// 片段可能全部是孤立片段（`media_id` 为空），此时两个数组都空。提前
+    /// 返回省掉一次往返，也避免 `= ANY('{}')` 的空数组语义被误读。
+    pub async fn covers_by_media_offsets(
+        &self,
+        media_ids: &[i32],
+        offsets: &[i32],
+    ) -> Result<Vec<MediaThumbnail>, DbError> {
+        if media_ids.is_empty() || offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, MediaThumbnail>(
+            "SELECT * FROM media_thumbnail \
+             WHERE media_id = ANY($1) AND \"offset\" = ANY($2)",
+        )
+        .bind(media_ids)
+        .bind(offsets)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 列出某条 Media 在 `[start, end]` **闭区间**内的缩略图，按 offset 升序。
+    ///
+    /// 对应上游 `_clip_thumbnail_rows`。两端都**含** —— 区间是用两张缩略图
+    /// 圈出来的，首尾两张图本身就在区间内；若用开区间，片段的第一帧与最后一帧
+    /// 会各丢一张，而那正是前端预览要用的两帧。
+    ///
+    /// `"offset"` 加引号：PostgreSQL 保留字。
+    ///
+    /// 走 `media_id` 前缀，区间过滤在内存索引上做 —— 一条 Media 的缩略图数量
+    /// 是几十量级（按 N 秒一张），拉全量再过滤比走索引范围更省。
+    pub async fn list_in_offset_range(
+        &self,
+        media_id: i32,
+        start: i32,
+        end: i32,
+    ) -> Result<Vec<MediaThumbnail>, DbError> {
+        Ok(sqlx::query_as::<_, MediaThumbnail>(
+            "SELECT * FROM media_thumbnail \
+             WHERE media_id = $1 AND \"offset\" >= $2 AND \"offset\" <= $3 \
+             ORDER BY \"offset\"",
+        )
+        .bind(media_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// 按 `image_search_index_status` 取出待处理的缩略图。
@@ -518,6 +587,307 @@ impl MediaClipRepository {
                      ORDER BY id LIMIT $1 OFFSET $2",
         }
     }
+
+    /// 删片段。返回是否真的删掉了一行。
+    ///
+    /// `clip_collection_item.clip_id` 的外键是 `ON DELETE CASCADE`，所以删除
+    /// 会把该片段从所有合集里移出，无需显式清理关联行 —— 与上游
+    /// `clip.delete_instance()` 一致。
+    ///
+    /// 存在的理由是**回收**：列表端点判定产物无效时会删行（见
+    /// `sm_service::playback::clip_artifact`），那是这条路径的调用方。
+    pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM media_clip WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 改片段标题。返回改后的行。
+    ///
+    /// 对应上游 `update_clip` 的 `save(only=[title, updated_at])`。
+    ///
+    /// # `updated_at` 必须显式写
+    ///
+    /// 上游的 `TimestampedMixin` **不自动维护** `updated_at`（上游注释专门
+    /// 提醒了这点），所以那里手动赋值。这里同理 —— 忘了写，列表的
+    /// `created_at DESC` 排序不会受影响，但任何按「最近修改」展示的地方都会
+    /// 读到旧值，而这种缺失不报错。
+    ///
+    /// `title` 存**裁剪后**的值（上游 `field_validator` 做的 strip），
+    /// 裁剪由 service 层负责。
+    pub async fn update_title(&self, id: i32, title: &str) -> Result<MediaClip, DbError> {
+        let now = crate::common::time::now_utc();
+        sqlx::query_as::<_, MediaClip>(
+            "UPDATE media_clip SET title = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(title.trim())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::business(CLIP_ENTITY, format!("片段 {id} 不存在，无法改标题")))
+    }
+
+    /// 该片段所属的合集，按 `name ASC, id ASC`。
+    ///
+    /// 对应上游 `_load_clip_collections`。返回 `(id, name)` **元组**而不是
+    /// 结构体，理由同
+    /// [`MovieResolutionLevelRow`](crate::repo::movie::MovieResolutionLevelRow)：
+    /// 这是 join 出来的投影行，不是任何表的镜像，而 `pub struct` + `FromRow`
+    /// 在本 crate 里的含义是「我映射一张表」，schema 对拍会因此要求一个不存在的
+    /// 上游模型。具名类型由消费方（service）定义。
+    ///
+    /// 排序两级：`name` 让选择器里的合集按名称排列，`id` 兜底。同名不会发生
+    /// （`clip_collection.name` 唯一），但次级键让排序在索引变动后仍然确定。
+    pub async fn list_collections_for_clip(
+        &self,
+        clip_id: i32,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT c.id, c.name FROM clip_collection c \
+             JOIN clip_collection_item i ON i.collection_id = c.id \
+             WHERE i.clip_id = $1 \
+             ORDER BY c.name ASC, c.id ASC",
+        )
+        .bind(clip_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 列出某条 Media 的**全部**片段，按 `created_at DESC, id DESC`。**不分页。**
+    ///
+    /// 对应上游 `list_clips` 的取数那一步（`.order_by(created_at.desc(),
+    /// id.desc())`，无 `LIMIT`）。刻意不用上面的 `list_by_media`：那个按
+    /// `start_offset_seconds, id` 排序并分页，而这里要的是创建时间倒序的全量 ——
+    /// 混用会让「按创建时间」悄悄变成「按区间起点」。
+    ///
+    /// 两级排序的理由与播放列表那条一致：同一时刻插入的多个片段
+    /// `created_at` 会并列，只按它排会让列表在两次刷新之间抖动。
+    pub async fn list_all_for_media(&self, media_id: i32) -> Result<Vec<MediaClip>, DbError> {
+        Ok(sqlx::query_as::<_, MediaClip>(
+            "SELECT * FROM media_clip WHERE media_id = $1 \
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(media_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按筛选条件列出片段。**刻意不分页，也不返回总数。**
+    ///
+    /// 对应上游 `list_media_clips` 里的 `list(query.order_by(*order_by))` ——
+    /// 那一行**取回全部匹配行**，`total` 与切片都在 Python 侧做。
+    ///
+    /// # 为什么这里不能有 `LIMIT` / `OFFSET`
+    ///
+    /// 上游在过滤**之后**才切页，而过滤（`valid_clips`）要看文件系统 ——
+    /// 产物文件是否还在、字节数是否对得上。数据库不知道这些，所以无法把
+    /// 分页下推。
+    ///
+    /// 若这里加了 `LIMIT/OFFSET`，会得到两个**各自成立但互相矛盾**的数：
+    /// 页里可能全是即将被回收的无效行，而基于全量算出的 `total` 与页内容
+    /// 对不上（页里 5 条、`total` 3 条那种）。所以本方法只负责「取回候选集」，
+    /// 由 service 过滤后切片。
+    ///
+    /// # 动态 SQL 的边界
+    ///
+    /// 条件个数随关键词数量变化，占位符个数也随之变化，所以这段要走
+    /// `safe_sql`（`repo::movie` 里的 crate 内部出口；值仍然是绑定的，只有
+    /// 条件**文本**是拼出来的）。排序只有两个取值，因此用两条字面量而
+    /// 不是把排序键拼进 SQL —— 排序键是客户端可控的，绝不能进字符串拼接。
+    ///
+    /// # 番号是**精确**匹配，不是子串
+    ///
+    /// 上游是 `MediaClip.movie_number == normalized`。子串匹配是
+    /// `keyword` 那条路径的事，两者不要混。
+    ///
+    /// # `NOT IN` 与 NULL
+    ///
+    /// `exclude_collection_id` 编译成 `id NOT IN (SELECT clip_id FROM ...)`。
+    /// 若子查询可能返回 NULL，`NOT IN` 的结果是 NULL（而非 TRUE），那些行会被
+    /// **静默漏掉**。`clip_collection_item.clip_id` 是 NOT NULL，所以这里是
+    /// 安全的 —— **但该列若改成可空，必须换成 `NOT EXISTS`**，否则排除会静默
+    /// 失效。
+    pub async fn list_filtered(&self, filter: &ClipFilter) -> Result<Vec<MediaClip>, DbError> {
+        let mut conditions: Vec<String> = Vec::new();
+        // sqlx 0.9 里 `Arguments` 是 trait，Postgres 的具体类型是 `PgArguments`。
+        // 用它而不是逐个 `.bind()`：条件个数随关键词数量变化，而 `.bind()`
+        // 的调用次数必须在编译期固定。
+        let mut args = sqlx::postgres::PgArguments::default();
+        let mut next = 1usize;
+
+        // 1) 番号精确匹配。空串与 None 都不加条件（上游 `if normalized_movie_number:`）。
+        if let Some(number) = filter
+            .movie_number
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            conditions.push(format!("movie_number = ${next}"));
+            add_bind(&mut args, number)?;
+            next += 1;
+        }
+
+        // 2) 关键词条件。`FilterBuilder` 交出的 SQL 自带 `$1..$n`，且它的
+        //    编号从 1 起 —— 所以这里必须把它**重编号**到已绑定值之后。
+        //
+        //    位移量是 `next - 1`（= 已绑定的值的个数），**不是 `next`**。
+        //    `next` 是「下一个编号」，当番号条件缺席时它就是 1，而此时关键词
+        //    条件本来就该从 `$1` 起 —— 位移 1 会把整段推到 `$2` 起，留下一个
+        //    无人提供的 `$1`，PostgreSQL 报 `could not determine data type of
+        //    parameter $1`。
+        //
+        //    `TRUE` 意味着「没有词」，等价于无过滤，丢掉即可；`FALSE` 意味着
+        //    「某个词匹配不到任何字段」，必须保留 —— 它让整条查询返回空，
+        //    这正是「不静默丢弃这个词」的效果。
+        if let Some(keyword_sql) = filter
+            .keyword_sql
+            .as_deref()
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty() && *sql != "TRUE")
+        {
+            conditions.push(format!("({})", shift_placeholders(keyword_sql, next - 1)));
+            for bind in &filter.keyword_binds {
+                add_bind(&mut args, bind)?;
+            }
+            next += filter.keyword_binds.len();
+        }
+
+        // 3) 排除某合集内的片段。
+        if let Some(collection_id) = filter.exclude_collection_id {
+            conditions.push(format!(
+                "id NOT IN (SELECT clip_id FROM clip_collection_item \
+                 WHERE collection_id = ${next})"
+            ));
+            add_bind(&mut args, collection_id)?;
+            next += 1;
+        }
+
+        debug_assert_eq!(
+            next - 1,
+            args.len(),
+            "占位符个数必须与绑定值个数一致，否则值会绑到错的条件上"
+        );
+
+        // 排序键是两个**字面量**之一，不接受任何客户端输入参与拼接。
+        let order = if filter.created_at_asc {
+            "created_at ASC, id ASC"
+        } else {
+            "created_at DESC, id DESC"
+        };
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!("SELECT * FROM media_clip {where_clause} ORDER BY {order}");
+
+        Ok(
+            sqlx::query_as_with::<_, MediaClip, _>(crate::repo::movie::safe_sql(sql), args)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+}
+
+/// 往参数列表尾部加一个值。
+///
+/// `Arguments::add` 返回 `Result`，因为编码可能失败。错误里没有上下文（它
+/// 只知道类型不知道列），所以这里补上位置 —— 排查时能立刻知道是第几个
+/// 占位符出的问题，而那正是本方法最容易错的地方。
+fn add_bind<'q, T>(args: &mut sqlx::postgres::PgArguments, value: T) -> Result<(), DbError>
+where
+    T: sqlx::Encode<'q, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    let position = args.len() + 1;
+    args.add(value).map_err(|err| {
+        DbError::business("MediaClip", format!("绑定第 {position} 个参数失败: {err}"))
+    })
+}
+
+/// 把一段 SQL 里的 `$n` 占位符整体后移 `by` 个。
+///
+/// `sm_service::playback::search_filters::FilterBuilder` 生成的关键词条件自带
+/// `$1..$k` 编号，而外层查询可能已经绑了番号（`$1`）。直接拼起来会让两段
+/// 编号**重叠** —— 而重叠不会报错，PostgreSQL 只是把后绑的值交给前一个位置，
+/// 于是「按番号筛选」悄悄变成「按关键词的第一个词筛选」。
+///
+/// # 只认「`$` + 数字」，其余原样保留
+///
+/// - `$` 后不接数字：不是占位符，原样输出；
+/// - `$$`：PostgreSQL 的美元引用起始标记，成对出现时整体跳过，
+///   否则 `$$1` 会被误读成 `$$` + 占位符 `$1`。
+///
+/// 绑定值里的 `$` 不受影响 —— 值是**绑定的**，从不拼进 SQL 文本，所以要防的
+/// 只有这段拼接文本，而它的内容全部由本仓库的代码生成。
+fn shift_placeholders(sql: &str, by: usize) -> String {
+    if by == 0 {
+        return sql.to_owned();
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            // 美元引用：两个 `$` 一起跳过，后面的内容不是编号。
+            if bytes.get(i + 1) == Some(&b'$') {
+                out.push_str("$$");
+                i += 2;
+                continue;
+            }
+            let digits_start = i + 1;
+            let mut j = digits_start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > digits_start {
+                // `$` + 数字：整体后移。
+                let value: usize = sql[digits_start..j].parse().expect("全是 ASCII 数字");
+                out.push('$');
+                out.push_str(&(value + by).to_string());
+                i = j;
+                continue;
+            }
+        }
+        // 非占位符字节：按 UTF-8 字符推进，避免把多字节字符截断。
+        let ch_len = utf8_len(bytes[i]);
+        out.push_str(&sql[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// 一个 ASCII 字符的 UTF-8 长度。
+fn utf8_len(byte: u8) -> usize {
+    if byte < 0x80 {
+        1
+    } else if byte < 0xE0 {
+        2
+    } else if byte < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// 片段列表的筛选条件。
+///
+/// 由 service 层组装：关键词条件来自
+/// `sm_service::playback::search_filters::FilterBuilder`，其余是标量筛选。
+#[derive(Debug, Clone, Default)]
+pub struct ClipFilter {
+    /// 精确匹配来源番号快照。`None` 或空串 = 不限。
+    pub movie_number: Option<String>,
+    /// 关键词条件 SQL（自带 `$1..$n`）。`None`、`""` 或 `"TRUE"` = 不限。
+    pub keyword_sql: Option<String>,
+    /// 与 `keyword_sql` 占位符一一对应，顺序即编号升序。
+    pub keyword_binds: Vec<String>,
+    /// 排除该合集内的片段。
+    pub exclude_collection_id: Option<i32>,
+    /// `true` = `created_at:asc`，`false` = `created_at:desc`（默认）。
+    pub created_at_asc: bool,
 }
 
 /// 新建一个片段。
@@ -563,6 +933,87 @@ impl NewMediaClip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------- 占位符重编号
+
+    /// 重编号是这个函数存在的全部理由，所以它的行为要逐条钉住。
+    #[test]
+    fn placeholders_shift_by_the_offset() {
+        assert_eq!(shift_placeholders("a = $1", 1), "a = $2");
+        assert_eq!(
+            shift_placeholders("a = $1 AND b = $2", 3),
+            "a = $4 AND b = $5"
+        );
+        assert_eq!(
+            shift_placeholders("($1) AND ($2 OR $3)", 10),
+            "($11) AND ($12 OR $13)"
+        );
+    }
+
+    #[test]
+    fn a_zero_offset_is_the_identity() {
+        assert_eq!(shift_placeholders("a = $1 AND $2", 0), "a = $1 AND $2");
+    }
+
+    /// `$` 后面没有数字时**不是**占位符，必须原样保留。
+    ///
+    /// 误改的后果是 SQL 语法错误或语义变化 —— 比如字面量里的 `$$`。
+    #[test]
+    fn a_dollar_without_digits_is_left_alone() {
+        assert_eq!(shift_placeholders("a = $$1", 5), "a = $$1");
+        assert_eq!(shift_placeholders("cost $ 5", 5), "cost $ 5");
+        assert_eq!(
+            shift_placeholders("no placeholder here", 5),
+            "no placeholder here"
+        );
+    }
+
+    /// 多位数编号要整体平移，不能只改个位。
+    ///
+    /// `$9` 加 1 应得 `$10`。若按字节处理就会得到 `$10` 但把 `1`、`0` 拆错。
+    #[test]
+    fn multi_digit_placeholders_shift_as_a_whole() {
+        assert_eq!(shift_placeholders("$9", 1), "$10");
+        assert_eq!(shift_placeholders("$99", 1), "$100");
+    }
+
+    /// 关键词条件里含中文（`ILIKE` 的字面量、列名旁的说明）时不能截断字符。
+    #[test]
+    fn multibyte_text_survives_the_rewrite() {
+        assert_eq!(
+            shift_placeholders("t ILIKE '%' || $1 || '%' AND 番号 IS NOT NULL", 2),
+            "t ILIKE '%' || $3 || '%' AND 番号 IS NOT NULL"
+        );
+        assert_eq!(shift_placeholders("编号 = $1", 1), "编号 = $2");
+    }
+
+    /// 真实形状：番号已绑 `$1`，关键词条件从 `$1` 起，必须让开。
+    ///
+    /// 这就是那个**不报错**的 bug 的原型 —— 不重编号的话两段都指向 `$1`。
+    #[test]
+    fn a_keyword_filter_never_collides_with_an_earlier_bind() {
+        let keyword = shift_placeholders(
+            "(c ILIKE '%' || $1 || '%' OR c ILIKE '%' || $2 || '%') AND (title ILIKE '%' || $3 || '%')",
+            1,
+        );
+        assert_eq!(
+            keyword,
+            "(c ILIKE '%' || $2 || '%' OR c ILIKE '%' || $3 || '%') AND (title ILIKE '%' || $4 || '%')"
+        );
+        // 编号必须严格递增且无重复
+        let numbers: Vec<usize> = keyword
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect();
+        let mut sorted = numbers.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(numbers, sorted, "占位符必须唯一：{numbers:?}");
+    }
 
     fn clip(start: i32, end: i32) -> NewMediaClip {
         NewMediaClip {

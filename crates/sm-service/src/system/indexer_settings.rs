@@ -1,18 +1,18 @@
 //! 索引器设置，对应上游
 //! `src/service/system/indexer_settings_service.py`（304 行）。
 //!
-//! # 落地的两个方法与一个被阻塞的
+//! # 三个方法全部落地
 //!
 //! | 上游方法 | 端点 | 状态 |
 //! |---|---|---|
 //! | `get_settings` | `GET /indexer-settings` | **已落** |
 //! | `update_settings` | `PATCH /indexer-settings` | **已落** |
-//! | `test_connection` | `GET /indexer-settings/test` | 阻塞：需要 `transfers` 域的 Torznab 客户端 |
+//! | `test_connection` | `GET /indexer-settings/test` | **已落**（用 [`crate::transfers::torznab`]） |
 //!
-//! `test_connection` 阻塞在**依赖**而不是难度：它要用固定番号 `SSNI-888`
-//! 对每个 indexer 发一次真实搜索请求，而 Torznab 客户端属于 `transfers`
-//! 域（上游 23 文件 / 4,235 行，未开工）。写一个只会返回 `healthy: false`
-//! 的假实现比不写更糟 —— 用户会以为自己的 indexer 坏了。
+//! `test_connection` 用固定番号 [`CONNECTION_TEST_QUERY`] 对每个 indexer
+//! 发一次**真实搜索**（不是 ping），以此验证地址与 apikey 整体可用。
+//! 它**不健康也回 200** —— 那是一份探测报告，不是请求失败；客户端按
+//! `healthy` / `error.type` 分支。
 //!
 //! # 整表替换语义
 //!
@@ -37,7 +37,9 @@
 //! `validation_error` 会让「名字重复了」和「URL 填错了」在界面上长得一样。
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
+use sm_db::common::time::now_utc;
 use sm_db::repo::{
     DownloadClientRepository, IndexerDownloadClientRepository, IndexerRepository, NewIndexer,
 };
@@ -45,6 +47,7 @@ use sm_db::transfers::downloads::indexer_kind;
 use sm_db::Db;
 
 use crate::error::{details_of, ServiceError};
+use crate::transfers::torznab::TorznabClient;
 
 /// 连通性测试用的固定番号。上游 `CONNECTION_TEST_QUERY`。
 ///
@@ -76,6 +79,31 @@ pub struct IndexerItemResource {
 pub struct BoundClientResource {
     pub id: i32,
     pub name: String,
+}
+
+/// `GET /indexer-settings/test` 的错误对象（上游 `IndexerConnectionTestError`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexerConnectionTestError {
+    /// 上游字段名就是 `type`（Rust 是关键字，DTO 层 `rename`）。
+    pub error_type: String,
+    pub message: String,
+}
+
+/// `GET /indexer-settings/test` 的响应（上游 `IndexerConnectionTestResponse`）。
+///
+/// **不健康也是 200** —— 这是一份探测报告，不是请求失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexerConnectionTestResponse {
+    pub healthy: bool,
+    /// naive UTC。
+    pub checked_at: chrono::NaiveDateTime,
+    pub query: String,
+    pub indexers_checked: i64,
+    pub result_count: i64,
+    pub elapsed_ms: i64,
+    /// 健康时为 `None`；不健康时带 `no_indexers_configured` /
+    /// `torznab_request_error`。
+    pub error: Option<IndexerConnectionTestError>,
 }
 
 /// `PATCH /indexer-settings` 的请求体。
@@ -119,17 +147,27 @@ pub struct IndexerItemUpdate {
 /// 索引器设置 service。
 #[derive(Debug, Clone)]
 pub struct IndexerSettingsService {
+    pool: Db,
     indexers: IndexerRepository,
     links: IndexerDownloadClientRepository,
     clients: DownloadClientRepository,
+    /// 连通性测试用的 Torznab 客户端。
+    torznab: TorznabClient,
 }
 
 impl IndexerSettingsService {
     pub fn new(db: &Db) -> Self {
+        Self::with_torznab(db, TorznabClient::new())
+    }
+
+    /// 注入自定义 Torznab 客户端 —— 测试用它指向一个假 indexer。
+    pub fn with_torznab(db: &Db, torznab: TorznabClient) -> Self {
         Self {
+            pool: db.clone(),
             indexers: IndexerRepository::new(db.clone()),
             links: IndexerDownloadClientRepository::new(db.clone()),
             clients: DownloadClientRepository::new(db.clone()),
+            torznab,
         }
     }
 
@@ -219,6 +257,58 @@ impl IndexerSettingsService {
         let validated = self.validate_indexers(&items, &existing).await?;
         self.indexers.replace_all(&validated).await?;
         self.get_settings().await
+    }
+
+    /// `GET /indexer-settings/test`。
+    ///
+    /// 用固定番号对**每个** indexer 发一次真实搜索。任一失败即整体判不健康
+    /// （上游 `continue_on_error=False`），错误类型是 `torznab_request_error`。
+    /// **探测失败不是 HTTP 错误** —— 返回值照常是 `Ok`，客户端按 `healthy`
+    /// 与 `error.type` 分支。
+    pub async fn test_connection(&self) -> Result<IndexerConnectionTestResponse, ServiceError> {
+        let start = Instant::now();
+        let indexers_checked = self.indexers.list_all().await?.len() as i64;
+
+        // 报告在**收尾时**构造：`checked_at` / `elapsed_ms` 反映整次探测。
+        let build =
+            |healthy: bool, result_count: i64, error: Option<IndexerConnectionTestError>| {
+                IndexerConnectionTestResponse {
+                    healthy,
+                    checked_at: now_utc(),
+                    query: CONNECTION_TEST_QUERY.to_owned(),
+                    indexers_checked,
+                    result_count,
+                    elapsed_ms: start.elapsed().as_millis() as i64,
+                    error,
+                }
+            };
+
+        if indexers_checked == 0 {
+            return Ok(build(
+                false,
+                0,
+                Some(IndexerConnectionTestError {
+                    error_type: "no_indexers_configured".to_owned(),
+                    message: "尚未配置任何 indexer，无法测试 Torznab 连通性".to_owned(),
+                }),
+            ));
+        }
+
+        match self
+            .torznab
+            .search(&self.pool, CONNECTION_TEST_QUERY, None, false)
+            .await
+        {
+            Ok(items) => Ok(build(true, items.len() as i64, None)),
+            Err(err) => Ok(build(
+                false,
+                0,
+                Some(IndexerConnectionTestError {
+                    error_type: "torznab_request_error".to_owned(),
+                    message: err.message().to_owned(),
+                }),
+            )),
+        }
     }
 
     /// 校验并归一一批索引器项。

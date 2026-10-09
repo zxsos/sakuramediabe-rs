@@ -40,7 +40,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 use sm_db::common::time::now_utc;
-use sm_db::repo::{BackgroundTaskRunRepository, Ctx, SystemNotificationRepository};
+use sm_db::repo::{
+    commit_or_rollback, BackgroundTaskRunRepository, Ctx, SystemNotificationRepository,
+};
 use sm_db::Db;
 
 use crate::error::ServiceError;
@@ -169,25 +171,27 @@ impl ActivityCleanupService {
         // 两步同事务：先置空通知外键，再删台账。顺序反了就会出现
         // 「通知指向刚被删的行」的窗口。
         let mut tx = self.pool.begin().await?;
-        let deleted = {
+        let outcome = async {
             let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
             let stale_ids = self
                 .tasks
                 .stale_terminal_ids_in(&mut ctx, task_key, threshold_id)
                 .await?;
             if stale_ids.is_empty() {
-                0
+                Ok::<u64, ServiceError>(0)
             } else {
                 // 先解除引用。通知本身**不删** —— 它的保留期由规则 ② 管。
                 self.notifications
                     .detach_task_runs_in(&mut ctx, &stale_ids)
                     .await?;
-                self.tasks
+                Ok(self
+                    .tasks
                     .delete_terminal_through_in(&mut ctx, task_key, threshold_id)
-                    .await?
+                    .await?)
             }
-        };
-        tx.commit().await?;
+        }
+        .await;
+        let deleted = commit_or_rollback(tx, outcome).await?;
         Ok(deleted)
     }
 
@@ -195,13 +199,14 @@ impl ActivityCleanupService {
     async fn cleanup_notifications(&self, retention_days: i64) -> Result<u64, ServiceError> {
         let cutoff = now_utc() - chrono::Duration::days(retention_days);
         let mut tx = self.pool.begin().await?;
-        let deleted = {
+        let outcome = async {
             let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
             self.notifications
                 .delete_read_before_in(&mut ctx, cutoff)
-                .await?
-        };
-        tx.commit().await?;
+                .await
+        }
+        .await;
+        let deleted = commit_or_rollback(tx, outcome).await?;
         if deleted > 0 {
             tracing::info!(retention_days, deleted, "已清理已读通知");
         }

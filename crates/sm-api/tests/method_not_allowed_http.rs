@@ -30,21 +30,60 @@ use tower::ServiceExt;
 /// 「必然不匹配」= 该路径上注册了别的方法。逐条挑出来的意义是：漏挂
 /// fallback 的表现必须是**该路径能匹配、只是方法不对**。
 const ROUTES: &[(&str, Method)] = &[
+    // actors.rs —— 每条路径挑一个**未注册**的方法。
+    ("/actors", Method::POST),
+    ("/actors/filter-options", Method::POST),
+    ("/actors/1", Method::POST),
+    ("/actors/1/merge", Method::GET),
+    ("/actors/1/profile-image", Method::POST),
+    ("/actors/1/subscription", Method::POST),
+    ("/actors/1/movie-ids", Method::POST),
+    ("/actors/1/tags", Method::POST),
+    ("/actors/1/years", Method::POST),
     // auth.rs
     ("/auth/tokens", Method::GET),
     ("/auth/token-refreshes", Method::GET),
     // config.rs
     ("/config", Method::POST),
     ("/config", Method::DELETE),
+    // downloads.rs
+    ("/download-candidates", Method::POST),
     // indexer_settings.rs
     ("/indexer-settings", Method::POST),
+    ("/indexer-settings/test", Method::POST),
+    // movie_subscriptions.rs
+    ("/movie-subscriptions", Method::POST),
+    ("/movie-subscriptions/status-counts", Method::POST),
+    ("/movie-subscriptions/search-resets", Method::GET),
+    // movies.rs
+    ("/movies", Method::POST),
+    ("/movies/by-series", Method::GET),
+    ("/movies/subscribed-actors/latest", Method::POST),
+    ("/movies/search/parse-number", Method::GET),
+    ("/movies/latest", Method::POST),
+    ("/movies/collection-type", Method::GET),
+    ("/movies/blacklist", Method::GET),
+    ("/movies/1/collection-status", Method::POST),
+    ("/movies/subscriptions", Method::GET),
+    ("/movies/unsubscriptions", Method::GET),
     // playlists.rs
     // GET /playlists 已注册（`list_playlists`），所以这里挑一个仍未注册的
     // 方法。**改路由时记得同步这张表** —— 见文件头的说明。
     ("/playlists", Method::PUT),
     ("/playlists/1", Method::POST),
+    ("/playlists/1/movies", Method::POST),
     ("/playlists/1/movies/ABC-001", Method::POST),
     ("/playlists/1/resolutions", Method::POST),
+    // media_clips.rs —— 挑该路径**已注册**的方法之外的那个。
+    // `POST /media/{id}/clips` 落在这里是**故意的**：它需要 ffmpeg，本批不做，
+    // 而路径存在（GET 能匹配），所以正确状态码是 405 而非 404。
+    ("/media/1/clips", Method::POST),
+    ("/media-clips", Method::POST),
+    ("/media-clips/1/thumbnails", Method::POST),
+    // tags.rs
+    ("/tags", Method::POST),
+    ("/tags/1", Method::POST),
+    ("/tags/1/movies", Method::POST),
     // status.rs
     ("/status/capabilities", Method::POST),
     ("/status", Method::POST),
@@ -175,8 +214,11 @@ fn every_registered_route_appears_in_the_table() {
     let source = include_str!("../src/routes.rs");
     // `include_str!` 只接受字面量，所以逐个列出而不是循环。
     for (name, text) in [
+        ("actors", include_str!("../src/routes/actors.rs")),
         ("auth", include_str!("../src/routes/auth.rs")),
         ("config", include_str!("../src/routes/config.rs")),
+        ("downloads", include_str!("../src/routes/downloads.rs")),
+        ("movies", include_str!("../src/routes/movies.rs")),
         (
             "indexer_settings",
             include_str!("../src/routes/indexer_settings.rs"),

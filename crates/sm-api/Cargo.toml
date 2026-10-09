@@ -35,3 +35,7 @@ tracing-subscriber = { workspace = true }
 # 造前置状态与回读期望值：把媒体判死、直接数一遍表以核对聚合口径。
 # 仓储层不提供「判死」这个业务动作（它由清理流程触发），所以只能写裸 SQL。
 sqlx = { workspace = true }
+# `GET /download-candidates` 要发真请求到索引器，而 URL 来自库里的 indexer
+# 行 —— 只有真起一个回环 HTTP 服务才能覆盖到「候选怎么从 XML 长成资源」。
+# 同一个理由让 sm-service 用了它。
+wiremock = "0.6"

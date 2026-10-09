@@ -123,6 +123,55 @@ fn code_of(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("<missing>")
 }
 
+// ====================================================== GET /indexer-settings/test
+
+/// `GET /test` —— **探测失败也是 200**（那是一份报告，不是请求失败），
+/// 且字段集合照抄上游 `IndexerConnectionTestResponse`。
+#[tokio::test]
+async fn the_connection_test_without_indexers_is_a_200_report() {
+    let (_db, state, token) = setup().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/indexer-settings/test")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("构造请求");
+    let response = app(&state).oneshot(request).await.expect("oneshot");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("读取响应体")
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("响应是 JSON");
+
+    assert_eq!(status, StatusCode::OK, "探测报告该是 200：{body}");
+    for key in [
+        "healthy",
+        "checked_at",
+        "query",
+        "indexers_checked",
+        "result_count",
+        "elapsed_ms",
+        "error",
+    ] {
+        assert!(body.get(key).is_some(), "缺字段 {key}: {body}");
+    }
+    assert_eq!(
+        body.as_object().expect("是对象").len(),
+        7,
+        "字段数变了：{body}"
+    );
+    // 全新的 schema 没有任何 indexer —— 正是 `no_indexers_configured` 那条。
+    assert_eq!(body["healthy"], json!(false));
+    assert_eq!(body["query"], json!("SSNI-888"));
+    assert_eq!(body["indexers_checked"], json!(0));
+    assert_eq!(body["result_count"], json!(0));
+    assert_eq!(body["error"]["type"], json!("no_indexers_configured"));
+    assert!(body["error"]["message"].as_str().is_some());
+}
+
 /// 一个合法的索引器项。
 fn item(name: &str, kind: &str, clients: Vec<i32>) -> Value {
     json!({
@@ -577,30 +626,6 @@ async fn a_method_other_than_get_or_patch_is_405_with_an_envelope() {
         let body: Value = serde_json::from_slice(&bytes).expect("应是 JSON 信封");
         assert_eq!(body["error"]["code"], json!("http_error"), "{method}");
     }
-}
-
-/// `GET /indexer-settings/test` 尚未落地（阻塞在 Torznab 客户端），
-/// 所以它必须落到 router 的 fallback —— **不能**被 `/indexer-settings`
-/// 的路由误接。
-#[tokio::test]
-async fn the_unimplemented_test_path_is_a_404_envelope() {
-    let (_db, state, token) = setup().await;
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/indexer-settings/test")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("构造请求");
-    let response = app(&state).oneshot(request).await.expect("oneshot");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("读体")
-        .to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).expect("应是 JSON 信封");
-    assert_eq!(body["error"]["code"], json!("http_error"));
 }
 
 #[tokio::test]

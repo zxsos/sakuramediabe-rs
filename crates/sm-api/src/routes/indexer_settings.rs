@@ -6,7 +6,10 @@
 //! |---|---|---|
 //! | `GET ""` | `IndexerSettingsService.get_settings` | **已落**（本文件） |
 //! | `PATCH ""` | `IndexerSettingsService.update_settings` | **已落**（本文件） |
-//! | `GET /test` | `IndexerSettingsService.test_connection` | 阻塞：`transfers` 域的 Torznab 客户端 |
+//! | `GET /test` | `IndexerSettingsService.test_connection` | **已落**（本文件；用 `transfers::torznab`） |
+//!
+//! `GET /test` **探测失败也是 200** —— 返回的是一份报告（`healthy` +
+//! `error.type`），不是请求失败。
 //!
 //! # 鉴权挂在 handler 上
 //!
@@ -27,8 +30,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_service::system::indexer_settings::{
-    BoundClientResource, IndexerItemResource, IndexerItemUpdate, IndexerSettingsService,
-    IndexerSettingsUpdateRequest,
+    BoundClientResource, IndexerConnectionTestError, IndexerConnectionTestResponse,
+    IndexerItemResource, IndexerItemUpdate, IndexerSettingsService, IndexerSettingsUpdateRequest,
 };
 
 use crate::auth::CurrentUser;
@@ -38,12 +41,17 @@ use crate::routes::method_not_allowed;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/indexer-settings",
-        get(get_indexer_settings)
-            .patch(update_indexer_settings)
-            .fallback(method_not_allowed),
-    )
+    Router::new()
+        .route(
+            "/indexer-settings",
+            get(get_indexer_settings)
+                .patch(update_indexer_settings)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/indexer-settings/test",
+            get(test_indexer_connection).fallback(method_not_allowed),
+        )
 }
 
 /// `GET /indexer-settings` 的响应体。
@@ -218,4 +226,64 @@ async fn update_indexer_settings(
     // 返回**替换后**的完整设置（上游同样返回 `get_settings()`）——
     // 客户端据此刷新本地状态，不用再发一次 GET。
     Ok(Json(updated.into()))
+}
+
+// ================================================================ GET /test
+
+/// `GET /indexer-settings/test` 的响应（上游 `IndexerConnectionTestResponse`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexerConnectionTestResource {
+    pub healthy: bool,
+    /// Pydantic `datetime` 字面量形状。
+    pub checked_at: String,
+    pub query: String,
+    pub indexers_checked: i64,
+    pub result_count: i64,
+    pub elapsed_ms: i64,
+    /// 健康时为 `null`。**不省略键** —— 上游 pydantic 默认就输出 `null`。
+    pub error: Option<IndexerConnectionTestErrorResource>,
+}
+
+/// 探测失败的原因（上游 `IndexerConnectionTestError`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexerConnectionTestErrorResource {
+    /// 上游字段名就是 `type`。
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+impl From<IndexerConnectionTestError> for IndexerConnectionTestErrorResource {
+    fn from(value: IndexerConnectionTestError) -> Self {
+        Self {
+            error_type: value.error_type,
+            message: value.message,
+        }
+    }
+}
+
+impl From<IndexerConnectionTestResponse> for IndexerConnectionTestResource {
+    fn from(value: IndexerConnectionTestResponse) -> Self {
+        Self {
+            healthy: value.healthy,
+            checked_at: value.checked_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            query: value.query,
+            indexers_checked: value.indexers_checked,
+            result_count: value.result_count,
+            elapsed_ms: value.elapsed_ms,
+            error: value.error.map(Into::into),
+        }
+    }
+}
+
+async fn test_indexer_connection(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+) -> Result<Json<IndexerConnectionTestResource>, ErrorResponse> {
+    Ok(Json(
+        IndexerSettingsService::new(state.db())
+            .test_connection()
+            .await?
+            .into(),
+    ))
 }

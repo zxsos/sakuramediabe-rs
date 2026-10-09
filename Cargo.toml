@@ -128,6 +128,8 @@ base64 = "0.23"
 percent-encoding = "2"
 url = "2"
 regex = "1"
+# XML（Torznab 搜索响应）。替代上游的 xmltodict。
+quick-xml = "0.42"
 
 # 图像（替代 Pillow + OpenCV）
 #

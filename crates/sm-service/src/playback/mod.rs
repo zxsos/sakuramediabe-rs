@@ -21,6 +21,7 @@
 //! - `provider_helpers` / `thumbnails/contracts` 依赖插件 ABI，阻塞。
 
 pub mod clip_artifact;
+pub mod media_clip;
 pub mod media_summary;
 pub mod operation_locks;
 pub mod search_filters;

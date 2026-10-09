@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 sm-plugin-api = { workspace = true }
 async-trait = { workspace = true }
+# `BoxStream`：默认实现层把流式 rpc 的返回类型固定成它（见 sm-plugin-api::provider）。
+futures = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }
 tokio = { workspace = true }

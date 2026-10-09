@@ -11,18 +11,45 @@
 
 | 域 | 上游文件 | 行数 | 状态 |
 |---|---|---|---|
-| `collections` | 5 | 1,292 | **完成**（9 个端点里落了 7 个） |
+| `collections` | 5 | 1,292 | **完成** |
 | `videos` | 4 | 927 | **完成** |
 | `system` | 19 | 2,935 | 进行中（`auth` / `account` / `activity_cleanup` / `config` / `task_queue` / `optional_services` / `status` / `indexer_settings` 完成，剩 11 个） |
-| `playback` | 19 | 3,738 | 进行中（`media_summary` + `operation_locks` + `search_filters` 完成，剩 16 个） |
-| `transfers` | 23 | 4,235 | 待做 |
-| `discovery` | 16 | 4,485 | 待做 |
-| `catalog` | 27 | 7,556 | 进行中（只有 `movie_resolution_service` 的档位部分落地） |
-| **合计** | **113** | **25,169** | 2/7 域完成 + 2 域部分 |
+| `playback` | 19 | 3,738 | 进行中（见下节，**能做的已做完**） |
+| `catalog` | 27 | 7,556 | 进行中（`movie_resolution_service` 的档位部分 + `actor_service` / `actor_merge_service` / `movie_service` 的订阅状态流转均已落；两个 ownership gateway 未落） |
+| `transfers` | 23 | 4,235 | 进行中（`torznab` 客户端与 `download_service` 的候选搜索已落：解锁 `system/indexer-settings/test` 与 `GET /download-candidates`） |
+| `discovery` | 16 | 4,485 | 待做（多数需 Qdrant） |
+| **合计** | **113** | **25,169** | 2/7 域完成 + 3 域部分 |
 
 行数口径与 `crates/sm-service/src/lib.rs` 的表格一致。推进次序沿用那里的
-约定：**最小且完整的域先定型**，之后照此推进 —— 下一个是 `system`
-（`auth` 已落地，剩 18 个文件），再往后按行数从小到大。
+约定：**最小且完整的域先定型**，之后照此推进。
+
+---
+
+## 阻塞地图 —— 决定「什么现在能做」
+
+外部依赖分三类。**避开这三类才能推进**，所以这张表比「按行数排序」更能
+决定下一步做什么。
+
+| 依赖 | 被阻塞 | 备注 |
+|---|---|---|
+| `provider_protocol` / `MEDIA_PROVIDER_REGISTRY` | **24 个文件 / 8,885 行** | 需先做 `sm-plugins` 宿主，而它目前是 1 行空壳 —— **这是最大的单点阻塞** |
+| PyAV（`import av`） | 含 `playback/media_metadata_probe_service`(338) | 属 `svc-probe`（阶段 9） |
+| zip 实现 | `playback/media_thumbnail_pack_backfill_service`(216) | 仓库无 zip crate；另缺 `write_pack` / `media_paths` 助手 |
+| Qdrant | `discovery/` 下 10 个文件 | `docker-compose.yml` **只有 postgres** |
+
+`playback` 域的 19 个文件里，**能做的都已做完**，剩下 4 类分别卡在上述三个
+依赖上（`thumbnails/task_service` 508 行卡 provider、`thumbnails/artifacts` 204
+行卡 provider 的一个类型、`media_metadata_probe` 338 行卡 PyAV、
+`thumbnail_pack_backfill` 216 行卡 zip）。`thumbnails/progress`(56) 用
+`threading.Thread` + 直连 DB，翻译成 tokio 是**设计变更**而非对译；
+`thumbnails/contracts`(22) 是个异常类，要等 `task_service` 落地才有意义。
+
+> ⚠️ **判断「某个上游文件是否被阻塞」必须读它的 import 段，不能用关键词 grep。**
+> 我用 `grep MEDIA_PROVIDER_REGISTRY` 判定过一次，四个文件判错，其中两个是
+> 700+ 行的大文件 —— 它们用的是多行
+> `from src.plugins.provider_protocol import (...)`，grep 漏了；而
+> `media_metadata_probe_service` 名字像纯逻辑，实际 `import av`。
+> 错误的答案比没有答案更贵：它会把人送进编不过的工作里。
 
 ---
 
@@ -112,7 +139,7 @@
 | `system::task_queue` | `system/task_queue_service.py` | **完成**（`settle_bootstrap_blocker` 除外，见下） |
 | `system::optional_services` | `system/optional_services.py` | **完成** |
 | `system::status` | `system/status_service.py` | **完成**（3/5 个方法，见下） |
-| `system::indexer_settings` | `system/indexer_settings_service.py` | **完成**（2/3 个方法，见下） |
+| `system::indexer_settings` | `system/indexer_settings_service.py` | **完成** |
 | 其余 11 个文件 | `system/*.py` | 待做 |
 
 ### `optional_services` —— 完成
@@ -264,18 +291,32 @@ provider registry 不存在。
 message 是「插件仍被 N 个媒体库引用（M 个媒体、K 个下载客户端），无法删除；
 请先迁移或删除相关媒体库。」
 
-### `indexer_settings` —— 完成 2/3 个方法
+### `indexer_settings` —— 完成
 
 | 上游方法 | 端点 | 状态 |
 |---|---|---|
 | `get_settings` | `GET /indexer-settings` | **完成** |
 | `update_settings` | `PATCH /indexer-settings` | **完成** |
-| `test_connection` | `GET /indexer-settings/test` | 阻塞：`transfers` 域的 Torznab 客户端 |
+| `test_connection` | `GET /indexer-settings/test` | **完成**（用 `transfers::torznab`） |
 
-`test_connection` 阻塞在**依赖**而不是难度：它要用固定番号 `SSNI-888` 对每个
-indexer 发一次真实搜索，而 Torznab 客户端属于 `transfers` 域（23 文件 /
-4,235 行，未开工）。写一个只会返回 `healthy: false` 的假实现比不写更糟 ——
-用户会以为自己的 indexer 坏了。常量 `CONNECTION_TEST_QUERY` 已就位。
+`test_connection` 用固定番号 `SSNI-888` 对每个 indexer 发一次**真实搜索**
+（不是 ping），以此验证地址与 apikey 整体可用。它的解锁点是 `transfers` 域的
+Torznab 客户端 —— 本批落了 `sm_service::transfers::torznab`（跨 indexer 搜一次
+并数结果），完整候选映射随搜索端点再做。
+
+**探测失败也是 200**：返回的是一份报告（`healthy` + `error.type`），不是请求
+失败。三个分支：没配 indexer → `no_indexers_configured`；请求失败（HTTP 非
+2xx / XML 被截断）→ `torznab_request_error`；成功 → `error` 为 `null`。
+
+两处容易出错的：**`apikey` 只在索引器自己有 key 时才带**（空 key = 不带参数，
+兼容免鉴权端点）；**失败消息里不能出现 URL 与凭据** —— 上游专门写了
+`_describe_search_error` 剥掉 httpx 内嵌的完整 URL，本批照做，并有集成测试
+钉住「HTTP 500」这种只有状态码的形态。
+
+**一处刻意的加严**：`xmltodict` 对截断的 XML 会抛错，而 `quick-xml` 默认
+**不校验**「EOF 时仍未闭合」。不补这道深度计数的话，一个被截断的响应会表现成
+「健康的 0 条结果」—— 而 `test_connection` 正是靠 `result_count` 判断 indexer
+是否可用。所以解析器自己数深度，未闭合即报错。
 
 **整表替换而非增量 diff**：`indexers` 是完整列表，保存后库里就正好是这些。
 全删全插**在同一个事务里**（`IndexerRepository::replace_all`）。不包事务的话
@@ -481,34 +522,158 @@ Peewee 的 `where(*conditions)` 默认处理），Rust 侧用 `and_all` 显式�
 | `media_service` | 781 | |
 | `provider_helpers` / `thumbnails/contracts` | 24 / 22 | 阻塞：插件 ABI |
 
-## `playback` / `transfers` / `discovery` / `catalog` —— 待做
+## `catalog` —— 进行中（演员子域 + 影片订阅流转）
 
-尚未开工。仓储层已就绪、可直接被这些域使用的部分：
+上游 `src/service/catalog/` 27 文件 / 7,556 行。已落四块：
 
-| 域 | 可用的既有仓储 |
+| Rust 模块 | 上游 | 说明 |
+|---|---|---|
+| `catalog::resolution` | `movie_resolution_service.py` 的档位部分 | 被 `collections` 的列表端点引用 |
+| `catalog::actor` | `actor_service.py`（827 行） | 11 个端点里可做的 9 个方法 |
+| `catalog::actor_merge` | `actor_merge_service.py`（208 行） | `POST /actors/{id}/merge` |
+| `catalog::movie` | `movie_service.py`（1,177 行）的订阅流转 + 最新到货 + 合集标记 + 黑名单 + **影片列表** | 番号定位 + 批量订阅/退订 + `GET /movies`（15 个筛选位 + 相关度排序）+ `/latest` + `GET /{n}/collection-status` + `PATCH /collection-type` + `PUT`/`DELETE /blacklist`（8 条端点） |
+
+### 影片订阅流转（本批落地）
+
+`POST /movies/subscriptions` 与 `POST /movies/unsubscriptions`，外加
+`MovieService::find_by_number` / `require_by_normalized_number`（后面 20 条
+影片端点都要用的共用件）。
+
+三条值得记住的规则：
+
+1. **「番号不存在」不是 4xx 而是 `skipped`**。批量端点走部分成功：用户勾了
+   20 部、其中 1 部已被删除时，他要的是另外 19 部订上。
+2. **去重不互换分隔符**（`_` 与 `-` 不折叠）。两种分隔符的番号同时存在时
+   （一本道 / 加勒比同日番号），折叠会让「订阅这部」扩散到**另一部影片**。
+3. **`updated_count` 是上游的一处双重计数**：被拉黑而跳过的那几条仍被算进
+   `updated_count`（同时也进 `skipped`）。**照抄** —— 客户端已按这个数字渲染，
+   改掉就是静默的契约变更；`tests/movie_subscriptions_http.rs` 把当前形状钉住
+   并说明了原因。
+
+另外记一个踩过的坑：`UpdateSet` 的 `ValueInner::Null` 在绑定层是
+`Option::<String>::None`，即一个 **text 类型的 NULL** —— 对 `timestamp` 列会报
+`expression is of type text`。所以「清订阅时间 / 重置检索状态」走的是
+`MovieRepository::mark_subscribed` / `clear_subscription` 里**字面量 `NULL`**
+的窄更新（与 `ActorUpdate` 单独维护 `nulls` 列表同一个思路）。
+
+### 演员子域的 HTTP 层
+
+### 演员子域的 HTTP 层（本批落地）
+
+`sm-service::catalog::actor` 的 9 个方法接进 `sm-api`，落了 **10 条路由**
+（订阅的 `PUT`/`DELETE` 算两条）。DTO 逐字段对齐上游
+`src/api/routers/catalog/actors.py` 与 `src/schema/catalog/actors.py`。
+
+**两类上游发生在 service 之前、本层必须补的校验**：
+
+1. `cups` 是逗号分隔字符串，`_parse_cups` 负责 trim / 大写 / 非 ASCII 字母即
+   422 `invalid_actor_filter`（`details.cups` 回显原始输入）；
+2. `age_min`/`age_max` 的 `ge=0`、`height_min`/`height_max` 的 `ge=1` 由
+   pydantic 承担 —— 不复刻的话 `age_min=-5` 会被 `years_before(today, -5)`
+   算成未来日期而**静默命中全部演员**。
+
+**`PATCH` 收原始 JSON 对象**：上游靠 `exclude_unset` 区分「键不存在」与
+「键存在但为 `null`」，serde 的 `Option<T>` 做不到，所以 handler 把 body 当
+`serde_json::Map` 透传给 service。
+
+**仍阻塞的两条**（逐条记在 `crates/sm-api/src/routes/actors.rs` 的模块文档）：
+
+| 上游 | 阻塞原因 |
 |---|---|
-| `playback` | `media` / `playback`（媒体、缩略图、进度、时刻点、片段） |
-| `transfers` | `download` / `transfer` / `submission` / `task` |
-| `discovery` | `discovery` / `recommendation` |
-| `catalog` | `movie` / `actor` / `asset` / `gateway` |
+| `PUT /{id}/profile-image` | EXIF 旋转 + LANCZOS + **有损** WebP（阶段 9） |
+| `POST /search/javdb/stream` | JavDB provider + `CatalogImportService`（插件 ABI） |
+
+### 演员合并（`actor_merge_service`）
+
+`POST /actors/{id}/merge` 已落，实现在 `sm_service::catalog::actor_merge`，
+对齐上游 `actor_merge_service._apply_merge` 的**六步**：搬影片关联 / 合并别名 /
+合并订阅（`subscribed_at` 取最早）/ 填空受保护字段（跳过 `host:manual` 的来源）/
+搬头像 / 打墓碑并压平链。整体在一个显式事务里（`pool.begin()` + `Ctx::in_tx`）。
+
+**这里抓到一个会挂死测试的真陷阱：不要依赖 `Transaction` 的 `Drop` 来回滚。**
+
+`Drop` 只把 `ROLLBACK` 排队到「这条连接下次被签出」时才执行 —— 连接于是以
+`idle in transaction` 留在池里，并继续持有 `FOR UPDATE` 的行锁。集成测试夹具
+的池是 `max_connections(1)`，而它的收尾用**另一条**连接执行
+`DROP SCHEMA ... CASCADE`，那条会一直等这把行锁：表现是**用例体跑完但进程
+挂住不动**，PG 里能看到「一个 idle in transaction + 一个 DROP 在等 relation 锁」。
+
+所以错误路径必须**显式**回滚。这条规则现在收敛成一个函数：
+`sm_db::repo::commit_or_rollback`（`Ok` 提交、`Err` 显式回滚，事务体放
+`async {}` 块里，里面的 `?` 不会把未结束的事务带出外层函数）。本批把
+`sm-service` 里所有「事务体可能早退」的点位都改用了它：
+
+| 位置 | 事务体里的失败点 |
+|---|---|
+| `videos::collection::add_item` | 唯一违例的幂等分支 |
+| `videos::collection::remove_items_by_video_ids` | 两次仓储调用 |
+| `videos::collection::reorder` | 成员行被并发删掉 |
+| `system::activity_cleanup`（两个清理方法） | 三条仓储调用 |
+| `collections::ordered::set_members` | 清空 + 逐条插入 |
+| `catalog::actor_merge` | 加锁后的四类校验 |
+
+`sm-db` 侧的 `user::rotate` 与 `common::page::in_snapshot_tx` 更早就已是显式
+提交/回滚 —— 前者的文档里就写着这个坑，本批只是把它推广到了别处。
+
+## `transfers` —— 进行中
+
+上游 `src/service/transfers/` 23 文件 / 4,235 行。已落两块，都在**不依赖插件
+ABI** 的那一侧 —— 这个域的大头全在 `sm-plugins` 宿主后面，见「阻塞地图」：
+
+| Rust 模块 | 上游 | 说明 |
+|---|---|---|
+| `transfers::torznab` | `downloads/clients/torznab.py`（296 行） | 跨索引器搜索 + 候选构造 |
+| `transfers::download_search` | `downloads/search_service.py`（98 行） | `GET /download-candidates` |
+
+### 候选搜索：三条规则
+
+1. **番号必须先大写**。比对的两边（请求里的番号、候选标题里解析出的番号）都过
+   `movie_numbers`，而识别是大小写不敏感的 —— 不适时大写，`?movie_number=ssni-888`
+   会把标题里的 `SSNI-888` 全部判成「错配」而剔除，表现为「搜得到却一条不返回」。
+2. **标题过滤是启发式，不是内容闸门**：解析出**别的**番号的候选直接剔除，
+   解析不出的保留，交给提交阶段的内容闸门做最终确认。比对**不折叠分隔符**
+   （`123456-789` 与 `123456_789` 是两部不同的影片，见 `movie_numbers` 的模块文档）。
+3. **「索引器全挂了」是 502 而不是 200 空列表**（`download_candidate_search_failed`）。
+   前者客户端该重试，后者是「这个番号没有资源」—— 两者处置相反，合并会让
+   「服务不可用」伪装成「没有资源」。
+
+### 仍未开工
+
+转存/下载编排（`import_service` / `task_service` /
+`media_transfer_task_service`）、`downloads` 客户端注册与优先选择，以及
+`GET/POST /download-clients`、`POST /download-requests`、`GET /download-tasks`
+等 8 条端点。它们都要「下载器 provider」，即插件 ABI 宿主。
+
+仓储层已就绪、可直接被这个域使用的部分：`download` / `transfer` /
+`submission` / `task`。
+
+## `discovery` —— 待做
+
+尚未开工。仓储侧已有 `discovery` / `recommendation`，多数端点还要 Qdrant。
+
+## 跨域次序：硬约束已解除，影片卡片已在 `collections` 侧定型
 
 依赖次序上原有的硬约束**已解除**：`playback` 的 `movie_resolution_service`
 被 `collections` 的列表端点引用，所以当初要求 `playback` 早于 `catalog`。
-其中与分辨率档位有关的三块（`resolution_interval` /
-`resolution_level_expression` / 档位分桶）已随
-`sm_service::catalog::resolution` 落地，`GET /playlists` 与
-`GET /playlists/{id}/resolutions` 因此得以接上路由。
+其中与分辨率档位有关的两块（`resolution_interval` / 档位分桶）已随
+`sm_service::catalog::resolution` 落地，档位**筛选**的 `EXISTS` 子查询随
+影片卡片一起进了 `sm_db::repo::collection`，`GET /playlists`、
+`GET /playlists/{id}/resolutions` 与 `GET /playlists/{id}/movies` 因此全部接上。
 
-`movie_resolution_service` 剩下的职责只有影片卡片的封面聚合，那属于
-`catalog` 域自身的工作量，不再构成跨域阻塞。
+`playlists` 域**9/9 端点全部落地**（最后一个是影片卡片）。它没有等 `catalog`
+侧开工，理由恰恰相反：影片卡片是 `catalog` 的影片列表**同一套东西**，先在这里
+把 `MovieListItemResource` 与聚合口径定下来，`catalog` 侧直接复用同一组 DTO
+与仓储查询，避免两边各写一份聚合后开始漂移。
 
-`playlists` 域还剩一个端点 `GET /playlists/{id}/movies`，它要
-`with_movie_card_relations` / `attach_movie_list_media` /
-`MovieListItemResource`。其中 **`attach_movie_list_media` 已随
-`playback::media_summary` 落地**（一条 `IN` 查询 + `LEFT JOIN` 取库名，
-再按番号在内存分组），所以剩下的只有影片卡片的封面聚合
-（`with_movie_card_relations` + `MovieListItemResource`）—— 那属于
-`catalog` 域自身的影片卡片，刻意留到那一侧一起做。
+### 影片卡片的四条口径（`catalog` 侧复用时要一致）
+
+1. **顺序只由分页查询决定**（`sm_db::repo::collection::list_movie_cards`）。
+   后来补的影片本体 / 封面 / 系列 / 媒体都是按 id 批量补，**不得重排** ——
+   在内存里重排会让 `added_at` / `bitrate` 两个相关子查询排序列直接失效。
+2. **档位区间是半开的**：`4K → [6, 7)`。闭区间会让 8K 影片同时命中 4K。
+3. **`can_play` 是 any 不是 all**：一条有效媒体就够。
+4. **`video_info` 是对象**：库里 TEXT 存 JSON，DTO 输出解析后的对象；
+   脏文本给 `null`（上游在那个情况下 500，而列表不该因为一条坏值整页拿不到）。
 
 ---
 

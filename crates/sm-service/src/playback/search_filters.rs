@@ -155,24 +155,64 @@ pub fn number_condition(column: &str, term: &str) -> Option<NumberMatch> {
 /// 「按番号过滤」静默地变成「按关键词的第一个词过滤」。这种错误只在特定
 /// 组合下才显形，所以编号必须由调用方分配，见 [`FilterBuilder`]。
 pub fn number_condition_at(column: &str, term: &str, placeholder: usize) -> Option<NumberMatch> {
+    let kind = number_match(term)?;
+    Some(NumberMatch {
+        sql: kind.render(column, placeholder),
+        bind: kind.bind().to_owned(),
+    })
+}
+
+/// 番号匹配走哪条路径，以及绑定值。
+///
+/// 拆成「先判定、再渲染」两步，是因为**占位符只能在确定要用之后才分配**。
+/// 若先分配编号再判定条件不适用（例如一个纯中文词在番号列上匹配不到），
+/// 那个编号就被跳过、无人绑定，而后面真正的条件会拿到下一个编号 ——
+/// 于是 SQL 里的编号与绑定值个数不等，PostgreSQL 报
+/// `bind message supplies N parameters, but prepared statement requires M`。
+///
+/// 只有真库能抓到它：SQL 片段拼得完全合法，类型检查与 clippy 全绿。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumberMatchKind {
+    /// 快路径：列原文 + 未归一化的词（`^\d+[-_]\d+$`）。
+    FastPath(String),
+    /// 归一化路径：归一化表达式 + 归一化后的键。
+    Normalized(String),
+}
+
+impl NumberMatchKind {
+    /// 该路径要绑的值。
+    #[must_use]
+    pub fn bind(&self) -> &str {
+        match self {
+            Self::FastPath(value) | Self::Normalized(value) => value,
+        }
+    }
+
+    /// 渲染成带指定编号的 SQL 条件。
+    #[must_use]
+    pub fn render(&self, column: &str, placeholder: usize) -> String {
+        let ph = format!("${placeholder}");
+        match self {
+            Self::FastPath(_) => format!("{column} LIKE '%' || {ph} || '%'"),
+            Self::Normalized(_) => {
+                format!("{} LIKE '%' || {ph} || '%'", normalized_column_expr(column))
+            }
+        }
+    }
+}
+
+/// 判定该词能否走番号匹配，返回路径与绑定值。`None` = 不适用。
+///
+/// 判据只有两条：词里有可搜索字符（否则连列都匹配不到），且归一化后仍有键。
+pub fn number_match(term: &str) -> Option<NumberMatchKind> {
     let upper = term.trim().to_ascii_uppercase();
     if !has_searchable_char(&upper) {
         return None;
     }
-    let ph = format!("${placeholder}");
-
     if is_plain_number_pattern(&upper) {
-        return Some(NumberMatch {
-            sql: format!("{column} LIKE '%' || {ph} || '%'"),
-            bind: upper,
-        });
+        return Some(NumberMatchKind::FastPath(upper));
     }
-
-    // 归一化表达式里没有可绑的列名以外的参数，所以绑**键**。
-    Some(NumberMatch {
-        sql: format!("{} LIKE '%' || {ph} || '%'", normalized_column_expr(column)),
-        bind: normalize_number_term(term)?,
-    })
+    Some(NumberMatchKind::Normalized(normalize_number_term(term)?))
 }
 
 /// 一个号码匹配条件及其绑定值。
@@ -288,11 +328,13 @@ impl<'a> KeywordFilters<'a> {
             let mut alternatives: Vec<String> = Vec::new();
 
             if let Some(column) = number_column {
-                // 编号在这里分配 —— 词内第二个条件拿到的是**下一个**编号。
-                let placeholder = self.builder.alloc_placeholder();
-                if let Some(m) = number_condition_at(column, term, placeholder) {
-                    self.builder.bind(m.bind);
-                    alternatives.push(m.sql);
+                // **先判定能不能用，再分配编号。** 顺序反了会留下一个无人绑定
+                // 的编号（见 `NumberMatchKind` 的文档）—— 那是个只有真库能
+                // 发现的错：SQL 合法、类型检查通过，只在执行时报参数个数不符。
+                if let Some(kind) = number_match(term) {
+                    let placeholder = self.builder.alloc_placeholder();
+                    self.builder.bind(kind.bind().to_owned());
+                    alternatives.push(kind.render(column, placeholder));
                 }
             }
 
@@ -686,6 +728,63 @@ mod tests {
         KeywordFilters::new(&mut builder).push_terms(&terms, Some("c"), None);
         let (sql, _) = builder.finish();
         assert!(sql.contains(" AND "), "多个词必须 AND: {sql}");
+    }
+
+    /// **回归**：不适用的番号条件不得占用编号。
+    ///
+    /// 纯中文词在番号列上匹配不到（`has_searchable_char` 要求 ASCII 字母
+    /// 数字），但它仍要匹配标题文本列。若先分配番号编号再判定不适用，
+    /// `$1` 就被跳过而无人绑定，标题条件拿到 `$2` —— SQL 里两个编号、绑定
+    /// 一个值，执行时报 `bind message supplies 1 parameters, but prepared
+    /// statement requires 2`。
+    ///
+    /// 只有真库能抓到（片段本身完全合法），所以这条在单元层钉住。
+    #[test]
+    fn an_inapplicable_number_condition_consumes_no_placeholder() {
+        let terms = vec!["命中词".to_owned()];
+        let mut builder = FilterBuilder::starting_at(1);
+        KeywordFilters::new(&mut builder).push_terms(&terms, Some("movie_number"), Some("title"));
+        let (sql, binds) = builder.finish();
+
+        assert_eq!(
+            sql, "title ILIKE '%' || $1 || '%'",
+            "标题条件必须拿到 $1，而不是被跳过的 $1 之后的 $2"
+        );
+        assert_eq!(binds, vec!["命中词".to_owned()], "恰好一个绑定值");
+
+        // 编号与绑定值个数必须逐位对齐
+        let found: Vec<usize> = sql
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect();
+        assert_eq!(found, vec![1], "SQL 里的编号必须从 1 起且连续");
+        assert_eq!(found.len(), binds.len(), "编号个数必须等于绑定值个数");
+    }
+
+    /// 混合情形：第一个词走不了番号路径、第二个词能走，两者的编号仍连续。
+    #[test]
+    fn a_skipped_number_branch_does_not_shift_later_terms() {
+        let terms = vec!["纯中文".to_owned(), "abc-123".to_owned()];
+        let mut builder = FilterBuilder::starting_at(1);
+        KeywordFilters::new(&mut builder).push_terms(&terms, Some("movie_number"), Some("title"));
+        let (sql, binds) = builder.finish();
+
+        // 第一个词：只有标题 $1；第二个词：番号 $2 + 标题 $3
+        assert_eq!(binds.len(), 3, "SQL: {sql}");
+        assert!(sql.contains("$3"), "第二个词的标题条件应拿到 $3: {sql}");
+        let numbers: Vec<usize> = sql
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect();
+        assert_eq!(numbers, vec![1, 2, 3], "编号必须连续无空洞: {sql}");
     }
 
     /// `push_atom` 让编号与绑定值在同一步产生 —— 不可能只做一半。

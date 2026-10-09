@@ -36,6 +36,8 @@
 pub mod catalog;
 pub mod collections;
 pub mod error;
+pub mod movie_numbers;
 pub mod playback;
 pub mod system;
+pub mod transfers;
 pub mod videos;

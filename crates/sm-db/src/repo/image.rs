@@ -29,6 +29,8 @@
 //!
 //! **这条索引此前是为一个不存在的查询建的** —— 没有任何仓储做前缀查询。
 
+use std::collections::HashMap;
+
 use sqlx::PgPool;
 
 use crate::catalog::asset::Image;
@@ -130,6 +132,30 @@ impl ImageRepository {
                 .fetch_optional(&self.pool)
                 .await?,
         )
+    }
+
+    /// 按 id **批量**取图，返回 `id -> Image` 映射。
+    ///
+    /// 存在的理由是片段列表的封面：一次要解析几十张缩略图对应的
+    /// `image_id`，逐个 `find_by_id` 就是 N+1。
+    ///
+    /// # 缺项不出现在结果里
+    ///
+    /// 返回的是映射而不是 `Vec`，所以「没有这张图」与「有这张图」的区别由
+    /// **键是否存在**表达，调用方不需要 `Option` 套 `Option`。
+    /// `image_id` 是外键且 NOT NULL，所以理论上不该缺 —— 但外键约束可以被
+    /// 关掉或延迟，而这里静默少一张封面比报错更容易排查。
+    ///
+    /// 空输入直接返回空映射，不发查询。
+    pub async fn find_by_ids(&self, ids: &[i32]) -> Result<HashMap<i32, Image>, DbError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Image>("SELECT * FROM image WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|image| (image.id, image)).collect())
     }
 
     /// 按 id 取一张图。

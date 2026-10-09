@@ -3,10 +3,7 @@
 //!
 //! # 与上游 `src/api/routers/collections/playlists.py` 的对应
 //!
-//! 上游 9 个端点里，本批落了 **7** 个。剩下 1 个读端点
-//! （`GET /playlists/{id}/movies`）依赖尚未实现的影片卡片聚合
-//! （`with_movie_card_relations` / `attach_movie_list_media` /
-//! `MovieListItemResource`）—— **不是**路由层写不出来。
+//! 上游 9 个端点**全部落地**。
 //!
 //! | 上游 | 本文件 | 状态 |
 //! |---|---|---|
@@ -16,9 +13,17 @@
 //! | `PATCH /{id}` | `update_playlist` | 已落（**含真实 `movie_count`**） |
 //! | `DELETE /{id}` | `delete_playlist` | 已落 |
 //! | `GET /{id}/resolutions` | `list_playlist_resolutions` | 已落（分辨率档位聚合） |
+//! | `GET /{id}/movies` | `list_playlist_movies` | 已落（影片卡片，见下） |
 //! | `PUT /{id}/movies/{n}` | `add_movie` | 已落 |
 //! | `DELETE /{id}/movies/{n}` | `remove_movie` | 已落 |
-//! | `GET /{id}/movies` | —— | **待做**：影片卡片聚合 |
+//!
+//! # `GET /{id}/movies` 的四个查询参数都不校验
+//!
+//! 上游写的是 `page: int = 1, page_size: int = 20, sort: str | None = None,
+//! resolution: str | None = None` —— 全是裸类型，没有 `ge` / `le`。这里照抄，
+//! **不加** `validate_page`：给 `page_size` 加个上限是行为变更，而客户端已经
+//! 按「传多少给多少」用它。分页与筛选的规则都在
+//! [`PlaylistService::list_playlist_movies`]。
 //!
 //! # 鉴权挂在 handler 上而不是 router 上
 //!
@@ -42,19 +47,22 @@ use axum::http::StatusCode;
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
+use sm_core::pagination::Paginated;
 use sm_service::collections::playlist::{PlaylistService, PlaylistUpdate};
 
 use crate::auth::CurrentUser;
 // 注意是 crate 自己的 Json —— axum 的那个会让解析失败绕过错误信封，
 // 见 extract.rs 的文档。
 use crate::dto::{
-    PlaylistCreateRequest, PlaylistResolutionOption, PlaylistResource, PlaylistUpdateRequest,
+    PlaylistCreateRequest, PlaylistMovieListItemResource, PlaylistResolutionOption,
+    PlaylistResource, PlaylistUpdateRequest,
 };
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::extract::Query as EnvelopeQuery;
 use crate::query::{default_true, deser_bool};
 use crate::routes::method_not_allowed;
+use crate::signing::{now_seconds, signing_secret};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -76,6 +84,12 @@ pub fn routes() -> Router<AppState> {
             "/playlists/{id}/resolutions",
             get(list_playlist_resolutions).fallback(method_not_allowed),
         )
+        .route(
+            "/playlists/{id}/movies",
+            get(list_playlist_movies).fallback(method_not_allowed),
+        )
+        // 与上面那条不是同一个形状（多一段静态以外的路径段），matchit 按段数
+        // 区分，不冲突。
         .route(
             "/playlists/{id}/movies/{movie_number}",
             put(add_movie)
@@ -127,6 +141,70 @@ async fn list_playlist_resolutions(
     Ok(Json(
         options.iter().map(PlaylistResolutionOption::from).collect(),
     ))
+}
+
+/// `GET /playlists/{id}/movies` 的查询参数。
+///
+/// 四个参数都是**裸类型**，缺省值照抄上游 `page=1, page_size=20` ——
+/// 为什么不加 `ge` / `le` 见本模块文档。
+#[derive(Debug, Deserialize)]
+struct ListPlaylistMoviesQuery {
+    #[serde(default = "default_page")]
+    page: i64,
+    #[serde(default = "default_page_size")]
+    page_size: i64,
+    /// `field:direction`，四个字段见 `parse_playlist_sort`。非法值 422
+    /// `invalid_playlist_filter`（`details.sort` 回显原始输入）。
+    #[serde(default)]
+    sort: Option<String>,
+    /// 分辨率档位标签（`4K` / `1080P` …）。非法值同样是 422
+    /// `invalid_playlist_filter`，但 `details` 的键是 `resolution` ——
+    /// 客户端据此高亮不同的控件。
+    #[serde(default)]
+    resolution: Option<String>,
+}
+
+fn default_page() -> i64 {
+    1
+}
+
+fn default_page_size() -> i64 {
+    20
+}
+
+async fn list_playlist_movies(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(path): Path<PlaylistPath>,
+    EnvelopeQuery(query): EnvelopeQuery<ListPlaylistMoviesQuery>,
+) -> Result<Json<Paginated<PlaylistMovieListItemResource>>, ErrorResponse> {
+    let page = PlaylistService::new(state.db())
+        .list_playlist_movies(
+            path.id,
+            query.page,
+            query.page_size,
+            query.sort.as_deref(),
+            query.resolution.as_deref(),
+        )
+        .await?;
+
+    // 密钥与当前时间每次请求现取 —— 见 [`crate::signing`]。
+    let secret = signing_secret(&state);
+    let now = now_seconds();
+    let items = page
+        .items
+        .iter()
+        .map(|card| PlaylistMovieListItemResource::from_card(card, &secret, now))
+        .collect();
+
+    // **回显请求里的 page / page_size**，而不是 service 归一后的值：上游
+    // `PageResponse` 装的就是入参，客户端据此拼下一页的 URL。
+    Ok(Json(Paginated::new(
+        items,
+        query.page,
+        query.page_size,
+        page.total,
+    )))
 }
 
 async fn create_playlist(

@@ -21,6 +21,7 @@
 //! | [`ServiceError::validation`] | 422 | `validation_error` |
 //! | [`ServiceError::conflict`] | 409 | `playlist_name_conflict`、`playlist_reserved_name`、`playlist_managed_by_system` |
 //! | [`ServiceError::not_found`] | 404 | `playlist_not_found`、`movie_not_found` |
+//! | [`ServiceError::bad_gateway`] | 502 | `download_candidate_search_failed` |
 //!
 //! 上游 `require_by_id` 默认生成 `{entity}_not_found` 与 `{entity}_id` 详情键
 //! —— [`ServiceError::not_found`] 的 `details_key` 参数保留了这个约定。
@@ -116,6 +117,23 @@ impl ServiceError {
         details.insert(details_key.to_owned(), Value::from(entity_id));
         Self {
             status: 404,
+            api: Box::new(ApiError::new(code, message).with_details(details)),
+        }
+    }
+
+    /// 上游服务失败（502）。
+    ///
+    /// 上游把「我们依赖的外部服务没成功」单列成 502 而不是 500 —— 客户端对
+    /// 两者的处置不同：502 值得重试（换一个索引器、过一会儿再试），500 是
+    /// 自身的缺陷（重试只会重复失败）。所以这条边界必须留在 service 层，
+    /// 不能让调用方自己拼状态码。
+    pub fn bad_gateway(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Map<String, Value>,
+    ) -> Self {
+        Self {
+            status: 502,
             api: Box::new(ApiError::new(code, message).with_details(details)),
         }
     }

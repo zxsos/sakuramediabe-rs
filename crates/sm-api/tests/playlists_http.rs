@@ -635,20 +635,22 @@ async fn the_resolutions_endpoint_requires_authentication() {
     assert_eq!(code_of(&body), "unauthorized");
 }
 
-/// `/playlists/{id}/movies` 仍未落地：它必须落到 router 的 fallback，
-/// **不能**悄悄匹配到 `/playlists/{id}` 之类的路径。
+/// `/playlists/{id}/movies` **已落地**，不能再落到 router 的 fallback。
 ///
-/// 错误码是 `http_error`（不是 `not_found`）—— 上游对**任何**未注册路径
-/// 都返回 `http_error` + 404，客户端靠状态码而非 `code` 分支。
+/// 这条曾经断言 404（端点未实现时的形状）。端点落地后它必须跟着改 ——
+/// 而不是删掉：删掉之后「这条路由被误删/误改」就没有任何用例看得见
+/// （本文件的其余用例一条都不走这个路径）。
+///
+/// 卡片内容的契约在 `tests/playlist_movies_http.rs`。
 #[tokio::test]
-async fn the_unimplemented_movies_endpoint_is_a_404_envelope() {
+async fn the_movies_endpoint_is_registered_not_a_fallback_404() {
     let (db, token) = setup().await;
-    let id = seed_playlist(&db, "http-未落地").await;
+    let id = seed_playlist(&db, "http-影片端点").await;
     let (status, body) = send(
         app(&db),
         authed("GET", &format!("/playlists/{id}/movies"), &token, None),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(code_of(&body), "http_error");
+    assert_eq!(status, StatusCode::OK, "响应: {body}");
+    assert!(body.get("items").is_some(), "应当是分页信封：{body}");
 }

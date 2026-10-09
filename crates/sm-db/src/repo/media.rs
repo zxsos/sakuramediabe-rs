@@ -18,6 +18,8 @@
 //! [`DbError::ConstraintViolation`]（409），因为「这条 Media 没归属」
 //! 是业务错误，不是状态冲突。
 
+use std::collections::HashSet;
+
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
 
@@ -172,6 +174,38 @@ impl MediaRepository {
             count = "SELECT COUNT(*) FROM media WHERE movie_number = $1",
             items = "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2 OFFSET $3",
         }
+    }
+
+    /// 这批番号里**有本地媒体**的那些（一次查询，去重）。
+    ///
+    /// 批量退订用它判定「有媒体就不许退订」——一次聚合查询换掉逐条的
+    /// `list_by_movie_number` 调用。
+    ///
+    /// # 参数必须传**番号**，不能传 `movie.id`
+    ///
+    /// `media.movie_number` 这个外键指向的是 `movie.movie_number`（字符串
+    /// 业务主键），不是 `movie.id`。把整数传进来会生成
+    /// `WHERE movie_number IN (1,2,3)` 而**恒不命中** —— 判定静默失效，
+    /// 表现为「有媒体也照样退订成功」。上游在同一处专门留了注释记这个坑。
+    ///
+    /// # 列可空，但 `= ANY(...)` 天然排除 NULL
+    ///
+    /// `NULL = ANY(...)` 是 NULL 而不是 TRUE，所以未关联影片的孤儿媒体
+    /// 不会进结果集，解码成 `String` 是安全的。
+    pub async fn numbers_with_media(
+        &self,
+        movie_numbers: &[String],
+    ) -> Result<HashSet<String>, DbError> {
+        if movie_numbers.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT movie_number FROM media WHERE movie_number = ANY($1)",
+        )
+        .bind(movie_numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// 按主键查询。

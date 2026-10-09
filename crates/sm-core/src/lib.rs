@@ -22,6 +22,7 @@ pub mod pagination;
 pub mod password;
 pub mod refresh_token;
 pub mod signing;
+pub mod text_search;
 
 pub use auth::{AuthTokens, AuthUser, InvalidAuthResponse};
 pub use error::{ApiError, ErrorEnvelope};

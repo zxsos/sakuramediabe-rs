@@ -1,6 +1,11 @@
 //! `StorageProvider` 的本地目录参考实现。
 //!
-//! 只落地最小集的 4 个 rpc，其余 28 个返回 `Status::unimplemented`。
+//! 只落地最小集的 4 个 rpc —— 其余 **28 个不再手写 stub**，改由
+//! [`sm_plugin_api::StorageProviderExt`] 的默认实现提供（返回
+//! `Status::unimplemented`）。这正是 gRPC 报告 P1-4 说的那笔税：本文件因此
+//! 少了约 **170 行纯签名**，而且是**编译期**少掉的 —— proto 再加 rpc 也不会
+//! 让插件编译不过。
+//!
 //! 实现过程中遇到的 proto 缺口都就地标注了 `GAP:` 注释，并汇总到
 //! `docs/parallel/grpc-plugin-report.md`。
 
@@ -9,18 +14,19 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures::stream::BoxStream;
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use prost_types::Struct;
-use sm_plugin_api::v1::storage_provider_server::StorageProvider;
+use sm_plugin_api::provider::StorageProviderExt;
 use sm_plugin_api::v1::{
     playback_plan, BrowseEntry, BrowsePage, BrowseRequest, EntryType, GenerateThumbnailsRequest,
     ImportFile, ImportFileEntry, LibraryHandle, MediaHandle, PlanPlaybackRequest,
     PlanPlaybackResponse, PlaybackDelivery, PlaybackPlan, ProgressEvent, RedirectPlan,
-    ScanImportSourceRequest, StagedMedia, TransferReadRequest, TransferReadResponse,
+    ScanImportSourceRequest,
 };
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Empty};
-use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 use crate::opaque::{ref_path, string_ref};
 
@@ -86,16 +92,6 @@ impl LocalRefProvider {
         &self.root
     }
 
-    /// 未实现方法的统一返回。
-    ///
-    /// GAP: tonic 0.14 生成的 trait 没有默认方法体（报告 §4.1），
-    /// 于是「只实现一个 4 方法切片」也要手写全部 32 个签名。
-    fn not_implemented<T>(&self, method: &str) -> Result<Response<T>, Status> {
-        Err(Status::unimplemented(format!(
-            "plugin-ref-local 未实现 StorageProvider::{method}"
-        )))
-    }
-
     /// 校验 library 句柄是不是指向自己。
     fn check_library(&self, library: &LibraryHandle) -> Result<(), Status> {
         if !library.provider_key.is_empty() && library.provider_key != self.provider_key {
@@ -142,11 +138,7 @@ impl LocalRefProvider {
 }
 
 #[async_trait]
-impl StorageProvider for LocalRefProvider {
-    type ScanImportSourceStream = ReceiverStream<Result<ImportFileEntry, Status>>;
-    type GenerateThumbnailsStream = ReceiverStream<Result<ProgressEvent, Status>>;
-    type ReadTransferSourceStream = Empty<Result<TransferReadResponse, Status>>;
-
+impl StorageProviderExt for LocalRefProvider {
     // ── ① browse ──────────────────────────────────────────────────
     async fn browse(
         &self,
@@ -188,7 +180,7 @@ impl StorageProvider for LocalRefProvider {
     async fn scan_import_source(
         &self,
         request: Request<ScanImportSourceRequest>,
-    ) -> Result<Response<Self::ScanImportSourceStream>, Status> {
+    ) -> Result<Response<BoxStream<'static, Result<ImportFileEntry, Status>>>, Status> {
         let payload = request.into_inner();
         let library = payload
             .library
@@ -207,56 +199,7 @@ impl StorageProvider for LocalRefProvider {
             walk_and_emit(base, start, sender).await;
         });
 
-        Ok(Response::new(ReceiverStream::new(receiver)))
-    }
-
-    async fn read_import_file(
-        &self,
-        _request: Request<sm_plugin_api::v1::ReadImportFileRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ImportFileContent>, Status> {
-        self.not_implemented("read_import_file")
-    }
-
-    async fn delete_import_file(
-        &self,
-        _request: Request<sm_plugin_api::v1::DeleteImportFileRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::DeleteImportFileResponse>, Status> {
-        self.not_implemented("delete_import_file")
-    }
-
-    async fn stage_import_file(
-        &self,
-        _request: Request<sm_plugin_api::v1::StageImportFileRequest>,
-    ) -> Result<Response<StagedMedia>, Status> {
-        self.not_implemented("stage_import_file")
-    }
-
-    async fn finalize_import(
-        &self,
-        _request: Request<sm_plugin_api::v1::FinalizeImportRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::FinalizeImportResponse>, Status> {
-        self.not_implemented("finalize_import")
-    }
-
-    async fn abort_import(
-        &self,
-        _request: Request<sm_plugin_api::v1::AbortImportRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::AbortImportResponse>, Status> {
-        self.not_implemented("abort_import")
-    }
-
-    async fn delete_media(
-        &self,
-        _request: Request<sm_plugin_api::v1::DeleteMediaRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::DeleteMediaResponse>, Status> {
-        self.not_implemented("delete_media")
-    }
-
-    async fn compute_file_hash(
-        &self,
-        _request: Request<sm_plugin_api::v1::ComputeFileHashRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ComputeFileHashResponse>, Status> {
-        self.not_implemented("compute_file_hash")
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 
     // ── ⑩ plan_playback ──────────────────────────────────────────
@@ -321,7 +264,7 @@ impl StorageProvider for LocalRefProvider {
     async fn generate_thumbnails(
         &self,
         request: Request<GenerateThumbnailsRequest>,
-    ) -> Result<Response<Self::GenerateThumbnailsStream>, Status> {
+    ) -> Result<Response<BoxStream<'static, Result<ProgressEvent, Status>>>, Status> {
         let payload = request.into_inner();
         let library = payload
             .library
@@ -378,154 +321,7 @@ impl StorageProvider for LocalRefProvider {
             // 见报告 §4.3。
         });
 
-        Ok(Response::new(ReceiverStream::new(receiver)))
-    }
-
-    async fn create_clip(
-        &self,
-        _request: Request<sm_plugin_api::v1::CreateClipRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::CreateClipResponse>, Status> {
-        self.not_implemented("create_clip")
-    }
-
-    async fn probe_duration_seconds(
-        &self,
-        _request: Request<sm_plugin_api::v1::ProbeDurationRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ProbeDurationResponse>, Status> {
-        self.not_implemented("probe_duration_seconds")
-    }
-
-    async fn probe_resolution(
-        &self,
-        _request: Request<sm_plugin_api::v1::ProbeResolutionRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ProbeResolutionResponse>, Status> {
-        self.not_implemented("probe_resolution")
-    }
-
-    async fn probe_video_info(
-        &self,
-        _request: Request<sm_plugin_api::v1::ProbeVideoInfoRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ProbeVideoInfoResponse>, Status> {
-        self.not_implemented("probe_video_info")
-    }
-
-    async fn open_cover_source(
-        &self,
-        _request: Request<sm_plugin_api::v1::OpenCoverSourceRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::OpenCoverSourceResponse>, Status> {
-        self.not_implemented("open_cover_source")
-    }
-
-    async fn get_import_source_identity(
-        &self,
-        _request: Request<sm_plugin_api::v1::GetImportSourceIdentityRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::GetImportSourceIdentityResponse>, Status> {
-        self.not_implemented("get_import_source_identity")
-    }
-
-    async fn scan_media_refs(
-        &self,
-        _request: Request<sm_plugin_api::v1::ScanMediaRefsRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ScanMediaRefsResponse>, Status> {
-        self.not_implemented("scan_media_refs")
-    }
-
-    async fn scan_managed_media_ref_keys(
-        &self,
-        _request: Request<sm_plugin_api::v1::ScanManagedMediaRefKeysRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ScanManagedMediaRefKeysResponse>, Status> {
-        self.not_implemented("scan_managed_media_ref_keys")
-    }
-
-    async fn managed_media_ref_key(
-        &self,
-        _request: Request<sm_plugin_api::v1::ManagedMediaRefKeyRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::ManagedMediaRefKeyResponse>, Status> {
-        self.not_implemented("managed_media_ref_key")
-    }
-
-    async fn get_space_usage(
-        &self,
-        _request: Request<sm_plugin_api::v1::GetSpaceUsageRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::GetSpaceUsageResponse>, Status> {
-        self.not_implemented("get_space_usage")
-    }
-
-    async fn plan_merged_playback(
-        &self,
-        _request: Request<sm_plugin_api::v1::PlanMergedPlaybackRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::PlanMergedPlaybackResponse>, Status> {
-        self.not_implemented("plan_merged_playback")
-    }
-
-    async fn preflight_merged_playback(
-        &self,
-        _request: Request<sm_plugin_api::v1::PreflightMergedPlaybackRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::PreflightMergedPlaybackResponse>, Status> {
-        self.not_implemented("preflight_merged_playback")
-    }
-
-    async fn open_transfer_source(
-        &self,
-        _request: Request<sm_plugin_api::v1::OpenTransferSourceRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::OpenTransferSourceResponse>, Status> {
-        self.not_implemented("open_transfer_source")
-    }
-
-    async fn read_transfer_source(
-        &self,
-        _request: Request<Streaming<TransferReadRequest>>,
-    ) -> Result<Response<Self::ReadTransferSourceStream>, Status> {
-        self.not_implemented("read_transfer_source")
-    }
-
-    async fn assert_transfer_source_unchanged(
-        &self,
-        _request: Request<sm_plugin_api::v1::TransferAssertRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::TransferAssertResponse>, Status> {
-        self.not_implemented("assert_transfer_source_unchanged")
-    }
-
-    async fn close_transfer_source(
-        &self,
-        _request: Request<sm_plugin_api::v1::CloseTransferSourceRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::CloseTransferSourceResponse>, Status> {
-        self.not_implemented("close_transfer_source")
-    }
-
-    async fn cleanup_transfer_source(
-        &self,
-        _request: Request<sm_plugin_api::v1::CleanupTransferSourceRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::CleanupTransferSourceResponse>, Status> {
-        self.not_implemented("cleanup_transfer_source")
-    }
-
-    async fn stage_transfer(
-        &self,
-        _request: Request<sm_plugin_api::v1::StageTransferRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::StageTransferResponse>, Status> {
-        self.not_implemented("stage_transfer")
-    }
-
-    async fn finalize_transfer(
-        &self,
-        _request: Request<sm_plugin_api::v1::FinalizeTransferRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::FinalizeTransferResponse>, Status> {
-        self.not_implemented("finalize_transfer")
-    }
-
-    async fn abort_transfer(
-        &self,
-        _request: Request<sm_plugin_api::v1::AbortTransferRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::AbortTransferResponse>, Status> {
-        self.not_implemented("abort_transfer")
-    }
-
-    async fn prepare_library(
-        &self,
-        _request: Request<sm_plugin_api::v1::PrepareLibraryRequest>,
-    ) -> Result<Response<sm_plugin_api::v1::PrepareLibraryResponse>, Status> {
-        self.not_implemented("prepare_library")
+        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
 }
 

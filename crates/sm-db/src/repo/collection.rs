@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDateTime;
 use sqlx::PgPool;
 
 use crate::collections::{
@@ -52,6 +53,7 @@ use crate::error::DbError;
 use crate::paged_list;
 
 use super::ctx::Ctx;
+use super::movie::{safe_sql, RESOLUTION_LEVEL_CASE};
 
 /// 三个合集共用一个错误实体名 —— 它们在 API 层是同一种资源，
 /// 报错时说「Playlist」比说「ClipCollection」更贴近调用方的心智模型。
@@ -581,6 +583,44 @@ impl_paged!(
      ORDER BY name LIMIT $2 OFFSET $3"
 );
 
+impl ClipCollectionRepository {
+    /// 列出全部片段合集，按 `updated_at DESC, id DESC`。**刻意不分页。**
+    ///
+    /// # 为什么不复用宏给的 `list()`
+    ///
+    /// 两条都不可省：
+    ///
+    /// 1. **排序键不同。** 宏里的 `list()` 按 `name`（与唯一索引一致，利于分页
+    ///    稳定）；这里按 `updated_at DESC` —— 上游合集列表的顺序是「最近动过
+    ///    的在前」，而**增删成员都会 touch `updated_at`**。按 `name` 排会让
+    ///    「刚加过片段的合集」停在字母原处，与上游可见的顺序不符。
+    /// 2. **不分页。** 上游返回 `list[...]` 而非 `PageResponse` —— 合集数量是
+    ///    用户级的小数字，分页没有意义。
+    ///
+    /// # 为什么是独立 impl 而不是进宏
+    ///
+    /// `impl_paged!` 收的是**字面量 SQL 字符串**，没有表名元变量，所以这段
+    /// 没法用 `concat!` 拼表名。而 `MomentCollectionRepository` 不需要它
+    /// （时刻点合集没有列表端点），`PlaylistRepository` 也 already有自己的
+    /// `list_ordered`。
+    ///
+    /// # `updated_at` 可空，而 DESC 在 PostgreSQL 里是 NULLS FIRST
+    ///
+    /// 从未被 touch 过的合集会排到最前面。看着违反直觉，但**与上游一致**
+    /// —— 上游 `ClipCollection.updated_at.desc()` 落到 PG 上是同一串 SQL。
+    /// 刻意不补 `NULLS LAST`：合集顺序是客户端会缓存并做乐观更新的状态。
+    ///
+    /// `id DESC` 作次级键：同一毫秒内被 touch 的两个合集（`add_clip` 会连带
+    /// touch 父合集）`updated_at` 会并列，只按它排会让列表在两次刷新间抖动。
+    pub async fn list_ordered_by_recency(&self) -> Result<Vec<ClipCollection>, DbError> {
+        Ok(sqlx::query_as::<_, ClipCollection>(
+            "SELECT * FROM clip_collection ORDER BY updated_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+}
+
 // ================================================================ 成员表
 
 /// 生成两张「有序合集成员表」的仓储。
@@ -803,6 +843,59 @@ macro_rules! impl_ordered_member_repo {
                 .fetch_all(&self.pool)
                 .await?)
             }
+            /// 按播放顺序列出**若干个**合集的全部成员。**刻意不分页。**
+            ///
+            /// 与 [`Self::list_by_collection`] 的区别是**入参是复数**，因此
+            /// 上游那个「列表页要显示每个合集的成员数」可以一次查完 ——
+            /// 逐个合集调 `list_by_collection` 就是 N+1，而列表页要渲染
+            /// 全部合集。
+            ///
+            /// 不按 `position` 排序：跨合集时那个顺序没有意义，调用方要按
+            /// 合集分组后自己排。只按 `collection_id` 排，让分组是连续的。
+            pub async fn list_by_collections(
+                &self,
+                collection_ids: &[i32],
+            ) -> Result<Vec<$model>, DbError> {
+                // 与 `count_by_playlists` 同理：空输入直接返回，不发查询。
+                if collection_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Ok(sqlx::query_as::<_, $model>(concat!(
+                    "SELECT * FROM ",
+                    $table,
+                    " WHERE collection_id = ANY($1) ORDER BY collection_id",
+                ))
+                .bind(collection_ids)
+                .fetch_all(&self.pool)
+                .await?)
+            }
+
+            /// 下一个可用位置：`COALESCE(MAX(position), -1) + 1`。
+            ///
+            /// **空合集返回 0** —— 那个 `-1` 就是为了让首项从 0 开始。
+            ///
+            /// # 追加成员请用 [`Self::append`]，不要用这个
+            ///
+            /// `append` 把「算位置」与「插入」合成**一条** `INSERT ... SELECT`，
+            /// 所以两个并发 `append` 不会算出同一个位置。这里是两条语句，
+            /// 中间有窗口 —— 上游 `add_clip` 正是那个两步式（先查
+            /// `MAX(position)` 再插，包在事务里），而单条语句在并发下更紧。
+            ///
+            /// 那为什么还留着它：`position` 语义（空位不重排、因此不能用
+            /// `COUNT(*)`）需要一处可执行的说明，而 [`Self::append`] 的文档
+            /// 已经在讲它。
+            pub async fn next_position(&self, collection_id: i32) -> Result<i32, DbError> {
+                let next: Option<i32> = sqlx::query_scalar(concat!(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM ",
+                    $table,
+                    " WHERE collection_id = $1",
+                ))
+                .bind(collection_id)
+                .fetch_one(&self.pool)
+                .await?;
+                Ok(next.unwrap_or(0))
+            }
+
             /// 解绑一个成员。返回是否真的删掉了一行。
             ///
             /// **不重排**留下的 `position` 空位 —— 见宏的文档。
@@ -1061,6 +1154,115 @@ impl PlaylistRepository {
     }
 }
 
+// ================================================================ 影片卡片
+
+/// 列表影片卡片的排序键。
+///
+/// # 为什么是闭集枚举，而不是让调用方递字符串进来
+///
+/// 上游 `_build_playlist_sort` 把 `field:direction` 解析成 Peewee 表达式树，
+/// 其中两个字段是**相关子查询**。Rust 侧没有表达式树，`ORDER BY` 只能以片段
+/// 形式写死 —— 而一旦允许调用方递片段进来，那两段子查询就成了注入口。
+/// 枚举让「允许的排序键」与「能拼进 SQL 的东西」是同一份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistMovieCardSort {
+    /// `movie.heat`。**非空**，两个方向都不带 `NULLS` 修饰。
+    Heat,
+    /// `movie.release_date`。**可空**：上游把它列在
+    /// `PLAYLIST_NULLABLE_SORT_FIELDS` 里，所以排序列与次级排序都带
+    /// `NULLS LAST`。
+    ReleaseDate,
+    /// 相关子查询：该影片最近一次媒体入库时间。
+    ///
+    /// **不加 `NULLS LAST`**：上游没加，加了自己改口径（`ASC` 下 PG 默认空值
+    /// 在后、`DESC` 下空值在前，与上游一致）。所以没有媒体的影片在 `DESC`
+    /// 排序下会浮到最前，那是**契约的一部分**。
+    AddedAt,
+    /// 相关子查询：该影片**有效**媒体的最高码率，没有媒体或解析不出按 `0`。
+    ///
+    /// `0` 兜底而不是 NULL：上游刻意 `COALESCE(..., 0)`。改成 NULL 后
+    /// 「没有媒体」与「码率真的是 0」会分成两队，`DESC` 下前者全部浮到最前。
+    Bitrate,
+}
+
+/// 排序方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// 最近一次媒体入库时间（相关子查询）。
+const LATEST_MEDIA_SUBQUERY: &str = "(SELECT MAX(md.created_at) FROM media md \
+     WHERE md.movie_number = m.movie_number)";
+
+/// 有效媒体的最高码率（相关子查询）。
+///
+/// # `video_info` 是 TEXT 存 JSON
+///
+/// `::json` 遇到脏文本会**抛错**（`invalid input syntax for type json`），
+/// 这一点上游一样（`Media.video_info.cast("json")`）—— 空串被 `NULLIF` 摘掉，
+/// 但 `not json at all` 会让整个列表 500。刻意不对齐掉这个行为：脏值是
+/// probe 写坏的数据，应该被发现而不是被静默当成码率 0。
+const MAX_BITRATE_SUBQUERY: &str =
+    "(SELECT COALESCE(MAX(NULLIF(md.video_info::json->'video'->>'bit_rate', '')::bigint), 0) \
+     FROM media md WHERE md.movie_number = m.movie_number AND md.valid = TRUE)";
+
+/// 分辨率筛选片段：影片的**最高**档位落在 `[threshold, upper)`。
+///
+/// 对应上游 `movie_resolution_service.resolution_exists_expression`。
+/// 除 `$2` / `$3` 两个占位符外全是常量，所以进 SQL 是安全的。
+///
+/// # `md.resolution ~ '^\d+x\d+$'` 是必需的，不是保险
+///
+/// [`RESOLUTION_LEVEL_CASE`] 对它做 `split_part(...)::int`。没有这条正则，
+/// 一个脏值（空串、`1920*1080`、`HD`）就会让 `::int` 抛错 —— 整个列表 500，
+/// 而不是少算一部影片。
+fn resolution_exists_fragment(has_upper: bool) -> String {
+    let upper = if has_upper {
+        format!(" AND MAX({RESOLUTION_LEVEL_CASE}) < $3")
+    } else {
+        String::new()
+    };
+    format!(
+        " AND EXISTS (SELECT 1 FROM media md \
+          WHERE md.movie_number = m.movie_number AND md.valid = TRUE \
+            AND md.resolution ~ '^\\d+x\\d+$' \
+          GROUP BY md.movie_number \
+          HAVING MAX({RESOLUTION_LEVEL_CASE}) >= $2{upper})"
+    )
+}
+
+/// `ORDER BY` 片段。列名全部来自枚举，**没有用户输入**。
+///
+/// 次级排序一律 `movie.id` **同向**，对应上游 `build_ordered_expressions` 的
+/// `tie_breaker=Movie.id` —— 少了它，同一热度/同一发布日的影片在两次刷新之间
+/// 会抖动。`nullable` 字段的次级排序也带 `NULLS LAST`，与上游一致。
+///
+/// 缺省（`None`）走「列表关系最近触达倒序」，对应上游
+/// `[PlaylistMovie.updated_at.desc(), PlaylistMovie.id.desc()]`。
+fn card_order_by(sort: Option<(PlaylistMovieCardSort, SortDirection)>) -> String {
+    let (column, direction, nullable) = match sort {
+        None => return "ORDER BY pm.updated_at DESC, pm.id DESC".to_owned(),
+        Some((PlaylistMovieCardSort::Heat, direction)) => ("m.heat".to_owned(), direction, false),
+        Some((PlaylistMovieCardSort::ReleaseDate, direction)) => {
+            ("m.release_date".to_owned(), direction, true)
+        }
+        Some((PlaylistMovieCardSort::AddedAt, direction)) => {
+            (LATEST_MEDIA_SUBQUERY.to_owned(), direction, false)
+        }
+        Some((PlaylistMovieCardSort::Bitrate, direction)) => {
+            (MAX_BITRATE_SUBQUERY.to_owned(), direction, false)
+        }
+    };
+    let direction = match direction {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
+    };
+    let nulls = if nullable { " NULLS LAST" } else { "" };
+    format!("ORDER BY {column} {direction}{nulls}, m.id {direction}{nulls}")
+}
+
 impl PlaylistMovieRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -1169,6 +1371,96 @@ impl PlaylistMovieRepository {
             .into_iter()
             .map(|r| (r.playlist_id, r.member_count))
             .collect())
+    }
+
+    /// 列表内影片卡片的**总数**（已应用分辨率筛选）。
+    ///
+    /// 对应上游 `list_playlist_movies` 里那条 `total_query.count()`。
+    /// **总数与当页用同一个筛选口径** —— 否则「共 20 条」配上 5 条结果，
+    /// 客户端会一直翻页。
+    pub async fn count_movie_cards(
+        &self,
+        playlist_id: i32,
+        resolution: Option<(i32, Option<i32>)>,
+    ) -> Result<i64, DbError> {
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM playlist_movie pm JOIN movie m ON m.id = pm.movie_id \
+             WHERE pm.playlist_id = $1",
+        );
+        if let Some((_, upper)) = resolution {
+            sql.push_str(&resolution_exists_fragment(upper.is_some()));
+        }
+        let mut query = sqlx::query_scalar::<_, i64>(safe_sql(sql)).bind(playlist_id);
+        if let Some((threshold, upper)) = resolution {
+            query = query.bind(threshold);
+            if let Some(upper) = upper {
+                query = query.bind(upper);
+            }
+        }
+        Ok(query.fetch_one(&self.pool).await?)
+    }
+
+    /// 列表内影片卡片的一页：`(playlist_movie.id, playlist_movie.updated_at, movie.id)`。
+    ///
+    /// # 为什么返回三元组，而不是把整张卡片查出来
+    ///
+    /// 卡片要 20+ 个列，横跨 `movie` / `image` / `movie_series` / `media` 四张表。
+    /// 一次 JOIN 展开就只能用 20+ 个位置元组（`sm-db` 不新增投影结构体，理由见
+    /// `MovieResolutionLevelRow` 的文档），而**位置元组错位是静默的** ——
+    /// 相邻两个字段类型相同就换得过来，只有断言到具体值时才暴露。
+    ///
+    /// 所以这一层只回答「这一页是哪些影片、按什么顺序」，影片本体与图片、
+    /// 系列名由调用方用各自的 `find_by_ids` **批量**补齐：每页固定条数，
+    /// 不随页大小增长，也不随影片数增长。
+    ///
+    /// # `resolution` 是 `(threshold, upper)`
+    ///
+    /// `upper == None` 只有最高档（8K）会出现，此时 `EXISTS` 只有一个下界，
+    /// 占位符编号随之少一个 —— 所以 `LIMIT/OFFSET` 的编号是**按分支算出来的**，
+    /// 写死会在筛 8K 时把 `limit` 绑到 `upper` 的位子上（而两者都是整数，
+    /// 不会报类型错，只会筛出一个安静的错误结果）。
+    ///
+    /// # `pm.updated_at` 回到 `Option`
+    ///
+    /// DDL 里该列可空，而上游 DTO 把它声明成非空 `datetime`。解码成 `Option`
+    /// 让调用方决定怎么呈现（本仓库对同类情况的约定是空串），而不是在这里
+    /// 因为一行 NULL 让整页 500。
+    pub async fn list_movie_cards(
+        &self,
+        playlist_id: i32,
+        resolution: Option<(i32, Option<i32>)>,
+        sort: Option<(PlaylistMovieCardSort, SortDirection)>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(i32, Option<NaiveDateTime>, i32)>, DbError> {
+        let has_upper = matches!(resolution, Some((_, Some(_))));
+        let mut sql = String::from(
+            "SELECT pm.id AS link_id, pm.updated_at AS link_updated_at, m.id AS movie_id \
+             FROM playlist_movie pm JOIN movie m ON m.id = pm.movie_id \
+             WHERE pm.playlist_id = $1",
+        );
+        if resolution.is_some() {
+            sql.push_str(&resolution_exists_fragment(has_upper));
+        }
+        sql.push(' ');
+        sql.push_str(&card_order_by(sort));
+        sql.push_str(if has_upper {
+            " LIMIT $4 OFFSET $5"
+        } else if resolution.is_some() {
+            " LIMIT $3 OFFSET $4"
+        } else {
+            " LIMIT $2 OFFSET $3"
+        });
+
+        let mut query =
+            sqlx::query_as::<_, (i32, Option<NaiveDateTime>, i32)>(safe_sql(sql)).bind(playlist_id);
+        if let Some((threshold, upper)) = resolution {
+            query = query.bind(threshold);
+            if let Some(upper) = upper {
+                query = query.bind(upper);
+            }
+        }
+        Ok(query.bind(limit).bind(offset).fetch_all(&self.pool).await?)
     }
 }
 

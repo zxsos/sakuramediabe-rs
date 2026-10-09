@@ -11,6 +11,12 @@ tonic-prost = "0.14"
 prost = { workspace = true }
 prost-types = { workspace = true }
 protoc-bin-vendored = "3"
+# 默认实现层把流式 rpc 的关联类型固定为 `BoxStream`（见 src/provider.rs）。
+futures = { workspace = true }
+
+[dev-dependencies]
+# 默认实现层的单测要直接 await 生成的 server trait。
+tokio = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

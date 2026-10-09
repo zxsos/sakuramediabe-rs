@@ -48,12 +48,12 @@ SakuraMedia 后端的 Rust 重写实现。
 | 仓储层 | 40 张表的读写 | 40 张表 | **100% ✅** |
 | 服务 `service/` | 114 文件 / 25,174 行 | `collections` + `videos` + `system`(8/11) + `playback`(3/19) | **~19%** |
 | Schema `schema/` | 44 文件 | DTO 随端点落地（`sm-api::dto`） | 按需 |
-| API `api/` | 126 端点 | 17 个（auth 2 + config 2 + playlists 7 + status 4 + indexer-settings 2） | **~13%** |
+| API `api/` | 126 端点 | 65 个（auth 2 + config 2 + indexer-settings 3 + playlists 9 + status 4 + clip-collections 9 + media-clips 7 + actors 11 + downloads 1 + movies 11 + tags 3 + movie-subscriptions 3） | **~52%** |
 | 调度 `scheduler` | 19 个内建任务 | 16 个 cron 已注册（只入队） | **~84%** |
 | 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | 参考插件（4/37 rpc）+ 可行性实测 | **~3%** |
 
 > 逐域台账（已落规则 / 刻意不复刻 / 待核对项）见
-> [docs/service-progress.md](docs/service-progress.md)。**为什么只有 17 个端点**
+> [docs/service-progress.md](docs/service-progress.md)。**为什么只有 65 个端点**
 > 与「哪些端点在等哪个域」也记在那里 —— 百分比本身看不出这些。
 
 ## 零外部依赖
@@ -192,16 +192,19 @@ UTC 时 PG 写入/读出的 naive datetime 会整体偏移，且这种偏移不�
 | **8** | 插件 ABI：**参考插件已落地**（`plugin-ref-local`，4/37 rpc + 开销实测 + 4 条 P1 缺口）；宿主侧 `sm-plugin-api` 重生成与 `sm-plugins` 未做 | 进行中 |
 | **9** | `svc-probe`（ffprobe）与封面生成的有损 WebP 路径 | 待做 |
 
-`playlists` 域已落 7/9 个端点。剩下的 `GET /playlists/{id}/movies` 卡在
-**影片卡片聚合**（`with_movie_card_relations` / `attach_movie_list_media` /
-`MovieListItemResource`）—— 它与 `catalog` 域的影片列表端点是同一套东西，
-所以**刻意不单独做**，等 `catalog` 侧开工时一起落地。
+`playlists` 域 **9/9 个端点全部落地**。最后那个 `GET /playlists/{id}/movies`
+（影片卡片）先在这里落地，而不是等 `catalog` 侧 —— 它与 `catalog` 的影片列表
+是同一套东西，先把 `MovieListItemResource` + `with_movie_card_relations` 的
+等价实现定下来，`catalog` 侧直接复用同一组 DTO 与仓储查询，不必两边各写一份
+聚合。今天的实现是「一条分页查询定顺序 + 四条批量查询补影片/封面/系列/媒体」，
+而不是上游那条 20 多列的 JOIN。
 
 原先记在这里的「`playback` 的 `movie_resolution_service` 被 `collections`
 的 4 个列表端点引用，所以 `playback` 早于 `catalog`」这条约束**已解除**：
-`resolution_interval` / `resolution_level_expression` / 档位分桶已随
-`sm_service::catalog::resolution` 落地。剩下的 `movie_resolution_service`
-职责只有影片卡片的封面聚合，那属于 `catalog` 域自身。
+`resolution_interval` / 档位分桶已随 `sm_service::catalog::resolution` 落地，
+档位筛选的 `EXISTS` 子查询随影片卡片一起进了 `sm_db::repo::collection`
+（与 `max_resolution_levels_by_playlist` 共用同一份
+`RESOLUTION_LEVEL_CASE`）。
 
 `svc-hash` / `media-file-hash` 的 Python 侧接入（改
 `resource_hash.py` 调 Rust）仍按 ADR §6 的「独立进程 + Unix socket 或 FFI」

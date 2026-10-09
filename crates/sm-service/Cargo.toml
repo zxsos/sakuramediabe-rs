@@ -20,6 +20,8 @@ reqwest = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
 sqlx = { workspace = true }
+# Torznab 搜索响应是 XML。
+quick-xml = { workspace = true }
 
 [dev-dependencies]
 sm-db = { workspace = true }
@@ -28,3 +30,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bcrypt = { workspace = true }
 sqlx = { workspace = true }
+# Torznab 的 HTTP 路径用假 indexer 起真实回环服务测（ADR §6）。
+wiremock = "0.6"

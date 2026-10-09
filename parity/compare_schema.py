@@ -110,6 +110,10 @@ STR_RE = re.compile(r'"([^"]+)"')
 # 上游 Python 侧按定义就不存在对应模型。
 UNCHECKED_STRUCT_EXEMPT = frozenset(
     {
+        # 纯值对象：影片列表的筛选条件，只作为参数传给
+        # `list_movie_card_ids` / `count_movies`；没有 FromRow、不映射任何表。
+        # 单独立它是因为 15 个可选筛选位塞进位置元组无法阅读。
+        "MovieListFilter",
         # 仓储与网关：持有 PgPool，不映射任何表
         "MovieRepository",
         "MovieSeriesRepository",
@@ -126,6 +130,18 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # 纯值对象：领取范围（并发道），只作为 bind 参数传给
         # `claim_in`，没有 FromRow、不参与 query_as
         "TaskLanes",
+        # 纯值对象：片段列表的筛选条件，只作为参数传给 `list_filtered`；
+        # 没有 FromRow、不映射任何表
+        "ClipFilter",
+        # 纯值对象：演员列表的筛选条件 / 排序描述 / 动态 SET 构造器。
+        # 与上面的 `ClipFilter` 同一形状 —— 全部只作为参数传给
+        # `sm_db::repo::actor` 的方法，没有 FromRow、不参与 query_as、
+        # 不是任何表的列集合（`ActorListFilter` 是筛选条件子集，
+        # `ActorScope` 只有性别与订阅两个维度，`ActorUpdate` 是待写列的
+        # 构造器，列名来自 `WRITABLE_ACTOR_COLUMNS` 白名单）。
+        "ActorListFilter",
+        "ActorScope",
+        "ActorUpdate",
         # 仓储与网关：持有 PgPool / 会话，不映射任何表
         "StatsRepository",
         # 纯值对象：会话级 advisory lock 守卫，持有 PoolConnection

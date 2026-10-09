@@ -47,7 +47,9 @@ pub mod error;
 pub mod extract;
 pub mod middleware;
 pub mod query;
+pub mod range;
 pub mod routes;
+pub mod signing;
 pub mod sse;
 pub mod state;
 
@@ -64,11 +66,18 @@ use tower_http::cors::CorsLayer;
 /// 顺序决定了 fallback 是否也享受 CORS —— 上游 CORS 是全站生效的。
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(routes::actors::routes())
         .merge(routes::auth::routes())
+        .merge(routes::clip_collections::routes())
         .merge(routes::config::routes())
+        .merge(routes::downloads::routes())
         .merge(routes::indexer_settings::routes())
+        .merge(routes::media_clips::routes())
+        .merge(routes::movie_subscriptions::routes())
+        .merge(routes::movies::routes())
         .merge(routes::playlists::routes())
         .merge(routes::status::routes())
+        .merge(routes::tags::routes())
         .fallback(error::not_found)
         .layer(CorsLayer::permissive())
         .with_state(state)

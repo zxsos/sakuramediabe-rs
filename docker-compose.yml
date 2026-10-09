@@ -27,6 +27,24 @@ services:
       - postgres
       - -c
       - timezone=UTC
+      # `max_locks_per_transaction` 必须抬高，否则并发跑集成测试会**间歇性**失败。
+      #
+      # 锁表总容量 = max_locks_per_transaction x max_connections，而每个集成测试
+      # 建一个独立 schema 并对它跑一遍 40 张表的 DDL —— 那是 40 表 + ~70 索引 +
+      # ~50 外键 ≈ **200 个可锁关系**，且在 DDL 全程都被持有。
+      #
+      # 默认 64 x 100 = 6,400，于是**并发 DDL 会话上限约 32 个**。串行跑时每个
+      # 二进制内部最多 8 线程（约 1,600 锁），所以一直没撞上；一旦让多个测试
+      # 二进制并行，就会压到边界上，表现为偶发的
+      # `53200 out of shared memory`（提示 "You might need to increase
+      # max_locks_per_transaction"）—— 那种失败重跑就好，所以很容易被当成
+      # "环境抖动" 而放过。
+      #
+      # 1024 x 100 = 102,400，约为 32 会话上限的 16 倍余量。共享内存分配是
+      # 按需的（`max_locks_per_transaction * max_connections * 约 100 字节`），
+      # 抬高它不会预分配那么多。
+      - -c
+      - max_locks_per_transaction=1024
     ports:
       - "127.0.0.1:5433:5432"
     healthcheck:

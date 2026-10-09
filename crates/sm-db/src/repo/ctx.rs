@@ -396,3 +396,52 @@ impl UnitOfWork<'_> {
         })
     }
 }
+
+/// 结束一个事务：`outcome` 为 `Ok` 则提交，为 `Err` 则**显式回滚**。
+///
+/// # 为什么不能靠 `Transaction` 的 `Drop` 回滚
+///
+/// sqlx 的 `Drop` 只调用 `start_rollback`，而那只是把 `ROLLBACK` **排队**到
+/// 「这条连接下次被异步调用时」才执行（见 sqlx-core `transaction.rs` 的
+/// `impl Drop for Transaction`）。于是连接会以 `idle in transaction` 的状态
+/// 留在池里，并**继续持有事务期间取得的锁**。
+///
+/// 测试夹具的池是 `max_connections(1)`，而它的收尾用**另一条**连接执行
+/// `DROP SCHEMA ... CASCADE` —— 那条会一直等这把锁，表现为**用例挂住、永不
+/// 返回且没有任何错误信息**。生产池（`max_connections = 20`）里则是「锁被
+/// 多占一会儿」，更难定位。[`crate::repo::user::UserRefreshTokenRepository::rotate`]
+/// 的文档记录过这个坑；这个函数把它收敛成**唯一**写法。
+///
+/// # 用法
+///
+/// ```ignore
+/// let mut tx = pool.begin().await?;
+/// let outcome = async {
+///     let mut ctx = Ctx::in_tx(&mut tx, pool);
+///     do_work_in(&mut ctx).await
+/// }
+/// .await;
+/// let value = commit_or_rollback(tx, outcome).await?;
+/// ```
+///
+/// 关键是事务体放在 `async {}` 里 —— 里面的 `?` 只会从这个块退出，不会把
+/// 外层函数带着**未结束的事务**一起返回。
+pub async fn commit_or_rollback<T, E>(
+    tx: Transaction<'_, Postgres>,
+    outcome: Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<sqlx::Error>,
+{
+    match outcome {
+        Ok(value) => {
+            tx.commit().await.map_err(E::from)?;
+            Ok(value)
+        }
+        Err(err) => {
+            // 回滚失败不掩盖原本的业务错误 —— 后者才是调用方要处理的。
+            let _ = tx.rollback().await;
+            Err(err)
+        }
+    }
+}

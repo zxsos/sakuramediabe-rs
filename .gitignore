@@ -7,7 +7,13 @@ target/
 __pycache__/
 *.pyc
 
-upstream/
+# 上游 Python 源码。clone 下来只做对译时的参照，不入库。
+#
+# **不带尾部斜杠**：pattern 末尾的 `/` 只匹配**目录**，而 git worktree 里为了
+# 共享同一份上游源码（它是只读参照材料，共享不可能冲突）会建一个**符号链接**
+# —— git 视为文件，于是 `upstream/` 匹配不到，它会以 `?? upstream` 出现在
+# `git status` 里，并在下一次 `git add -A` 时被提交进去。
+upstream
 
 # 并行开发的 git worktree（各自独立分支 + 独立 target 目录）
 .worktrees/

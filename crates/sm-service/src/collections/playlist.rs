@@ -17,18 +17,35 @@
 //! 系统列表不可改 | `_require_custom_playlist` | 409 `playlist_managed_by_system` |
 //! 空更新被拒 | `update_playlist` | 422 `validation_error` |
 //!
-//! # 查询编排：已落地一部分
+//! # 查询编排：已全部落地
 //!
-//! 上述五条规则之外，两个**不依赖影片卡片聚合**的查询也已落地：
+//! 上述五条规则之外，三个查询也已落地：
 //!
 //! - [`PlaylistService::list`] —— 系统列表排序 + 批量成员计数。
 //! - [`PlaylistService::resolution_options`] —— 分辨率档位聚合。
+//! - [`PlaylistService::list_playlist_movies`] —— 列表内影片分页（影片卡片）。
 //!
-//! 剩下 `list_playlist_movies`（列表内影片分页）仍未落地：它要
-//! `with_movie_card_relations` 的封面/薄封面别名、`attach_movie_list_media`
-//! 的媒体挂载，以及 `PlaylistMovieListItemResource`（继承自
-//! `MovieListItemResource`）—— 后者属于影片卡片那一整套，与 `catalog` 域的
-//! 影片列表端点重合，等那一侧开工时一起做，避免两边各写一套聚合。
+//! ## 影片卡片怎么拼
+//!
+//! 上游 `list_playlist_movies` 是一条大 JOIN（`with_movie_card_relations` 追加
+//! 封面/薄封面/系列三个关联）+ `attach_movie_list_media` 挂媒体。Rust 侧拆成
+//! **固定的几条查询**，而不是一条 20+ 列的 JOIN：
+//!
+//! | 步 | 查询 | 产出 |
+//! |---|---|---|
+//! | 1 | `PlaylistMovieRepository::count_movie_cards` | `total` |
+//! | 2 | `PlaylistMovieRepository::list_movie_cards` | 当页 `(link_id, updated_at, movie_id)` |
+//! | 3 | `MovieRepository::find_by_ids` | 影片本体 |
+//! | 4 | `ImageRepository::find_by_ids` | 封面 + 薄封面（一条 `ANY` 查询） |
+//! | 5 | `MovieSeriesRepository::find_by_ids` | 系列名 |
+//! | 6 | `attach_movie_list_media` | `media_items` / `media_count` / `can_play` |
+//!
+//! 条数与页大小无关，也不随影片数增长 —— 3/4/5/6 全是批量。拆开的代价是
+//! 多几次往返，换来的是**不必用 20+ 个位置元组**在四张表之间对齐字段
+//! （那种错位是静默的，见 `sm_db::repo::collection::list_movie_cards` 的文档）。
+//!
+//! **顺序只由第 2 步的 SQL 决定**，后面几步都是按 id 补齐 —— 内存里再排一次
+//! 会让 `added_at` / `bitrate` 这两个子查询排序列直接失效。
 //!
 //! # 两处容易搞反的地方
 //!
@@ -47,16 +64,28 @@
 //! 一部已经在列表里的影片，**不会**把它挪到末尾。这一点与
 //! `moment_collection` / `clip_collection` 不同（那两个有 `position`）。
 
+use std::collections::HashMap;
+
+use chrono::NaiveDateTime;
+
+use sm_db::catalog::asset::Image;
+use sm_db::catalog::movie::Movie;
 use sm_db::collections::{
     Playlist, PLAYLIST_KIND_RECENTLY_PLAYED, RECENTLY_PLAYED_PLAYLIST_DESCRIPTION,
     RECENTLY_PLAYED_PLAYLIST_NAME,
 };
+use sm_db::common::Page;
 use sm_db::error::DbError;
-use sm_db::repo::{MovieRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository};
+use sm_db::repo::collection::{PlaylistMovieCardSort, SortDirection};
+use sm_db::repo::{
+    ImageRepository, MovieRepository, MovieSeriesRepository, NewCollection,
+    PlaylistMovieRepository, PlaylistRepository,
+};
 use sm_db::Db;
 
 use crate::catalog::resolution::{self, RESOLUTION_LEVELS};
 use crate::error::{details_of, ServiceError};
+use crate::playback::media_summary::{attach_movie_list_media, MovieMediaAttachment};
 
 /// 更新播放列表的请求。**两个字段都可缺省** —— 缺省表示不改动。
 #[derive(Debug, Clone, Default)]
@@ -90,6 +119,37 @@ pub struct ResolutionOption {
     pub count: i32,
 }
 
+/// 列表内的一张影片卡片。
+///
+/// 上游的 `PlaylistMovieListItemResource` 是 `MovieListItemResource`（23 个字段）
+/// 加上 `playlist_item_updated_at`。这里**不直接产出 DTO**：封面 `origin` 要签名，
+/// 而签名密钥属于 HTTP 层（`sm-api` 每次请求重读配置 —— 见 `sm_api::signing`）。
+/// 所以这一层交出原料，由调用方组装。
+///
+/// # 为什么把图与系列名一起带出来
+///
+/// 它们本来挂在 `Movie` 上（`cover_image_id` / `series_id`），但 DTO 要的是
+/// **签名后的 URL 与系列名**，而不是 id。放在这里而不是让调用方各自再查一次，
+/// 是为了让「一次请求几条查询」这件事在 service 里就定死。
+#[derive(Debug, Clone)]
+pub struct PlaylistMovieCard {
+    pub movie: Movie,
+    /// `movie.cover_image_id` 指向的图。没有封面、或图已被删时为 `None`。
+    pub cover_image: Option<Image>,
+    /// 薄封面。与封面是**两个独立**的 id，可能一个有一个没有。
+    pub thin_cover_image: Option<Image>,
+    /// `movie.series_id` 指向的系列名。不在系列里 / 系列被删时为 `None`。
+    pub series_name: Option<String>,
+    /// 媒体摘要与三个派生字段：`media_items` / `media_count` / `can_play`。
+    pub media: MovieMediaAttachment,
+    /// 列表关系上的最近触达时间。
+    ///
+    /// **可空** —— DDL 里 `playlist_movie.updated_at` 是 `timestamp NULL`，
+    /// 而上游 DTO 把它声明成非空 `datetime`。本仓库对同类情况的约定是
+    /// 序列化成空串（见 `sm_api::dto::PlaylistResource`）。
+    pub playlist_item_updated_at: Option<NaiveDateTime>,
+}
+
 /// 播放列表 service。
 ///
 /// 方法都是 `&self` 上的异步函数，持有仓储而不是用类方法 —— Rust 没有
@@ -98,6 +158,10 @@ pub struct PlaylistService {
     playlists: PlaylistRepository,
     members: PlaylistMovieRepository,
     movies: MovieRepository,
+    /// 影片卡片要的封面/薄封面。
+    images: ImageRepository,
+    /// 影片卡片要的系列名。
+    series: MovieSeriesRepository,
 }
 
 impl PlaylistService {
@@ -111,6 +175,8 @@ impl PlaylistService {
             playlists: PlaylistRepository::new(db.clone()),
             members: PlaylistMovieRepository::new(db.clone()),
             movies: MovieRepository::new(db.clone()),
+            images: ImageRepository::new(db.clone()),
+            series: MovieSeriesRepository::new(db.clone()),
         }
     }
 
@@ -292,6 +358,113 @@ impl PlaylistService {
                 })
             })
             .collect())
+    }
+
+    /// 列出播放列表内的影片（分页）。对应上游 `list_playlist_movies`。
+    ///
+    /// # 分页参数**刻意不校验**
+    ///
+    /// 上游这个端点的 `page` / `page_size` 是裸 `int`（没有 `ge` / `le`），
+    /// 起始位置算的是 `max(page - 1, 0) * page_size`。别的列表端点走
+    /// `validate_page`（`page_size` 上限 100），这里不走 —— 给 `page_size`
+    /// 加个上限是**行为变更**，而客户端已经在按「传多少给多少」用它。
+    ///
+    /// # 404 先于一切查询
+    ///
+    /// 列表不存在 → 404，且**在任何聚合查询之前**（与上游
+    /// `cls._require_playlist(playlist_id)` 的位置一致）。非法分辨率档位同理：
+    /// 上游注释写明是「避免非法值到查询层才炸出未预期错误」。
+    ///
+    /// # 顺序由 SQL 决定，补齐不得重排
+    ///
+    /// 第 2 步（[`PlaylistMovieRepository::list_movie_cards`]）已经排好序，
+    /// 后面几步只是按 id 补齐。在内存里再排一次会让 `added_at` / `bitrate`
+    /// 这两个**相关子查询**排序列直接失效（它们不在返回的字段里）。
+    pub async fn list_playlist_movies(
+        &self,
+        playlist_id: i32,
+        page: i64,
+        page_size: i64,
+        sort: Option<&str>,
+        resolution: Option<&str>,
+    ) -> Result<Page<PlaylistMovieCard>, ServiceError> {
+        self.require_playlist(playlist_id).await?;
+
+        // 档位 → `[threshold, upper)`。`None` = 不筛。
+        let interval = resolution::resolution_interval(resolution, "invalid_playlist_filter")?;
+        let filter = interval.map(|interval| (interval.threshold, interval.upper));
+        let sort_key = parse_playlist_sort(sort)?;
+
+        let total = self.members.count_movie_cards(playlist_id, filter).await?;
+        // `max(page - 1, 0)`：`page=0` 与负数都是第一页，与上游同一表达式。
+        let offset = (page - 1).max(0) * page_size;
+        let links = self
+            .members
+            .list_movie_cards(playlist_id, filter, sort_key, page_size, offset)
+            .await?;
+
+        let movie_ids: Vec<i32> = links.iter().map(|(_, _, movie_id)| *movie_id).collect();
+        let mut movies = self.movies.find_by_ids(&movie_ids).await?;
+
+        // 番号是「影片 ↔ 媒体」的连接键：`media.movie_number` 指向它，不是 id。
+        let numbers: Vec<String> = links
+            .iter()
+            .filter_map(|(_, _, movie_id)| movies.get(movie_id).map(|m| m.movie_number.clone()))
+            .collect();
+        let mut media = attach_movie_list_media(self.movies.pool(), &numbers).await?;
+
+        let images = self.load_card_images(&movies).await?;
+        let series = self.load_card_series(&movies).await?;
+
+        let mut items = Vec::with_capacity(links.len());
+        for (_, playlist_item_updated_at, movie_id) in links {
+            // 内连接保证影片存在（FK 也是）。真缺了只可能是并发删除 ——
+            // 跳过这一行而不是 panic：release 是 `panic = "abort"`，
+            // 一次竞态会带走整个进程，代价远大于少一行。
+            let Some(movie) = movies.remove(&movie_id) else {
+                continue;
+            };
+            items.push(PlaylistMovieCard {
+                cover_image: movie.cover_image_id.and_then(|id| images.get(&id).cloned()),
+                thin_cover_image: movie
+                    .thin_cover_image_id
+                    .and_then(|id| images.get(&id).cloned()),
+                series_name: movie
+                    .series_id
+                    .and_then(|id| series.get(&id).map(|row| row.name.clone())),
+                media: media.remove(&movie.movie_number).unwrap_or_default(),
+                playlist_item_updated_at,
+                movie,
+            });
+        }
+        Ok(Page::new(items, total))
+    }
+
+    /// 一次取回这一页影片用到的全部封面与薄封面。
+    ///
+    /// 两种图合成**一条** `ANY` 查询：分别查会多一次往返，而它们总是同批用到。
+    async fn load_card_images(
+        &self,
+        movies: &HashMap<i32, Movie>,
+    ) -> Result<HashMap<i32, Image>, ServiceError> {
+        let ids: Vec<i32> = movies
+            .values()
+            .flat_map(|movie| [movie.cover_image_id, movie.thin_cover_image_id])
+            .flatten()
+            .collect();
+        Ok(self.images.find_by_ids(&ids).await?)
+    }
+
+    /// 一次取回这一页影片用到的全部系列。
+    async fn load_card_series(
+        &self,
+        movies: &HashMap<i32, Movie>,
+    ) -> Result<HashMap<i32, sm_db::catalog::movie::MovieSeries>, ServiceError> {
+        let ids: Vec<i32> = movies
+            .values()
+            .filter_map(|movie| movie.series_id)
+            .collect();
+        Ok(self.series.find_by_ids(&ids).await?)
     }
 
     // ---------------------------------------------------------------- 写入
@@ -498,6 +671,59 @@ impl PlaylistService {
 /// `DbError::Business` 当成 422：业务错误在 service 层已经各自处理过了，
 /// 漏到这里的是「仓储认为不合法而 service 没拦住」的情形，那是服务端
 /// 问题而不是用户输入问题。
+/// 解析 `field:direction` 排序表达式。
+///
+/// `None` / 空串 = 不指定，仓储走「列表关系最近触达倒序」。非法值 422
+/// `invalid_playlist_filter`，`details.sort` 回显**原始输入**（不是归一后的
+/// 小写串）—— 客户端据此高亮它自己填的那个值。
+///
+/// # 为什么只认这四个字段
+///
+/// 上游的 `field_map` 就是这四个（`heat` / `release_date` / `added_at` /
+/// `bitrate`），其中后两个是相关子查询。多收一个写法不会让它工作，只会让
+/// 客户端以为它能用。
+fn parse_playlist_sort(
+    value: Option<&str>,
+) -> Result<Option<(PlaylistMovieCardSort, SortDirection)>, ServiceError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let (field, direction) = normalized
+        .split_once(':')
+        .ok_or_else(|| invalid_playlist_sort(raw))?;
+    let direction = match direction {
+        "asc" => SortDirection::Asc,
+        "desc" => SortDirection::Desc,
+        _ => return Err(invalid_playlist_sort(raw)),
+    };
+    let sort = match field {
+        "heat" => PlaylistMovieCardSort::Heat,
+        "release_date" => PlaylistMovieCardSort::ReleaseDate,
+        "added_at" => PlaylistMovieCardSort::AddedAt,
+        "bitrate" => PlaylistMovieCardSort::Bitrate,
+        _ => return Err(invalid_playlist_sort(raw)),
+    };
+    Ok(Some((sort, direction)))
+}
+
+/// 非法排序表达式。
+///
+/// **排序与分辨率筛选共用 `invalid_playlist_filter` 这个码** —— 上游
+/// `_build_playlist_sort` 与 `resolution_exists_expression` 拿到的是同一个
+/// `error_code`。客户端按 `details` 的键（`sort` / `resolution`）区分是哪个
+/// 参数错了。
+fn invalid_playlist_sort(raw: &str) -> ServiceError {
+    ServiceError::validation_with(
+        "invalid_playlist_filter",
+        "Invalid sort expression",
+        details_of("sort", raw),
+    )
+}
+
 impl From<DbError> for ServiceError {
     fn from(value: DbError) -> Self {
         Self {

@@ -31,7 +31,7 @@
 //!
 //! | 缺口 | 阻塞了什么 |
 //! |---|---|
-//! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写。`UnitOfWork::merge_actors` 也等它 |
+//! | [`crate::catalog::actor::Actor`] 的**字段主权网关**缺失 | [`actor::ActorRepository`] 已能读写，但 9 个受保护字段没有 `MovieOwnershipGateway` 那样的受控入口 —— 插件能绕过归属直接写 |
 //! | `Movie.subscription_search_*` 9 列无方法 | 这是**第二个重试状态机**（与 `download_task` 的双状态机同构），但既没有「列出到期任务」也没有「记录一次尝试」。注意 [`movie::MovieRepository::list_by_subscription_state`] 过滤的是 `is_subscribed`，与这 9 列无关 |
 //!
 //! # 全表覆盖之后，接下来不是加表
@@ -121,9 +121,10 @@
 //! 参与者用 `Ctx` 接入事务；方法成对提供（`insert` / `insert_in`），
 //! 共用一个私有实现，所以事务内外**不可能出现两套逻辑**。
 //!
-//! 仍缺的是演员合并 —— 它要搬运影片关联、合并别名、合并订阅、
-//! 填空受保护字段、搬运头像、打墓碑并压平链，共 6 步，
-//! 且需要 `Actor` 的字段主权网关先就位。
+//! 演员合并**不在这里**：它要搬运影片关联、合并别名、合并订阅、填空受保护
+//! 字段、搬运头像、打墓碑并压平链，共 6 步，且要产出 `invalid_actor_merge`
+//! 这类 service 层错误契约 —— 所以落在 `sm_service::catalog::actor_merge`，
+//! 自行 `pool.begin()` + `Ctx::in_tx` 编排本模块的 `_in` 方法。
 //!
 //! [`Actor`]: crate::catalog::actor::Actor
 //! [`MediaLibrary`]: crate::playback::media::MediaLibrary
@@ -158,6 +159,7 @@ pub mod recommendation;
 pub mod stats;
 pub mod submission;
 pub mod subtitle;
+pub mod tag_list;
 pub mod task;
 pub mod transfer;
 pub mod user;
@@ -170,7 +172,7 @@ pub use collection::{
     ClipCollectionItemRepository, ClipCollectionRepository, MomentCollectionItemRepository,
     MomentCollectionRepository, NewCollection, PlaylistMovieRepository, PlaylistRepository,
 };
-pub use ctx::{Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
+pub use ctx::{commit_or_rollback, Ctx, CtxConnection, GeneratedThumbnail, UnitOfWork};
 pub use discovery::{
     ImageSearchIndexStateRepository, ImageSearchSessionRepository, NewImageSearchSession,
     NewRankingItem, RankingItemRepository,
@@ -182,8 +184,8 @@ pub use library::{MediaLibraryRepository, NewMediaLibrary};
 pub use media::{MediaRepository, NewMedia};
 pub use movie::{MovieRepository, MovieSeriesRepository, NewMovie, SubscriptionState};
 pub use playback::{
-    MediaClipRepository, MediaPointRepository, MediaProgressRepository, MediaThumbnailRepository,
-    NewMediaClip,
+    ClipFilter, MediaClipRepository, MediaPointRepository, MediaProgressRepository,
+    MediaThumbnailRepository, NewMediaClip,
 };
 pub use recommendation::{
     DailyRecommendationItemRepository, MomentRecommendationRepository, NewDailyRecommendation,

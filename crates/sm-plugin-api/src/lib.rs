@@ -19,6 +19,13 @@ pub mod v1 {
     tonic::include_proto!("sakuramedia.v1");
 }
 
+/// 插件侧默认实现层：把生成的 trait 的 37 个方法都变成有默认体的。
+///
+/// 见 [`provider`] 的模块文档（gRPC 报告的 P1-4）。
+pub mod provider;
+
+pub use provider::{DownloadProviderExt, StorageProviderExt};
+
 /// 契约包名，供代码生成与文档引用。
 pub const PACKAGE: &str = "sakuramedia.v1";
 

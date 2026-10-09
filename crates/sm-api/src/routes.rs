@@ -4,11 +4,18 @@ use axum::http::StatusCode;
 
 use crate::error::ErrorResponse;
 
+pub mod actors;
 pub mod auth;
+pub mod clip_collections;
 pub mod config;
+pub mod downloads;
 pub mod indexer_settings;
+pub mod media_clips;
+pub mod movie_subscriptions;
+pub mod movies;
 pub mod playlists;
 pub mod status;
+pub mod tags;
 
 /// 路径命中但方法不匹配 → 405 `http_error`。
 ///

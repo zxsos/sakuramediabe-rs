@@ -23,7 +23,14 @@
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sm_db::collections::Playlist;
+use sm_service::catalog::actor::{
+    ActorFilterOptions, ActorFilterRange, ActorTag, ActorView, ActorYear,
+};
+use sm_service::catalog::movie::MovieCard;
+use sm_service::collections::playlist::PlaylistMovieCard;
+use sm_service::playback::media_summary::{MediaSummary, MovieMediaAttachment};
 
 /// 播放列表响应体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +218,590 @@ impl ConfigUpdateResource {
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect(),
+        }
+    }
+}
+
+/// 图片资源（上游 `ImageResource`）。
+///
+/// # `origin` 必须是签名后的 URL
+///
+/// 上游用 pydantic 的 `field_validator` 在序列化前改写 `origin`。这里把签名
+/// 放在 API 层而不是 `Serialize` 实现里，因为签名要密钥，而密钥是运行时配置
+/// —— 序列化时拿不到。代价是每个构造 `ImageResource` 的地方都要记得调
+/// [`sign_image_origin`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageResource {
+    pub id: i32,
+    /// 签名后的 `/files/images/...` URL，或空串。
+    pub origin: String,
+}
+
+/// 把图片相对路径换成签名 URL，逐条对应上游的 `sign_image_path` validator。
+///
+/// - 空串 / 全空白 -> 原样返回（上游 `if not value`）；
+/// - 已以 `/files/images/` 开头 -> 原样返回。**再签一次会得到一个指向不存在
+///   资源的 URL**，因为签名串会被当成路径的一部分；
+/// - 否则签名。
+///
+/// 签名失败返回原值而非报错：上游的 validator 抛错会让整个响应 500，而一张图
+/// 签不了名不该让整个列表拿不到。
+pub fn sign_image_origin(secret: &str, origin: &str, now_seconds: i64) -> String {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed.starts_with("/files/images/") {
+        return trimmed.to_owned();
+    }
+    sm_core::signing::build_signed_image_url(secret, trimmed, now_seconds)
+        .unwrap_or_else(|_| trimmed.to_owned())
+}
+
+/// 片段所属合集的摘要（上游 `ClipCollectionSummary`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipCollectionSummary {
+    pub id: i32,
+    pub name: String,
+}
+
+/// 片段资源（上游 `MediaClipResource`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaClipResource {
+    /// 上游字段名是 `clip_id` 而非 `id` —— 与缩略图接口一致，客户端按它跳转。
+    pub clip_id: i32,
+    /// 来源 Media。**孤立片段为 `null`**（来源被删，外键 SET NULL）。
+    pub media_id: Option<i32>,
+    pub movie_number: Option<String>,
+    pub start_offset_seconds: i32,
+    pub end_offset_seconds: i32,
+    pub title: String,
+    pub duration_seconds: i32,
+    pub file_size_bytes: i64,
+    /// 区间首帧封面。孤立片段或该帧无缩略图时为 `null`。
+    pub cover_image: Option<ImageResource>,
+    /// 带签名的流播放 URL。
+    pub stream_url: String,
+    /// 上游非可空（`clip: datetime`）而 DB 列可空 —— `None` 时输出空串，
+    /// 与本文件其余 DTO 的时间戳处理一致。
+    pub created_at: String,
+}
+
+/// 片段详情（上游 `MediaClipDetailResource`）。`base` 会被摊平进 JSON，
+/// 所以响应体的键与列表项**完全一致**，再加两个数组。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaClipDetailResource {
+    #[serde(flatten)]
+    pub base: MediaClipResource,
+    /// 区间内所有帧，供前端循环播放成动态预览。
+    pub preview_frames: Vec<ImageResource>,
+    /// 该片段所属的合集，供「加入合集」选择器回显已勾选项。
+    pub collections: Vec<ClipCollectionSummary>,
+}
+
+/// 片段区间内的一个缩略图（上游 `MediaClipThumbnailResource`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaClipThumbnailResource {
+    pub clip_id: i32,
+    /// 源媒体缩略图 id，与 `/media/{id}/thumbnails` 语义一致。
+    pub thumbnail_id: i32,
+    /// **相对片段起点**的秒数，供进度条定位跳转。
+    pub offset_seconds: i32,
+    pub image: ImageResource,
+}
+
+/// `PATCH /media-clips/{id}` 的请求体。
+///
+/// `title` **必填且允许空串** —— 上游是 `title: str`（无默认值），而「清空
+/// 标题」是合法的编辑动作，所以不能加 `#[serde(default)]`：那会让缺字段的
+/// 请求体变成「清空标题」，而上游会 422。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaClipUpdateRequest {
+    pub title: String,
+}
+
+// ------------------------------------------------------------- 片段合集
+
+/// `POST /clip-collections` 的请求体（上游 `ClipCollectionCreateRequest`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClipCollectionCreateRequest {
+    /// 上游是 `Field(min_length=1)` + validator 双重保证：长度 0 在 pydantic
+    /// 层被拒，全空白在 validator 层被拒。落到这里是 service 的同一个判据。
+    pub name: String,
+    /// 上游默认空串，**不是** `Option`。
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `PATCH /clip-collections/{id}` 的请求体。
+///
+/// # 显式 `null` 与「不给出」在这里是同一件事 —— 刻意的偏离
+///
+/// 上游是 `name: str | None = None`，validator 对 `None` 直接返回 `None`，
+/// 而 `update_collection` 用 `model_dump(exclude_unset=True)` —— 于是
+/// `{"name": null}` 会得到 `update_data["name"] = None`，紧接着
+/// `_normalize_name(None)` 调 `.strip()` 抛 `AttributeError`，**整个请求 500**。
+///
+/// Rust 的 `Option<String>` 天然把「不给出」与「给出 null」都收成 `None`，
+/// 所以这里两者等价：显式 `null` 等于「不改这一列」。这与客户端的意图一致，
+/// 也避开了那个 500。要「清空描述」请给 `""` 而不是 `null`。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClipCollectionUpdateRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `Some("")` 清空描述；`None` 或不给出 = 不改。
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// `PUT /clip-collections/{id}/clips` 的请求体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClipCollectionSetClipsRequest {
+    /// 目标有序列表。**重复 id 会被去重，以首次出现的位置为准。**
+    pub clip_ids: Vec<i32>,
+}
+
+/// 合集资源（上游 `ClipCollectionResource`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipCollectionResource {
+    pub id: i32,
+    pub name: String,
+    /// 上游默认空串，DB 也是 NOT NULL —— 不会是 `null`。
+    pub description: String,
+    /// **只数产物有效的成员。** 客户端按它决定要不要显示数字。
+    pub clip_count: i32,
+    /// 第一个**有效**成员的封面；无有效成员或该成员是孤立片段时为 `null`。
+    pub cover_image: Option<ImageResource>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 合集里的一个成员（上游 `ClipCollectionClipItemResource`）。
+///
+/// 继承列表项的全部字段再加 `position`，所以响应体的键与片段列表项**完全
+/// 一致**，末尾多一个 `position`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipCollectionClipItemResource {
+    #[serde(flatten)]
+    pub base: MediaClipResource,
+    /// 显式 `position` 维护的播放顺序。
+    pub position: i32,
+}
+
+// ---------------------------------------------------------------- 演员目录
+
+/// naive UTC 时间戳 → 上游 Pydantic 的 `datetime` 字面量形状；缺失时 `null`。
+///
+/// 与 `format_timestamp` 的区别：后者给**非可空**字段用（缺失输出空串），
+/// 这里给可空字段用（缺失输出 `null`）。两个形状不能混：客户端对
+/// `birthday` / `subscribed_at` 判 `null`，对 `created_at` 判空串。
+fn format_optional_timestamp(value: Option<NaiveDateTime>) -> Option<String> {
+    value.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+/// 演员列表项（上游 `ActorResource`，`src/schema/catalog/actors.py:36-52`）。
+///
+/// 比 [`ActorDetailResource`] 少 7 个字段（`gender` / `birthplace` /
+/// `blood_type` / `display_name_override` / `has_profile_image_override` /
+/// `mutation_revision` / `manual_fields`）—— 上游列表页不需要这些，多带了
+/// 只是徒增响应体。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorResource {
+    pub id: i32,
+    pub javdb_id: String,
+    pub name: String,
+    /// 别名，`"主名 / 别名"` 形式。
+    pub alias_name: String,
+    /// 展示名：本地覆盖优先，否则 `name`。
+    pub display_name: String,
+    /// 生效头像（覆盖优先）。无头像时 `null`。
+    pub profile_image: Option<ImageResource>,
+    pub is_subscribed: bool,
+    /// 订阅时间；未订阅时 `null`。
+    pub subscribed_at: Option<String>,
+    /// 关联影片数（实时按 `movie_actor` 数）。
+    pub movie_count: i64,
+    /// 周岁；`birthday` 为空时 `null`。
+    pub age: Option<i32>,
+    /// `YYYY-MM-DD`；为空时 `null`。
+    pub birthday: Option<String>,
+    pub height_cm: Option<i32>,
+    pub bust_cm: Option<i32>,
+    pub waist_cm: Option<i32>,
+    pub hips_cm: Option<i32>,
+    pub cup: Option<String>,
+}
+
+/// 演员详情（上游 `ActorDetailResource`）。
+///
+/// `#[serde(flatten)]` 让响应体的键与列表项**完全一致**，末尾多 7 个详情字段
+/// —— 与上游 `ActorDetailResource(ActorResource)` 的继承语义一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorDetailResource {
+    #[serde(flatten)]
+    pub base: ActorResource,
+    /// 1 = 女、2 = 男、0 = 未知。
+    pub gender: i32,
+    pub birthplace: Option<String>,
+    pub blood_type: Option<String>,
+    pub display_name_override: Option<String>,
+    pub has_profile_image_override: bool,
+    pub mutation_revision: i64,
+    /// 归属为 `host:manual` 的字段名，升序。
+    pub manual_fields: Vec<String>,
+}
+
+/// 一位演员的共享字段 → 列表项。
+fn actor_base(view: &ActorView, secret: &str, now: i64) -> ActorResource {
+    let actor = &view.actor;
+    ActorResource {
+        id: actor.id,
+        javdb_id: actor.javdb_id.clone(),
+        name: actor.name.clone(),
+        alias_name: actor.alias_name.clone(),
+        display_name: actor.display_name().to_owned(),
+        profile_image: view.image_id.map(|id| ImageResource {
+            id,
+            origin: sign_image_origin(
+                secret,
+                view.image_origin.as_deref().unwrap_or_default(),
+                now,
+            ),
+        }),
+        is_subscribed: actor.is_subscribed,
+        subscribed_at: format_optional_timestamp(actor.subscribed_at),
+        movie_count: view.movie_count,
+        age: view.age,
+        birthday: actor
+            .birthday
+            .map(|date| date.format("%Y-%m-%d").to_string()),
+        height_cm: actor.height_cm,
+        bust_cm: actor.bust_cm,
+        waist_cm: actor.waist_cm,
+        hips_cm: actor.hips_cm,
+        cup: actor.cup.clone(),
+    }
+}
+
+impl ActorResource {
+    /// 从 service 的投影构造列表项。
+    ///
+    /// 需要 `secret` 是因为头像 `origin` 必须签名后才能给客户端 —— 与
+    /// [`sign_image_origin`] 同一个理由。
+    pub fn from_view(view: &ActorView, secret: &str, now: i64) -> Self {
+        actor_base(view, secret, now)
+    }
+}
+
+impl ActorDetailResource {
+    /// 从 service 的投影构造详情。
+    pub fn from_view(view: &ActorView, secret: &str, now: i64) -> Self {
+        let actor = &view.actor;
+        Self {
+            base: actor_base(view, secret, now),
+            gender: actor.gender,
+            birthplace: actor.birthplace.clone(),
+            blood_type: actor.blood_type.clone(),
+            display_name_override: actor.display_name_override.clone(),
+            has_profile_image_override: actor.has_profile_image_override(),
+            mutation_revision: actor.mutation_revision,
+            manual_fields: view.manual_fields.clone(),
+        }
+    }
+}
+
+/// 筛选项里的一个区间（上游 `ActorFilterRangeResource`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorFilterRangeResource {
+    pub min: Option<i32>,
+    pub max: Option<i32>,
+    /// 该区间里**有值**的演员数（`COUNT(col)`，不是 `COUNT(*)`）。
+    pub populated_count: i64,
+}
+
+/// 罩杯筛选项（上游 `ActorCupFilterOption`）。
+///
+/// 字段名是 `value` 而不是 `cup` —— 客户端按 `value` 读。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorCupFilterOption {
+    pub value: String,
+    pub count: i64,
+}
+
+/// `GET /actors/filter-options` 的结果（上游 `ActorFilterOptionsResource`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorFilterOptionsResource {
+    pub actor_count: i64,
+    /// `YYYY-MM-DD`，客户端据此显示「截至某日」。
+    pub as_of_date: String,
+    pub age: ActorFilterRangeResource,
+    pub height_cm: ActorFilterRangeResource,
+    pub cups: Vec<ActorCupFilterOption>,
+}
+
+impl From<ActorFilterRange> for ActorFilterRangeResource {
+    fn from(value: ActorFilterRange) -> Self {
+        Self {
+            min: value.min,
+            max: value.max,
+            populated_count: value.populated_count,
+        }
+    }
+}
+
+impl From<ActorFilterOptions> for ActorFilterOptionsResource {
+    fn from(value: ActorFilterOptions) -> Self {
+        Self {
+            actor_count: value.actor_count,
+            as_of_date: value.as_of_date.format("%Y-%m-%d").to_string(),
+            age: value.age.into(),
+            height_cm: value.height_cm.into(),
+            cups: value
+                .cups
+                .into_iter()
+                .map(|(value, count)| ActorCupFilterOption { value, count })
+                .collect(),
+        }
+    }
+}
+
+/// 标签资源（上游 `src/schema/catalog/movies.py:102` 的 `TagResource`）。
+///
+/// 主键叫 `tag_id` 而不是 `id` —— 与片段资源里的 `clip_id` 同一种约定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagResource {
+    pub tag_id: i32,
+    pub name: String,
+}
+
+impl From<ActorTag> for TagResource {
+    fn from(value: ActorTag) -> Self {
+        Self {
+            tag_id: value.tag_id,
+            name: value.name,
+        }
+    }
+}
+
+/// `POST /actors/{id}/merge` 的请求体（上游 `ActorMergeRequest`）。
+///
+/// 上游是 `source_actor_ids: list[int] = Field(min_length=1)` + 正整数校验；
+/// 落到本层的是原始 `Vec<i32>`，「非空 / 正整数」在 handler 里判 —— 那是
+/// pydantic 的职责，serde 不表达 `min_length`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorMergeRequest {
+    /// 待归并到目标名下的来源演员 id。
+    pub source_actor_ids: Vec<i32>,
+}
+
+/// 年份分布（上游 `YearResource`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YearResource {
+    pub year: i32,
+    pub movie_count: i64,
+}
+
+impl From<ActorYear> for YearResource {
+    fn from(value: ActorYear) -> Self {
+        Self {
+            year: value.year,
+            movie_count: value.movie_count,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 影片卡片
+
+/// 一条媒体摘要（上游 `MediaSummaryResource`，`src/schema/common/media.py`）。
+///
+/// 主键字段叫 `media_id` 而不是 `id` —— 上游是 `validation_alias="id"`，
+/// 与片段资源的 `clip_id`、标签资源的 `tag_id` 同一种约定：**客户端按业务名读**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaSummaryResource {
+    pub media_id: i32,
+    /// 所属库。**`null` 只在左连接未命中时出现**，而 `media_library_id_fk` 是
+    /// `ON DELETE CASCADE`，所以实践里恒有值；保留可空是为了与上游 DTO 一致。
+    pub library_id: Option<i32>,
+    pub library_name: Option<String>,
+    /// 客户端据此决定用哪个 provider 的播放/下载能力。
+    pub provider_key: Option<String>,
+    pub file_name: String,
+    pub resolution: Option<String>,
+    pub file_size_bytes: i64,
+    pub duration_seconds: i32,
+    /// probe 写入的视频参数，**对象**而不是字符串。
+    ///
+    /// 库里是 TEXT 存 JSON，上游 `JsonTextField` 在读取时就解码成 `dict`，
+    /// 所以契约要求这里是对象。解码失败（脏文本 / 空串）时给 `null` ——
+    /// 上游在那个情况下会 500，而**摘要的用途是渲染列表**，一个坏值不该让
+    /// 整个列表拿不到（同一个理由写在 `sm_service::playback::media_summary`）。
+    pub video_info: Option<Value>,
+    pub valid: bool,
+}
+
+impl From<&MediaSummary> for MediaSummaryResource {
+    fn from(value: &MediaSummary) -> Self {
+        Self {
+            media_id: value.media_id,
+            library_id: value.library_id,
+            library_name: value.library_name.clone(),
+            provider_key: value.provider_key.clone(),
+            file_name: value.file_name.clone(),
+            resolution: value.resolution.clone(),
+            file_size_bytes: value.file_size_bytes,
+            duration_seconds: value.duration_seconds,
+            video_info: value
+                .video_info
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok()),
+            valid: value.valid,
+        }
+    }
+}
+
+/// 影片卡片（上游 `MovieListItemResource`）。
+///
+/// 字段集合照抄上游，共 23 个 —— **多一个少一个都是契约变更**。
+///
+/// # `can_play` / `media_count` / `media_items` 三个是派生字段
+///
+/// 上游挂在 `Movie` 实例上（`attach_movie_list_media`），Rust 侧装在
+/// [`PlaylistMovieCard::media`] 里。注意 `can_play` 是「**至少一条**有效媒体」，
+/// 不是「全部有效」也不是「有媒体」。
+///
+/// # `is_collection` / `is_subscribed` / `is_blacklisted` 取自 `movie` 表
+///
+/// 前两个由导入流程维护，`is_blacklisted` 由黑名单动作维护 —— 都不是这里算的。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MovieListItemResource {
+    /// 影片主键。番号才是对外主标识，但统一 action 协议收的是整数 id。
+    pub id: i32,
+    pub javdb_id: Option<String>,
+    /// 元数据来源记录（JSONB）。**原样透传**，不做字段级校验。
+    pub metadata_source: Option<Value>,
+    pub movie_number: String,
+    pub title: String,
+    pub series_id: Option<i32>,
+    pub series_name: Option<String>,
+    pub cover_image: Option<ImageResource>,
+    pub thin_cover_image: Option<ImageResource>,
+    /// `YYYY-MM-DD`；没有发布日期时 `null`（上游 validator 把空串也归成 `null`）。
+    pub release_date: Option<String>,
+    pub duration_minutes: i32,
+    pub score: f64,
+    pub watched_count: i32,
+    pub want_watch_count: i32,
+    pub comment_count: i32,
+    pub score_number: i32,
+    pub heat: i32,
+    pub is_collection: bool,
+    pub is_subscribed: bool,
+    pub is_blacklisted: bool,
+    pub can_play: bool,
+    pub media_count: i64,
+    pub media_items: Vec<MediaSummaryResource>,
+}
+
+/// 影片卡片 23 个字段的**唯一**映射实现。
+///
+/// 播放列表卡片与影片列表卡片都走这里。抄成两份的话，将来加一个字段就会漏掉
+/// 一个端点 —— 而漏掉的字段在 JSON 里只是**少一个键**，客户端反序列化拿到
+/// null，不报错。
+fn movie_list_item(
+    movie: &sm_db::catalog::movie::Movie,
+    cover_image: Option<&sm_db::catalog::asset::Image>,
+    thin_cover_image: Option<&sm_db::catalog::asset::Image>,
+    series_name: Option<&str>,
+    media: &MovieMediaAttachment,
+    secret: &str,
+    now: i64,
+) -> MovieListItemResource {
+    let signed = |image: &sm_db::catalog::asset::Image| ImageResource {
+        id: image.id,
+        origin: sign_image_origin(secret, &image.origin, now),
+    };
+    MovieListItemResource {
+        id: movie.id,
+        javdb_id: movie.javdb_id.clone(),
+        metadata_source: movie.metadata_source.clone(),
+        movie_number: movie.movie_number.clone(),
+        title: movie.title.clone(),
+        series_id: movie.series_id,
+        series_name: series_name.map(str::to_owned),
+        cover_image: cover_image.map(signed),
+        thin_cover_image: thin_cover_image.map(signed),
+        release_date: movie
+            .release_date
+            .map(|value| value.format("%Y-%m-%d").to_string()),
+        duration_minutes: movie.duration_minutes,
+        score: movie.score,
+        watched_count: movie.watched_count,
+        want_watch_count: movie.want_watch_count,
+        comment_count: movie.comment_count,
+        score_number: movie.score_number,
+        heat: movie.heat,
+        is_collection: movie.is_collection,
+        is_subscribed: movie.is_subscribed,
+        is_blacklisted: movie.is_blacklisted,
+        can_play: media.can_play,
+        media_count: media.media_count,
+        media_items: media.media_items.iter().map(Into::into).collect(),
+    }
+}
+
+impl MovieListItemResource {
+    /// 从播放列表卡片组装（`GET /playlists/{id}/movies`）。
+    ///
+    /// `secret` / `now` 用于给封面签名 —— 与 [`ActorResource`] 同一个理由：
+    /// 签名要运行时密钥，序列化时拿不到。
+    pub fn from_card(card: &PlaylistMovieCard, secret: &str, now: i64) -> Self {
+        movie_list_item(
+            &card.movie,
+            card.cover_image.as_ref(),
+            card.thin_cover_image.as_ref(),
+            card.series_name.as_deref(),
+            &card.media,
+            secret,
+            now,
+        )
+    }
+
+    /// 从影片卡片组装（`GET /movies*`）。与
+    /// [`MovieListItemResource::from_card`] 共用同一份字段映射。
+    pub fn from_movie_card(card: &MovieCard, secret: &str, now: i64) -> Self {
+        movie_list_item(
+            &card.movie,
+            card.cover_image.as_ref(),
+            card.thin_cover_image.as_ref(),
+            card.series_name.as_deref(),
+            &card.media,
+            secret,
+            now,
+        )
+    }
+}
+
+/// 播放列表内的影片卡片（上游 `PlaylistMovieListItemResource`）。
+///
+/// `#[serde(flatten)]` 让响应体的键与 [`MovieListItemResource`] **完全一致**，
+/// 末尾多一个 `playlist_item_updated_at` —— 与上游的继承语义一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaylistMovieListItemResource {
+    #[serde(flatten)]
+    pub base: MovieListItemResource,
+    /// 列表关系上的最近触达时间。
+    ///
+    /// 上游声明成非空 `datetime`，而 DDL 里 `playlist_movie.updated_at` 可空 ——
+    /// 本仓库对同类情况的约定是空串（见 [`PlaylistResource`] 的 `created_at`）。
+    pub playlist_item_updated_at: String,
+}
+
+impl PlaylistMovieListItemResource {
+    /// 从 service 的卡片投影组装。
+    ///
+    /// 时间戳的格式化留在这里而不是让调用方自己 `format!`：
+    /// `format_timestamp` 是本模块对「可空 → 空串」这条约定的唯一实现。
+    pub fn from_card(card: &PlaylistMovieCard, secret: &str, now: i64) -> Self {
+        Self {
+            base: MovieListItemResource::from_card(card, secret, now),
+            playlist_item_updated_at: format_timestamp(card.playlist_item_updated_at),
         }
     }
 }

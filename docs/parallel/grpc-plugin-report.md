@@ -174,6 +174,15 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
   另一个方向：把 32 个 rpc 拆成几个更小的 service（必需 / 可选 / 转存 / 合并播放），
   让插件按需实现 —— 代价是宿主要管理多条 service，值得单独开一次讨论。
 
+- **已落地（SMA）**：`sm_plugin_api::provider::StorageProviderExt` /
+  `DownloadProviderExt` —— 37 个方法全部有默认体（返回
+  `Status::unimplemented`），空白实现把它们接到生成的 trait 上。3 个流式
+  关联类型固定为 `BoxStream<'static, Result<…, Status>>`（关联类型在 stable
+  上不能有默认值），插件的流式方法返回一个 boxed stream 即可。
+  `plugin-ref-local` 已迁移：**删除约 170 行纯 stub**，`impl` 里只剩那 4 个
+  真实方法。选「适配层」而不是「拆 service」，理由是不必改 proto、宿主也不必
+  管理多条 service 的注册与版本。
+
 ### P2-5 · 不透明 `Struct` 的 schema 无处宣告
 
 - 位置：`LibraryHandle.provider_config`、`MediaHandle.storage_ref`、
@@ -244,7 +253,9 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
 
 - [ ] 就 P1-1 / P1-2 / P1-3 三个缺口做一次决策（改 proto or 写文档约定），
       结论出来后 `sm-plugin-api` 重生成
-- [ ] 在 `sm-plugin-api` 里引入默认实现层，消灭 P1-4 的税
+- [x] 在 `sm-plugin-api` 里引入默认实现层，消灭 P1-4 的税
+      —— 见 `provider::StorageProviderExt` / `DownloadProviderExt`，
+      `plugin-ref-local` 已迁移（少约 170 行）
 - [ ] 把 `data_plane_endpoint` 写成字节搬运的强制路径
 - [ ] 目标 NAS 硬件上复跑 §3 的测量，验证 §3.1 的 ~41ms 是否为环境噪声
 

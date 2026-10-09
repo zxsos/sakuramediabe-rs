@@ -293,7 +293,11 @@ async fn add_rejects_a_point_that_does_not_exist() {
     let list = svc.create(&format!("bad-{}", n()), None).await.unwrap();
 
     let err = svc.add(list.id, 9_999_999).await.expect_err("");
-    assert_error(&err, 404, "point_id_not_found");
+    // 码用**实体名**（`media_point`），详情键用外键列名（`point_id`）。
+    // 上游 `require_by_id(MediaPoint, id, "media_point",
+    // error_details_key="point_id")` 就是这个分工 —— 此前实现把两者混用，
+    // 产出 `point_id_not_found`，而这个断言把那个错误码照抄了下来。
+    assert_error(&err, 404, "media_point_not_found");
     assert_eq!(err.api.message, "Media point not found");
     assert_eq!(
         err.api.details.as_ref().unwrap().get("point_id"),
@@ -385,7 +389,7 @@ async fn set_members_validates_all_before_writing_anything() {
         .set_members(list.id, &[9_999_999, good])
         .await
         .expect_err("不存在的 point 应被拒");
-    assert_error(&err, 404, "point_id_not_found");
+    assert_error(&err, 404, "media_point_not_found");
 
     // 关键：失败后**原来的成员还在**。
     let members = svc.list_members(list.id).await.unwrap();
@@ -414,7 +418,7 @@ async fn clip_collection_has_the_same_shape_with_its_own_codes() {
     );
 
     let err = svc.add(list.id, 9_999_999).await.expect_err("");
-    assert_error(&err, 404, "clip_id_not_found");
+    assert_error(&err, 404, "media_clip_not_found");
     assert_eq!(err.api.message, "Media clip not found");
 
     // `name varchar(255)`，所以 256 字符会违反约束。

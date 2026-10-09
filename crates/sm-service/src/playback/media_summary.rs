@@ -90,7 +90,11 @@ impl MediaSummary {
 ///
 /// 这三个字段是上游挂在 `Movie` 实例上的三个属性，语义都属于「派生」——
 /// 它们完全由 `media_items` 决定，所以放在这里而不在 `Movie` 上。
-#[derive(Debug, Clone, PartialEq)]
+/// `Default` 是**「没有媒体」**这个事实的取值：空列表、计数 0、不能播。
+/// 卡片组装时用它兜底（`attach_movie_list_media` 对每个问到的番号都会给一项，
+/// 兜底路径实际不可达 —— 但 `unwrap_or_default` 比 `expect` 好，因为 release
+/// 是 `panic = "abort"`）。
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct MovieMediaAttachment {
     /// 按 `media.id` 升序（与上游 `ORDER BY Media.movie, Media.id` 一致）。
     pub media_items: Vec<MediaSummary>,

@@ -36,8 +36,8 @@
 //! 防线。
 
 use sm_db::repo::{
-    Ctx, NewVideoCollection, VideoCollectionItemRepository, VideoCollectionRepository,
-    VideoItemRepository,
+    commit_or_rollback, Ctx, NewVideoCollection, VideoCollectionItemRepository,
+    VideoCollectionRepository, VideoItemRepository,
 };
 use sm_db::videos::{VideoCollection, VideoCollectionItem};
 use sm_db::Db;
@@ -224,7 +224,7 @@ impl VideoCollectionService {
         }
 
         let mut tx = self.pool.begin().await?;
-        let appended = {
+        let outcome = async {
             let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
             match self
                 .members
@@ -233,19 +233,19 @@ impl VideoCollectionService {
             {
                 Ok(link) => {
                     self.collections.touch_in(&mut ctx, collection_id).await?;
-                    link
+                    Ok::<Added, ServiceError>(Added::Added {
+                        id: link.id,
+                        position: link.position,
+                    })
                 }
                 // 与上面那次查询并发：唯一索引兜住了。语义上仍然是
                 // 「已经加过了」，所以幂等而不是 409。
-                Err(err) if is_unique_violation(&err) => return Ok(Added::AlreadyPresent),
-                Err(err) => return Err(err.into()),
+                Err(err) if is_unique_violation(&err) => Ok(Added::AlreadyPresent),
+                Err(err) => Err(err.into()),
             }
-        };
-        tx.commit().await?;
-        Ok(Added::Added {
-            id: appended.id,
-            position: appended.position,
-        })
+        }
+        .await;
+        commit_or_rollback(tx, outcome).await
     }
 
     /// 移除一个成员，按**关联行 id**。
@@ -277,7 +277,7 @@ impl VideoCollectionService {
             return Ok(());
         }
         let mut tx = self.pool.begin().await?;
-        {
+        let outcome = async {
             let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
             let deleted = self
                 .members
@@ -288,8 +288,10 @@ impl VideoCollectionService {
             if deleted > 0 {
                 self.collections.touch_in(&mut ctx, collection_id).await?;
             }
+            Ok::<(), ServiceError>(())
         }
-        tx.commit().await?;
+        .await;
+        commit_or_rollback(tx, outcome).await?;
         Ok(())
     }
 
@@ -333,7 +335,7 @@ impl VideoCollectionService {
         }
 
         let mut tx = self.pool.begin().await?;
-        {
+        let outcome = async {
             let mut ctx = Ctx::in_tx(&mut tx, &self.pool);
             for (position, link_id) in ordered.iter().enumerate() {
                 if !self
@@ -351,8 +353,10 @@ impl VideoCollectionService {
                 }
             }
             self.collections.touch_in(&mut ctx, collection_id).await?;
+            Ok::<(), ServiceError>(())
         }
-        tx.commit().await?;
+        .await;
+        commit_or_rollback(tx, outcome).await?;
         Ok(self.members.list_by_collection(collection_id).await?)
     }
 

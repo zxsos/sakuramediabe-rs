@@ -11,8 +11,11 @@
 //! - L1 `parity/compare_schema.py` 保证 Rust 结构体与 Peewee 模型一致
 //! - L2 集成测试在真实 PG 上跑，任何不匹配会在运行时报出来
 
-use sqlx::{PgPool, Postgres};
+use std::collections::HashMap;
 
+use sqlx::{PgPool, Postgres, QueryBuilder};
+
+use super::collection::SortDirection;
 use super::ctx::Ctx;
 use crate::catalog::movie::{field_owner, Movie, MovieSeries, PROTECTED_MOVIE_FIELDS};
 use crate::common::guard::{FieldGuard, WriteSource};
@@ -68,7 +71,16 @@ fn guard() -> FieldGuard {
 /// `8K=7680宽` / `4K=3840宽` / `2K=1440高` / `1080P=1080高` /
 /// `720P=720高` / `480P=480高` / `360P=360高`。改任何一个数字都会让
 /// 已入库媒体的档位归属变化，进而改变筛选结果。
-const RESOLUTION_LEVEL_CASE: &str = "CASE \
+///
+/// # `pub(crate)` 而不是私有
+///
+/// `repo::collection` 的影片卡片查询要用同一份表达式做
+/// 「最高档位落在 `[threshold, upper)`」的 `EXISTS` 筛选。**复制一份**会让
+/// 两处的阈值各自漂移 —— 那是「筛 4K 筛出来的影片和档位计数对不上」这类
+/// 只能靠用户发现的缺陷。所以只此一份，两处共用。
+///
+/// 共用的前提是**别名必须是 `md`**（见上），调用方的 SQL 也要自带这个别名。
+pub(crate) const RESOLUTION_LEVEL_CASE: &str = "CASE \
      WHEN split_part(md.resolution, 'x', 1)::int <= 0 \
        OR split_part(md.resolution, 'x', 2)::int <= 0 THEN 0 \
      WHEN split_part(md.resolution, 'x', 1)::int >= 7680 THEN 7 \
@@ -108,6 +120,102 @@ const RESOLUTION_LEVEL_CASE: &str = "CASE \
 /// 若哪天这个前提破了，解码会**报 ColumnDecode**（可定位），而不是静默
 /// 变成「无法解析」而少算一档。
 pub type MovieResolutionLevelRow = (i32, i32);
+
+/// 影片列表的筛选条件（上游 `_filtered_movies` 的入参）。
+///
+/// 纯值对象：只作为参数传给 [`MovieRepository::list_movie_card_ids`]，没有
+/// `FromRow`、不映射任何表 —— 与 `ClipFilter` 同一类（见对拍豁免名单）。
+///
+/// # 为什么用 `Option<bool>` / `Option<i32>` 而不是枚举
+///
+/// 上游的 `MovieListStatus` / `MovieNumberSource` 是 schema 层的枚举，服务层
+/// 解析请求时已经校验过。这里用最朴素的三态表达，`sm-db` 就不必认识那些枚举
+/// （也就少两个对拍豁免项）。
+#[derive(Debug, Clone, Default)]
+pub struct MovieListFilter {
+    /// 演员 id。走 `COALESCE(merged_into_id, id)` —— **被合并的演员也要能筛出
+    /// 它名下的影片**，否则用户点开一个已合并的演员会得到空列表。
+    pub actor_id: Option<i32>,
+    /// 标签 id。空 = 不筛。
+    pub tag_ids: Vec<i32>,
+    /// `true` = 必须同时含**全部**标签（AND）；`false` = 命中任一（OR）。
+    pub tag_match_all: bool,
+    /// 发行年份，按 `[year-01-01, year+1-01-01)` 半开区间。
+    pub year: Option<i32>,
+    /// `Some(true)` = 已订阅，`Some(false)` = 未订阅，`None` = 不限。
+    pub subscribed: Option<bool>,
+    /// 只看**能播**的（至少一条有效媒体）。
+    ///
+    /// 与 `subscribed` 同属上游的一个枚举，但语义正交，所以拆成两个字段。
+    pub playable_only: bool,
+    /// 只要**单片**。合集与单片互斥，所以没有对应的 `Some(false)`。
+    pub single_only: bool,
+    pub series_id: Option<i32>,
+    /// **精确**匹配（上游 `parse_optional_exact_text` 已 strip）。
+    pub director_name: Option<String>,
+    pub maker_name: Option<String>,
+    /// `Some(true)` = 仅 FC2，`Some(false)` = 排除 FC2。
+    pub fc2: Option<bool>,
+    pub heat_min: Option<i32>,
+    pub heat_max: Option<i32>,
+    /// 分辨率档位区间 `[threshold, upper)`，与影片卡片同一口径。
+    pub resolution: Option<(i32, Option<i32>)>,
+    /// 只要黑名单里的。默认 `false` = 只要**不在**黑名单的。
+    pub blacklisted: bool,
+    /// 检索词。空 = 不检索。
+    pub search_terms: Vec<String>,
+}
+
+/// 影片列表的排序键。
+///
+/// 闭集枚举的理由与 [`super::collection::PlaylistMovieCardSort`] 相同：
+/// `ORDER BY` 片段必须写死，否则 `added_at` 那段相关子查询就是注入口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovieListSort {
+    ReleaseDate,
+    /// `status = playable` 时是「媒体入库时间」子查询，否则退化成 `movie.id`
+    /// （上游 `extra_sort_builders` 只在 playable 时挂上去）。
+    AddedAt,
+    SubscribedAt,
+    CommentCount,
+    ScoreNumber,
+    WantWatchCount,
+    Heat,
+}
+
+/// 「最近一次媒体入库时间」相关子查询（`added_at` 在 playable 时的排序列）。
+const MOVIE_LATEST_MEDIA_SUBQUERY: &str =
+    "(SELECT MAX(md.created_at) FROM media md WHERE md.movie_number = m.movie_number)";
+
+/// `^\d+[-_]\d+$`：纯数字番号。
+///
+/// 这类番号的分隔符是**片商标识**（一本道 `_` / 加勒比 `-`，同日番号是两部
+/// 不同影片），所以检索时保留分隔符、**不折叠**。
+fn is_pure_numeric_number(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index == 0 || index >= bytes.len() || (bytes[index] != b'-' && bytes[index] != b'_') {
+        return false;
+    }
+    index += 1;
+    index < bytes.len() && bytes[index..].iter().all(u8::is_ascii_digit)
+}
+
+/// 番号检索键：去掉 `-`/`_`，并把 `FC2PPV` 折叠成 `FC2`。
+///
+/// 与查询里那段 `REPLACE(UPPER(TRANSLATE(movie_number, '-_', '')), 'FC2PPV', 'FC2')`
+/// 逐条对应 —— 两处必须一起改，否则「存的值」与「比的值」落到不同形态，
+/// 检索会安静地查不到（不报错，只是没有结果）。
+fn number_search_key(normalized: &str) -> String {
+    let key = normalized.replace(['-', '_'], "");
+    match key.strip_prefix("FC2PPV") {
+        Some(rest) => format!("FC2{rest}"),
+        None => key,
+    }
+}
 
 /// 插入一条影片。
 ///
@@ -189,6 +297,785 @@ impl MovieRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    /// 按主键**批量**取回，返回 `id → Movie`。**没命中的 id 不在结果里。**
+    ///
+    /// # 为什么列表页需要它
+    ///
+    /// 影片卡片的聚合查询里，影片本体与封面/系列是几条独立查询。先分页拿到
+    /// `movie_id`，再**一次**取回这一页的影片，而不是每部影片查一次
+    /// （那就是 N+1，而列表页一次渲染 20 部）。
+    ///
+    /// 「已订阅演员的最新影片」的一页 id。
+    ///
+    /// 对应上游 `_subscribed_actor_latest_movies_query`。三处口径：
+    ///
+    /// 1. **内连接** `movie_actor` + `actor`：只列至少关联一位**已订阅**演员的影片；
+    /// 2. **排除合集番号**（`is_collection = FALSE`）—— 合集是合辑，不该出现在
+    ///    这个流里；
+    /// 3. 排序是 `release_date IS NULL, release_date DESC, id DESC`：用
+    ///    `IS NULL` 把没有发行日期的垫到最后（等价于 `NULLS LAST`，但上游写的是
+    ///    这个形式）。
+    pub async fn list_subscribed_actor_movie_ids(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT m.id FROM movie m \
+             JOIN movie_actor ma ON ma.movie_id = m.id \
+             JOIN actor a ON a.id = ma.actor_id \
+             WHERE a.is_subscribed = TRUE AND m.is_collection = FALSE \
+             GROUP BY m.id \
+             ORDER BY m.release_date IS NULL, m.release_date DESC, m.id DESC \
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 上面那条的总数（`COUNT(DISTINCT)`,与当页同一口径）。
+    pub async fn count_subscribed_actor_movies(&self) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT m.id) FROM movie m \
+             JOIN movie_actor ma ON ma.movie_id = m.id \
+             JOIN actor a ON a.id = ma.actor_id \
+             WHERE a.is_subscribed = TRUE AND m.is_collection = FALSE",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// 「最近入库」影片的 id：**只含有本地媒体的影片**，按该影片**最近一次
+    /// 媒体入库时间**倒序，其次 `id` 倒序。
+    ///
+    /// 对应上游 `_latest_movies_query`。两点与直觉不同：
+    ///
+    /// 1. 排序键是 **`MAX(media.created_at)`**，不是 `movie.created_at` ——
+    ///    「最近入库」指的是本地文件到了，而不是影片记录被创建。
+    /// 2. **内连接 media** —— 没有本地媒体的影片不出现在这个列表里（它不是一个
+    ///    「最新影片」列表，而是「最新到货」列表）。
+    pub async fn list_latest_with_media_ids(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar::<_, i32>(
+            "SELECT m.id FROM movie m JOIN media md ON md.movie_number = m.movie_number \
+             WHERE m.is_blacklisted = FALSE \
+             GROUP BY m.id ORDER BY MAX(md.created_at) DESC, m.id DESC \
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 上面那条查询的总数。
+    ///
+    /// # 上游的 `total` **不带黑名单过滤**
+    ///
+    /// 上游写的是 `Movie.select(Movie.id).join(Media).group_by(Movie.id).count()`，
+    /// 而当页查询有 `is_blacklisted == False`。所以拉黑过一部有媒体的影片后，
+    /// `total` 会比实际能翻到的条数多 —— 最后一页可能是空的。
+    ///
+    /// 这里**照抄**（与 `batch_set_subscription` 的 `updated_count` 同一处理）：
+    /// 客户端在用这个数字渲染分页，改它就是静默的契约变更。
+    pub async fn count_with_media(&self) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (SELECT m.id FROM movie m \
+             JOIN media md ON md.movie_number = m.movie_number \
+             GROUP BY m.id) AS grouped",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// 影片列表的一页 id（按 `filter` 筛、按 `sort` 排）。
+    ///
+    /// 用 [`QueryBuilder`] 而不是拼字符串：占位符编号由它维护，15 个可选筛选位
+    /// 各带 0..n 个绑定值，手写编号迟早错位（而错位的失败方式是**静默**的：
+    /// 两个相邻绑定值类型相同时 SQL 照样执行，只是筛出了别的东西）。
+    ///
+    /// `sort` 为 `None` 且 `filter.search_terms` 非空时按**相关度**排，见
+    /// `push_movie_list_order`。
+    pub async fn list_movie_card_ids(
+        &self,
+        filter: &MovieListFilter,
+        sort: Option<(MovieListSort, SortDirection)>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT m.id FROM movie m WHERE ");
+        Self::push_movie_list_filter(&mut builder, filter);
+        builder.push(" ORDER BY ");
+        Self::push_movie_list_order(&mut builder, filter, sort);
+        builder
+            .push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        Ok(builder
+            .build_query_scalar::<i32>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 同一筛选口径下的**总数**。
+    ///
+    /// 与当页用同一套条件（`count` 不带排序与分页）—— 口径不一致会让
+    /// 「共 20 条」配上 5 条结果，客户端一直翻页。
+    pub async fn count_movies(&self, filter: &MovieListFilter) -> Result<i64, DbError> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM movie m WHERE ");
+        Self::push_movie_list_filter(&mut builder, filter);
+        Ok(builder
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// 把 15 个筛选位推到 builder 上（**从第一个条件开始**，不含 `WHERE`）。
+    ///
+    /// 每个 `AND` 都必须带上前导空格 —— `QueryBuilder` 不做拼接，少一个空格就是
+    /// 语法错误，而那种错误只在运行时出现。
+    fn push_movie_list_filter(builder: &mut QueryBuilder<Postgres>, filter: &MovieListFilter) {
+        builder
+            .push("m.is_blacklisted = ")
+            .push_bind(filter.blacklisted);
+
+        if let Some(actor_id) = filter.actor_id {
+            // 合并链：`COALESCE(merged_into_id, id)` —— 点开一个**已合并**的
+            // 演员也要能筛出影片。
+            builder
+                .push(
+                    " AND m.id IN (SELECT ma.movie_id FROM movie_actor ma WHERE ma.actor_id IN \
+                     (SELECT COALESCE(a.merged_into_id, a.id) FROM actor a WHERE a.id = ",
+                )
+                .push_bind(actor_id)
+                .push("))");
+        }
+
+        if !filter.tag_ids.is_empty() {
+            builder
+                .push(" AND m.id IN (SELECT mt.movie_id FROM movie_tag mt WHERE mt.tag_id = ANY(")
+                .push_bind(filter.tag_ids.clone())
+                .push(")");
+            if filter.tag_match_all {
+                // AND：按影片分组后，命中的**去重**标签数等于请求数。
+                builder
+                    .push(" GROUP BY mt.movie_id HAVING COUNT(DISTINCT mt.tag_id) = ")
+                    .push_bind(filter.tag_ids.len() as i64);
+            }
+            builder.push(")");
+        }
+
+        if let Some(year) = filter.year {
+            // 半开区间：`[year-01-01, year+1-01-01)`。用闭区间会把次年 1/1 零点
+            // 那部算进今年。
+            if let (Some(start), Some(end)) = (
+                chrono::NaiveDate::from_ymd_opt(year, 1, 1).and_then(|d| d.and_hms_opt(0, 0, 0)),
+                chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1)
+                    .and_then(|d| d.and_hms_opt(0, 0, 0)),
+            ) {
+                builder
+                    .push(" AND m.release_date >= ")
+                    .push_bind(start)
+                    .push(" AND m.release_date < ")
+                    .push_bind(end);
+            }
+        }
+
+        match filter.subscribed {
+            Some(true) => {
+                builder.push(" AND m.is_subscribed = TRUE");
+            }
+            Some(false) => {
+                builder.push(" AND m.is_subscribed = FALSE");
+            }
+            None => {}
+        }
+        if filter.playable_only {
+            // 「能播」= 至少一条**有效**媒体（与影片卡片的 can_play 同一口径）。
+            builder.push(
+                " AND EXISTS (SELECT 1 FROM media md WHERE md.movie_number = m.movie_number \
+                 AND md.valid = TRUE)",
+            );
+        }
+        if filter.single_only {
+            builder.push(" AND m.is_collection = FALSE");
+        }
+        if let Some(series_id) = filter.series_id {
+            builder.push(" AND m.series_id = ").push_bind(series_id);
+        }
+        if let Some(name) = &filter.director_name {
+            builder
+                .push(" AND m.director_name = ")
+                .push_bind(name.clone());
+        }
+        if let Some(name) = &filter.maker_name {
+            builder.push(" AND m.maker_name = ").push_bind(name.clone());
+        }
+        match filter.fc2 {
+            Some(true) => {
+                builder.push(" AND m.movie_number LIKE 'FC2%'");
+            }
+            // `movie_number` 是 NOT NULL，所以 `NOT LIKE` 不会因 NULL 静默漏行。
+            Some(false) => {
+                builder.push(" AND m.movie_number NOT LIKE 'FC2%'");
+            }
+            None => {}
+        }
+        if let Some(min) = filter.heat_min {
+            builder.push(" AND m.heat >= ").push_bind(min);
+        }
+        if let Some(max) = filter.heat_max {
+            builder.push(" AND m.heat <= ").push_bind(max);
+        }
+
+        if let Some((threshold, upper)) = filter.resolution {
+            // 与影片卡片同一套 EXISTS，共用 `RESOLUTION_LEVEL_CASE`（别名必须是
+            // `md`）。**不能复用 `collection` 里的片段**：那个把占位符编号写死成
+            // `$2`/`$3`，而这里的编号由 QueryBuilder 决定。
+            builder
+                .push(
+                    " AND EXISTS (SELECT 1 FROM media md WHERE md.movie_number = m.movie_number \
+                     AND md.valid = TRUE AND md.resolution ~ '^\\d+x\\d+$' \
+                     GROUP BY md.movie_number HAVING MAX(",
+                )
+                .push(RESOLUTION_LEVEL_CASE)
+                .push(") >= ")
+                .push_bind(threshold);
+            if let Some(upper) = upper {
+                builder
+                    .push(" AND MAX(")
+                    .push(RESOLUTION_LEVEL_CASE)
+                    .push(") < ")
+                    .push_bind(upper);
+            }
+            builder.push(")");
+        }
+
+        // 多词：词之间 **AND**。
+        for term in &filter.search_terms {
+            builder.push(" AND (");
+            Self::push_search_term(builder, term);
+            builder.push(")");
+        }
+    }
+
+    /// 单个检索词在各字段上的 **OR** 条件：片名、番号、演员、标签。
+    ///
+    /// `LIKE` 的 `%` **不转义** —— 上游 `.contains(term)` 直接拼 `%term%`，
+    /// 所以用户输入里的 `%` 在上游也是通配符。转义会改变既有检索行为。
+    fn push_search_term(builder: &mut QueryBuilder<Postgres>, term: &str) {
+        builder.push("m.title LIKE ").push_bind(format!("%{term}%"));
+
+        let normalized = term.trim().to_uppercase();
+        let has_key = normalized.chars().any(|c| c.is_ascii_alphanumeric());
+        if has_key {
+            if is_pure_numeric_number(&normalized) {
+                // 纯数字番号**保留分隔符**做子串匹配（一本道 `_` 与加勒比 `-`
+                // 是两部不同影片，折叠会让检索互相串台）。
+                builder
+                    .push(" OR m.movie_number LIKE ")
+                    .push_bind(format!("%{normalized}%"));
+            } else {
+                // 其余番号去掉 `-`/`_` 后再比，`FC2PPV` 折叠成 `FC2`。
+                builder
+                    .push(
+                        " OR REPLACE(UPPER(TRANSLATE(m.movie_number, '-_', '')), 'FC2PPV', 'FC2') \
+                         LIKE ",
+                    )
+                    .push_bind(format!("%{}%", number_search_key(&normalized)));
+            }
+        }
+
+        // 演员命中（**只认未合并的**，与上游 `_matching_actor_ids` 一致）。
+        builder
+            .push(
+                " OR m.id IN (SELECT ma.movie_id FROM movie_actor ma WHERE ma.actor_id IN \
+                 (SELECT a.id FROM actor a WHERE a.merged_into_id IS NULL AND \
+                 (a.name LIKE ",
+            )
+            .push_bind(format!("%{term}%"))
+            .push(" OR a.alias_name LIKE ")
+            .push_bind(format!("%{term}%"))
+            .push(")))");
+
+        // 标签命中。
+        builder
+            .push(
+                " OR m.id IN (SELECT mt.movie_id FROM movie_tag mt WHERE mt.tag_id IN \
+                 (SELECT t.id FROM tag t WHERE t.name LIKE ",
+            )
+            .push_bind(format!("%{term}%"))
+            .push("))");
+    }
+
+    /// 相关度分数：**越小越靠前**，每个词取最高档命中，多词求和。
+    ///
+    /// 分档与上游逐条一致：完整番号 0、番号前缀 1、片名精确 2、片名前缀 3、
+    /// 片名包含 4、仅演员或标签命中 5。`CASE` 从上往下第一个命中即返回。
+    fn push_search_score(builder: &mut QueryBuilder<Postgres>, terms: &[String]) {
+        for (index, term) in terms.iter().enumerate() {
+            if index > 0 {
+                builder.push(" + ");
+            }
+            builder.push("CASE");
+            let normalized = term.trim().to_uppercase();
+            let has_key = normalized.chars().any(|c| c.is_ascii_alphanumeric());
+            if has_key {
+                if is_pure_numeric_number(&normalized) {
+                    builder
+                        .push(" WHEN m.movie_number = ")
+                        .push_bind(normalized.clone())
+                        .push(" THEN 0 WHEN LEFT(m.movie_number, ")
+                        .push_bind(normalized.chars().count() as i32)
+                        .push(") = ")
+                        .push_bind(normalized.clone())
+                        .push(" THEN 1");
+                } else {
+                    let key = number_search_key(&normalized);
+                    let expression = "REPLACE(UPPER(TRANSLATE(m.movie_number, '-_', '')), \
+                                      'FC2PPV', 'FC2')";
+                    builder
+                        .push(" WHEN ")
+                        .push(expression)
+                        .push(" = ")
+                        .push_bind(key.clone())
+                        .push(" THEN 0 WHEN LEFT(")
+                        .push(expression)
+                        .push(", ")
+                        .push_bind(key.chars().count() as i32)
+                        .push(") = ")
+                        .push_bind(key)
+                        .push(" THEN 1");
+                }
+            }
+            builder
+                .push(" WHEN UPPER(m.title) = ")
+                .push_bind(normalized)
+                .push(" THEN 2 WHEN m.title LIKE ")
+                .push_bind(format!("{term}%"))
+                .push(" THEN 3 WHEN m.title LIKE ")
+                .push_bind(format!("%{term}%"))
+                .push(" THEN 4 ELSE 5 END");
+        }
+    }
+
+    /// `ORDER BY` 的片段构造。
+    ///
+    /// 有检索词且没显式给排序时按**相关度**（上游 `_build_movie_search_sort`），
+    /// 否则按 `sort`，都没给就是上游的默认值 `movie_number ASC`。
+    fn push_movie_list_order(
+        builder: &mut QueryBuilder<Postgres>,
+        filter: &MovieListFilter,
+        sort: Option<(MovieListSort, SortDirection)>,
+    ) {
+        if !filter.search_terms.is_empty() && sort.is_none() {
+            Self::push_search_score(builder, &filter.search_terms);
+            builder.push(" ASC, m.release_date DESC NULLS LAST, m.id DESC NULLS LAST");
+            return;
+        }
+
+        let Some((sort, direction)) = sort else {
+            builder.push("m.movie_number ASC");
+            return;
+        };
+        let direction = match direction {
+            SortDirection::Asc => "ASC",
+            SortDirection::Desc => "DESC",
+        };
+        // 可空的那两列在两个方向上都要显式 `NULLS LAST`（上游
+        // `MOVIE_LIST_NULLABLE_SORT_FIELDS`），次级排序同款 —— 否则 `DESC` 下
+        // 没有发行日期/订阅时间的影片会全部浮到最前。
+        let (column, nullable) = match sort {
+            MovieListSort::ReleaseDate => ("m.release_date".to_owned(), true),
+            MovieListSort::SubscribedAt => ("m.subscribed_at".to_owned(), true),
+            MovieListSort::CommentCount => ("m.comment_count".to_owned(), false),
+            MovieListSort::ScoreNumber => ("m.score_number".to_owned(), false),
+            MovieListSort::WantWatchCount => ("m.want_watch_count".to_owned(), false),
+            MovieListSort::Heat => ("m.heat".to_owned(), false),
+            // `added_at` 只有 playable 时才是「媒体入库时间」；其余情况上游把它
+            // 映射成 `Movie.id`。
+            MovieListSort::AddedAt => {
+                if filter.playable_only {
+                    (MOVIE_LATEST_MEDIA_SUBQUERY.to_owned(), false)
+                } else {
+                    ("m.id".to_owned(), false)
+                }
+            }
+        };
+        let nulls = if nullable { " NULLS LAST" } else { "" };
+        builder
+            .push(column)
+            .push(" ")
+            .push(direction)
+            .push(nulls)
+            .push(", m.id ")
+            .push(direction)
+            .push(nulls);
+    }
+
+    /// 影片订阅状态的**唯一定义**：一个七路 `CASE`，求值为状态字符串。
+    ///
+    /// 筛选 / 计数 / 列表展示共用这一个片段 —— 上游这么组织就是为了避免「SQL 一套
+    /// 判定、Python 再抄一套」的漂移（此前正是两份实现，靠注释约束一致）。
+    ///
+    /// # 分支顺序即优先级
+    ///
+    /// `downloading` 必须在 `import_failed` **之前**：前者是后者的真子集，顺序反了
+    /// 会被吞掉。两者并集恒等于「有活跃任务」。
+    ///
+    /// # 三处容易写反
+    ///
+    /// - `imported` **不判 `valid`** —— 判死的媒体也算已入库（上游 docstring 写明）；
+    /// - `failed` 要**排除** `no_candidate_found` —— 那是「没找到资源」，不算失败；
+    /// - `CASE` 是短路求值的，每行最多跑到三个 `EXISTS`，所以不要改成七个独立的
+    ///   `SUM(CASE)`（上游记过这笔账：那样每行会展开 11 个相关子查询）。
+    ///
+    /// 互斥性由顺序保证，于是「各状态计数之和恒等于订阅总数」自动成立。
+    const SUBSCRIPTION_STATUS_CASE: &str = "CASE \
+     WHEN EXISTS (SELECT 1 FROM media md WHERE md.movie_number = m.movie_number) \
+       THEN 'imported' \
+     WHEN EXISTS (SELECT 1 FROM download_task dt WHERE dt.movie_number = m.movie_number \
+       AND dt.state IN ('queued', 'downloading', 'completed') \
+       AND dt.import_status IN ('pending', 'running')) \
+       THEN 'downloading' \
+     WHEN EXISTS (SELECT 1 FROM download_task dt WHERE dt.movie_number = m.movie_number \
+       AND dt.state IN ('queued', 'downloading', 'completed')) \
+       THEN 'import_failed' \
+     WHEN m.subscription_search_state = 'exhausted' THEN 'exhausted' \
+     WHEN m.subscription_search_state = 'failed_retryable' \
+       AND (m.subscription_search_error_code IS NULL \
+            OR m.subscription_search_error_code <> 'no_candidate_found') THEN 'failed' \
+     WHEN m.subscription_search_last_attempted_at IS NOT NULL THEN 'missing' \
+     ELSE 'pending' END";
+
+    /// 按订阅状态分组计数（**一次** `GROUP BY` 算齐七项）。
+    ///
+    /// 上游注释：每个 tab 打一次 `COUNT` 会重复扫表，所以合成一条。
+    pub async fn count_subscription_statuses(&self) -> Result<Vec<(String, i64)>, DbError> {
+        let sql = format!(
+            "SELECT {} AS status, COUNT(*) FROM movie m \
+             WHERE m.is_subscribed = TRUE GROUP BY 1",
+            Self::SUBSCRIPTION_STATUS_CASE
+        );
+        Ok(sqlx::query_as::<_, (String, i64)>(safe_sql(sql))
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 订阅影片的一页：`(movie_id, status)`，顺序由 `order_by` 片段决定。
+    ///
+    /// `# 状态在 WHERE 里要重复渲染一遍` —— PostgreSQL 的 `WHERE` 不能引用
+    /// `SELECT` 别名（上游注释记着这条）。
+    pub async fn list_subscription_ids(
+        &self,
+        status: Option<&str>,
+        search: Option<&str>,
+        order_by: &'static str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT m.id, ");
+        builder
+            .push(Self::SUBSCRIPTION_STATUS_CASE)
+            .push(" AS status");
+        Self::push_subscription_filter(&mut builder, status, search);
+        builder
+            .push(" ORDER BY ")
+            .push(order_by)
+            .push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        Ok(builder
+            .build_query_as::<(i32, String)>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 同一筛选口径下的**总数**（`total` 与当页必须一致）。
+    pub async fn count_subscriptions(
+        &self,
+        status: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT COUNT(*) ");
+        Self::push_subscription_filter(&mut builder, status, search);
+        Ok(builder
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// 把「已订阅 + 状态 + 检索词」这段 `WHERE` 推到 builder 上。
+    ///
+    /// 列表与计数共用，免得两处口径漂移（上游的 `_base_query` + `list_subscriptions`
+    /// 也是同一段）。
+    fn push_subscription_filter(
+        builder: &mut QueryBuilder<Postgres>,
+        status: Option<&str>,
+        search: Option<&str>,
+    ) {
+        builder.push(" FROM movie m WHERE m.is_subscribed = TRUE");
+        if let Some(status) = status {
+            builder
+                .push(" AND ")
+                .push(Self::SUBSCRIPTION_STATUS_CASE)
+                .push(" = ")
+                .push_bind(status.to_owned());
+        }
+        let keyword = search.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(keyword) = keyword {
+            builder
+                .push(" AND (m.movie_number LIKE ")
+                .push_bind(format!("%{keyword}%"))
+                .push(" OR m.title LIKE ")
+                .push_bind(format!("%{keyword}%"))
+                .push(")");
+        }
+    }
+
+    /// 每部影片的媒体数，按番号**精确**匹配。
+    ///
+    /// 上游注释强调：状态判定里 `media_exists` 用的是精确相等，所以这里也必须
+    /// 精确匹配 —— 用 `LIKE` 会让「列表显示的媒体数」与「判成已入库」不一致。
+    pub async fn count_media_by_numbers(
+        &self,
+        numbers: &[String],
+    ) -> Result<HashMap<String, i64>, DbError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT movie_number, COUNT(*) FROM media WHERE movie_number = ANY($1) \
+             GROUP BY movie_number",
+        )
+        .bind(numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 每部影片**判死**的下载任务数（`state = 'failed'`）。
+    ///
+    /// 列表里叫 `dead_download_task_count` —— 「试过几个种子都失败了」。
+    pub async fn count_failed_tasks_by_numbers(
+        &self,
+        numbers: &[String],
+    ) -> Result<HashMap<String, i64>, DbError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT movie_number, COUNT(*) FROM download_task WHERE movie_number = ANY($1) \
+             AND state = 'failed' GROUP BY movie_number",
+        )
+        .bind(numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 每部影片**最新活跃任务**的导入状态。
+    ///
+    /// 活跃 = `state IN ('queued','downloading','completed')`；最新 = `created_at`
+    /// 倒序、再 `id` 倒序（与上游 `_latest_import_status` 的排序一致）。
+    pub async fn latest_import_status_by_numbers(
+        &self,
+        numbers: &[String],
+    ) -> Result<HashMap<String, String>, DbError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT DISTINCT ON (dt.movie_number) dt.movie_number, dt.import_status \
+             FROM download_task dt \
+             WHERE dt.movie_number = ANY($1) \
+               AND dt.state IN ('queued', 'downloading', 'completed') \
+             ORDER BY dt.movie_number, dt.created_at DESC, dt.id DESC",
+        )
+        .bind(numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 重开订阅检索：把九列检索状态重置回 `pending`，返回影响行数。
+    ///
+    /// 对应上游 `MovieSubscriptionSearchStateService.reset`。三个口径：
+    ///
+    /// 1. **只动已订阅的影片**（`is_subscribed = TRUE`）；
+    /// 2. 给了 `movie_ids` 就只重开这些（去重后 `= ANY`）；`None` 或**空数组**时
+    ///    只重开 `exhausted`（已放弃）的 —— 上游 `if movie_ids:` 对空列表为假，
+    ///    所以「传空数组」与「省略」**等价**，不是「什么都不做」；
+    /// 3. **不推进 `updated_at`**：上游用 `Model.update()`，它绕过 Peewee 的
+    ///    `save()` 覆写，时间戳不动。这里照抄 —— 订阅状态没变，只是检索预算被
+    ///    重开。
+    ///
+    /// `retry_round` 是**加一**而不是清零：它记「这部影片被重开过几次」，
+    /// 清零会让无限重开看起来像第一次尝试。
+    pub async fn reset_subscription_search(
+        &self,
+        movie_ids: Option<&[i32]>,
+    ) -> Result<u64, DbError> {
+        /// 九列状态的重置。置空只能用 SQL 字面量 `NULL`，理由见
+        /// [`MovieRepository::mark_subscribed`]。
+        const RESET: &str = "UPDATE movie SET \
+             subscription_search_state = 'pending', \
+             subscription_search_attempt_count = 0, \
+             subscription_search_retry_round = subscription_search_retry_round + 1, \
+             subscription_search_last_attempted_at = NULL, \
+             subscription_search_last_succeeded_at = NULL, \
+             subscription_search_next_retry_at = NULL, \
+             subscription_search_error_code = NULL, \
+             subscription_search_last_error = NULL, \
+             subscription_search_last_error_at = NULL \
+             WHERE is_subscribed = TRUE";
+
+        let mut unique: Vec<i32> = Vec::new();
+        if let Some(ids) = movie_ids {
+            for id in ids {
+                if !unique.contains(id) {
+                    unique.push(*id);
+                }
+            }
+        }
+
+        let sql = if unique.is_empty() {
+            format!("{RESET} AND subscription_search_state = 'exhausted'")
+        } else {
+            format!("{RESET} AND id = ANY($1)")
+        };
+        let mut stmt = sqlx::query(safe_sql(sql));
+        if !unique.is_empty() {
+            stmt = stmt.bind(&unique);
+        }
+        Ok(stmt.execute(&self.pool).await?.rows_affected())
+    }
+
+    /// 按「大写后的番号」点查。
+    ///
+    /// 人工输入（URL 路径、批量操作的请求体）不是库内规范形态，所以大小写要
+    /// 靠 `UPPER(movie_number)` 抹平 —— 那正是函数索引 `movie_movie_number_upper`
+    /// 的用途，用裸列比较会让这个索引失效。
+    ///
+    /// 分隔符**不在这里**互换：候选顺序由 `sm_service::movie_numbers` 的
+    /// `movie_number_lookup_values` 决定，这里只管一次点查。
+    pub async fn find_by_upper_number(&self, upper_number: &str) -> Result<Option<Movie>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Movie>("SELECT * FROM movie WHERE UPPER(movie_number) = $1")
+                .bind(upper_number)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 按「大写后的番号」**批量**取回，`ORDER BY id`。
+    ///
+    /// 批量订阅/黑名单用它一次定位全部入参。排序是为了让「部分成功」的结果
+    /// 稳定 —— 同一次请求两次调用的顺序不应不同。
+    ///
+    /// # 与 [`MovieRepository::find_by_ids`] 的空输入语义一致
+    pub async fn list_by_upper_numbers(
+        &self,
+        upper_numbers: &[String],
+    ) -> Result<Vec<Movie>, DbError> {
+        if upper_numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, Movie>(
+            "SELECT * FROM movie WHERE UPPER(movie_number) = ANY($1) ORDER BY id",
+        )
+        .bind(upper_numbers)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 订阅：写订阅位，可选地同时把九列检索状态重置成「待抓取」。
+    ///
+    /// # 为什么手写 SQL 而不是 `UpdateSet`
+    ///
+    /// 重置要把**六列置 NULL**，而 `UpdateSet` 的 `ValueInner::Null` 在绑定层
+    /// 是 `Option::<String>::None`（见本文件的绑定分支）—— 那是一个 **text
+    /// 类型的 NULL**，对 `timestamp` 列直接报
+    /// `column ... is of type timestamp without time zone but expression is of
+    /// type text`。置空只能用 SQL 字面量 `NULL`，与 `ActorUpdate` 单独维护
+    /// `nulls` 列表是同一个思路。
+    ///
+    /// 这几列都**不在** `PROTECTED_MOVIE_FIELDS` 里，所以绕开字段护栏不改变
+    /// 任何可见行为。
+    ///
+    /// # `reset_search_state = false` 时**不碰** `subscribed_at`
+    ///
+    /// 对应上游 `if not was_subscribed or movie.subscribed_at is None:` ——
+    /// 重复订阅一部已订阅的影片要保留原订阅时间，否则客户端的「最近订阅」
+    /// 排序会被一次重复点击打乱。
+    pub async fn mark_subscribed(&self, id: i32, reset_search_state: bool) -> Result<(), DbError> {
+        let now = crate::common::time::now_utc();
+        if reset_search_state {
+            sqlx::query(
+                "UPDATE movie SET is_subscribed = TRUE, subscribed_at = $2, \
+                 subscription_search_state = 'pending', \
+                 subscription_search_attempt_count = 0, \
+                 subscription_search_retry_round = subscription_search_retry_round + 1, \
+                 subscription_search_last_attempted_at = NULL, \
+                 subscription_search_last_succeeded_at = NULL, \
+                 subscription_search_next_retry_at = NULL, \
+                 subscription_search_error_code = NULL, \
+                 subscription_search_last_error = NULL, \
+                 subscription_search_last_error_at = NULL, \
+                 updated_at = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("UPDATE movie SET is_subscribed = TRUE, updated_at = $2 WHERE id = $1")
+                .bind(id)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// 退订：清订阅位与订阅时间。
+    ///
+    /// `subscribed_at = NULL` 同样只能用字面量，理由见
+    /// [`MovieRepository::mark_subscribed`]。
+    pub async fn clear_subscription(&self, id: i32) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE movie SET is_subscribed = FALSE, subscribed_at = NULL, updated_at = $2 \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(crate::common::time::now_utc())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// # 空输入直接返回空 map，不发查询
+    ///
+    /// `id = ANY('{}')` 返回零行而不是报错，两者结果相同 —— 提前返回省掉一次
+    /// 往返，也让「筛选后这一页为空」这个常见情形不产生 DB 往返。
+    pub async fn find_by_ids(&self, ids: &[i32]) -> Result<HashMap<i32, Movie>, DbError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Movie>("SELECT * FROM movie WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| (row.id, row)).collect())
     }
 
     /// 播放列表内每部影片的**最高分辨率档位序号**。
@@ -629,5 +1516,21 @@ impl MovieSeriesRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    /// 按主键**批量**取回，返回 `id → MovieSeries`。**没命中的 id 不在结果里。**
+    ///
+    /// 影片卡片只用到系列**名**，而它是 `movie.series_id` 指向的另一张表 ——
+    /// 逐部影片查一次就是 N+1。见 [`MovieRepository::find_by_ids`] 的同款说明。
+    pub async fn find_by_ids(&self, ids: &[i32]) -> Result<HashMap<i32, MovieSeries>, DbError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows =
+            sqlx::query_as::<_, MovieSeries>("SELECT * FROM movie_series WHERE id = ANY($1)")
+                .bind(ids)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|row| (row.id, row)).collect())
     }
 }

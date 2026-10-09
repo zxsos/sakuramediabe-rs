@@ -96,8 +96,8 @@ macro_rules! impl_ordered_collection_service {
         $name_conflict:literal,
         $collection_missing:literal,
         $member_missing:literal,
-        $member_field:ident,
-        $member_key:literal
+        $member_key:literal,
+        $member_entity:literal
     ) => {
         #[doc = concat!("`", $entity, "` 表的 service。")]
         ///
@@ -168,29 +168,29 @@ macro_rules! impl_ordered_collection_service {
             }
 
             /// 校验成员存在 —— 查的是**成员的父表**，见模块文档。
+            ///
+            /// # 错误码用 `$member_entity`，**不是** `$member_key`
+            ///
+            /// 上游 `require_by_id(MediaClip, id, "media_clip",
+            /// error_details_key="clip_id")` 的规则是：默认码由**实体名**生成
+            /// （`{entity}_not_found`），而 `error_details_key` 只管详情键。
+            /// 两者是不同字符串 —— 码是 `media_clip_not_found`，详情键是
+            /// `clip_id`。
+            ///
+            /// 此前这里用 `$member_key` 拼码，于是产生 `clip_id_not_found`
+            /// （moment 侧同病：`point_id_not_found`）。客户端按 `code` 分支，
+            /// 所以那是一个**可见的契约偏差**，而不是文案差异。
             async fn require_member(&self, id: i32) -> Result<(), ServiceError> {
                 if self.origin.find_by_id(id).await?.is_some() {
                     Ok(())
                 } else {
                     Err(ServiceError::not_found(
-                        concat!($member_key, "_not_found"),
+                        concat!($member_entity, "_not_found"),
                         $member_missing,
                         $member_key,
                         id,
                     ))
                 }
-            }
-
-            /// 从成员行取出外键值。两个成员模型的字段名不同
-            /// （`point_id` / `clip_id`），所以分成两个宏参数：
-            /// `$member_field` 是**标识符**（做字段访问），`$member_key` 是
-            /// **字面量**（拼错误码与详情键）。
-            ///
-            /// 分成两个是因为 `m.$x` 要求 `x` 是 `ident`，而
-            /// `concat!($x, "_not_found")` 要求 `x` 是 `literal` —— 一个参数
-            /// 满足不了两者。
-            fn member_key_of(m: &$member_model) -> i32 {
-                m.$member_field
             }
 
             // ---------------------------------------------------------- 父表
@@ -254,6 +254,17 @@ macro_rules! impl_ordered_collection_service {
             ///
             /// 先查存在性而不是直接插入撞唯一索引：结果一样，但白跑一次
             /// 事务，而上游明确先查。
+            /// 幂等加入一个成员。**已在合集里就直接返回，不改位置。**
+            ///
+            /// # 用 `find_by_member` 而不是「拉全量再扫」
+            ///
+            /// 「重复加入要幂等」这条规则要求**先查后插**，而
+            /// `list_by_collection` 是把整个合集读出来在内存里扫 ——
+            /// 复杂度 O(合集规模)，每次加人都重来一遍。万级成员的合集在上游
+            /// 是真实存在的（`moment_collection_item` 同理），所以那不是理论问题。
+            ///
+            /// `find_by_member` 走唯一索引 `(collection_id, <成员外键>)`，
+            /// 是 O(1) 点查。仓储层那个方法的文档本来就写明它是为这条规则存在的。
             pub async fn add(
                 &self,
                 collection_id: i32,
@@ -261,8 +272,12 @@ macro_rules! impl_ordered_collection_service {
             ) -> Result<(), ServiceError> {
                 self.require_collection(collection_id).await?;
                 self.require_member(member_id).await?;
-                let existing = self.members.list_by_collection(collection_id).await?;
-                if existing.iter().any(|m| Self::member_key_of(m) == member_id) {
+                if self
+                    .members
+                    .find_by_member(collection_id, member_id)
+                    .await?
+                    .is_some()
+                {
                     return Ok(());
                 }
                 self.members.append(collection_id, member_id).await?;
@@ -300,7 +315,7 @@ macro_rules! impl_ordered_collection_service {
                 }
 
                 let mut tx = self.pool.begin().await?;
-                {
+                let outcome = async {
                     let mut ctx = sm_db::repo::Ctx::in_tx(&mut tx, &self.pool);
                     self.members.clear_in(&mut ctx, collection_id).await?;
                     for (position, id) in ordered.iter().enumerate() {
@@ -308,8 +323,10 @@ macro_rules! impl_ordered_collection_service {
                             .insert_at_in(&mut ctx, collection_id, *id, position as i32)
                             .await?;
                     }
+                    Ok::<(), ServiceError>(())
                 }
-                tx.commit().await?;
+                .await;
+                sm_db::repo::commit_or_rollback(tx, outcome).await?;
                 self.parent.touch(collection_id).await?;
                 Ok(())
             }
@@ -337,8 +354,8 @@ impl_ordered_collection_service!(
     "moment_collection_name_conflict",
     "Moment collection not found",
     "Media point not found",
-    point_id,
-    "point_id"
+    "point_id",
+    "media_point"
 );
 
 impl_ordered_collection_service!(
@@ -352,9 +369,253 @@ impl_ordered_collection_service!(
     "clip_collection_name_conflict",
     "Clip collection not found",
     "Media clip not found",
-    clip_id,
-    "clip_id"
+    "clip_id",
+    "media_clip"
 );
+
+/// 片段合集所有 422 的错误码。与上游
+/// `validate_page(..., error_code="invalid_clip_collection_filter")` 一致。
+///
+/// 刻意不用 `sm_core::pagination` 的默认码（`invalid_page` /
+/// `invalid_page_size`）—— 那是别的域的契约，客户端按 `code` 分支。
+pub const INVALID_CLIP_COLLECTION_FILTER: &str = "invalid_clip_collection_filter";
+
+/// 一个成员行加上它所属的片段。
+///
+/// 宏生成的 `list_members` 只返回 `ClipCollectionItem`，而合集列表的
+/// `clip_count` 与封面都需要片段本体（要 `movie_number`、`file_path`、以及
+/// 封面解析用的 `start_offset_seconds`）。
+///
+/// **不是表镜像**，所以不声明成 `pub struct` + `FromRow` —— 那在本仓库意味着
+/// 「我映射一张表」，schema 对拍会要求一个上游 Peewee 模型（见
+/// `sm_db::repo::movie::MovieResolutionLevelRow` 的文档：投影行用元组，
+/// 具名类型放 service）。
+/// **刻意不派生 `PartialEq`**
+///
+/// 与 `sm_db::repo::ClaimedTask` 同一个理由：两个内含数据库行的结构体
+/// 「相等」不是一个有意义的问题。要断言就断言 `item.id` 或 `clip.id`。
+#[derive(Debug, Clone)]
+pub struct MemberWithClip {
+    pub item: sm_db::collections::ClipCollectionItem,
+    pub clip: sm_db::playback::media::MediaClip,
+}
+
+/// 合集连同它的**有效**成员数。
+#[derive(Debug, Clone)]
+pub struct CollectionWithCount {
+    pub collection: ClipCollection,
+    /// **只数产物有效的成员。** 见 [`ClipCollectionService::valid_members`]。
+    pub clip_count: i32,
+}
+
+/// 片段合集专属的读路径。
+///
+/// # 为什么不放进 `impl_ordered_collection_service!`
+///
+/// 宏是 `MomentCollectionService` 与 `ClipCollectionService` 共用的，而
+/// 「成员是否有效」只有片段合集有 —— 时刻点没有产物文件。所以有效性判定与
+/// 回收只能落在这个**只针对 clip 的 impl 块**里。
+///
+/// 它能访问 `parent` / `members` / `origin` / `pool` 这些私有字段，是因为
+/// 与宏展开处在**同一个模块**。
+///
+/// # 合集的读写**也会回收失效片段**
+///
+/// 上游每个读路径都先过 `_valid_collection_items`，而它内部调
+/// `MediaClipService.valid_clips` —— 与片段列表端点同一套判定。因此：
+///
+/// - `clip_count` 只数**产物仍然存在**的成员；
+/// - 合集封面取「按 position 排最前**且有效**」那个片段的封面；
+/// - 顺带把失效成员从库里删掉、把文件删掉。
+///
+/// 这不是「顺手清理」，而是 `clip_count` 口径的一部分：客户端按它决定要不要
+/// 显示数字，而一个点开播不出来的片段不该被计数。
+impl ClipCollectionService {
+    /// 确认合集存在，否则 404 `clip_collection`。
+    ///
+    /// 宏里的 `require_collection` 是私有的，而 `list_clips_paged` 之前需要
+    /// 先做存在性校验 —— 上游 `_require_collection` 在 `validate_page`
+    /// **之前**，所以「合集不存在」不能被报成分页错误。
+    pub async fn require(&self, collection_id: i32) -> Result<ClipCollection, ServiceError> {
+        self.require_collection(collection_id).await
+    }
+
+    /// 取**一个**合集，带它的有效成员数。
+    ///
+    /// 刻意不借用 `list_collections` 再筛 —— 那会把**所有**合集的成员都拉出来
+    /// 判有效性，而这里只关心一个。
+    pub async fn get_with_count(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+        collection_id: i32,
+    ) -> Result<CollectionWithCount, ServiceError> {
+        let collection = self.require_collection(collection_id).await?;
+        let clip_count = i32::try_from(self.valid_members(media, &[collection_id]).await?.len())
+            .unwrap_or(i32::MAX);
+        Ok(CollectionWithCount {
+            collection,
+            clip_count,
+        })
+    }
+
+    /// 列出**给定这些合集**的**有效**成员，按 `(collection_id, position, id)` 排。
+    ///
+    /// 对应上游 `_valid_collection_items`。**顺带回收失效片段**。
+    ///
+    /// 两次批量查询而不是 N+1：成员行一次拿全，片段按去重后的 `clip_id`
+    /// 一次拿全 —— 同一片段可能加入多个合集，所以要先按 `clip_id` 去重。
+    pub async fn valid_members(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+        collection_ids: &[i32],
+    ) -> Result<Vec<MemberWithClip>, ServiceError> {
+        use std::collections::{HashMap, HashSet};
+
+        if collection_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let items = self.members.list_by_collections(collection_ids).await?;
+
+        let mut wanted: Vec<i32> = items.iter().map(|item| item.clip_id).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+
+        let mut clips: HashMap<i32, sm_db::playback::media::MediaClip> = HashMap::new();
+        let mut candidates = Vec::with_capacity(wanted.len());
+        for clip_id in wanted {
+            if let Some(clip) = self.origin.find_by_id(clip_id).await? {
+                clips.insert(clip_id, clip.clone());
+                candidates.push(clip);
+            }
+        }
+
+        // 有效性判定 + 回收，与片段列表端点**同一个函数**。
+        let (valid, _reclaimed) = media.retain_valid(candidates).await?;
+        let valid_ids: HashSet<i32> = valid.into_iter().map(|clip| clip.id).collect();
+
+        let mut members: Vec<MemberWithClip> = items
+            .into_iter()
+            .filter_map(|item| {
+                let clip = clips.get(&item.clip_id)?;
+                valid_ids.contains(&clip.id).then(|| MemberWithClip {
+                    item,
+                    clip: clip.clone(),
+                })
+            })
+            .collect();
+        // 跨合集时 `position` 各自独立，所以先按合集分组、组内再按位置 ——
+        // 上游 `sort(key=(position, id))` 只在单合集时才有意义。
+        members.sort_by(|a, b| {
+            a.item
+                .collection_id
+                .cmp(&b.item.collection_id)
+                .then(a.item.position.cmp(&b.item.position))
+                .then(a.item.id.cmp(&b.item.id))
+        });
+        Ok(members)
+    }
+
+    /// 列出全部合集，按 `updated_at DESC, id DESC`，各带**有效**成员数。
+    pub async fn list_collections(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+    ) -> Result<Vec<CollectionWithCount>, ServiceError> {
+        let collections = self.parent.list_ordered_by_recency().await?;
+        let ids: Vec<i32> = collections.iter().map(|row| row.id).collect();
+
+        let mut counts: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        for member in self.valid_members(media, &ids).await? {
+            *counts.entry(member.item.collection_id).or_insert(0) += 1;
+        }
+
+        Ok(collections
+            .into_iter()
+            .map(|collection| {
+                let clip_count = counts.get(&collection.id).copied().unwrap_or(0);
+                CollectionWithCount {
+                    collection,
+                    clip_count,
+                }
+            })
+            .collect())
+    }
+
+    /// 一个合集的**有效**成员数。
+    pub async fn valid_clip_count(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+        collection_id: i32,
+    ) -> Result<i32, ServiceError> {
+        Ok(
+            i32::try_from(self.valid_members(media, &[collection_id]).await?.len())
+                .unwrap_or(i32::MAX),
+        )
+    }
+
+    /// 合集封面：按 position 排最前的**有效**成员的封面。
+    ///
+    /// 对应上游 `_collection_cover`。**没有有效成员时返回 `None`**。
+    ///
+    /// 孤立片段（`media_id` 为空）也返回 `None` —— `load_cover_map` 会跳过
+    /// 它们，所以没有键可查。
+    pub async fn cover(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+        collection_id: i32,
+    ) -> Result<Option<sm_db::catalog::asset::Image>, ServiceError> {
+        let members = self.valid_members(media, &[collection_id]).await?;
+        let Some(first) = members.first() else {
+            return Ok(None);
+        };
+        let Some(media_id) = first.clip.media_id else {
+            return Ok(None);
+        };
+        let covers = media
+            .load_cover_map(std::slice::from_ref(&first.clip))
+            .await?;
+        Ok(covers
+            .get(&(media_id, first.clip.start_offset_seconds))
+            .cloned())
+    }
+
+    /// 合集成员分页。**先过滤回收，再计数，再切片** —— 与片段列表同序。
+    ///
+    /// 返回 `(本页成员, 过滤后的总数)`。切在内存里做，因为有效性判定要看
+    /// 文件系统，数据库不知道。
+    pub async fn list_clips_paged(
+        &self,
+        media: &crate::playback::media_clip::MediaClipService,
+        collection_id: i32,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<MemberWithClip>, i64), ServiceError> {
+        // 分页校验与上游同一个错误码。
+        if page <= 0 {
+            return Err(ServiceError::validation_with(
+                INVALID_CLIP_COLLECTION_FILTER,
+                "page must be greater than 0",
+                crate::error::details_of("page", page),
+            ));
+        }
+        if page_size <= 0 || page_size > 100 {
+            return Err(ServiceError::validation_with(
+                INVALID_CLIP_COLLECTION_FILTER,
+                "page_size must be between 1 and 100",
+                crate::error::details_of("page_size", page_size),
+            ));
+        }
+
+        let members = self.valid_members(media, &[collection_id]).await?;
+        let total = i64::try_from(members.len()).unwrap_or(i64::MAX);
+        let start = usize::try_from(sm_core::pagination::page_offset(page, page_size))
+            .unwrap_or(usize::MAX)
+            .min(members.len());
+        let end = start
+            .saturating_add(usize::try_from(page_size).unwrap_or(usize::MAX))
+            .min(members.len());
+        Ok((members[start..end].to_vec(), total))
+    }
+}
 
 #[cfg(test)]
 mod tests {
