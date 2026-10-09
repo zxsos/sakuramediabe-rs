@@ -124,6 +124,15 @@ if ($runParity) {
     # 这个错在本次重构里犯了五次，每一次都要等编译失败才发现。
     Step 'paged wrappers' { python (Join-Path $parity 'check_paged_wrappers.py') }
 
+    # 契约两仓同步。P1-1 落地时只改了宿主这一边（proto/storage.proto 的
+    # GenerateThumbnails 换了流的消息类型），而插件按契约仓的 tag 编译 ——
+    # 于是宿主把插件发来的 ProgressEvent 当 GenerateThumbnailsResponse 解，
+    # 报一个指错方向的解码错误。ABI_MAJOR 两边当时都是 1，注册校验也拦不住。
+    #
+    # 契约仓不在（CI / 别的布局）时该脚本 SKIP 并 exit 0 ——「没有对照物」与
+    # 「对照物不一致」是两件事。要显式指定用 SM_CONTRACT_ROOT。
+    Step 'contract sync' { python (Join-Path $parity 'check_contract_sync.py') }
+
     # 第八道门：**进度基线漂移**。改了代码却没重跑 `scripts/progress.ps1 -Write`
     # 就会在这里失败 —— 这正是本仓库对「检查」的一贯要求：一个要靠人记得跑的
     # 检查不是检查（见本文件开头那段）。

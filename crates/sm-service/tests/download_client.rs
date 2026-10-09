@@ -13,12 +13,79 @@ use sm_db::repo::{
     NewMediaLibrary,
 };
 use sm_db::testing::TestDb;
-use sm_service::transfers::download_client::{DownloadClientService, DownloadClientUpdateRequest};
+use sm_service::transfers::download_client::{
+    DownloadCapabilityRegistry, DownloadClientCapability, DownloadClientConfigField,
+    DownloadClientDiagnostic, DownloadClientService, DownloadClientUpdateRequest,
+    PreviousClientHandle, ProviderFailureInfo,
+};
+use std::sync::Arc;
 
 fn unique() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos())
+}
+
+/// 一个假的下载能力注册表：只给 `local` 提供能力，字段表声明 `host`（可见）
+/// 与 `token`（secret）。
+///
+/// **不是可有可无的脚手架**：`_resource` 要**知道哪些字段是 secret** 才剥得掉，
+/// 而字段表的唯一来源是插件；拿不到时上游把整份配置换成 `{}`
+/// （`client_config_service.py:73-91`）。没有它，`list_clients` 只能断言 `{}`，
+/// 「secret 被剥掉」这条就没人盯了。与 `sm-api/tests/media_libraries_http.rs`
+/// 的 `FakeRegistry` 是同一个套路（媒体库 `_resource` 判据相同）。
+struct FakeDownloads;
+
+struct FakeCapability;
+
+impl DownloadClientCapability for FakeCapability {
+    fn config_fields(&self) -> Vec<DownloadClientConfigField> {
+        vec![
+            DownloadClientConfigField {
+                key: "host".to_owned(),
+                input: "text".to_owned(),
+                read_only: false,
+            },
+            DownloadClientConfigField {
+                key: "token".to_owned(),
+                input: "secret".to_owned(),
+                read_only: false,
+            },
+        ]
+    }
+
+    fn prepare_client(
+        &self,
+        submitted: &serde_json::Value,
+        _library_id: i32,
+        _previous: Option<&PreviousClientHandle>,
+    ) -> Result<serde_json::Value, ProviderFailureInfo> {
+        Ok(submitted.clone())
+    }
+
+    fn test_client(
+        &self,
+        _submitted: &serde_json::Value,
+        _library_id: i32,
+    ) -> Result<DownloadClientDiagnostic, ProviderFailureInfo> {
+        Err(ProviderFailureInfo {
+            code: "unimplemented".to_owned(),
+            message: "FakeCapability 不探测".to_owned(),
+        })
+    }
+}
+
+impl DownloadCapabilityRegistry for FakeDownloads {
+    fn download_client_for(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<Box<dyn DownloadClientCapability>>, ProviderFailureInfo> {
+        if provider_key == "local" {
+            Ok(Some(Box::new(FakeCapability)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 async fn seed_library(db: &TestDb) -> i32 {
@@ -46,16 +113,18 @@ async fn seed_client(db: &TestDb, library_id: i32, config: Option<&str>) -> i32 
         .id
 }
 
-/// ★ 列表：**最新在前**（`created_at DESC, id DESC`），`provider_config` 是对象。
+/// ★ 列表：**最新在前**（`created_at DESC, id DESC`），`provider_config` 是对象，
+/// 且 **secret 字段被剥掉**（上游 `_resource`，`client_config_service.py:73-91`）。
 #[tokio::test]
 async fn listing_is_newest_first_and_projects_an_object() {
     let db = TestDb::require().await;
     let library_id = seed_library(&db).await;
     let first = seed_client(&db, library_id, None).await;
-    let second = seed_client(&db, library_id, Some(r#"{"host":"h"}"#)).await;
+    // `token` 是 provider 声明的 secret —— 响应里**必须**看不到它。
+    let second = seed_client(&db, library_id, Some(r#"{"host":"h","token":"s3cr3t"}"#)).await;
     let third = seed_client(&db, library_id, None).await;
 
-    let clients = DownloadClientService::new(db.pool())
+    let clients = DownloadClientService::new_with_downloads(db.pool(), Arc::new(FakeDownloads))
         .list_clients()
         .await
         .expect("列出");
@@ -71,7 +140,8 @@ async fn listing_is_newest_first_and_projects_an_object() {
         .expect("第二个在列表里");
     assert_eq!(
         with_config.provider_config,
-        serde_json::json!({"host": "h"})
+        serde_json::json!({"host": "h"}),
+        "`host` 留下、`token` 被 `_resource` 剥掉"
     );
     assert_eq!(with_config.library_id, library_id);
     let without = clients

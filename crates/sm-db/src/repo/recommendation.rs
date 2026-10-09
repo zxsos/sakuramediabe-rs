@@ -213,6 +213,40 @@ impl DailyRecommendationItemRepository {
     }
 
     paged_list! {
+        /// 列出**可见**的推荐（关联影片未拉黑），按 `rank`。**分页。**
+        ///
+        /// 上游 `list_items`（`daily_recommendation_service.py:424`）：
+        ///
+        /// ```python
+        /// query = DailyRecommendationItem.select().join(Movie).where(Movie.is_blacklisted == False)
+        /// total = query.count()
+        /// rows = query.order_by(DailyRecommendationItem.rank.asc()).offset(start).limit(page_size)
+        /// ```
+        ///
+        /// # 为什么要 JOIN 而不是拉回后在 Rust 侧过滤
+        ///
+        /// 拉黑的影片**不占分页槽位**：`COUNT` 与 `SELECT` 必须带同一个
+        /// `is_blacklisted = false`，否则最后一页会少于 `page_size` 条而
+        /// `total` 偏大 —— 正是 `paged_list!` 要避免的那类不一致（它把两段
+        /// SQL 锁在同一次编辑里）。
+        ///
+        /// # 排序只有 `rank`
+        ///
+        /// `rank` 全表唯一（见类型文档），排序是确定的，不需要 tie-breaker。
+        pub async fn list_visible_page(
+            &self,
+        ) -> Result<Page<DailyRecommendationItem>, DbError> {
+            count = "SELECT COUNT(*) FROM daily_recommendation_item d \
+                     JOIN movie m ON m.id = d.movie_id \
+                     WHERE m.is_blacklisted = false",
+            items = "SELECT d.* FROM daily_recommendation_item d \
+                     JOIN movie m ON m.id = d.movie_id \
+                     WHERE m.is_blacklisted = false \
+                     ORDER BY d.rank LIMIT $1 OFFSET $2",
+        }
+    }
+
+    paged_list! {
         /// 按快照日期列出。**分页。**
         ///
         /// 走 `daily_recommendation_item_snapshot_date_idx`。因为全表只存

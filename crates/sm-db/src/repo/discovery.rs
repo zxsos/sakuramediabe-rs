@@ -289,6 +289,41 @@ impl RankingItemRepository {
         .map_err(|e| DbError::from(e).with_entity(RANKING_ENTITY))?;
         Ok(result.rows_affected())
     }
+
+    /// 候选影片在各榜单上的名次行 `(movie_id, rank, period)`。**刻意不限榜单。**
+    ///
+    /// 对应上游 `_load_ranking_scores`（`daily_recommendation_service.py:219-234`）：
+    ///
+    /// ```python
+    /// rows = RankingItem.select(RankingItem.movie, RankingItem.rank, RankingItem.period)
+    ///     .where(RankingItem.movie.in_(candidate_ids))
+    /// ```
+    ///
+    /// # 为什么**不跨源去重**、也不在 SQL 里聚合
+    ///
+    /// 同一部影片可能同时挂在几个源 / 几个榜上。上游把这些行**全取回来**，
+    /// 在 Python 侧按 `(rank, period)` 衰减后取**每个周期的最大值**再比。
+    ///
+    /// 聚合条件（周期权重表 + `RANK_DECAY_WINDOW`）在服务层，SQL 里再写一份
+    /// 就成了两处真相 —— 而它们的分歧表现为「推荐次序略有出入」，
+    /// 归因成本远高于多读几行。
+    ///
+    /// **返回顺序不排序**：服务层的 `ranking_scores` 取最大值，与行序无关。
+    /// 加 `ORDER BY` 只会让这个查询多一次排序步骤。
+    pub async fn list_rank_rows_for_movies(
+        &self,
+        movie_ids: &[i32],
+    ) -> Result<Vec<(i32, i32, String)>, DbError> {
+        if movie_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as(
+            "SELECT movie_id, rank, period FROM ranking_item WHERE movie_id = ANY($1)",
+        )
+        .bind(movie_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
 }
 
 // ================================================================ image_search_session

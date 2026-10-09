@@ -119,8 +119,12 @@ impl MediaLibraryRegistry for FakeRegistry {
         provider_key: &str,
     ) -> Result<Option<Box<dyn MediaLibraryCapability>>, ProviderFailureInfo> {
         match self.mode {
+            // 裸码：服务层 `bundle_for` 会补 `provider_` 前缀，拼出
+            // `provider_not_installed`（见 `MediaLibraryRegistry::library_for` 的文档）。
+            // 写 `unavailable` 会拼成 `provider_unavailable` —— 那是「装了但连不上」，
+            // 与「没安装」是两种语义，`provider_failure` 的状态分流也靠这个区分。
             Mode::NotInstalled => Err(ProviderFailureInfo {
-                code: "unavailable".to_owned(),
+                code: "not_installed".to_owned(),
                 message: "provider not installed".to_owned(),
             }),
             Mode::Installed if provider_key == PROVIDER => Ok(Some(Box::new(FakeCapability))),

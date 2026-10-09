@@ -66,8 +66,10 @@ SakuraMedia 后端的 Rust 重写实现。
 任务声明 cron** —— 所以应该有 cron 的就是 16 个，而 16 个已全部注册，**cron 这一半
 早就是 100%**。
 
-真正的缺口是 **handler 落地 1/21**（`sm-scheduler/src/worker.rs` 的
-`HandlerRegistry` 里只注册了 `activity_record_cleanup`）。其余 20 个按各自域的
+真正的缺口是 **handler 落地 6/21**（`sm-scheduler/src/worker.rs` 的
+`HandlerRegistry` 目前注册了 `activity_record_cleanup`、`movie_asset_pack_backfill`、
+`movie_heat_update`、`image_search_index`、`movie_similarity_recompute`、
+`daily_recommendation_generate`）。其余 15 个按各自域的
 阻塞原因分布，见 [docs/service-progress.md](docs/service-progress.md) 的阻塞地图。
 
 > 逐域台账（已落规则 / 刻意不复刻 / 待核对项）见
@@ -78,6 +80,10 @@ SakuraMedia 后端的 Rust 重写实现。
 > 文件的计数与旧表逐个吻合（合计 65），新增 11 个（account 3 + activity 6 +
 > jobs 由 1 增至 2）。改动端点时请一并更新此表，**并用同样的口径复算** ——
 > 口径错了数字只会偏小，而偏小的进度看不出「统计本身不可信」。
+>
+> **为什么重构、最终怎么部署** 见 [docs/deployment.md](docs/deployment.md)：
+> 上游那个 4GB Python 镜像的体积逐条归因（带 `文件:行号`）、还要移植哪些插件、
+> **什么时候才能删掉 Python 运行时**，以及替换时的灰度方案。
 
 ## 零外部依赖
 

@@ -115,6 +115,12 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
 
 ### P1-1 · `GenerateThumbnails` 的返回值丢了（定义被冷落的 `GenerateThumbnailsResponse`）
 
+> ✅ **2026-10-07 已落地**（提交 `99671f1`）：rpc 已改为
+> `returns (stream GenerateThumbnailsResponse)`，消息是
+> `oneof payload { progress = 1; done = 2; }`，宿主侧「流里没有 `done`」判为
+> provider 违约。⚠️ **但契约仓尚未同步**（tag `v0.1.0` 仍是旧版），
+> 详见 [`../tasks/proto-p1-gaps.md`](../tasks/proto-p1-gaps.md) §二。
+
 - 位置：`proto/storage.proto:369`，对照 `159-176`
 - 现状：`rpc GenerateThumbnails(...) returns (stream ProgressEvent)`，
   而 `GenerateThumbnailsResponse { ThumbnailGeneration generation = 1; }`
@@ -131,6 +137,11 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
 
 ### P1-2 · `PlaybackPlan` 缺一种 delivery：本地路径
 
+> ⬜ **2026-10-07 仍未做** —— 这是 P1 里**唯一还没决策的 proto 改动**。
+> 改动提案（含精确 diff 与影响面）见
+> [`../tasks/proto-p1-gaps.md`](../tasks/proto-p1-gaps.md) §三。
+> 它必须先于 `local_provider` 的 Rust 移植。
+
 - 位置：`proto/storage.proto:26-52`
 - 现状：`delivery` 只有 `RedirectPlan`（302 外链 URL）与 `ProxyPlan`
   （插件自己的 HTTP endpoint）。
@@ -144,6 +155,12 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
   （走 `OpenCoverSourceResponse` 同一套语义）。
 
 ### P1-3 · 失败只有一个布尔位，`ProviderError` 无处安放
+
+> ✅ **2026-10-07 已落地（采用 (a) 的变体）**：`sm-plugin-api/src/error.rs` 的
+> `to_status` / `from_status` 把 `ProviderError` 编进 **`Status::details`**
+> （不必引 `google/protobuf/any.proto`，也不必改任何 rpc 签名）；
+> 宿主 `sm-plugins/src/provider_calls.rs` 的 `classify_status` 先解结构、
+> 解不出才按 gRPC 码猜。往返无损有单测锁着。
 
 - 位置：`proto/common.proto:311-329`（定义了 `ProviderError` + `ProviderErrorCode` + `retryable`），
   对照 `PlaybackPlan.unavailable`（`storage.proto:50-51`）
@@ -251,11 +268,20 @@ cargo clippy -p plugin-ref-local --all-targets -- -D warnings
 
 给主线的下一步建议（按优先级）：
 
-- [ ] 就 P1-1 / P1-2 / P1-3 三个缺口做一次决策（改 proto or 写文档约定），
-      结论出来后 `sm-plugin-api` 重生成
+> ⚠️ **2026-10-07 更新：本清单已过时一半，别再照它开工。**
+> 核对结果见 [`../tasks/proto-p1-gaps.md`](../tasks/proto-p1-gaps.md) §一：
+> **P1-1 与 P1-3 都已在本仓落地**（`99671f1` 的 proto 修订 +
+> `sm-plugin-api/src/error.rs` 的 `to_status`/`from_status` +
+> `sm-plugins/src/provider_calls.rs` 的 `classify_status`），P1-4 见下。
+> 真正剩下的是两件事：**契约仓尚未同步**（P0，且 `ABI_MAJOR` 两边同为 1
+> 导致检查不到）与 **P1-2**。
+
+- [x] ~~就 P1-1 / P1-2 / P1-3 三个缺口做一次决策~~ —— P1-1 / P1-3 已直接落地（见上）
 - [x] 在 `sm-plugin-api` 里引入默认实现层，消灭 P1-4 的税
       —— 见 `provider::StorageProviderExt` / `DownloadProviderExt`，
       `plugin-ref-local` 已迁移（少约 170 行）
+- [ ] **契约仓同步**（P0）：本仓 `proto/` 与 `src/` 已前进，契约仓 tag `v0.1.0` 停在旧版
+- [ ] **P1-2**：`PlaybackPlan` 加 `local_path` delivery
 - [ ] 把 `data_plane_endpoint` 写成字节搬运的强制路径
 - [ ] 目标 NAS 硬件上复跑 §3 的测量，验证 §3.1 的 ~41ms 是否为环境噪声
 

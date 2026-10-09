@@ -121,6 +121,27 @@ pub(crate) const RESOLUTION_LEVEL_CASE: &str = "CASE \
 /// 变成「无法解析」而少算一档。
 pub type MovieResolutionLevelRow = (i32, i32);
 
+/// 每日推荐的**全库候选**投影行。
+///
+/// 位置依次是 **`(id, heat, release_date, created_at, is_subscribed)`**。
+/// 消费方用 `let (id, heat, ..) = row;` 解构，别用 `.0` / `.1` ——
+/// 五个位置里有两个同类型的时间戳，写错位是**静默**的（编译通过、语义反了）。
+///
+/// # 为什么是元组而不是 `pub struct`
+///
+/// 它是 `movie` 表的**列子集**（5 列），不是表镜像：上游没有这样一张 Peewee
+/// 模型可以逐列对照，写成 `pub struct` 会被门禁报 `UNCHECKED_STRUCT`。
+/// 具名类型 `sm_service::discovery::daily_recommendation::CandidateMovie` 放在
+/// 服务层，与 [`MovieResolutionLevelRow`] 同一选法（见
+/// `parity/compare_schema.py` 的豁免说明：带 `FromRow` 的投影行不在豁免范围内）。
+pub type CandidateMovieRow = (
+    i32,
+    i32,
+    Option<chrono::NaiveDateTime>,
+    Option<chrono::NaiveDateTime>,
+    bool,
+);
+
 /// 影片列表的筛选条件（上游 `_filtered_movies` 的入参）。
 ///
 /// 纯值对象：只作为参数传给 [`MovieRepository::list_movie_card_ids`]，没有
@@ -2104,5 +2125,43 @@ impl MovieRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|(number,)| number).collect())
+    }
+
+    /// 每日推荐的**全库候选**：全部「非集合、未拉黑」影片的 5 列投影。
+    ///
+    /// 对应上游 `_load_candidate_movies`（`daily_recommendation_service.py:130-154`）：
+    ///
+    /// ```python
+    /// Movie.select(Movie.id, Movie.heat, Movie.release_date, Movie.created_at,
+    ///              Movie.is_subscribed)
+    ///      .where(Movie.is_collection == False, Movie.is_blacklisted == False)
+    ///      .order_by(Movie.id.asc())
+    /// ```
+    ///
+    /// # 只投影 5 列，是**内存**问题不是风格问题
+    ///
+    /// 上游注释（`:132`）：全库 30 万行若加载完整模型实例，「**实测峰值
+    /// 3.9GB**」。这个是每日推荐任务能在小内存机器上跑起来的前提。
+    /// `is_collection` 只进 `WHERE`，不进投影。
+    ///
+    /// # `ORDER BY id` 不能省
+    ///
+    /// 打分是纯函数、结果由 `sort_scored` 的 tie-breaker 决定 —— 但**同分且
+    /// 同日**的影片最终次序取决于候选取回顺序（`sort_by` 是稳定的）。少了
+    /// 排序，两次生成之间同分影片的相对位置会漂，而快照每天重写一次，
+    /// 那种漂移会被用户看见。
+    ///
+    /// # 拉黑影片**不进入候选**，而不是「进候选后得 0 分」
+    ///
+    /// 上游把过滤放在 SQL 里。放在打分侧会让它们在 `freshness` 里占排名位次
+    /// （拉黑的影片越多，真实候选的 freshness 分被压得越低）。
+    pub async fn list_daily_candidates(&self) -> Result<Vec<CandidateMovieRow>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, heat, release_date, created_at, is_subscribed FROM movie \
+             WHERE is_collection = false AND is_blacklisted = false \
+             ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 }

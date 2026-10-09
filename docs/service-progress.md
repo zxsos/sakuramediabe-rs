@@ -39,7 +39,7 @@
 
 | 依赖 | 被阻塞 | 备注 |
 |---|---|---|
-| `provider_protocol` / `MEDIA_PROVIDER_REGISTRY` | **24 个文件 / 8,885 行** | ⚠️ **本行原写的理由已失效** —— 原文说「需先做 `sm-plugins` 宿主，而它目前是 1 行空壳 —— 这是最大的单点阻塞」。实测 `sm-plugins` 是 **12 个文件 / 127,655 字节**（`supervisor.rs` 16.5KB、`movie_delivery.rs` 18.4KB、`extensions.rs` 25KB、`jobs.rs` 13.4KB、`loader.rs`、`runner.rs`、`registration.rs`、`registry.rs`、`scheduling.rs`、`extension_calls.rs`、`error.rs`），组合根也已接上（`sm-server/src/plugins.rs`）。**真正剩下的阻塞是「还没有任何真实 provider 插件被移植过来」** —— 宿主有能力了，缺的是被宿主承载的东西。 |
+| `provider_protocol` / `MEDIA_PROVIDER_REGISTRY` | **24 个文件 / 8,885 行** | ⚠️ **本行原写的理由已失效** —— 原文说「需先做 `sm-plugins` 宿主，而它目前是 1 行空壳 —— 这是最大的单点阻塞」。实测 `sm-plugins` 是 **12 个文件 / 127,655 字节**（`supervisor.rs` 16.5KB、`movie_delivery.rs` 18.4KB、`extensions.rs` 25KB、`jobs.rs` 13.4KB、`loader.rs`、`runner.rs`、`registration.rs`、`registry.rs`、`scheduling.rs`、`extension_calls.rs`、`error.rs`），组合根也已接上（`sm-server/src/plugins.rs`）。**真正剩下的阻塞是「还没有任何真实 provider 插件被移植过来」** —— 宿主有能力了，缺的是被宿主承载的东西。**7 个插件的体量、难度与移植次序见 [`deployment.md`](deployment.md) §5.2，执行顺序见 [`handoff.md`](handoff.md) §八。** |
 | PyAV（`import av`） | 含 `playback/media_metadata_probe_service`(338) | 属 `svc-probe`（阶段 9） |
 | zip 实现 | `playback/media_thumbnail_pack_backfill_service`(216) | 仓库无 zip crate；另缺 `write_pack` / `media_paths` 助手 |
 | Qdrant | ~~`discovery/` 下 10 个文件~~ | ✅ **已不是阻塞**（2026-10-05）。`qdrant-client 1.19` 已接入（`sm-service/src/discovery/qdrant/`），服务端用 Podman 跑在 `127.0.0.1:6333/6334`。剩下的是 `movie_similarity` 那套**稀疏向量 + 别名切换**，结构与稠密那套不同，是独立的活 |
@@ -663,8 +663,17 @@ ABI** 的那一侧 —— 这个域的大头全在 `sm-plugins` 宿主后面，�
 `todo!()`，**且未做编译验证**（重构阶段）。所以「已铺」指类型与依赖经代码
 走查对得上上游，**不是「验证过能跑」**。
 
-未铺的两个是超大文件：`moment_recommendation_service.py`（24KB）与
-`daily_recommendation_service.py`（18.7KB）—— 两者都消费
+**2026-10-07 更新**：`daily_recommendation_service.py`（18.7KB）
+**读侧 + 生成侧都已落地并验证**：
+
+- 读侧 `c801441`：`list_items` + `GET /daily-recommendations` + 完整影片卡片
+  （`DailyRecommendationMovieResource`）；
+- 生成侧 `2655f4d`：`generate_latest_snapshot` + 四个 IO 装载器 + Qdrant 相似度
+  降级，并注册 `daily_recommendation_generate`（worker handler 5 → 6）；
+- 测试：17 个纯函数单测 + 6 个真库集成测试
+  （`crates/sm-service/tests/daily_recommendation_generate.rs`）。
+
+未铺的一个是超大文件：`moment_recommendation_service.py`（24KB）—— 它消费
 `recommendation_service` 的产出，单独一轮。
 
 ### 外部依赖：**已无阻塞**

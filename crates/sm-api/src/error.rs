@@ -132,7 +132,7 @@ fn body_rejection(detail: String) -> ErrorResponse {
 }
 
 impl From<FormRejection> for ErrorResponse {
-    /// 表单解析失败 → 422 `validation_error`（同 [`body_rejection`]）。
+    /// 表单解析失败 → 422 `validation_error`（同 `body_rejection`）。
     ///
     /// axum 的 `FormRejection` 对「content-type 不是 form」默认回 **415**、对
     /// 字段缺失回 422，且都是纯文本。两者都收敛到这里 —— 上游 `OAuth2PasswordRequestForm`

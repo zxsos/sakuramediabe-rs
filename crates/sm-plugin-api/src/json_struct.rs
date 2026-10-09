@@ -95,15 +95,30 @@ mod tests {
     use super::*;
 
     /// 四种标量 + 嵌套对象 / 数组，往返一致。
+    ///
+    /// ★ 数字一律按 **f64** 往返（`Struct.number_value` 是 double，见模块文档），
+    /// 所以这里用浮点字面量。原先写的是整数字面量 `1` / `2`，而它们回来是
+    /// `1.0` / `2.0` —— 那条断言**不可能成立**（`number_value` 是 double，
+    /// 类型信息在 protobuf 层就丢了），不是待修的 bug。
     #[test]
     fn a_round_trip_preserves_every_kind() {
         let json = serde_json::json!({
             "s": "x", "b": true, "n": 1.5, "nil": null,
-            "list": [1, "a", null],
-            "obj": {"inner": {"deep": 2}}
+            "list": [1.0, "a", null],
+            "obj": {"inner": {"deep": 2.0}}
         });
         let struct_value = json_to_struct(&json).expect("根是对象");
         assert_eq!(struct_to_json(Some(&struct_value)), json);
+    }
+
+    /// ★ 整数字面量往返后**变成浮点** —— 把上面那条注释里的取舍钉成契约，
+    /// 免得后来者把它当 bug「修」掉（protobuf 层无从区分 `1` 与 `1.0`）。
+    #[test]
+    fn an_integer_literal_comes_back_as_a_float() {
+        let json = serde_json::json!({ "count": 1 });
+        let round_tripped = struct_to_json(Some(&json_to_struct(&json).expect("根是对象")));
+        assert!(round_tripped["count"].is_f64(), "回来必须是浮点");
+        assert_eq!(round_tripped["count"].as_f64(), Some(1.0));
     }
 
     /// ★ 根不是对象 → `None`，**不是**空对象（那是调用方传错形状）。

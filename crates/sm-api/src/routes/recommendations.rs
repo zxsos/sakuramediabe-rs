@@ -33,13 +33,14 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sm_db::repo::discovery::HotActressReleaseRepository;
-use sm_service::discovery::daily_recommendation::DailyRecommendationItem;
+use sm_service::discovery::daily_recommendation::DailyRecommendationService;
 use sm_service::discovery::hot_actress_release::{HotActressReleaseItem, HotActressReleaseQuery};
 
 use crate::auth::CurrentUser;
-use crate::dto::{ImageResource, MovieListItemResource};
+use crate::dto::{DailyRecommendationMovieResource, ImageResource, MovieListItemResource};
 use crate::error::ErrorResponse;
 use crate::query::{one, twenty};
+use crate::signing::{now_seconds, signing_secret};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -72,28 +73,40 @@ struct PageResponse<T> {
 
 /// `GET /daily-recommendations`
 ///
-/// ⚠️ **这不是「接线没做」，是服务层的读、写两侧都缺**（见
-/// [`sm_service::discovery::daily_recommendation`] 顶部的说明）：
+/// 读**当前**快照的一页（上游 `list_items`，`daily_recommendation_service.py:414-476`）。
+/// 响应元素是**完整影片卡片** + 8 个推荐字段
+/// （[`DailyRecommendationMovieResource`]），**页级没有 `snapshot_date`**。
 ///
-/// 1. **读侧**：`DailyRecommendationService::list_items` 不存在。要加仓储分页查询
-///    （`DailyRecommendationItem ⋈ Movie(is_blacklisted=False) ORDER BY rank`），
-///    并把 `catalog::movie::MovieService::load_cards` 从**私有改公开**（现在外部
-///    拿不到卡片），再拼卡片；
-/// 2. **生成侧**：`generate_latest_snapshot` 与它的四个 IO 装载器不存在
-///    （调度任务 `daily_recommendation_generate_cron`）；Qdrant 相似度失败要
-///    **只跳过该信号**、不整体失败；
-/// 3. **形状**：下面的 `PageResponse<DailyRecommendationItem>` 用的是**缩过的、
-///    名不对的**元素。上游是 `PageResponse[DailyRecommendationMovieResource]`，
-///    元素 = 完整影片卡片 + `{snapshot_date, generated_at, rank,
-///    recommendation_score, reason_codes, reason_texts, signal_scores, is_stale}`，
-///    且**没有页级 `snapshot_date`**。落地时一并换掉（复用
-///    [`crate::dto::MovieListItemResource`] + `#[serde(flatten)]`）。
+/// `page < 1` 或 `page_size` 不在 `1..=100` → 422
+/// `invalid_daily_recommendation_filter`（服务层给，**不夹到边界** —— FastAPI
+/// 的 `ge` / `le` 行为）。
+///
+/// ⚠️ **生成侧仍未接**：`generate_latest_snapshot` 与它的 IO 装载器还不存在，
+/// 所以库里没有快照时返回**空页**（`items: []`, `total: 0`）—— 这不是 bug。
+/// 见 [`sm_service::discovery::daily_recommendation`] 顶部说明。
 async fn list_daily_recommendations(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-    axum::extract::Query(_query): axum::extract::Query<BoundedPageQuery>,
-) -> Result<Json<PageResponse<DailyRecommendationItem>>, ErrorResponse> {
-    todo!("骨架：需先实现 DailyRecommendationService 的 list_items / generate_latest_snapshot 与公开 load_cards（见上）")
+    axum::extract::Query(query): axum::extract::Query<BoundedPageQuery>,
+) -> Result<Json<PageResponse<DailyRecommendationMovieResource>>, ErrorResponse> {
+    let page = DailyRecommendationService::new(state.db())
+        .list_items(query.page, query.page_size)
+        .await?;
+
+    let secret = signing_secret(&state)?;
+    let now = now_seconds();
+    let items = page
+        .items
+        .iter()
+        .map(|card| DailyRecommendationMovieResource::from_daily_card(card, &secret, now))
+        .collect();
+
+    Ok(Json(PageResponse {
+        items,
+        page: query.page,
+        page_size: query.page_size,
+        total: page.total,
+    }))
 }
 
 /// 瞬时推荐分页查询 —— **刻意无上下界**。

@@ -185,6 +185,44 @@ impl MovieActorRepository {
         }
     }
 
+    /// 候选集里、**关联了已订阅演员**的影片 id（去重，顺序不定）。
+    ///
+    /// 对应上游 `_load_subscribed_actor_movie_ids`
+    /// （`daily_recommendation_service.py:171-181`）：
+    ///
+    /// ```python
+    /// MovieActor.select(MovieActor.movie)
+    ///     .join(Actor, JOIN.INNER, on=(MovieActor.actor == Actor.id))
+    ///     .where(Actor.is_subscribed == True, MovieActor.movie.in_(candidate_ids))
+    /// ```
+    ///
+    /// # `DISTINCT` 不是优化，是语义
+    ///
+    /// 一部影片常有多个演员，其中两个都被订阅 —— 不去重会返回同一个
+    /// `movie_id` 两次。上游用 `{movie_id for (movie_id,) in rows}` 去重。
+    ///
+    /// # **不解析 `merged_into_id`**（与 `MovieRepository::numbers_for_actor_ids` 不同）
+    ///
+    /// 上游这一处没有走演员合并链，照抄：被合并演员名下的订阅影片在这里
+    /// **算不进去**。改成解析合并链会让推荐结果与上游不同，而那种差异
+    /// 表现为「某几部影片多/少了一点订阅演员分」，很难归因。
+    pub async fn list_with_subscribed_actor_in(
+        &self,
+        candidate_ids: &[i32],
+    ) -> Result<Vec<i32>, DbError> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT ma.movie_id FROM movie_actor ma \
+             JOIN actor a ON a.id = ma.actor_id \
+             WHERE a.is_subscribed = true AND ma.movie_id = ANY($1)",
+        )
+        .bind(candidate_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 关联一位演员。重复关联返回既有行。
     pub async fn link(&self, movie_id: i32, actor_id: i32) -> Result<MovieActor, DbError> {
         let mut ctx = Ctx::over_pool(&self.pool);

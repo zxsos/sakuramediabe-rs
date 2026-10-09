@@ -28,10 +28,11 @@
 //!
 //! # 已落地与未落地
 //!
-//! [`worker::builtin_handlers`] 目前注册了 3 个：
-//! `activity_record_cleanup`、`image_search_index`、`movie_similarity_recompute`
-//! —— 三者都只依赖**已就位**的 service。19 个内建任务里其余 16 个的 service
-//! 还没写（`docs/service-progress.md` 有逐条阻塞原因）。
+//! [`worker::builtin_handlers`] 目前注册了 6 个：`activity_record_cleanup`、
+//! `movie_asset_pack_backfill`、`movie_heat_update`、`image_search_index`、
+//! `movie_similarity_recompute`、`daily_recommendation_generate`
+//! —— 六者都只依赖**已就位**的 service。19 个内建 cron 任务里其余 13 个的
+//! service 还没写（`docs/service-progress.md` 有逐条阻塞原因）。
 //!
 //! 未注册的任务被领到时会**明确 `failed`** 并写清原因，而不是静默跳过；
 //! 理由见 [`worker`] 模块文档。

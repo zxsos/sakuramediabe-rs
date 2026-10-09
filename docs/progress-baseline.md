@@ -2,13 +2,13 @@
 
 | 指标 | 现在 |
 |---|---|
-| 未实现的方法体（`todo!()`） | **76** 处（`sm-service` 33 + 路由 43）|
-| 端点（方法级） | 175 / 177 已注册，**其中 43 条仍是 `todo!()`** |
+| 未实现的方法体（`todo!()`） | **74** 处（`sm-service` 32 + 路由 42）|
+| 端点（方法级） | 175 / 177 已注册，**其中 42 条仍是 `todo!()`** |
 | 端点（路径级） | 136 / 136（未注册的方法级端点 2 条）|
 | 完成的域 | `collections`、`videos`（2/7 个域） |
-| 待办最多的域 | `transfers` 16 · `catalog` 7 · `playback` 5 |
-| worker handler | 5 / 21 |
-| 基线提交 | `8616efc`（生成时的 HEAD）|
+| 待办最多的域 | `transfers` 16 · `catalog` 6 · `playback` 5 |
+| worker handler | 6 / 21 |
+| 基线提交 | `73bd706`（生成时的 HEAD）|
 
 > 数字由 `pwsh -File scripts/progress.ps1 -Write` 生成（**不要手数**：手数三次错过
 > 分母，126 应为 177）。改完代码就跑 `-Write` 并提交本文件 —— 门禁里有 `-Diff`，
@@ -18,21 +18,21 @@
 
 口径：`todo!(` / `unimplemented!(` 出现次数（剥掉注释）。与「注册了多少」是两件事。
 
-- 全仓合计：**76** 处
-- 其中 `crates/sm-api/src/routes/*.rs`：**43** 处（= 已注册但**未实现**的端点 / 辅助函数）
+- 全仓合计：**74** 处
+- 其中 `crates/sm-api/src/routes/*.rs`：**42** 处（= 已注册但**未实现**的端点 / 辅助函数）
 
 | crate | `todo!()` |
 |---|---|
-| `sm-api` | 43 |
-| `sm-service` | 33 |
+| `sm-api` | 42 |
+| `sm-service` | 32 |
 
 ### 按模块目录
 
 | 位置 | `todo!()` |
 |---|---|
-| `sm-api/routes` | 43 |
+| `sm-api/routes` | 42 |
 | `sm-service/transfers` | 16 |
-| `sm-service/catalog` | 7 |
+| `sm-service/catalog` | 6 |
 | `sm-service/playback` | 5 |
 | `sm-service/discovery` | 3 |
 | `sm-service/system` | 2 |
@@ -49,7 +49,6 @@
 | `discovery\moment_recommendation.rs` | 2 |
 | `system\plugin_removal.rs` | 2 |
 | `catalog\catalog_import.rs` | 1 |
-| `catalog\metadata_source.rs` | 1 |
 | `discovery\image_search_space.rs` | 1 |
 | `playback\media_file_hash_backfill.rs` | 1 |
 | `playback\media_metadata_probe.rs` | 1 |
@@ -79,7 +78,7 @@
 - `/actors/{}/profile-image|PUT`
 - `/media/{}/clips|POST`
 
-⚠️ 注册 ≠ 能用：其中 **43** 条的 handler 还是 `todo!()`。
+⚠️ 注册 ≠ 能用：其中 **42** 条的 handler 还是 `todo!()`。
 
 ### 已注册端点（按文件）
 
@@ -113,7 +112,7 @@
 | `playlists.rs` | 9 | 0 |
 | `plugins.rs` | 8 | 8 |
 | `ranking_sources.rs` | 3 | 0 |
-| `recommendations.rs` | 3 | 3 |
+| `recommendations.rs` | 3 | 2 |
 | `status.rs` | 6 | 2 |
 | `tags.rs` | 3 | 0 |
 | `video_collections.rs` | 9 | 0 |
@@ -136,24 +135,25 @@
 
 | 域 | Rust 文件 | Rust 行 | 上游文件 | 上游行 |
 |---|---|---|---|---|
-| catalog | 26 | 11559 | 27 | 7556 |
+| catalog | 26 | 11908 | 27 | 7556 |
 | collections | 4 | 2062 | 5 | 1292 |
-| discovery | 17 | 7155 | 16 | 4485 |
+| discovery | 17 | 7769 | 16 | 4485 |
 | playback | 20 | 7075 | 19 | 3741 |
 | system | 19 | 5551 | 19 | 2935 |
 | transfers | 17 | 7771 | 23 | 4248 |
 | videos | 3 | 1735 | 4 | 927 |
-| **合计** | **106** | **42908** | **113** | **25184** |
+| **合计** | **106** | **43871** | **113** | **25184** |
 
 > ⚠️ **行数比不是完成度**（本仓注释占大头）；看上面的 `todo!()`。
 
 ## 调度
 
 - 上游内建任务：21
-- worker handler 已落地：**5**
+- worker handler 已落地：**6**
   - `activity_record_cleanup`
   - `image_search_index`
   - `movie_similarity_recompute`
+  - `daily_recommendation_generate`
   - `movie_asset_pack_backfill`
   - `movie_heat_update`
 

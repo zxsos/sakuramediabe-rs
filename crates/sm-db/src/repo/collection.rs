@@ -1375,6 +1375,54 @@ impl PlaylistMovieRepository {
         .await?)
     }
 
+    /// 「最近播放」列表里、属于**候选集**的影片，取最近的 N 部。**只返回 id。**
+    ///
+    /// 对应上游 `_load_recent_seed_ids`（`daily_recommendation_service.py:156-169`）：
+    ///
+    /// ```python
+    /// rows = (PlaylistMovie.select(PlaylistMovie.movie)
+    ///         .where(PlaylistMovie.playlist == playlist,
+    ///                PlaylistMovie.movie.in_(candidate_ids))
+    ///         .order_by(PlaylistMovie.updated_at.desc(), PlaylistMovie.id.desc())
+    ///         .limit(RECENT_SEED_LIMIT))
+    /// ```
+    ///
+    /// # `candidate_ids` 必须在 SQL 里过滤，不能取回来再筛
+    ///
+    /// 「最近播放」里可能有已拉黑或已删除的影片。先取最近 30 条再在内存里
+    /// 剔除，会让**被剔除的名额不被补齐** —— 最近 30 条里恰有 5 条是拉黑的，
+    /// 就只拿到 25 个种子。上游把过滤放进 `WHERE`，`LIMIT` 数的是候选。
+    ///
+    /// # 排序两级，且**不补 `NULLS LAST`**
+    ///
+    /// `updated_at DESC, id DESC`。`updated_at` 可空（老行），在 PG 的 `DESC`
+    /// 下按默认排最前；补 `NULLS LAST` 会让顺序与上游不同。第二级 `id DESC`
+    /// 给同一毫秒写入的多行一个确定次序（否则两次生成之间种子顺序会抖，
+    /// 而种子位置决定 `seed_weight` 的线性衰减值）。
+    pub async fn list_recent_played_in(
+        &self,
+        playlist_id: i32,
+        candidate_ids: &[i32],
+        limit: i64,
+    ) -> Result<Vec<i32>, DbError> {
+        // 空候选集提前返回：`movie_id = ANY('{}')` 本就零行，省一次往返。
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT movie_id FROM playlist_movie \
+             WHERE playlist_id = $1 AND movie_id = ANY($2) \
+             ORDER BY updated_at DESC, id DESC LIMIT $3",
+        )
+        .bind(playlist_id)
+        .bind(candidate_ids)
+        // `max(1)`：`LIMIT 0` 会让「最近的种子」这个查询静默返回空表，
+        // 而那看起来像「最近播放是空的」。上游的 `RECENT_SEED_LIMIT` 是常量 30。
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     paged_list! {
         /// 列出某个影片出现在哪些播放列表里。**分页。**
         ///

@@ -30,6 +30,7 @@ use sm_service::catalog::actor::{
 };
 use sm_service::catalog::movie::MovieCard;
 use sm_service::collections::playlist::PlaylistMovieCard;
+use sm_service::discovery::daily_recommendation::DailyRecommendationCard;
 use sm_service::playback::media_summary::{MediaSummary, MovieMediaAttachment};
 
 /// 播放列表响应体。
@@ -1114,6 +1115,55 @@ impl MovieListItemResource {
             secret,
             now,
         )
+    }
+}
+
+/// 每日推荐响应元素（上游 `DailyRecommendationMovieResource`，
+/// `schema/discovery/daily_recommendations.py:6-14`）。
+///
+/// **继承完整的影片卡片**（[`MovieListItemResource`]，`#[serde(flatten)]`），
+/// 再挂 8 个推荐字段。**页级没有 `snapshot_date`** —— 快照日期是元素级字段
+/// （`is_stale` 也是元素级：`row.snapshot_date < today`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyRecommendationMovieResource {
+    #[serde(flatten)]
+    pub base: MovieListItemResource,
+    /// 快照日期，`YYYY-MM-DD`。
+    pub snapshot_date: String,
+    /// 生成时刻，`YYYY-MM-DDTHH:MM:SS`（与 [`PlaylistResource`] 同一约定，
+    /// 见模块文档「已知偏差」）。
+    pub generated_at: String,
+    pub rank: i32,
+    /// 综合推荐分。上游 `row.score` → `recommendation_score`。
+    pub recommendation_score: f64,
+    pub reason_codes: Vec<String>,
+    /// 理由**文案**。取库里存的 `reason_texts`，**不**由 `reason_codes` 现翻。
+    pub reason_texts: Vec<String>,
+    /// 六路信号分量。**原样透传库里存的 JSON 对象**（缺省 `{}`）。
+    pub signal_scores: serde_json::Map<String, Value>,
+    /// 快照是否早于今天（元素级）。
+    pub is_stale: bool,
+}
+
+impl DailyRecommendationMovieResource {
+    /// 从读侧装配结果组装（`GET /daily-recommendations`）。
+    ///
+    /// 日期 / 时间戳 / JSON 三种兜底的格式化都留在本模块：时间戳走本模块的
+    /// `format_timestamp`，与 [`MovieListItemResource::from_movie_card`]
+    /// 的封面签名是同一个调用点。
+    pub fn from_daily_card(card: &DailyRecommendationCard, secret: &str, now: i64) -> Self {
+        let item = &card.item;
+        Self {
+            base: MovieListItemResource::from_movie_card(&card.card, secret, now),
+            snapshot_date: item.snapshot_date.format("%Y-%m-%d").to_string(),
+            generated_at: format_timestamp(Some(item.generated_at)),
+            rank: item.rank,
+            recommendation_score: item.score,
+            reason_codes: item.parsed_reason_codes().unwrap_or_default(),
+            reason_texts: item.parsed_reason_texts().unwrap_or_default(),
+            signal_scores: item.parsed_signal_scores().unwrap_or_default(),
+            is_stale: card.is_stale,
+        }
     }
 }
 

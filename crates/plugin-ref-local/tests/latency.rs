@@ -126,7 +126,7 @@ async fn measure_unary(
 
 /// 流式调用「建流 → 首帧」的延迟样本。
 ///
-/// 每次都完整收完 4 帧再收下一次：这样测的是冷启动流量的首帧，
+/// 每次都完整收完 5 帧再收下一次：这样测的是冷启动流量的首帧，
 /// 而不是同一个生产者被反复唤醒的情况。
 async fn measure_stream(
     client: &mut StorageProviderClient<tonic::transport::Channel>,
@@ -166,8 +166,9 @@ async fn measure_stream(
             frame.expect("后续帧不应出错");
             remaining += 1;
         }
-        // 4 = 3 个进度 + 1 个终态 `done`（P1-1 修订后流多了一条）。
-        assert_eq!(remaining, 4);
+        // 5 = 4 个进度 + 1 个终态 `done`（P1-1 修订后流多了一条）。
+        // 进度条数 = `thumbnail_count(40s)` = 40 / 10 = 4（见 `provider.rs` 的采样规则）。
+        assert_eq!(remaining, 5);
 
         if round >= STREAM_WARMUP {
             collected.push(elapsed);

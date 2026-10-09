@@ -13,7 +13,7 @@
 //! 用 mock 或内存实现时，「第二次调用不插入」看起来也对 —— 但那是因为内存里
 //! 恰好没有并发/重放。这两个判据只有真的落库才算数。
 
-use sm_db::repo::SystemNotificationRepository;
+use sm_db::repo::{BackgroundTaskRunRepository, NewTaskRun, SystemNotificationRepository};
 use sm_db::testing::TestDb;
 use sm_service::transfers::import_notifications::{
     create_new_media_reminder, NewMovieReminderItem, NEW_MEDIA_EVENT, NEW_MEDIA_TITLE,
@@ -30,6 +30,32 @@ fn repo(db: &TestDb) -> SystemNotificationRepository {
     SystemNotificationRepository::new(db.pool().clone())
 }
 
+fn n() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// 造一条**真实**的 `background_task_run`。
+///
+/// 不能随便编 id：`system_notification.related_task_run_id` 有外键指过来
+/// （`system_notification_related_task_run_id_fk`），编出来的 id 在真库里直接撞 FK。
+/// 这正是本文件开头「为什么必须连真库」的又一个例子 —— 内存实现看不见外键。
+async fn seed_run(db: &TestDb) -> i32 {
+    BackgroundTaskRunRepository::new(db.pool().clone())
+        .enqueue(&NewTaskRun {
+            task_key: format!("notif-{:06}", n()),
+            task_name: "通知集成测试任务".to_owned(),
+            trigger_type: "manual".to_owned(),
+            mutex_key: None,
+            params: None,
+            scheduled_at: None,
+        })
+        .await
+        .expect("enqueue")
+        .id
+}
+
 async fn notification_count(db: &TestDb) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM system_notification")
         .fetch_one(db.pool())
@@ -41,6 +67,8 @@ async fn notification_count(db: &TestDb) -> i64 {
 #[tokio::test]
 async fn an_empty_import_creates_no_notification() {
     let db = TestDb::require().await;
+    // `Some(1)` 是个不存在的 run id —— 这里无所谓：没有新增影片时函数在**落库前**
+    // 就返回了，编的 id 撞不到外键。凡是真会写库的用例都必须走 `seed_run`。
     let created = create_new_media_reminder(&repo(&db), &[], Some(1))
         .await
         .expect("不该出错");
@@ -59,9 +87,10 @@ async fn an_empty_import_creates_no_notification() {
 #[tokio::test]
 async fn the_reminder_is_a_single_aggregated_row() {
     let db = TestDb::require().await;
+    let run_id = seed_run(&db).await;
     let items = [item("ABC-001"), item(" ABC-002 "), item("ABC-001")];
 
-    let row = create_new_media_reminder(&repo(&db), &items, Some(17))
+    let row = create_new_media_reminder(&repo(&db), &items, Some(run_id))
         .await
         .expect("可落库")
         .expect("有新增就该发");
@@ -74,13 +103,11 @@ async fn the_reminder_is_a_single_aggregated_row() {
         "计数是**去重后**的：重复番号只算一次"
     );
     assert_eq!(row.event_type.as_deref(), Some(NEW_MEDIA_EVENT));
-    assert_eq!(
-        row.dedupe_key.as_deref(),
-        Some("download_import_new_media:task_run:17")
-    );
+    let expected_key = format!("download_import_new_media:task_run:{run_id}");
+    assert_eq!(row.dedupe_key.as_deref(), Some(expected_key.as_str()));
     assert_eq!(row.resource_type.as_deref(), Some("background_task_run"));
-    assert_eq!(row.resource_id, Some(17));
-    assert_eq!(row.related_task_run_id, Some(17));
+    assert_eq!(row.resource_id, Some(run_id));
+    assert_eq!(row.related_task_run_id, Some(run_id));
     assert_eq!(row.related_resource_type.as_deref(), Some("movie"));
     assert_eq!(
         row.related_resource_id, None,
@@ -93,12 +120,13 @@ async fn the_reminder_is_a_single_aggregated_row() {
 async fn the_same_task_run_does_not_get_a_second_notification() {
     let db = TestDb::require().await;
     let items = [item("ABC-001")];
+    let run_id = seed_run(&db).await;
 
-    let first = create_new_media_reminder(&repo(&db), &items, Some(23))
+    let first = create_new_media_reminder(&repo(&db), &items, Some(run_id))
         .await
         .expect("可落库")
         .expect("第一条");
-    let second = create_new_media_reminder(&repo(&db), &items, Some(23))
+    let second = create_new_media_reminder(&repo(&db), &items, Some(run_id))
         .await
         .expect("可落库")
         .expect("幂等键命中时返回**既有行**，不是 None");

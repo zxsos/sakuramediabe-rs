@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -32,6 +33,10 @@ use sm_db::testing::TestDb;
 use sm_db::Db;
 use sm_service::system::auth::AuthConfig;
 use sm_service::system::ConfigService;
+use sm_service::transfers::download_client::{
+    DownloadCapabilityRegistry, DownloadClientCapability, DownloadClientConfigField,
+    DownloadClientDiagnostic, PreviousClientHandle, ProviderFailureInfo,
+};
 use tower::ServiceExt;
 
 const SECRET: &str = "download-client-http-secret";
@@ -62,6 +67,67 @@ impl Drop for Fixture {
     }
 }
 
+/// 一个假的下载能力注册表：只给 `local` 提供能力，字段表声明 `host`（可见）
+/// 与 `token`（secret）。
+///
+/// **响应体里能不能看到 `provider_config` 取决于它**：`_resource` 的字段表来自
+/// 插件，拿不到时上游把整份配置换成 `{}`（`client_config_service.py:73-91`）。
+/// 所以那条断言「`provider_config` 是对象且带上 `host`」必须先注入本表 ——
+/// 与同目录的 `media_libraries_http.rs::FakeRegistry` 是同一个套路。
+struct FakeDownloads;
+
+struct FakeCapability;
+
+impl DownloadClientCapability for FakeCapability {
+    fn config_fields(&self) -> Vec<DownloadClientConfigField> {
+        vec![
+            DownloadClientConfigField {
+                key: "host".to_owned(),
+                input: "text".to_owned(),
+                read_only: false,
+            },
+            DownloadClientConfigField {
+                key: "token".to_owned(),
+                input: "secret".to_owned(),
+                read_only: false,
+            },
+        ]
+    }
+
+    fn prepare_client(
+        &self,
+        submitted: &Value,
+        _library_id: i32,
+        _previous: Option<&PreviousClientHandle>,
+    ) -> Result<Value, ProviderFailureInfo> {
+        Ok(submitted.clone())
+    }
+
+    fn test_client(
+        &self,
+        _submitted: &Value,
+        _library_id: i32,
+    ) -> Result<DownloadClientDiagnostic, ProviderFailureInfo> {
+        Err(ProviderFailureInfo {
+            code: "unimplemented".to_owned(),
+            message: "FakeCapability 不探测".to_owned(),
+        })
+    }
+}
+
+impl DownloadCapabilityRegistry for FakeDownloads {
+    fn download_client_for(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<Box<dyn DownloadClientCapability>>, ProviderFailureInfo> {
+        if provider_key == "local" {
+            Ok(Some(Box::new(FakeCapability)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 fn unique() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,6 +151,19 @@ fn app(db: &TestDb, fixture: &Fixture) -> axum::Router {
         AuthConfig::new(SECRET),
         ConfigService::new(fixture.config_path.clone()),
     ))
+}
+
+/// 带上假下载能力。**只有需要看到 `provider_config` 内容的用例用它** ——
+/// 拿不到插件字段表时 `_resource` 会把配置换成 `{}`（见 `FakeDownloads` 的文档）。
+fn app_with_downloads(db: &TestDb, fixture: &Fixture) -> axum::Router {
+    router(
+        AppState::new(
+            db.pool().clone(),
+            AuthConfig::new(SECRET),
+            ConfigService::new(fixture.config_path.clone()),
+        )
+        .with_download_capabilities(Arc::new(FakeDownloads)),
+    )
 }
 
 fn request(method: &str, uri: &str, token: &str) -> Request<Body> {
@@ -163,7 +242,7 @@ async fn listing_returns_a_bare_array_newest_first() {
     let second = seed_client(&db, library_id, Some(r#"{"host":"h"}"#)).await;
 
     let (status, _, bytes) = send(
-        app(&db, &fixture),
+        app_with_downloads(&db, &fixture),
         request("GET", "/download-clients", &token),
     )
     .await;

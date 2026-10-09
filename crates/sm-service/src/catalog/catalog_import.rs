@@ -126,6 +126,36 @@ pub trait CatalogImport {
         detail: &serde_json::Value,
     ) -> Result<(i32, bool), ServiceError>;
 
+    /// 按番号查**已有**记录的 id。上游 `find_movie_by_number`。
+    ///
+    /// # 为什么窄接口要有它
+    ///
+    /// [`super::metadata_source::MetadataSourceService::import_by_number`] 在
+    /// **问外部来源之前**先查一次库：已有的番号不该再打一次 JavDB 或插件
+    /// （上游那一节的第一行就是这个短路）。
+    ///
+    /// 少了它，调用方只能自己拿一个 `MovieRepository` 来查 —— 那就把「窄接口」
+    /// 漏成了「窄接口 + 一个仓储」。
+    async fn find_movie_id(&self, movie_number: &str) -> Result<Option<i32>, ServiceError>;
+
+    /// 从**插件交付**导入。上游
+    /// `import_plugin_movie(detail, source, provider, *, force_subscribed)`。
+    ///
+    /// # 与 [`Self::import_movie_if_missing`] 的差别在**建记录**那一步
+    ///
+    /// 那一支建的是 **JavDB 来源**的记录（带 `javdb_id`）；这一支建的是
+    /// **插件来源**的记录 —— `javdb_id` 为 `None`、`metadata_source` 写插件身份、
+    /// 并把 `javdb_next_check_at` 预定到 7 天后（过一阵子再问 JavDB 收没收）。
+    ///
+    /// 两支分开而不是加一个来源参数：上游就是两个方法，而「哪一支」决定了
+    /// 建记录时写哪些列。
+    async fn import_plugin_movie(
+        &self,
+        detail: &serde_json::Value,
+        source: &serde_json::Value,
+        force_subscribed: bool,
+    ) -> Result<(i32, bool), ServiceError>;
+
     /// 从 JavDB 资源 upsert 一位演员，返回演员 id。
     async fn upsert_actor(&self, actor_resource: &serde_json::Value) -> Result<i32, ServiceError>;
 }
@@ -600,8 +630,38 @@ impl CatalogImport for CatalogImportService {
         movie_number: &str,
         detail: &serde_json::Value,
     ) -> Result<(i32, bool), ServiceError> {
+        // 番号**从 `detail` 取**（具体服务那支就是这么做的，上游也一样）——
+        // 这个参数存在只是为了让窄接口对「元数据是一份原文」这件事不敏感。
         let _ = movie_number;
+        // `Self::` 前缀解析到**固有方法**，不是要递归调 trait 方法。
         let result = Self::import_movie_if_missing(self, detail, false).await?;
+        Ok((result.movie_id, result.created))
+    }
+
+    async fn find_movie_id(&self, movie_number: &str) -> Result<Option<i32>, ServiceError> {
+        let number = movie_number.trim();
+        if number.is_empty() {
+            // 空番号是**调用方的 bug**，不是「查不到」—— 返回 `Ok(None)` 会让
+            // 调用方接着去问外部来源，而那个查询注定也拿不到东西。
+            return Err(ServiceError::validation(
+                "movie_number_missing",
+                "番号不能为空",
+            ));
+        }
+        Ok(MovieRepository::new(self.db.clone())
+            .find_by_number(number)
+            .await?
+            .map(|movie| movie.id))
+    }
+
+    async fn import_plugin_movie(
+        &self,
+        detail: &serde_json::Value,
+        source: &serde_json::Value,
+        force_subscribed: bool,
+    ) -> Result<(i32, bool), ServiceError> {
+        // 同上：`Self::` 是固有方法。
+        let result = Self::import_plugin_movie(self, detail, source, force_subscribed).await?;
         Ok((result.movie_id, result.created))
     }
 

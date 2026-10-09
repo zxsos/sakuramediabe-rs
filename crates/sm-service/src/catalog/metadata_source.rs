@@ -94,14 +94,35 @@ pub struct PluginDelivery {
     pub javdb_detail: Option<serde_json::Value>,
     /// 插件那一支：已通过交付校验的结构化结果。JavDB 那支为 `None`。
     pub plugin_delivery: Option<MovieDelivery>,
-    /// 来源标识（`javdb` / `plugin:<id>`），落进 `movie.metadata_source`。
+    /// 这份元数据是谁给的。
     ///
-    /// ⚠️ 上游这一支存的是 `{plugin_id, display_name, source_id, source_url}`
-    /// 四个键；这里只存一个串（骨架期既有的契约，改它会波及还没落地的
-    /// `catalog_import`）。`source_id` / `source_url` 在 [`MovieDelivery`] 上，没丢。
-    pub source: String,
+    /// # 从「一个串」改成枚举（2026-10-07）
+    ///
+    /// 骨架期这里是 `String`（`"javdb"` / `"plugin:<id>"`），而
+    /// `import_plugin_movie` 要往 `movie.metadata_source` 写
+    /// `{plugin_id, display_name, source_id, source_url}` 四个键 ——
+    /// `display_name` 在那个串里**根本没有**，`plugin_id` 也只能靠拆
+    /// `plugin:` 前缀得到（自造格式，改前缀就静默失效）。
+    ///
+    /// 落地 [`MetadataSourceService::import_by_number`] 时把插件的两个身份字段
+    /// 直接带上：它们本来就在 `fetch_plugin` 手上，只是在构造这里时被丢掉了。
+    pub source: DeliverySource,
     /// 交付目录。**闭包退出后即失效**（清理已发生）。JavDB 那支为 `None`。
     pub delivery_dir: Option<PathBuf>,
+}
+
+/// 一份元数据是谁给的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliverySource {
+    /// JavDB provider 原文。
+    Javdb,
+    /// 插件交付。
+    Plugin {
+        plugin_id: String,
+        /// 展示名。上游 `enabled_plugin_sources` 三元组里的第二个，落进
+        /// `metadata_source.display_name` —— 客户端会显示它。
+        display_name: String,
+    },
 }
 
 /// 元数据来源服务。
@@ -199,7 +220,10 @@ impl MetadataSourceService {
         let result = consume(PluginDelivery {
             javdb_detail: None,
             plugin_delivery: Some(delivery),
-            source: format!("plugin:{plugin_id}"),
+            source: DeliverySource::Plugin {
+                plugin_id: plugin_id.to_owned(),
+                display_name: source.display_name.clone(),
+            },
             delivery_dir: Some(delivery_dir),
         })
         .await;
@@ -274,7 +298,7 @@ impl MetadataSourceService {
                     return Ok(consume(PluginDelivery {
                         javdb_detail: Some(detail),
                         plugin_delivery: None,
-                        source: "javdb".to_owned(),
+                        source: DeliverySource::Javdb,
                         delivery_dir: None,
                     })
                     .await)
@@ -301,7 +325,10 @@ impl MetadataSourceService {
                     let result = consume(PluginDelivery {
                         javdb_detail: None,
                         plugin_delivery: Some(delivery),
-                        source: format!("plugin:{}", source.plugin_id),
+                        source: DeliverySource::Plugin {
+                            plugin_id: source.plugin_id.clone(),
+                            display_name: source.display_name.clone(),
+                        },
                         delivery_dir: Some(delivery_dir),
                     })
                     .await;
@@ -322,15 +349,102 @@ impl MetadataSourceService {
         Err(MetadataSourceError::NotFound)
     }
 
-    /// 按番号导入（JavDB 优先）。**不返回交付目录** —— 导入过程中用即可。
+    /// 按番号导入（JavDB 优先）。上游 `import_by_number`
+    /// （`metadata_source_service.py:30-44`）。
+    ///
+    /// ```python
+    /// existing = find_movie_by_number(movie_number)
+    /// if existing is not None:
+    ///     return existing, False
+    /// with cls.fetch(movie_number, provider) as (detail, source):
+    ///     if source is not None:
+    ///         return import_service.import_plugin_movie(detail, source, provider, force_subscribed=…)
+    ///     return import_service.import_movie_if_missing(detail, force_subscribed=…)
+    /// ```
+    ///
+    /// 返回 `(movie_id, 是否新建)`。
+    ///
+    /// # 第一段的短路**不能省**
+    ///
+    /// 它是「已经有的番号不再打一次外部来源」。批量导入时那是每条一次 JavDB
+    /// 查询或插件 gRPC 调用 —— `import_*` 内部虽然也会二次确认，但那是**拿锁
+    /// 之后**的事，外面的这次外部调用早就付出去了。
+    ///
+    /// # 为什么整段在闭包内
+    ///
+    /// 插件那一支的交付文件在闭包退出后**立刻被清理**（见 [`Self::fetch`] 与
+    /// `cleanup_delivery`）—— 入库必须在那之前做完，否则交给导入方的是已经
+    /// 不存在的图片路径。
+    ///
+    /// # 错误是 `MetadataSourceError` 而不是 `ServiceError`
+    ///
+    /// 与 [`Self::match_actors`] 同一个取向：本模块的错误语义属于「来源」，
+    /// HTTP 状态码由调用方决定（见模块文档）。导入侧的 `ServiceError` 在这里
+    /// 被折成 [`MetadataSourceError::RequestFailed`]。
     pub async fn import_by_number(
         &self,
+        config: &serde_json::Value,
         movie_number: &str,
-        import_service: &mut dyn crate::catalog::catalog_import::CatalogImport,
+        import_service: &dyn crate::catalog::catalog_import::CatalogImport,
         force_subscribed: bool,
-    ) -> Result<bool, MetadataSourceError> {
-        let _ = (movie_number, import_service, force_subscribed);
-        todo!("骨架：fetch() 闭包内调 import_movie_if_missing；闭包退出即清理交付文件")
+    ) -> Result<(i32, bool), MetadataSourceError> {
+        // ① 已存在 → 直接返回（上游第一行）。`false` = 没有新建。
+        if let Some(movie_id) = import_service
+            .find_movie_id(movie_number)
+            .await
+            .map_err(import_failed)?
+        {
+            return Ok((movie_id, false));
+        }
+
+        // ② JavDB 优先，逐个插件兜底；**入库在闭包内做**。
+        self.fetch(
+            config,
+            movie_number,
+            |delivery: PluginDelivery| async move {
+                match delivery.plugin_delivery {
+                    // 插件那一支：交付形状要翻译成 `CatalogImport` 认的键。
+                    Some(plugin) => {
+                        let detail = import_detail_of(&plugin);
+                        let source = match &delivery.source {
+                            DeliverySource::Plugin {
+                                plugin_id,
+                                display_name,
+                            } => source_identity_of(
+                                plugin_id.as_str(),
+                                display_name.as_str(),
+                                &plugin,
+                            ),
+                            // 到不了：`plugin_delivery` 有值时 `source` 一定是
+                            // `Plugin`（两个构造点都这么写）。给 `Null` 而不是
+                            // panic —— 一个来源身份的缺失不该让整条导入挂掉。
+                            DeliverySource::Javdb => {
+                                tracing::warn!(
+                                    movie_number,
+                                    "插件交付带着 JavDB 来源标识，metadata_source 将为空"
+                                );
+                                serde_json::Value::Null
+                            }
+                        };
+                        import_service
+                            .import_plugin_movie(&detail, &source, force_subscribed)
+                            .await
+                    }
+                    // JavDB 那一支：provider 原文直接交给导入方（宿主只搬运）。
+                    None => {
+                        let detail = delivery.javdb_detail.unwrap_or(serde_json::Value::Null);
+                        import_service
+                            .import_movie_if_missing(movie_number, &detail)
+                            .await
+                    }
+                }
+                .map_err(import_failed)
+            },
+        )
+        // 两层 `Result` 是刻意的：**外层**是 `fetch` 自己的失败（谁都没有这部片
+        // = `NotFound`），**内层**是导入结果。`?` 只传播外层 —— 内层正是要返回
+        // 给调用方的东西（「找到了但写库失败」与「压根没找到」是两回事）。
+        .await?
     }
 
     /// 搜演员并逐个入库。返回入库的演员数。
@@ -355,6 +469,80 @@ impl MetadataSourceService {
         }
         Ok(imported)
     }
+}
+
+/// 导入侧的 [`ServiceError`](crate::error::ServiceError) → 本模块的来源错误。
+///
+/// 两类错误在这里被压成同一个 `RequestFailed`：本模块**不区分**「来源坏了」
+/// 与「写库失败」。上游也是这么做的（`import_service` 抛出来的异常一路冒到
+/// 调用方）。要区分得给 [`MetadataSourceError`] 再加一种变体，而目前没有
+/// 调用方按它分支。
+fn import_failed(error: crate::error::ServiceError) -> MetadataSourceError {
+    MetadataSourceError::RequestFailed(error.code().to_owned())
+}
+
+/// 把插件交付**翻译成 `CatalogImport` 认的元数据形状**。
+///
+/// # 为什么需要这一层
+///
+/// 上游 `import_plugin_movie(detail: PluginMovieMetadata, …)` 直接把 pydantic
+/// 模型交下去；本仓的 [`CatalogImport`](crate::catalog::catalog_import::CatalogImport)
+/// 窄接口收 `&serde_json::Value`（骨架期为了不让它依赖契约层的结构），所以
+/// 这里要做一次搬运。
+///
+/// **键名与 JavDB 那一支一致** —— `CatalogImportService::create_movie` 对两支
+/// 读同一组键（`movie_number` / `title` / `summary` / `maker_name` /
+/// `director_name` / `release_date` / `duration_minutes`）。改键名要同时看那边。
+///
+/// # 不写 `javdb_id`
+///
+/// 插件来源**没有** JavDB 身份：`create_movie` 在 `source` 非空时强制把它写成
+/// `None`，这里再给一个也只是被覆盖。给它反而会让「这一支到底有没有 JavDB
+/// 身份」变成要看两处才能回答的问题。
+///
+/// # 不写 `series_name` / `actors` / `tags`
+///
+/// `create_movie` 现在**不读**它们（系列要 join、演员与标签要那两张表的写入
+/// 方法，都还没接 —— 见 `catalog_import` 的模块文档）。这里给不给结果一样，
+/// 所以不给：一个「看起来在传、其实被丢掉」的键比不传更容易让人误解。
+fn import_detail_of(delivery: &MovieDelivery) -> serde_json::Value {
+    serde_json::json!({
+        "movie_number": delivery.movie_number,
+        "title": delivery.title,
+        "summary": delivery.summary,
+        "maker_name": delivery.maker_name,
+        "director_name": delivery.director_name,
+        // 严格 `YYYY-MM-DD`（`validate_movie_delivery` 保证的），下游
+        // `CatalogImportService` 的 `date_of` 按同一个格式解析。
+        "release_date": delivery.release_date,
+        "duration_minutes": delivery.duration_minutes,
+    })
+}
+
+/// 写进 `movie.metadata_source` 的那个对象。
+///
+/// 上游 `import_plugin_movie(detail, source, …)` 的 `source` 就是这四个键
+/// （`metadata_source_service.py:145-152`）：
+///
+/// ```python
+/// {"plugin_id": …, "display_name": …,
+///  "source_id": detail.source_id, "source_url": detail.source_url}
+/// ```
+///
+/// 前两个描述**哪个插件**（来自 [`DeliverySource::Plugin`]），后两个描述
+/// **这一条记录**（来自插件交付本身）—— 同一个插件的两部影片 `source_url`
+/// 不同，所以它们属于交付而不属于插件的注册信息。
+fn source_identity_of(
+    plugin_id: &str,
+    display_name: &str,
+    delivery: &MovieDelivery,
+) -> serde_json::Value {
+    serde_json::json!({
+        "plugin_id": plugin_id,
+        "display_name": display_name,
+        "source_id": delivery.source_id,
+        "source_url": delivery.source_url,
+    })
 }
 
 /// 向一个插件发一次 `FetchMovie`。
@@ -476,5 +664,100 @@ mod tests {
         let not_found = MetadataSourceError::NotFound;
         let failed = MetadataSourceError::RequestFailed("超时".to_owned());
         assert_ne!(not_found, failed);
+    }
+
+    /// 造一份插件交付（字段值本身不重要，形状要全）。
+    fn delivery() -> MovieDelivery {
+        MovieDelivery {
+            movie_number: "ABC-123".to_owned(),
+            title: "标题".to_owned(),
+            release_date: "2024-03-05".to_owned(),
+            duration_minutes: 120,
+            cover_image_path: PathBuf::from("/tmp/metadata-tmp/req-1/cover.jpg"),
+            plot_image_paths: vec![PathBuf::from("/tmp/metadata-tmp/req-1/plot-1.jpg")],
+            summary: "简介".to_owned(),
+            maker_name: Some("厂商".to_owned()),
+            director_name: Some("导演".to_owned()),
+            series_name: Some("系列".to_owned()),
+            actors: Vec::new(),
+            tag_names: vec!["标签".to_owned()],
+            source_url: Some("https://example.test/ABC-123".to_owned()),
+            source_id: Some("abc-123".to_owned()),
+        }
+    }
+
+    /// ★ 交付 → 入库形状：**键名要对上 `create_movie` 读的那一组**。
+    ///
+    /// 这条测的不是「值传对了」（那是它自己的事），而是**键没写错**：
+    /// `CatalogImportService::create_movie` 用 `text_of` / `int_of` 按名取值，
+    /// 读不到就是 `None` —— 少写一个键不会报错，只会让那一列静默变成空串/0
+    /// （`maker_name` 尤其隐蔽：它是**可选**列，丢了看不出异常）。
+    #[test]
+    fn the_import_detail_uses_the_keys_create_movie_reads() {
+        let detail = import_detail_of(&delivery());
+        for key in [
+            "movie_number",
+            "title",
+            "summary",
+            "maker_name",
+            "director_name",
+            "release_date",
+            "duration_minutes",
+        ] {
+            assert!(!detail[key].is_null(), "{key} 不该缺");
+        }
+        assert_eq!(detail["movie_number"], "ABC-123");
+        assert_eq!(detail["maker_name"], "厂商");
+        assert_eq!(detail["duration_minutes"], 120);
+        // 插件来源**没有** JavDB 身份 —— 给了也会被 `create_movie` 覆盖成 None。
+        assert!(detail.get("javdb_id").is_none());
+        // 上面列出但**刻意不写**的三个：`create_movie` 现在不读它们。
+        for key in ["series_name", "actors", "tag_names"] {
+            assert!(
+                detail.get(key).is_none(),
+                "{key} 不该出现（读不到就是误导）"
+            );
+        }
+    }
+
+    /// 可选字段缺失时给 `null` 而不是省略。
+    ///
+    /// `text_of` 对「键不存在」与「值为 null」都返回 `None`，但省略会让
+    /// 「这个键到底在不在」变成调用方要靠 `get` 猜的事。
+    #[test]
+    fn absent_optional_fields_are_null_not_missing() {
+        let mut movie = delivery();
+        movie.maker_name = None;
+        movie.director_name = None;
+        let detail = import_detail_of(&movie);
+        assert!(detail["maker_name"].is_null());
+        assert!(detail.get("maker_name").is_some(), "键要在，值是 null");
+        assert!(detail["director_name"].is_null());
+    }
+
+    /// `metadata_source` 的四个键：前两个来自**注册信息**，后两个来自**交付**。
+    ///
+    /// 分开是有意义的：同一个插件的两部影片 `source_url` 不同，所以 `source_id`
+    /// / `source_url` 属于那条记录，不能塞进注册信息里。
+    #[test]
+    fn the_source_identity_carries_both_registration_and_delivery_facts() {
+        let source = source_identity_of("javbus", "JavBus 元数据", &delivery());
+        assert_eq!(source["plugin_id"], "javbus");
+        assert_eq!(source["display_name"], "JavBus 元数据");
+        assert_eq!(source["source_id"], "abc-123");
+        assert_eq!(source["source_url"], "https://example.test/ABC-123");
+    }
+
+    /// 交付**没有** `source_url` 时写 `null` —— 不是空串。
+    ///
+    /// 空串会被客户端当成「有一个空链接」并渲染出可点的空 `href`。
+    #[test]
+    fn a_missing_source_url_stays_null() {
+        let mut movie = delivery();
+        movie.source_url = None;
+        movie.source_id = None;
+        let source = source_identity_of("javbus", "JavBus", &movie);
+        assert!(source["source_url"].is_null());
+        assert!(source["source_id"].is_null());
     }
 }

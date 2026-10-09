@@ -114,6 +114,10 @@ UNCHECKED_STRUCT_EXEMPT = frozenset(
         # `list_movie_card_ids` / `count_movies`；没有 FromRow、不映射任何表。
         # 单独立它是因为 15 个可选筛选位塞进位置元组无法阅读。
         "MovieListFilter",
+        # 同上：下载台账列表的筛选条件（上游 `list_tasks` 的三个可选筛选位，
+        # `task_service.py:43-72`）。与 `MovieListFilter` 是同一个形状 ——
+        # 纯值对象，没有 FromRow、不映射任何表。
+        "DownloadTaskFilter",
         # 仓储与网关：持有 PgPool，不映射任何表
         "MovieRepository",
         "MovieSeriesRepository",

@@ -421,7 +421,13 @@ impl MovieService {
     ///
     /// 影片本体 / 封面与薄封面 / 系列 / 媒体摘要各一条。不是 N+1，也不随页大小
     /// 增长。
-    async fn load_cards(&self, ids: &[i32]) -> Result<Vec<MovieCard>, ServiceError> {
+    ///
+    /// # 公开给「结果集带影片卡片」的其他域复用
+    ///
+    /// 它等价于上游 `with_movie_card_relations` + `attach_movie_list_media`
+    /// 的组合（`service_helpers.py`）。每日推荐（`discovery::daily_recommendation`）
+    /// 直接复用它装配卡片，不再抄一份 —— 上游那两处也是同一套聚合。
+    pub async fn load_cards(&self, ids: &[i32]) -> Result<Vec<MovieCard>, ServiceError> {
         let movies = self.movies.find_by_ids(ids).await?;
 
         let numbers: Vec<String> = ids

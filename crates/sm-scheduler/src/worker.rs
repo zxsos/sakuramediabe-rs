@@ -278,9 +278,9 @@ impl HandlerRegistry {
 
 /// 已落地的内建处理器。
 ///
-/// # 现在有四个
+/// # 现在有六个
 ///
-/// 21 个任务里 17 个的 service 还没写（zip / provider 各挡一批，
+/// 19 个内建 cron 任务里 13 个的 service 还没写（zip / provider 各挡一批，
 /// 见 `docs/service-progress.md`）。**不注册就没有处理器**，那些任务被领到
 /// 时会明确 `failed` 并写清「未在处理器注册表中」，而不是静默跳过。
 ///
@@ -288,8 +288,10 @@ impl HandlerRegistry {
 /// |---|---|---|
 /// | `activity_record_cleanup` | `system` | 无 |
 /// | `movie_asset_pack_backfill` | `catalog` | 无（只读库 + 本地图片根）|
+/// | `movie_heat_update` | `catalog` | 无 |
 /// | `image_search_index` | `discovery` | 推理服务 + Qdrant（都已在 `sm-service` 侧就位）|
 /// | `movie_similarity_recompute` | `discovery` | Qdrant（稀疏向量通路）|
+/// | `daily_recommendation_generate` | `discovery` | Qdrant（**可选**：不可用时只丢相似度那一路）|
 ///
 /// `activity_record_cleanup` 先把链路端到端跑通；`image_search_index` 是第一个
 /// 带外部依赖的 handler（依赖通路 [`HandlerDeps`] 就是为它加的）；
@@ -449,6 +451,53 @@ pub fn builtin_handlers(deps: HandlerDeps) -> HandlerRegistry {
                         .await
                         .map_err(|error| format!("影片相似度重算失败：{}", error.code()))?;
                     // 键名与上游逐字一致 —— 会进 `signal_scores` 一类的列。
+                    serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
+                })
+            });
+            Ok(handler)
+        }),
+    );
+
+    // `daily_recommendation_generate` —— 每日推荐快照生成。
+    //
+    // **第五个落地的 handler**，也是第一个「Qdrant 可用性不影响成败」的：
+    // 相似度只是六路信号里的一路（权重 8/19），Qdrant 不可用时其余五路照常
+    // 打分（上游 `:196-199` 捕获 `MovieSimilarityIndexError` 后 `return {}`）。
+    //
+    // # 与 `movie_similarity_recompute` 的对照
+    //
+    // 那个任务**就是**在维护相似度索引，Qdrant 不可用等于任务失败；
+    // 这个任务只是**消费**它，不可用时降级。所以这里 `build_similarity_store`
+    // 返回 `Option`（未启用 / 未配置都是 `None`），而
+    // `build_movie_similarity_service` 在配置矛盾时报错。
+    //
+    // # 没有参数
+    //
+    // 上游 registry 的 handler 是
+    // `lambda reporter, _params: DailyRecommendationService.generate_latest_snapshot(
+    //     progress_callback=reporter.progress_callback)` —— `target_date` 与
+    // `limit` 都走默认（今天 / 200）。
+    let daily_deps = Arc::clone(&deps);
+    registry.register(
+        "daily_recommendation_generate",
+        Box::new(move |db: &Db, _params: &Value| {
+            let deps = Arc::clone(&daily_deps);
+            let db = Db::clone(db);
+            let handler: TaskHandler = Box::new(move |reporter| {
+                Box::pin(async move {
+                    let similarity = build_similarity_store(&deps)?;
+                    let service = sm_service::discovery::daily_recommendation::DailyRecommendationService::new(&db);
+                    let sink = progress_sink_for(&reporter);
+                    let stats = service
+                        .generate_latest_snapshot(
+                            None,
+                            sm_service::discovery::daily_recommendation::DAILY_RECOMMENDATION_LIMIT,
+                            similarity.as_ref(),
+                            Some(sink),
+                        )
+                        .await
+                        .map_err(|error| format!("每日推荐快照生成失败：{}", error.code()))?;
+                    // 键名与上游 stats dict 逐字一致（进 `result_summary`）。
                     serde_json::to_value(stats).map_err(|error| format!("摘要序列化失败：{error}"))
                 })
             });
@@ -726,6 +775,48 @@ fn build_movie_similarity_service(
         store,
         sm_db::repo::recommendation::MovieFeatureRepository::new(db.clone()),
     )))
+}
+
+/// 构造 `MovieSimilarityStore`。**未启用或未配置端点时返回 `None`（合法状态）。**
+///
+/// # 与 [`build_movie_similarity_service`] 的差别：这里的 `None` 不是「跳过任务」
+///
+/// `daily_recommendation_generate` 的任务不是「维护相似度索引」，而是**消费**它。
+/// 索引不可用时每日推荐仍有热度 / 榜单 / 新鲜度等五路信号（上游
+/// `daily_recommendation_service.py:196-199` 把 `MovieSimilarityIndexError`
+/// 捕获成空表），所以这里：
+///
+/// | 情形 | 本函数 | 后果 |
+/// |---|---|---|
+/// | `movie_similarity_enabled` 为假 | `None` | 相似度全程 0，推荐照常产出 |
+/// | `qdrant.enabled` 真但 `url` 空（配置矛盾） | `None` + warn | 同上 —— **不报错** |
+/// | 端点可连 | `Some(store)` | 正常 |
+///
+/// `build_movie_similarity_service` 在第 2 行那种情形**报错**，因为它的任务
+/// 离了 Qdrant 什么也做不了；这里离了它还能产出推荐。
+fn build_similarity_store(
+    deps: &HandlerDeps,
+) -> Result<Option<sm_service::discovery::qdrant::similarity::MovieSimilarityStore>, String> {
+    use sm_service::discovery::qdrant::similarity::MovieSimilarityStore;
+
+    // 与 `build_image_search_service` 同一条理由：读不到配置按「未启用」处理，
+    // 不让整个 worker 因配置读失败而把任务判失败。
+    let Ok(snapshot) = deps.config.snapshot() else {
+        return Ok(None);
+    };
+    if !sm_service::system::optional_services::movie_similarity_enabled(&snapshot) {
+        return Ok(None);
+    }
+    if !deps.qdrant.is_configured() {
+        // 这里是**降级**而不是报错 —— 见上面的表格。配置矛盾值得一条日志，
+        // 但不该让「每日推荐」整个停摆。
+        warn!("movie_similarity 已启用但 qdrant.url 为空，每日推荐将跳过相似度信号");
+        return Ok(None);
+    }
+    let base = deps.qdrant.url.trim_end_matches('/');
+    MovieSimilarityStore::connect(base, deps.qdrant.api_key.as_deref())
+        .map(Some)
+        .map_err(|error| format!("向量库连接失败：{}", error.code()))
 }
 
 /// worker 的构造参数。

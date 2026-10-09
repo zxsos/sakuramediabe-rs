@@ -68,8 +68,8 @@ pub fn routes() -> Router<AppState> {
 
 /// 签名参数 —— 两个端点共用。
 ///
-/// **`expires` 与 `signature` 同生共死**：缺一即拒（见
-/// [`require_signed_params`]；播放端点 `routes/media_playback.rs` 走的是上游
+/// **`expires` 与 `signature` 同生共死**：缺一即拒（见下面的
+/// `require_signed_params`；播放端点 `routes/media_playback.rs` 走的是上游
 /// 同一个 `_utils.py` 规则）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SignedUrlQuery {
