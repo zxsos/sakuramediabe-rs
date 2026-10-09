@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --bin sakuramedia_more_movies --bin sakuramedia_more_rank_movies
+
+      - name: Package more_movies
+        run: |
+          mkdir -p dist1
+          cp target/release/sakuramedia_more_movies dist1/
+          cat > dist1/manifest.json << 'MANIFEST'
+          {
+            "id": "sakuramedia_more_movies",
+            "version": "${{ github.ref_name }}",
+            "entry": "sakuramedia_more_movies",
+            "display_name": "More Movies"
+          }
+          MANIFEST
+          cd dist1 && zip -r ../sakuramedia_more_movies-${{ github.ref_name }}.zip manifest.json sakuramedia_more_movies
+
+      - name: Package more_rank_movies
+        run: |
+          mkdir -p dist2
+          cp target/release/sakuramedia_more_rank_movies dist2/
+          cat > dist2/manifest.json << 'MANIFEST'
+          {
+            "id": "sakuramedia_more_rank_movies",
+            "version": "${{ github.ref_name }}",
+            "entry": "sakuramedia_more_rank_movies",
+            "display_name": "More Rank Movies"
+          }
+          MANIFEST
+          cd dist2 && zip -r ../sakuramedia_more_rank_movies-${{ github.ref_name }}.zip manifest.json sakuramedia_more_rank_movies
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            sakuramedia_more_movies-${{ github.ref_name }}.zip
+            sakuramedia_more_rank_movies-${{ github.ref_name }}.zip
