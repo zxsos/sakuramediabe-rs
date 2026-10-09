@@ -9,11 +9,12 @@
 //! | 候选里挑**番号完全相等**的那一个（且发行日期**新的优先**）| 导入成同前缀的另一部片（`ABC-123` ↔ `ABC-1234`）|
 //! | 详情返回的是 `data.movie`，**不是整个信封** | 宿主按 `detail["id"]` 读时拿到 `null`，而入库静默建了空记录 |
 //! | `success != 1` 是**请求失败**，不是「没收录」| 把它当 404 → 用户看到「JavDB 没这部片」，而真实原因是服务端拒绝了请求 |
+//! | 每个请求都带**当场算的** `jdsignature` | 对端回 `ParameterInvalid`（HTTP 200），而**搜索**路径不查 `success` → 报「没这部片」|
 //!
 //! 打桩方式：`JavdbProvider::with_base_url`（生产用 `new(host)` 拼 `https://`）。
 //! 那个缝存在的理由见它的文档。
 
-use sm_service::catalog::javdb::JavdbProvider;
+use sm_service::catalog::javdb::{signature_at, JavdbProvider};
 use sm_service::catalog::metadata_source::{MetadataProvider, MetadataSourceError};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -91,6 +92,70 @@ async fn by_javdb_id_skips_the_search_entirely() {
         .expect("应当查到")
         .expect("应当有详情");
     assert_eq!(detail["title"], "X");
+}
+
+/// ★ 每个请求都必须带 `jdsignature`，且是**当场算的**。
+///
+/// 这条只有**真发一次请求**才测得到：wiremock 不校验请求头，所以「头漏了」在
+/// 其它用例里完全静默。而它的后果是最难排查的那一类 —— 对端回 HTTP **200** +
+/// `{"success":0,"action":"ParameterInvalid"}`，搜索路径不查 `success`（上游
+/// `_search_movie` 亦然）于是报 `NotFound`：用户看到「JavDB 没收录**任何**番号」。
+#[tokio::test]
+async fn every_request_carries_a_fresh_jdsignature() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/movies/A123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(detail_body(serde_json::json!({ "id": "A123" }))),
+        )
+        .mount(&server)
+        .await;
+
+    provider_for(&server)
+        .get_movie_by_javdb_id("A123")
+        .await
+        .expect("应当查到");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("打桩服务应当记录到请求");
+    assert_eq!(requests.len(), 1, "只该发一次请求");
+    let headers = &requests[0].headers;
+
+    assert_eq!(
+        headers
+            .get("accept-language")
+            .expect("★ 少了 accept-language")
+            .to_str()
+            .expect("该是 ASCII"),
+        "zh-TW"
+    );
+
+    let signature = headers
+        .get("jdsignature")
+        .expect("★ 少了 jdsignature：JavDB 会回 ParameterInvalid，而搜索路径把它当成「没这部片」")
+        .to_str()
+        .expect("该是 ASCII");
+    let (timestamp, _) = signature
+        .split_once('.')
+        .expect("形状该是 {timestamp}.lpw6vgqzsp.{md5}");
+    let timestamp: i64 = timestamp.parse().expect("前缀该是 Unix 秒");
+
+    // 值与上游算法一致。算法/secret 本身的正确性由 `javdb.rs` 单元测试里那个
+    // **跨实现**的固定向量锚定，这里只保证「发出去的确实是它」。
+    assert_eq!(signature, signature_at(timestamp));
+
+    // 新鲜度：必须带**这一刻**的时间戳，而不是某个缓存的常量。10s 容差吸收慢机器。
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("系统时钟早于 1970")
+        .as_secs() as i64;
+    assert!(
+        (now - timestamp).abs() <= 10,
+        "签名该是每次请求现算的（now={now} ts={timestamp}）"
+    );
 }
 
 #[tokio::test]

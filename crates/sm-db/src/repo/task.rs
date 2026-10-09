@@ -481,6 +481,31 @@ impl BackgroundTaskRunRepository {
         .await?)
     }
 
+    /// 该 `task_key` 在队 / 在跑的**那一行**（状态页判「重建中」用）。
+    ///
+    /// 上游 `StatusService._is_image_search_rebuilding`（`status_service.py:592-602`）：
+    /// `WHERE task_key = ? AND state IN ('pending','running')` 取 `.first()`，再看
+    /// 那一行的 `params.reset` 是不是 `true`。
+    ///
+    /// **只取一行、且不加 `ORDER BY`，是照抄上游** —— 多个活跃行时取哪一行由
+    /// 数据库决定。刻意不「改进」成 `EXISTS(… AND params->>'reset' = 'true')`：
+    /// 那会在多行情形下给出与上游不同的答案，而本接口是排查用的诊断页，
+    /// 与上游一致比「更聪明」重要。何况同一个 `task_key` 同时有 pending 与
+    /// running 本身就说明并发控制出了问题，这时纠结取哪一行没有意义。
+    pub async fn find_active_by_task_key(
+        &self,
+        task_key: &str,
+    ) -> Result<Option<BackgroundTaskRun>, DbError> {
+        Ok(sqlx::query_as::<_, BackgroundTaskRun>(
+            "SELECT * FROM background_task_run \
+             WHERE task_key = $1 AND state = ANY($2) LIMIT 1",
+        )
+        .bind(task_key.trim())
+        .bind(task_state::ACTIVE)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// 上报进度。
     ///
     /// 用通用 `update` 之外的专用方法：进度三件套**要么都不填，

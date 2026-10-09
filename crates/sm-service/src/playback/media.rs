@@ -271,6 +271,12 @@ pub struct MediaService {
     /// [`StorageGateway`](crate::playback::provider_helpers::StorageGateway) 的
     /// 文档：`sm-service` 不能依赖 `sm-plugins`（依赖方向会成环）。
     gateway: Option<std::sync::Arc<dyn StorageGateway>>,
+    /// provider 的**播放投递**能力。
+    ///
+    /// ★ 与 `gateway` 是**两个字段**（而不是同一个 trait 多加几个方法）：上游把
+    /// 「支持哪些投递方式」当**可选能力**声明，缺它时业务层要**换行为**，不是
+    /// 503。见 `docs/adr/2026-10-08-provider-seam.md` D1。
+    playback: Option<std::sync::Arc<dyn provider_helpers::PlaybackGateway>>,
 }
 
 impl MediaService {
@@ -285,6 +291,7 @@ impl MediaService {
             pool: db.clone(),
             config: config.clone(),
             gateway: None,
+            playback: None,
         }
     }
 
@@ -296,6 +303,96 @@ impl MediaService {
     pub fn with_gateway(mut self, gateway: std::sync::Arc<dyn StorageGateway>) -> Self {
         self.gateway = Some(gateway);
         self
+    }
+
+    /// 注入播放投递能力。由组合根调用（与 [`Self::with_gateway`] 同一个理由）。
+    ///
+    /// **没调用过 = 没有 provider**：`plan_playback` 会报 503
+    /// `provider_not_installed`，而不是假装能播。
+    pub fn with_playback_gateway(
+        mut self,
+        playback: std::sync::Arc<dyn provider_helpers::PlaybackGateway>,
+    ) -> Self {
+        self.playback = Some(playback);
+        self
+    }
+
+    /// 单条媒体的**播放投递计划**。上游 `play_media`（`media.py:249-319`）里属于
+    /// 服务层的那部分。
+    ///
+    /// # 这是 (b) 方案的落点
+    ///
+    /// 上游在**路由**里拿 `bundle.playback_deliveries` 做 422 判定 —— 那要求宿主
+    /// 持有「provider 声明了哪些投递方式」。本仓改为把请求的 `delivery` **传给
+    /// 插件**、由插件判定（见 [`provider_helpers::RequestedDelivery`]）。
+    ///
+    /// ⚠️ **已知近似**：插件回 `unsupported` 时宿主分不清「不支持这种投递方式」
+    /// （换一种能成）与「根本不支持播放」（换也没用），两者都报 422。想分清就得
+    /// 回到 (a)。这是 (b) 明码标价的代价，不是遗漏。
+    ///
+    /// 上游**不做逐媒体分级**的两级 404 在 [`Self::require_media`] 与这里各一次：
+    /// 媒体缺失 → 404 `media_not_found`；媒体在但库为空 → 404
+    /// `media_library_not_found`。**两者都在 404 之前查签名** —— 那是路由的事。
+    pub async fn plan_playback(
+        &self,
+        media_id: i32,
+        resource_path: &str,
+        requested: provider_helpers::RequestedDelivery,
+    ) -> Result<provider_helpers::PlaybackPlan, ServiceError> {
+        let media = self.require_media(media_id).await?;
+
+        // 没有 provider 就 503，**不降级**：降级会让客户端拿到一个「空计划」，
+        // 而它无法区分「没装插件」与「插件说资源不在」。
+        let Some(gateway) = self.playback.as_deref() else {
+            return Err(ServiceError::unavailable(
+                "provider_not_installed",
+                "媒体提供方未安装",
+            ));
+        };
+
+        let library = sm_db::repo::MediaLibraryRepository::new(self.pool.clone())
+            .find_by_id(media.library_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found(
+                    "media_library_not_found",
+                    "Media library not found",
+                    "library_id",
+                    media.library_id,
+                )
+            })?;
+        let handle = provider_helpers::media_handle_for(&provider_helpers::MediaRecord {
+            id: i64::from(media.id),
+            library_id: i64::from(media.library_id),
+            storage_ref: json_or_null(media.storage_ref.as_deref()),
+            provider_config: json_or_null(library.provider_config.as_deref()),
+            provider_key: library.provider_key.clone(),
+            account_key: library.account_key.clone(),
+            file_name: media.file_name.clone(),
+            file_size_bytes: media.file_size_bytes,
+            duration_seconds: media.duration_seconds,
+        });
+
+        gateway
+            .plan_playback(&handle, resource_path, requested)
+            .await
+            .map_err(|failure| Self::map_playback_failure(&failure))
+    }
+
+    /// 播放投递失败的映射。
+    ///
+    /// ★ `unsupported` **不走** [`Self::map_provider_failure`]：上游在这个端点给
+    /// 它的码是 **422** `provider_playback_delivery_unsupported`
+    /// （`media.py:278-283`），**不是 5xx** —— 那是客户端**换一种 `delivery`
+    /// 重试可能成功**的情形，报 5xx 会让它一直退避重试同一个必败请求。
+    fn map_playback_failure(failure: &ProviderFailure) -> ServiceError {
+        if failure.code == provider_helpers::PROVIDER_UNSUPPORTED {
+            return ServiceError::validation(
+                "provider_playback_delivery_unsupported",
+                "媒体提供方不支持该播放方式",
+            );
+        }
+        Self::map_provider_failure(failure)
     }
 
     /// 取媒体，不存在则 404 `media_not_found`。

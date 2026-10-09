@@ -179,10 +179,25 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         std::sync::Arc::new(sm_plugins::admin::PluginAdminService::new(
             config_service.clone(),
         ));
+    // 同一个 `ProviderGateway` 实例挂到两条缝上（数据面 + 播放投递）。
+    //
+    // ⚠️ 这里**必须先落一个具体类型的中间值**，再把标注写在外层 `let` 上：
+    // `Arc::clone` 的类型参数会从「期望类型」向内传播，所以
+    // `let x: Arc<dyn Trait> = Arc::clone(&concrete)` 会要求
+    // `&Arc<dyn Trait>`，直接编译失败（E0308）。写成两步，unsize 才发生在
+    // 外层 `let` 这个 coercion site 上。
+    let storage_source = std::sync::Arc::clone(&gateway);
+    let storage_gateway: std::sync::Arc<
+        dyn sm_service::playback::provider_helpers::StorageGateway,
+    > = storage_source;
+    let playback_gateway: std::sync::Arc<
+        dyn sm_service::playback::provider_helpers::PlaybackGateway,
+    > = gateway;
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
-        .with_storage_gateway(gateway)
+        .with_storage_gateway(storage_gateway)
+        .with_playback_gateway(playback_gateway)
         .with_plugin_admin(plugin_admin);
     // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
     //

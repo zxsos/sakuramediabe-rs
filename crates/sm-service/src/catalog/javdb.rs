@@ -85,6 +85,29 @@ pub fn normalize_image_url(url: Option<&str>) -> Option<String> {
     Some(url.to_owned())
 }
 
+/// `jdsignature` 里那段固定后缀（上游 `_get_sign`，`javdb.py:676`）。
+const SIGN_SUFFIX: &str = "lpw6vgqzsp";
+
+/// `_get_sign` 里与时间戳拼接的固定 secret（上游 `javdb.py:671-674`）。
+///
+/// ⚠️ 这**不是本仓的配置项**，而是上游**硬编码在客户端里的共享密钥**（官方
+/// App 抓包所得）。它随上游发版而变；变了而这里没跟，JavDB 会对**所有**请求回
+/// `{"success":0,"action":"ParameterInvalid"}`，而搜索路径不看 `success`
+/// （上游亦然）—— 于是表现为「所有番号都查不到」，极易被误判成网络或番号问题。
+const SIGN_SECRET: &str = "71cf27bb3c0bcdf207b64abecddc970098c7421ee7203b9cdae54478478a199e7d5a6e1a57691123c1a931c057842fb73ba3b3c83bcd69c17ccf174081e3d8aa";
+
+/// 计算 `jdsignature` 头的值（上游 `JavdbProvider._get_sign`，`javdb.py:669-676`）。
+///
+/// 形状：`{timestamp}.lpw6vgqzsp.{md5(timestamp + SIGN_SECRET)}`。
+/// `timestamp` 是 **Unix 秒**（上游 `int(time.time())`），服务端据此判新鲜度
+/// —— 所以必须**每次请求重新计算**，不能缓存、不能跨请求复用。
+///
+/// 时间戳作为参数而不是内部取当前时间，是为了让测试能对固定时刻断言固定值。
+pub fn signature_at(timestamp: i64) -> String {
+    let sign = hashing::md5_hex(format!("{timestamp}{SIGN_SECRET}").as_bytes());
+    format!("{timestamp}.{SIGN_SUFFIX}.{sign}")
+}
+
 /// JavDB provider。
 #[derive(Debug, Clone)]
 pub struct JavdbProvider {
@@ -152,11 +175,47 @@ impl JavdbProvider {
         format!("{base}?{}", encoded.join("&"))
     }
 
-    /// 发一次 GET 并解析 JSON。上游 `request_json`。
+    /// 发一次 GET 并解析 JSON。上游 `request_json`（`http_client.py:37-44`）。
+    ///
+    /// # 每个请求都必须带 `jdsignature`
+    ///
+    /// 上游 `MetadataRequestClient._request:44` 在**每次请求**都调
+    /// `build_request_headers()`，而 `JavdbProvider` 覆盖它，补上
+    /// `jdsignature` + `accept-language`（`javdb.py:661-667`）。少了这个头，
+    /// JavDB 一律回 `{"success":0,"action":"ParameterInvalid","message":
+    /// "參數不能爲空: jdsignature"}`，且 **HTTP 仍是 200** —— 于是：
+    ///
+    /// - 详情路径查了 `success` → 报「请求失败」（还算诚实）；
+    /// - 搜索路径**不查** `success`（上游 `_search_movie` 同样不查）→ 候选为空
+    ///   → 报 `NotFound`，看起来像「JavDB 没收录这部片」。
+    ///
+    /// 后者就是「**所有**番号都查不到」这个症状的来源，见 [`signature_at`]。
+    ///
+    /// 上游那份头里还有 `connection` 与 `host`，本函数**不搬**：它们是客户端
+    /// 托管的 —— HTTP/1.1 默认即 keep-alive，`Host` 由 hyper 按 URL 自动填，
+    /// 显式设置反而会与连接复用打架。只搬真正承载语义的那两个。
     async fn request_json(&self, url: &str) -> Result<Value, MetadataSourceError> {
-        let response = self.client.get(url).send().await.map_err(|error| {
-            MetadataSourceError::RequestFailed(format!("请求 JavDB 失败 {url}: {error}"))
-        })?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            reqwest::header::HeaderValue::from_static("zh-TW"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("jdsignature"),
+            reqwest::header::HeaderValue::from_str(&signature_at(chrono::Utc::now().timestamp()))
+                .map_err(|error| {
+                MetadataSourceError::RequestFailed(format!("构造 JavDB 签名头失败：{error}"))
+            })?,
+        );
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|error| {
+                MetadataSourceError::RequestFailed(format!("请求 JavDB 失败 {url}: {error}"))
+            })?;
         let status = response.status();
         let body = response.text().await.map_err(|error| {
             MetadataSourceError::RequestFailed(format!("读 JavDB 响应失败 {url}: {error}"))
@@ -356,6 +415,27 @@ mod tests {
             "https://javdb.com/x",
             "host 末尾的斜杠要归一"
         );
+    }
+
+    #[test]
+    fn the_signature_matches_the_upstream_algorithm() {
+        // 期望值是**跨实现**得到的（另一实现按上游 `hashlib.md5(f"{ts}{SECRET}")
+        // .hexdigest()` 算出），所以这一条能同时抓住「算法抄错」与「secret 抄错」
+        // —— 用本仓自己的 md5 去验本仓自己的签名会漏掉后者。
+        assert_eq!(
+            signature_at(1_700_000_000),
+            "1700000000.lpw6vgqzsp.dacaffcd8b4e1b35c2752f065e906f3a"
+        );
+        // 时间戳必须真的参与运算，而不是被丢掉。
+        assert_ne!(signature_at(1_700_000_001), signature_at(1_700_000_000));
+    }
+
+    #[test]
+    fn the_secret_is_the_upstream_literal() {
+        // 长度 128（512 bit）。抄漏一段时先在这里红，而不是在生产里表现为
+        // 「所有番号都查不到」。
+        assert_eq!(SIGN_SECRET.len(), 128);
+        assert!(SIGN_SECRET.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

@@ -3,22 +3,25 @@
 //! 这里刻意不引入 `sha1` / `sha2` / `data-encoding` 等 crate，原因有三：
 //!
 //! 1. 产出的静态二进制要塞进 `sakuramedia` 镜像，依赖越少，交叉编译与审计面越小。
-//! 2. 三个算法（SHA-1、SHA-256、Base32）都是固定的标准实现，总计约 200 行，
+//! 2. 四个算法（SHA-1、SHA-256、MD5、Base32）都是固定的标准实现，总计约 300 行，
 //!    且每一处都有公开测试向量兜底，不构成维护负担。
 //! 3. 本工作区需要能在无外网环境下完成 `cargo build`（CI / 离线 NAS 构建）。
 //!
 //! **用途限定**：SHA-1 在本工作区只用于内容指纹与 BitTorrent v1 info hash，
-//! 不用于任何需要抗碰撞的场景。
+//! 不用于任何需要抗碰撞的场景。MD5 的适用面更窄 —— 只用于 JavDB 的
+//! `jdsignature` 请求头（对端按 MD5 校验，本工作区无从选择），详见 `md5` 模块。
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
 mod base32;
+mod md5;
 mod sha1;
 mod sha256;
 
 pub use base32::Base32Error;
+pub use md5::Md5;
 pub use sha1::Sha1;
 pub use sha256::Sha256;
 
@@ -44,6 +47,20 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 /// 一次性求 SHA-256 十六进制小写摘要。
 pub fn sha256_hex(data: &[u8]) -> String {
     hex(&sha256(data))
+}
+
+/// 一次性求 MD5 摘要，等价于 Python 的 `hashlib.md5(data).digest()`。
+///
+/// ⚠️ 仅供 JavDB 的 `jdsignature`（对端算法固定）。**不要**用它做完整性校验。
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/// 一次性求 MD5 十六进制小写摘要，等价于 Python 的 `hashlib.md5(data).hexdigest()`。
+pub fn md5_hex(data: &[u8]) -> String {
+    hex(&md5(data))
 }
 
 /// 小写十六进制编码，对应 Python 的 `bytes.hex()`。

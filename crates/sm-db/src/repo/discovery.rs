@@ -1027,6 +1027,33 @@ impl PendingImageRepository {
             .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
         Ok(total)
     }
+
+    /// 按索引状态统计**缩略图行**数（状态页的 `indexing` 摘要）。
+    ///
+    /// 上游 `StatusService._indexing_status`（`status_service.py:576-590`）：
+    /// 两次 `MediaThumbnail.select().where(状态 == …).count()`，口径就是
+    /// `media_thumbnail` 的**全部行** —— 不 join、不过滤 `movie`。
+    ///
+    /// # ⚠️ 别与 [`Self::pending_count`] 互换
+    ///
+    /// 那个是**索引任务的候选口径**（并了 `movie_plot_image`，还加了
+    /// `m.movie IS NOT NULL`），回答的是「任务还要处理多少」；本方法是
+    /// **状态展示口径**，回答的是「库里有多少行停在某个状态」。两者不相等是
+    /// 正常的，把它们对齐反而会让状态页的数字不再反映任务队列。
+    ///
+    /// 状态取值见 [`crate::playback::media::image_search_index_status`]
+    /// （0 待处理 / 1 失败 / 2 成功 / 3 跳过）。**不校验入参**：这是一次纯读，
+    /// 传了未知状态只是数出 0，为此把状态页变成 500 不值得。
+    pub async fn count_thumbnails_with_status(&self, status: i32) -> Result<i64, DbError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_thumbnail WHERE image_search_index_status = $1",
+        )
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(HOT_ACTRESS_ENTITY))?;
+        Ok(count)
+    }
 }
 impl PendingImageRepository {
     /// 把缩略图的索引状态写成终态。

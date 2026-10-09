@@ -64,6 +64,15 @@ pub struct AppState {
     /// `provider_not_installed`（`require_provider` 的文档）。缺省就是它 ——
     /// 单测里不注入也能构造 `AppState`。
     storage: Option<Arc<dyn StorageGateway>>,
+    /// provider 的**播放投递能力**（`plan_playback` / `plan_merged_playback`）。
+    ///
+    /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 503
+    /// `provider_not_installed`。
+    ///
+    /// ★ 但**能力缺失**（插件装了、却不支持这个投递方式）**不是** 503 —— 那是
+    /// `ProviderFailure.code == "unsupported"`：调用方要**换行为**（跳过 / 拒绝），
+    /// 不是重试。见 `docs/adr/2026-10-08-provider-seam.md` D2。
+    playback: Option<Arc<dyn sm_service::playback::provider_helpers::PlaybackGateway>>,
     /// provider 的**下载能力**（`config_fields` / `prepare_client` / `test_client`）。
     ///
     /// 与 `storage` 同一个理由：**活的** `Option`，缺省 = 没装插件 → 写方法报
@@ -132,6 +141,7 @@ impl AppState {
             jobs: JobCatalog::default(),
             ranking: RankingSourceCatalog::default(),
             storage: None,
+            playback: None,
             downloads: None,
             media_libraries: None,
             plugins: None,
@@ -233,6 +243,26 @@ impl AppState {
     pub fn with_storage_gateway(mut self, storage: Arc<dyn StorageGateway>) -> Self {
         self.storage = Some(storage);
         self
+    }
+
+    /// 挂上播放投递能力。**只有组合根会调** —— 理由与 `with_storage_gateway` 一致。
+    pub fn with_playback_gateway(
+        mut self,
+        playback: Arc<dyn sm_service::playback::provider_helpers::PlaybackGateway>,
+    ) -> Self {
+        self.playback = Some(playback);
+        self
+    }
+
+    /// provider 的**播放投递能力**（`play_media` / `play_merged_media` 要用）。
+    ///
+    /// `None` = 组合根没注入（等价于「没装任何插件」）→ 调用方报 503
+    /// `provider_not_installed`。**别让路由自己拼** —— 拼漏了的表现是「播放一律
+    /// 503」，而不是「缺哪个插件报哪个错」。
+    pub fn playback_gateway(
+        &self,
+    ) -> Option<&Arc<dyn sm_service::playback::provider_helpers::PlaybackGateway>> {
+        self.playback.as_ref()
     }
 
     /// 挂上下载能力。**只有组合根会调** —— 理由与上面那条完全一致。

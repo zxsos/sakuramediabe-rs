@@ -283,6 +283,82 @@ pub async fn delete_media(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 播放组
+//
+// 上游 `StorageProvider.handle_playback` / `handle_merged_playback`。
+//
+// ★ 上游返回 starlette `Response`（插件自己写 302 / 开流），跨进程不可行 ——
+// 契约层把职责切开（`proto/storage.proto:20-24`）：
+//
+//     插件回答「字节从哪里来」  -> PlaybackPlan
+//     宿主回答「HTTP 怎么写」   -> 统一构造 200/206/416/302
+//
+// 所以下面拿到的只是一份**描述**。好处是 Range / 206 / 416 只实现一次
+// （上游 `local_provider` 与 115 各写了一份 `_parse_range`）。
+// ══════════════════════════════════════════════════════════════════════
+
+/// 让 provider 算出「字节从哪里来」。上游 `StorageProvider.handle_playback`。
+///
+/// ⚠️ 成功返回**不等于**能播：`PlaybackPlan.unavailable == true` 是**正常应答里
+/// 的否定结果**（文件不在 / 权限没了），调用方该按「资源不存在」处理。把它当
+/// 502 会让「影片文件被删」看起来像「插件坏了」。
+pub async fn plan_playback(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    media: sm_plugin_api::v1::MediaHandle,
+    resource_path: &str,
+    delivery: i32,
+) -> Result<sm_plugin_api::v1::PlanPlaybackResponse, ProviderOperationError> {
+    client
+        .plan_playback(sm_plugin_api::v1::PlanPlaybackRequest {
+            media: Some(media),
+            resource_path: resource_path.to_owned(),
+            delivery,
+        })
+        .await
+        .map(|response| response.into_inner())
+        .map_err(|status| classify_status(provider_key, "plan_playback", status))
+}
+
+/// 合并播放的投递计划。上游 `StorageProvider.handle_merged_playback`。
+///
+/// 与 [`plan_playback`] 分开是因为合并流**没有单个 provider 地址可指** ——
+/// 上游同样只允许中转。签发前还要过 [`preflight_merged_playback`]。
+pub async fn plan_merged_playback(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    medias: Vec<sm_plugin_api::v1::MediaHandle>,
+    resource_path: &str,
+    delivery: i32,
+) -> Result<sm_plugin_api::v1::PlanMergedPlaybackResponse, ProviderOperationError> {
+    client
+        .plan_merged_playback(sm_plugin_api::v1::PlanMergedPlaybackRequest {
+            medias,
+            resource_path: resource_path.to_owned(),
+            delivery,
+        })
+        .await
+        .map(|response| response.into_inner())
+        .map_err(|status| classify_status(provider_key, "plan_merged_playback", status))
+}
+
+/// 合并播放预检。上游 `StorageProvider.preflight_merged_playback`。
+///
+/// 「签发合并播放 URL 前校验，不通过则**整体失败**」（`storage.proto:65-70`）。
+/// 返回值是空消息 —— 信息全在 `Err` 里。
+pub async fn preflight_merged_playback(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    medias: Vec<sm_plugin_api::v1::MediaHandle>,
+) -> Result<(), ProviderOperationError> {
+    client
+        .preflight_merged_playback(sm_plugin_api::v1::PreflightMergedPlaybackRequest { medias })
+        .await
+        .map(|_| ())
+        .map_err(|status| classify_status(provider_key, "preflight_merged_playback", status))
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 导入组（`import_service` 用的那四个 + 指纹）
 //
 // 上游 `StorageProvider.scan_import_source` / `stage_import_file` /

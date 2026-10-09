@@ -213,3 +213,28 @@ async fn a_method_other_than_get_is_405_with_an_envelope() {
     let body: Value = serde_json::from_slice(&bytes).expect("应是 JSON 信封");
     assert_eq!(body["error"]["code"], json!("http_error"));
 }
+
+/// `GET /status/metadata-providers/{provider}/test` —— **只接受 `javdb`**。
+///
+/// 其它值一律 422 `invalid_metadata_provider`，且 `details.provider` 回显
+/// **原始**入参（上游 `{"provider": provider}`，不是归一化后的值）—— 客户端据此
+/// 显示自己到底发了什么。
+///
+/// ⚠️ **这里只测 422 那条路**。`javdb` 那条会去连真 JavDB（host 是硬编码常量），
+/// 在测试里发真实外网请求是不允许的；探测链路本身由
+/// `crates/sm-service/tests/status_metadata_provider.rs` 用假 JavDB 覆盖。
+#[tokio::test]
+async fn an_unknown_metadata_provider_is_422_and_echoes_the_raw_value() {
+    let (_db, state, token) = setup_with("").await;
+
+    // 大小写与空格都不影响判断（上游 `provider.strip().lower()`），但回显的是原样。
+    let (status, body) = get(&state, &token, "/status/metadata-providers/JavBus/test").await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "响应: {body}");
+    assert_eq!(body["error"]["code"], json!("invalid_metadata_provider"));
+    assert_eq!(
+        body["error"]["details"]["provider"],
+        json!("JavBus"),
+        "details 放**原始**入参，不是归一化后的 javbus"
+    );
+}

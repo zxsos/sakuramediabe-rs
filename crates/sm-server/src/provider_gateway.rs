@@ -36,7 +36,8 @@ use prost_types::{Struct, Value as PbValue};
 use sm_plugins::provider_calls::{self, ProviderOperationError};
 use sm_plugins::registry::ProviderRegistry;
 use sm_service::playback::provider_helpers::{
-    MediaHandle, ProviderFailure, StorageGateway, ThumbnailJobArtifact, ThumbnailJobResult,
+    DeliveryTarget, MediaHandle, PlaybackGateway, PlaybackPlan, ProviderFailure, RequestedDelivery,
+    StorageGateway, ThumbnailJobArtifact, ThumbnailJobResult,
 };
 
 /// 未被插件声明时的失败码。
@@ -156,6 +157,249 @@ impl StorageGateway for ProviderGateway {
                     .collect(),
             })
         })
+    }
+}
+
+impl PlaybackGateway for ProviderGateway {
+    fn plan_playback(
+        &self,
+        handle: &MediaHandle,
+        resource_path: &str,
+        requested: RequestedDelivery,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<PlaybackPlan, ProviderFailure>> + Send + '_>>
+    {
+        let handle = handle.clone();
+        let resource_path = resource_path.to_owned();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&handle.provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &handle.provider_key,
+                &endpoint,
+                "plan_playback",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            let (_, media) = proto_handles(&handle);
+            // `PLAYBACK_DELIVERY_UNSPECIFIED` = 让插件自己选（客户端没指定时）。
+            let response = provider_calls::plan_playback(
+                &mut client,
+                &handle.provider_key,
+                media,
+                &resource_path,
+                proto_delivery(requested),
+            )
+            .await
+            .map_err(|error| to_failure(&error))?;
+            Ok(playback_plan_from_proto(response.plan.unwrap_or_default()))
+        })
+    }
+
+    fn plan_merged_playback(
+        &self,
+        handles: &[MediaHandle],
+        resource_path: &str,
+        requested: RequestedDelivery,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<PlaybackPlan, ProviderFailure>> + Send + '_>>
+    {
+        // 合并播放的多个媒体**必须来自同一个 provider** —— 一次调用只能打到一个
+        // 插件的端点。跨 provider 的拼接是宿主的事（上游同样如此）。
+        let Some(first) = handles.first() else {
+            return Box::pin(async {
+                Err(ProviderFailure {
+                    code: sm_service::playback::provider_helpers::PROVIDER_UNSUPPORTED.to_owned(),
+                    safe_message: "合并播放至少要一个媒体".to_owned(),
+                    retryable: false,
+                })
+            });
+        };
+        let provider_key = first.provider_key.clone();
+        let medias: Vec<_> = handles
+            .iter()
+            .map(|handle| proto_handles(handle).1)
+            .collect();
+        let resource_path = resource_path.to_owned();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &provider_key,
+                &endpoint,
+                "plan_merged_playback",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            let response = provider_calls::plan_merged_playback(
+                &mut client,
+                &provider_key,
+                medias,
+                &resource_path,
+                proto_delivery(requested),
+            )
+            .await
+            .map_err(|error| to_failure(&error))?;
+            Ok(playback_plan_from_proto(response.plan.unwrap_or_default()))
+        })
+    }
+}
+
+/// proto 的 `PlaybackPlan` → 宿主侧的 [`PlaybackPlan`]。
+///
+/// # 为什么是**无损**的形状转换（除了下面这一处）
+///
+/// proto 的 `oneof delivery` 本来就允许不设 —— `unavailable: true` 时插件不会
+/// 给目标。所以宿主侧的 `delivery` 是 `Option`，两种「没有目标」的情形都在那里
+/// 说明。
+///
+/// ⚠️ **一处已知的信息降级**：`unavailable == false` 却没有投递方式是插件违约
+/// （既说能提供、又不给目标），宿主此刻只能与「资源不可用」同处理。这里 `warn`
+/// 留痕，区分它需要一个新的失败码 —— 见 ADR §6 未决项。
+///
+/// `headers` 从 `HashMap` 转成**有序** `Vec`：proto 的 map 无序，而它会被带到
+/// HTTP 响应上，顺序不确定会让同一份计划在两次调用间产生不同的字节。
+fn playback_plan_from_proto(plan: sm_plugin_api::v1::PlaybackPlan) -> PlaybackPlan {
+    use sm_plugin_api::v1::playback_plan::Delivery as ProtoDelivery;
+
+    let delivery = plan.delivery.map(|delivery| match delivery {
+        ProtoDelivery::Redirect(redirect) => DeliveryTarget::Redirect {
+            url: redirect.url,
+            headers: sorted_headers(redirect.headers),
+        },
+        ProtoDelivery::Proxy(proxy) => DeliveryTarget::Proxy {
+            endpoint: proxy.endpoint,
+            path_prefix: proxy.path_prefix,
+            headers: sorted_headers(proxy.headers),
+        },
+    });
+
+    if delivery.is_none() && !plan.unavailable {
+        // 插件违约：既没说不提供，也没给投递方式。
+        tracing::warn!(
+            file_name = %plan.file_name,
+            "插件返回的播放计划既未标记 unavailable、也没有投递方式 —— 按资源不可用处理"
+        );
+    }
+
+    PlaybackPlan {
+        delivery,
+        file_name: plan.file_name,
+        size_bytes: plan.size_bytes,
+        content_type: plan.content_type,
+        unavailable: plan.unavailable,
+    }
+}
+
+/// 宿主侧的投递意图 → proto 的枚举值。
+///
+/// 客户端没指定时传 `UNSPECIFIED` —— **与上游一致**：那时插件按自己的默认选
+/// （上游是取 `bundle.playback_deliveries[0]`）。宿主不替它猜。
+fn proto_delivery(requested: RequestedDelivery) -> i32 {
+    match requested {
+        RequestedDelivery::Unspecified => sm_plugin_api::v1::PlaybackDelivery::Unspecified as i32,
+        RequestedDelivery::Proxy => sm_plugin_api::v1::PlaybackDelivery::Proxy as i32,
+        RequestedDelivery::Redirect => sm_plugin_api::v1::PlaybackDelivery::Redirect as i32,
+    }
+}
+
+/// proto 的 `map<string,string>` → 有序键值对（按 key 升序）。
+fn sorted_headers(headers: std::collections::HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = headers.into_iter().collect();
+    pairs.sort();
+    pairs
+}
+
+/// 播放计划：proto → 宿主形状的转换。
+///
+/// 单独一个模块（不并进文件末尾那个 `tests`）：这条缝里**只有这一步**不需要
+/// gRPC —— 其余都要真起一个插件进程，所以它值得与「注册表是活的」那类装配测试
+/// 分开看。
+#[cfg(test)]
+mod playback_plan_conversion_tests {
+    use super::*;
+    use sm_plugin_api::v1::playback_plan::Delivery as ProtoDelivery;
+    use sm_plugin_api::v1::{PlaybackPlan as ProtoPlan, ProxyPlan, RedirectPlan};
+
+    fn headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn plan_with(delivery: Option<ProtoDelivery>) -> ProtoPlan {
+        ProtoPlan {
+            delivery,
+            file_name: "m.mp4".to_owned(),
+            size_bytes: Some(1024),
+            content_type: Some("video/mp4".to_owned()),
+            unavailable: false,
+        }
+    }
+
+    /// `redirect` 分支：URL 原样带出，**头按 key 排序**。
+    ///
+    /// 排序不是洁癖：`HashMap` 无序，而这份头会写到 HTTP 响应上 —— 顺序不定会让
+    /// 同一份计划在两次调用间产生不同字节，比对抓包时会被当成"变了"。
+    #[test]
+    fn a_redirect_plan_carries_the_url_and_sorted_headers() {
+        let plan =
+            playback_plan_from_proto(plan_with(Some(ProtoDelivery::Redirect(RedirectPlan {
+                url: "https://pan.example/d/abc".to_owned(),
+                headers: headers(&[("z-last", "1"), ("a-first", "2")]),
+            }))));
+
+        assert_eq!(plan.file_name, "m.mp4");
+        assert_eq!(plan.size_bytes, Some(1024));
+        assert_eq!(plan.content_type.as_deref(), Some("video/mp4"));
+        assert!(!plan.unavailable);
+        assert_eq!(
+            plan.delivery,
+            Some(DeliveryTarget::Redirect {
+                url: "https://pan.example/d/abc".to_owned(),
+                headers: vec![
+                    ("a-first".to_owned(), "2".to_owned()),
+                    ("z-last".to_owned(), "1".to_owned()),
+                ],
+            })
+        );
+    }
+
+    /// `proxy` 分支：端点与**前缀**都要带出（前缀丢了会拼错请求路径）。
+    #[test]
+    fn a_proxy_plan_carries_the_endpoint_and_prefix() {
+        let plan = playback_plan_from_proto(plan_with(Some(ProtoDelivery::Proxy(ProxyPlan {
+            endpoint: "http://127.0.0.1:5001".to_owned(),
+            path_prefix: "/v1/media".to_owned(),
+            headers: headers(&[("x-token", "t")]),
+        }))));
+
+        assert_eq!(
+            plan.delivery,
+            Some(DeliveryTarget::Proxy {
+                endpoint: "http://127.0.0.1:5001".to_owned(),
+                path_prefix: "/v1/media".to_owned(),
+                headers: vec![("x-token".to_owned(), "t".to_owned())],
+            })
+        );
+    }
+
+    /// ★ `unavailable` 的否定结果**没有**投递目标，且**不是**错误。
+    ///
+    /// 把它变成 `Err` 就会让「影片文件被删」看起来像「插件坏了」（502）—— 而
+    /// proto 的 `oneof` 本来就可以不设，这是**正常应答**。
+    #[test]
+    fn an_unavailable_plan_has_no_delivery_target() {
+        let mut proto = plan_with(None);
+        proto.unavailable = true;
+
+        let plan = playback_plan_from_proto(proto);
+
+        assert!(plan.unavailable, "否定结果要如实带出");
+        assert_eq!(plan.delivery, None, "没有目标，但这是正常应答而不是错误");
     }
 }
 

@@ -200,6 +200,156 @@ pub trait StorageGateway: Send + Sync {
     >;
 }
 
+/// 能力缺失（provider 在，但**不支持这个操作**）。
+///
+/// # ★ 这是**上游自己的码**，不是宿主新造的
+///
+/// 上游 `ProviderOperationError.code` 只有七个取值
+/// （`provider_calls.rs:20-21` 有完整清单）：
+///
+/// ```text
+/// invalid_config / authentication_failed / source_not_found /
+/// task_not_managed / source_blacklisted / unsupported / unavailable
+/// ```
+///
+/// `unsupported` 就是「这个 provider 不做这件事」。**不要**再发明一个
+/// `provider_not_supported` 之类的字面量 —— 那会让调用方要同时认识两套码。
+///
+/// # 与 `unavailable`、`provider_not_installed` 的分工
+///
+/// | 码 | 含义 | `retryable` | 调用方该做什么 |
+/// |---|---|---|---|
+/// | `unsupported` | provider 在，但不做这件事 | `false` | **换行为**（跳过 / `blocked_reason` / 拒绝）|
+/// | `unavailable` | 暂时不可达 | 通常 `true` | 退避重试 |
+/// | `provider_not_installed` | **宿主**侧：插件根本没装（非上游码）| `false` | 提示去装插件（503）|
+///
+/// 决策依据：`docs/adr/2026-10-08-provider-seam.md` D2。
+pub const PROVIDER_UNSUPPORTED: &str = "unsupported";
+
+/// 一次播放投递的**计划**。
+///
+/// # 为什么是「描述」而不是 HTTP 响应
+///
+/// 上游 provider 的 `handle_playback` 直接返回 starlette `Response`
+/// （`provider_protocol.py:344`）—— 插件自己构造 302 或开流。跨进程做不到：
+/// 让每个 provider 都各自实现一遍 HTTP 语义，等于把宿主的响应职责外移。
+/// 契约层因此把它降级成这份描述（`proto/storage.proto:12-24`），**由宿主执行**。
+///
+/// 这里是宿主侧类型（不引 proto），与 [`MediaHandle`] 同取向：proto 是嵌套的，
+/// 宿主侧展平，转换只在组合根做一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackPlan {
+    /// 「字节从哪里来」。
+    ///
+    /// `None` 表示**没有投递目标**，两种情形都在这里：
+    ///
+    /// - `unavailable == true`：**正常**的否定结果（proto 的 `oneof` 本来就可以
+    ///   不设），调用方按「资源不可用」处理；
+    /// - `unavailable == false`：插件**违约**（既说能提供、又不给目标）。当前与
+    ///   上一种同处理 —— 转换处会 `warn`，但**信息在宿主侧被降级了**。要区分
+    ///   的话得给它一个独立的失败码（七码里没有合适的，见
+    ///   `docs/adr/2026-10-08-provider-seam.md` §6 未决项）。
+    pub delivery: Option<DeliveryTarget>,
+    /// 供宿主与客户端展示的文件名。
+    pub file_name: String,
+    /// 文件大小；provider 拿不到时为 `None`。
+    pub size_bytes: Option<i64>,
+    /// 内容类型；provider 不声明时为 `None`（宿主按扩展名兜底）。
+    pub content_type: Option<String>,
+    /// ★ `true` = provider **无法提供**该资源（文件不在 / 权限没了）。
+    ///
+    /// 与「provider 报错」**不是一回事**：这是**正常应答里的否定结果**
+    /// （`storage.proto:50-51` 的注释：「宿主应回退或报错」），宿主该按
+    /// **资源不存在**处理，而不是 502。合成一种会让「影片文件被删」看起来
+    /// 像「插件坏了」。
+    pub unavailable: bool,
+}
+
+/// 字节从哪来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryTarget {
+    /// **302 直连存储**（支持直链的网盘）。`headers` 原样带到响应上。
+    Redirect {
+        url: String,
+        headers: Vec<(String, String)>,
+    },
+    /// **经宿主代理转发**到插件的 HTTP 端点。
+    Proxy {
+        endpoint: String,
+        /// 宿主拼请求路径用的前缀（proto 的 `path_prefix`）。
+        path_prefix: String,
+        /// 转发时必须附加的请求头。**不含 `Range`** —— 那个由宿主自己解析
+        /// （`storage.proto:37-38`）。
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// **客户端请求**的投递方式。上游 `Literal["proxy","redirect"] | None`。
+///
+/// # 为什么由插件判定，而不是宿主
+///
+/// 上游有一道 422 门（`media.py:277-283`）：把请求的 delivery 与
+/// `bundle.playback_deliveries` **声明**比对，不支持就报
+/// `provider_playback_delivery_unsupported`。那要求宿主持有「provider 声明了哪些
+/// 投递方式」这份清单 —— 本仓的 ABI 里**没有**它（决策记录：ADR
+/// `2026-10-08-provider-seam.md`）。
+///
+/// 按 (b) 的做法：宿主把请求的 delivery **原样传给插件**
+/// （`storage.proto` 的 `PlanPlaybackRequest.delivery` 本就有这个字段），
+/// 插件不支持时回 `unsupported`，宿主据此报同一个 422 码。
+///
+/// # ⚠️ 这是 (b) 的已知代价：一处无法区分的近似
+///
+/// 收到 `unsupported` 时，宿主**分不清**是「不支持这种投递方式」还是
+/// 「根本不支持播放」。上游靠那份声明能分清。区别在客户端行为：前者换一种
+/// `delivery` 重试**能成**，后者不能。所以两者都会被报成
+/// `provider_playback_delivery_unsupported` —— 想分清就得回到 (a)（宿主持有声明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedDelivery {
+    /// 客户端没指定 —— 与上游一致：让插件按自己的默认选。
+    Unspecified,
+    /// 本仓库中转（200 + 字节流）。
+    Proxy,
+    /// 302 到 provider 的真实地址。
+    Redirect,
+}
+
+/// 播放投递能力。
+///
+/// # ★ 为什么不并进 [`StorageGateway`]
+///
+/// 上游把「支持哪些投递方式」声明在
+/// `MediaProviderBundle.playback_deliveries`（`provider_protocol.py:505-513`），
+/// 缺它时业务层要**分支**（换投递方式或拒绝），而不是 503。方法少的窄 trait
+/// 才配得上那个语义 —— 塞进 fat trait 只会让每个实现者（含测试替身）在
+/// 用不到的方法上写 `unimplemented!()`，把「不支持」编成 panic。
+///
+/// 决策依据：`docs/adr/2026-10-08-provider-seam.md` D1。
+pub trait PlaybackGateway: Send + Sync {
+    /// 单个媒体的投递计划。上游 `StorageProvider.handle_playback`。
+    fn plan_playback(
+        &self,
+        handle: &MediaHandle,
+        resource_path: &str,
+        requested: RequestedDelivery,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PlaybackPlan, ProviderFailure>> + Send + '_>,
+    >;
+
+    /// 多媒体的**合并**投递计划。上游 `handle_merged_playback`。
+    ///
+    /// 与 [`Self::plan_playback`] 分开是因为合并流**只能中转、不能重定向**
+    /// （没有单个 provider 地址可指），而且签发前还要过一道预检。
+    fn plan_merged_playback(
+        &self,
+        handles: &[MediaHandle],
+        resource_path: &str,
+        requested: RequestedDelivery,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PlaybackPlan, ProviderFailure>> + Send + '_>,
+    >;
+}
+
 /// 一件缩略图产物。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThumbnailJobArtifact {

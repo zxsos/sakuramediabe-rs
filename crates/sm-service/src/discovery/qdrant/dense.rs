@@ -30,9 +30,9 @@
 use std::time::Duration;
 
 use qdrant_client::qdrant::{
-    vectors_config, Condition, CreateCollectionBuilder, Datatype, Distance, FieldType, Filter,
-    HnswConfigDiff, MaxOptimizationThreadsBuilder, OptimizersConfigDiff, PointId, PointStruct,
-    QueryPointsBuilder, ScoredPoint, SearchParams, VectorParamsBuilder,
+    vectors_config, CollectionStatus, Condition, CreateCollectionBuilder, Datatype, Distance,
+    FieldType, Filter, HnswConfigDiff, MaxOptimizationThreadsBuilder, OptimizersConfigDiff,
+    PointId, PointStruct, QueryPointsBuilder, ScoredPoint, SearchParams, VectorParamsBuilder,
 };
 use qdrant_client::{Qdrant, QdrantError};
 
@@ -229,6 +229,12 @@ impl DenseStore {
             .collection_exists(self.collection.clone())
             .await
             .unwrap_or(false)
+    }
+
+    /// 集合名。状态探测要把它回显给客户端 —— 让调用方问本 store 而不是去引
+    /// 常量，将来两个 store 的集合名各自变化时不会有人抄错。
+    pub fn collection_name(&self) -> &str {
+        &self.collection
     }
 
     /// 建表；已存在则**校验**而不是重建。
@@ -592,37 +598,160 @@ impl DenseStore {
         }
     }
 
-    /// 集合是否存在（供状态接口用），带已索引点数。
+    /// 集合是否存在（供状态接口用），带已索引点数与向量参数。
     ///
     /// 点数走 `count(exact=true)` 而不是从 `collection_info` 里取 ——
     /// 后者的 `CollectionInfo` 只带 segment 数与状态枚举，点数在
     /// `CollectionStatus` 内部、不是本客户端的稳定接口。直接问 `count`
     /// 更省事也更准。
+    ///
+    /// 向量维度 / 数据类型 / 集合状态则**必须**从 `collection_info` 取
+    /// （`count` 给不了），取法与 [`Self::validate_collection`] 同一套路径。
     pub async fn status(&self) -> Result<DenseStoreStatus, ServiceError> {
-        if !self.exists().await {
+        // ⚠️ **刻意不复用 `self.exists()`**：那个方法把错误吞成 `false`
+        //（`search` 路径要求「向量库挂了也当没结果」，见模块文档第 1 条），
+        // 而状态接口必须把「连不上」如实报成 `Err` —— 否则 Qdrant 宕机会被
+        // 显示成 `exists: false` + 健康，也就是「一切正常，只是还没建集合」，
+        // 正好是本端点要消灭的那种误报。
+        //
+        // 上游 `_collection_exists` 在这里同样不吞异常
+        //（`qdrant_thumbnail_store.py:117-126`：只有降级分支才 `try/except`，
+        // 主分支让异常冒到 `inspect_status` 的 `except` → `healthy: False`）。
+        let exists = self
+            .client
+            .collection_exists(self.collection.clone())
+            .await
+            .map_err(|error| map_qdrant_error(&error))?;
+        if !exists {
             return Ok(DenseStoreStatus {
                 exists: false,
                 points: 0,
+                vector_size: None,
+                vector_dtype: None,
+                collection_status: None,
             });
         }
+        let info = self
+            .client
+            .collection_info(self.collection.clone())
+            .await
+            .map_err(|error| map_qdrant_error(&error))?;
+        let result = info.result.as_ref();
+        // 命名向量（`ParamsMap`）与「取不到向量参数」都落到 `None`，与
+        // `validate_collection` 同样的取舍：本模块只建单向量集合，那条分支
+        // 属于不该出现的状态，猜它的语义反而可能显示错。
+        let vector_params = result
+            .and_then(|info| info.config.as_ref())
+            .and_then(|config| config.params.as_ref())
+            .and_then(|params| params.vectors_config.as_ref())
+            .and_then(|config| config.config.as_ref())
+            .and_then(|config| match config {
+                vectors_config::Config::Params(params) => Some(params),
+                _ => None,
+            });
         Ok(DenseStoreStatus {
             exists: true,
             points: self.count().await?,
+            vector_size: vector_params.map(|params| params.size),
+            vector_dtype: vector_params.and_then(|params| datatype_name(params.datatype)),
+            collection_status: result
+                .map(|info| info.status)
+                .and_then(collection_status_name),
         })
     }
 }
+
 /// 集合状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenseStoreStatus {
     /// 集合是否已建。
     pub exists: bool,
     /// 已索引的点数。
     pub points: u64,
+    /// 向量维度。集合未建、或取不到向量参数时为 `None`。
+    pub vector_size: Option<u64>,
+    /// 向量数据类型，REST 风格小写串（如 `float16`）。
+    pub vector_dtype: Option<String>,
+    /// 集合状态，REST 风格小写串（如 `green`）。
+    pub collection_status: Option<String>,
+}
+
+/// `Datatype` → REST 风格小写串（上游 `_enum_value` 的产出）。
+///
+/// 字面量取自上游自己的黄金用例 `tests/api/test_status_api.py:201`
+/// （`"vector_dtype": "float16"`），**不是**把 proto 枚举名小写化猜出来的 ——
+/// 猜成 `Float16` 会让客户端按 `float16` 匹配时对不上。
+///
+/// `UnknownDatatype`（0）与将来新增的类型返回 `None`：上游那套 REST 枚举里
+/// 没有对应字面量，编一个反而更难排查。
+fn datatype_name(datatype: Option<i32>) -> Option<String> {
+    match datatype? {
+        value if value == Datatype::Float16 as i32 => Some("float16".to_owned()),
+        value if value == Datatype::Float32 as i32 => Some("float32".to_owned()),
+        value if value == Datatype::Uint8 as i32 => Some("uint8".to_owned()),
+        _ => None,
+    }
+}
+
+/// `CollectionStatus` → REST 风格小写串。字面量来源同 [`datatype_name`]
+/// （`tests/api/test_status_api.py:202` 的 `"collection_status": "green"`）。
+fn collection_status_name(status: i32) -> Option<String> {
+    match status {
+        value if value == CollectionStatus::Green as i32 => Some("green".to_owned()),
+        value if value == CollectionStatus::Yellow as i32 => Some("yellow".to_owned()),
+        value if value == CollectionStatus::Red as i32 => Some("red".to_owned()),
+        value if value == CollectionStatus::Grey as i32 => Some("grey".to_owned()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ 锁住 `vector_dtype` / `collection_status` 的**字面量形状**。
+    ///
+    /// 上游这两个值走 `_enum_value()`，产出是 REST 风格小写串，证据是上游自己的
+    /// 黄金用例 `tests/api/test_status_api.py:201-202`
+    /// （`"vector_dtype": "float16"`、`"collection_status": "green"`）。
+    ///
+    /// 这不是「我的函数返回我写下的常量」那种同义反复 —— 它锁的是一个**跨仓
+    /// 事实**：一旦有人把它改成 proto 枚举名小写化之外的形状（`Float16`、整数
+    /// `3`、`green_`），客户端按 REST 值匹配就对不上，而线上表现只是状态页那两格
+    /// 显示怪值，没人会去查。
+    #[test]
+    fn qdrant_enums_map_to_the_rest_literals_upstream_reports() {
+        let cases = [
+            (Some(Datatype::Float16 as i32), Some("float16")),
+            (Some(Datatype::Float32 as i32), Some("float32")),
+            (Some(Datatype::Uint8 as i32), Some("uint8")),
+            // 未知 / 未设：宁可为 `None`，也不要编一个字面量出来。
+            (Some(0), None),
+            (None, None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                datatype_name(input).as_deref(),
+                expected,
+                "datatype={input:?}"
+            );
+        }
+
+        let statuses = [
+            (CollectionStatus::Green as i32, "green"),
+            (CollectionStatus::Yellow as i32, "yellow"),
+            (CollectionStatus::Red as i32, "red"),
+            (CollectionStatus::Grey as i32, "grey"),
+        ];
+        for (input, expected) in statuses {
+            assert_eq!(
+                collection_status_name(input).as_deref(),
+                Some(expected),
+                "status={input}"
+            );
+        }
+        assert_eq!(collection_status_name(0), None);
+    }
 
     #[test]
     fn score_is_normalized_from_cosine_range() {

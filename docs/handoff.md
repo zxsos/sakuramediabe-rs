@@ -1990,30 +1990,172 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 `on_disk` 71.6 MB，峰值是稳态的 2 倍）见 [`deployment.md` §3.4](deployment.md) ——
 那里也记着两处**待实测校正**的偏差（没建 payload 索引、每部媒体几张缩略图未测）。
 
-### 7.3 剩余 59 条的**卡点表**（按卡点而非按文件归类）
+### 7.2h ★ 一批**陈旧卡点注释**在骗人；以及一次「照文档改代码」的翻车（2026-10-08）
+
+这一轮没动业务代码，做的全是**核对**。三条结论，都会影响后面怎么排活。
+
+#### 1. 「本仓还没有 image store」是**假的** —— 多处注释还这么写
+
+`crates/sm-service/src/catalog/image_store.rs` **早就存在、零 `todo!()`**，而且
+`crates/sm-api/src/routes/files.rs:135` 已经在用它（`read_image_bytes`）。但下面这些
+地方的注释仍在说「本仓还没有那一层」：
+
+- `discovery/moment_recommendation.rs:378` —— 「唯一还缺的是读种子图字节 …… 本仓库
+  还没有 image store 模块」。**那句话已经过期**：`image_store::read_image_bytes(root,
+  path)` 就在那儿。真正缺的是 **image root 从哪来**（服务只持有 store + embedding，
+  而 `media_paths::media_image_root_path(config)` 要 `ConfigService`）+ **种子行不带
+  `image.origin`**（`MomentSeedRow` 是 6 个 `i32`，位置说明见 `repo/moment.rs:81`；
+  `MediaThumbnailRow` 带 origin，种子行不带）。
+- `catalog/catalog_import.rs:41/60/173/215/482` —— 五处同款说法。
+
+**教训**：卡点注释写下来就会过期，而过期的卡点会让人**整片跳过**可做的工作。下次看到
+「本仓还没有 X」，先 `Get-ChildItem -Filter X*` 搜一下再说。
+
+#### 2. `status.rs` 元数据源探测：卡点不是「`metadata` 域」，是 **JavDB host 从哪来**
+
+模块文档原先写「阻塞：`metadata` 域」。核实后：零件都在 ——
+`JavdbProvider` 已实现 `MetadataProvider::get_movie_by_number`（`javdb.rs:244`，零 todo）。
+真正缺的：全仓**没有任何生产代码构造过 `JavdbProvider`**，也没有 host 常量或配置键
+（`config_schema.rs` 的 `metadata` 节只有两个 gfriends URL）；上游是在
+`metadata/factory.py:15` **硬编码** `JAVDB_HOST = "jdforrepam.com"`。
+
+→ 实现前要定：跟上游一样硬编码，还是补 `metadata.javdb_host`。**这是待拍板项。**
+实现形状（探测用固定番号 `SSNI-888`、失败也回 200 + `error.type`）已记在
+`status.rs` 的 handler 文档里，不用再读上游。
+
+✅ **已落（2026-10-08）**：按建议 (a) 硬编码，见 `sm_service::system::status::JAVDB_HOST`。
+服务层 + 路由 + 真回环集成测试一起做完（`52 -> 51`）。§7.5 项 3 结案。
+
+⚠️ 但落地时发现：这个端点**能编译、能解析、测试全绿，却对真站一个请求都发不出去** ——
+`javdb.rs` 少了 `jdsignature` 头。详见 §7.2i（那条是独立的缺陷，不属于本项）。
+
+#### 3. ★ 我照一份**写错了动词的模块文档**去改代码，把对的改错了
+
+`status.rs` 文件头的表格写着 `POST /status/metadata-provider/test`。我据此把
+`get(test_metadata_provider)` 改成 `post(...)`，还写了注释「★ 是 POST，不是 GET」。
+**上游是 `@router.get`**（`status.py:60`）—— 代码本来就对，错的是那张表（动词错、
+路径也丢了 `providers` 的 `s` 和 `{provider}` 段）。
+
+拦住我的是 **`method_not_allowed_http.rs` 的 405 用例**：改错后它报
+`GET /status/metadata-providers/javdb/test 应当是 405`。已全部回滚，只留下：
+表格订正、那条用例（现在锁的是「别再照文档改动词」）、以及 `422` 补上的
+`details.provider`（上游 `{"provider": provider}`，回显**原始**入参）。
+
+我的「反向验证」（把动词翻回 GET 看用例是否变红）只是证明**测试与我的实现一致**
+—— 那是自己给自己发合格证，**不能**用来验证上游事实。要验上游只有一条路：读上游。
+
+#### 4. 顺带把一条推理补上了出处：依赖先于参数校验
+
+§7.2g 那条「未启用 → 409 先于参数校验 422」当时是**照记忆推的**（手上没有 FastAPI
+源码）。这轮下到上游锁的版本核实了：`pyproject.toml` 是 `fastapi==0.110.1`，其
+`solve_dependencies` 里 `for sub_dependant in dependant.dependencies` 确实在
+`dependant.path_params` 之前。结论成立，注释里已补上可复核的来源。
+
+### 7.2i ★ 零 `todo!()` 的组件里也可能藏着致命缺陷：JavDB 请求缺 `jdsignature`（2026-10-08）
+
+`javdb.rs` 从头到尾 **0 个 `todo!()`**，带着一批单测 + 10 个 wiremock 集成测试，
+交接文档里一直当它「已完成」。它确实**能编译、能解析**，但对真站**一个请求都发不出去**：
+
+- 上游 `MetadataRequestClient._request:44` 在**每次请求**都调
+  `build_request_headers()`；`JavdbProvider` 覆盖它，补上 `jdsignature` +
+  `accept-language`（`javdb.py:661-667`）。签名 = `md5(f"{int(time.time())}{SECRET}")`，
+  拼成 `{ts}.lpw6vgqzsp.{md5}`，**每请求重算**（服务端判新鲜度）。
+- 本仓的 `request_json` 只设了 User-Agent。少了签名，JavDB 回
+  `{"success":0,"action":"ParameterInvalid","message":"參數不能爲空: jdsignature"}`
+  —— **HTTP 仍是 200**。
+- 于是**症状取决于谁看 `success`**：详情路径看了 → 报「请求失败」（还算诚实）；
+  **搜索路径不看**（上游 `_search_movie:401` 同样不看，本仓照抄）→ 候选为空 →
+  报 `NotFound`。用户看到的是「JavDB 没收录**任何**番号」。
+
+**为什么那 10 个集成测试全绿也没发现**：wiremock **不校验请求头**，断言全在响应
+解析那一侧。这类「出网形状错、但解析逻辑对」的缺陷，桩测试**结构上**测不到 ——
+所以本轮补了一条会**读回请求头**的用例（`every_request_carries_a_fresh_jdsignature`）。
+
+**修法**：`crates/sm-service/src/catalog/javdb.rs` 加 `signature_at()`，在
+`request_json` 挂上那两个头；MD5 自写进 `crates/hashing`（该 crate 的文档明写
+「刻意不引 sha1/sha2」，且离线可编是硬要求），带 RFC 1321 七向量 + 一个**跨实现**
+算出的固定签名向量 —— 用本仓自己的 md5 去验本仓自己的签名，会恰好漏掉「secret
+抄错」这一类。上游头里的 `connection` / `host` **故意不搬**：都是客户端托管的
+（HTTP/1.1 默认即 keep-alive；`Host` 由 hyper 按 URL 自动填），显式设置反与连接
+复用打架。
+
+**真机验证**：`get_movie_by_number("SSNI-888")` → `id=9G2v6`、真标题 / 标签 / 演员、
+`release_date=2020-10-19`，0.72s。
+
+**已知脆弱点（★）**：`SIGN_SECRET` 是上游**硬编码在客户端里的共享密钥**，随官方 App
+发版而变。变了而这里没跟，症状就是「所有番号都查不到」—— 真遇到先读
+`signature_at` 的文档注释，别从网络层查起。
+
+> 这一条的教训与 §7.2h 是同一枚硬币：§7.2h 是「注释说不行、其实行」，
+> 这里是「注释说行、其实不行」。**两边都不能只信文字。**
+
+### 7.2j ★ 图搜状态端点：三个「照着抄也会错」的接法（2026-10-08）
+
+`GET /status/image-search` 落地（`51 -> 50`，路由 `24 -> 23`）。规格逐字可抄，
+但**装配层**有三处会撒谎的地方 —— 三者都能编译、单测也能过，只有真连上才看得出来：
+
+**1.「集合不存在」被吞成「健康」。** `DenseStore::exists()` 把错误吞成 `false`
+（`search` 路径要求「向量库挂了也当没结果」，见该模块文档第 1 条）。`status()`
+原先**复用**了它，于是 Qdrant 连不上时返回 `Ok{exists: false}` → 状态页显示
+`healthy: true` + 「还没建集合」。**这正是本端点要消灭的那类误报。** 上游
+`_collection_exists`（`qdrant_thumbnail_store.py:117-126`）在这里**不吞异常**
+（只有降级分支才 `try/except`）。已改为直接调 `collection_exists` 并 `map_err`。
+
+**2. `enabled` 不等于「服务存在」。** 上游 `enabled` 取**配置开关**；而
+`AppState::image_search()` 在「开关开着但 `inference_base_url` 为空」时也是 `None`
+（组合根 warn 后不建）。两者合一会把**配置错误**谎报成**功能没开**。已拆成
+`ImageSearchProbe { enabled, service }`。该组合下与上游有一处**已知偏差**（上游仍
+能探通 Qdrant，我们没有客户端），已在代码注释里写明。
+
+**3. 两个「待索引计数」不是一个口径。** 仓里原有的 `pending_count` 并了
+`movie_plot_image`、还加了 `m.movie IS NOT NULL`，那是**任务候选口径**；上游这个
+端点（`status_service.py:576-590`）是两次裸 `count()`，是**展示口径**。互换后状态页
+的数字与任务实际要处理的量对不上，**且没有任何报错**。新查询单独写在
+`count_thumbnails_with_status`，测试里特意播了一条「没有 movie 归属」的待处理缩略图
+把它钉住（反向验证过：给计数加回 `movie_number IS NOT NULL` → 该用例红）。
+
+**还有一处字面量不能猜。** `vector_dtype` / `collection_status` 走上游
+`_enum_value()`，产出是 **REST 风格小写串** —— 证据是上游自己的黄金用例
+（`tests/api/test_status_api.py:201-202`：`"float16"` / `"green"`）。猜成 `Float16`
+或枚举序数，都会让客户端按 REST 值匹配时对不上，而线上只表现为状态页那两格显示
+怪值。映射写完**对着真 Qdrant 验过**（`status_image_search.rs` 完整分支），并反向
+验证过（改回 `Float16` → 该用例红）。
+
+> 与 §7.2h / §7.2i 同源：**能编译、有测试、零 `todo!()`，都不等于接对了。**
+
+### 7.3 剩余 50 条的**卡点表**（按卡点而非按文件归类）
 
 > 总数与分域计数以 `docs/progress-baseline.md` 为准（那份由脚本生成）；下表按
 > **卡点**归类，只用来判断「下一步该动哪一块」。
+>
+> ⚠️ 本表 2026-10-08 重写过一次。旧的「59 条」版把 `recommendations.rs` 标成
+> **已解决**，其实那里还留着 2 条（见下）—— 一条「已解决」的笔记会让后面的
+> 人整片跳过。**别只信「已完成」的结论，回去数一遍。**
+>
+> 同日又动了一次：`status.rs` 的元数据源探测落地（`52 -> 51`，路由 `25 -> 24`）。
+>
+> 同日再动一次：`status.rs` 的图搜状态落地（`51 -> 50`，路由 `24 -> 23`），
+> 见 §7.2j。**`system` 域的路由至此清零**（`status.rs` 再无 `todo!()`）。
 
-**路由 33 条：**
+**路由 23 条：**
 
 | 卡点 | 文件（条数） | 说明 |
 |---|---|---|
-| **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `playback_deliveries`、下载器注册表 |
-| **`MovieService` 方法不存在** | `movies.rs` 5 | reviews（要 JavBus）/ merged-playback（要 provider）/ metadata-refresh（要 JavBus **+** 详情）/ 2 条 SSE（要 JavBus）。**详情、订阅、退订已落地**（`803337f`、本轮）|
-| ~~**Qdrant / 嵌入探测客户端缺失**~~ | ~~`image_search.rs` 7~~ | ⚠️ **已作废（见 §7.2g）**：客户端 2000+ 行早已实现、零 todo。真卡点是「上游 `image_search_input.py` 848 行没读」。`status.rs` 2 条仍卡在 probe（要健康探测端点） |
-| **插件管理的剩余 2 条** | `plugins.rs` 2 | 两个 settings。它们**不是接线**：上游的 `schema`/`defaults` 来自插件的 pydantic `settings_model`，要先定「Rust 插件怎么声明自己的设置项」 |
-| 待核 | `actors.rs` 1 | 卡点已查清（见 §7.2f）：SSE，阻塞在 JavBus provider 缺失 |
-| ~~service IO 编排缺失~~ | ~~`recommendations.rs` 3~~ | ✅ **已解决**：读侧 `c801441` + 生成侧 `2655f4d` |
-| ~~插件 zip 上传~~ | ~~`plugins.rs` 5~~ | ✅ **六条已落地**：列表 / 详情 / 启停 / 安装 / 升级（`7933f56`、`8656a21`）+ 卸载（`2b06074`） |
+| **插件 ABI / provider 无实现** | `media_playback.rs` 3、`videos.rs` 3、`media_import.rs` 3、`media_transfer.rs` 2、`download_tasks.rs` 2 | 要 provider 的 `library_handle` / `playback_deliveries` / 下载器注册表。**13 条**，最大一块 |
+| **JavBus provider 不存在** | `movies.rs` 2（SSE）、`actors.rs` 1（SSE） | 见 §7.2f |
+| **`MovieService` 缺方法** | `movies.rs` 3 | `get_movie_reviews`（要 JavBus）/ `get_merged_playback`（要 provider）/ `refresh_movie_metadata`。⚠️ 三个的**服务层方法都不存在**（不是「有方法只差接线」），别照骨架注释当成接线做。`refresh_movie_metadata` 尤其容易读错：`catalog_import.rs:468` 那个是**已实现的辅助函数** `refresh_movie_metadata_strict`，端点真正要的 `MovieMetadataRefreshService::refresh_movie_metadata`（`movie_metadata_refresh.rs:49`）**本身就是 `todo!()`** —— 所以「JavDB host 定下来」也解不开它（2026-10-08 核过）|
+| ~~**`status.rs` 1**~~ | ~~`status.rs`~~ | ✅ **本文件已清零**。`GET /status/image-search` → ✅ **已落**（§7.2j）；`GET /status/metadata-providers/{provider}/test` → ✅ **已落**（§7.5 项 3，依赖 §7.2i 的 `jdsignature` 修复才真能用）|
+| **`recommendations.rs` 2** | `recommendations.rs` 2 | `moment-recommendations`：要 `MomentRecommendationService::list_items`（自身也是 todo）+ API 层的 `PageContext` 实现。`hot-actress-releases`：要 `PageContext` 的两个方法（影片卡片 + 女优资料），§7.3 旧版误标已解决 |
+| **插件设置 2** | `plugins.rs` 2 | 见 §7.5，要先定「Rust 插件怎么声明自己的设置项」 |
 
-**服务层 35 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 / `import_task` 3 /
-其余各 1：`auto_download` / `download_common` / `download_request` / `download_task` /
-`provider_browse`）、`catalog` 7（`movie_metadata_refresh` 3 / `movie_metadata_search` 2 /
-`catalog_import` 1 / `metadata_source` 1）、`playback` 5（五个 worker 装载器各 1：
-`media_file_hash_backfill` / `media_metadata_probe` / `media_thumbnail_pack_backfill` /
-`media_validity_scan` / `media_video_info_backfill`）、`system` 4（`plugin_removal` 2 /
-`telemetry` 2）、`discovery` 3（`moment_recommendation` 2 / `image_search_space` 1）。
+**服务层 27 条**：`transfers` 16（`download_sync` 4 / `media_transfer_task` 4 /
+`import_task` 3，其余各 1：`auto_download` / `download_common` / `download_request` /
+`download_task` / `provider_browse`）、`catalog` 6（`movie_metadata_refresh` 3 /
+`movie_metadata_search` 2 / `catalog_import` 1）、`playback` 3（`media_file_hash_backfill` /
+`media_validity_scan` / `media_video_info_backfill`）、`discovery` 2（`moment_recommendation`）。
+
+**按卡点合并后的真相**：`transfers` 16 + `playback` 3 + 路由那 13 条 ≈ **32 条压在同一件
+事上 —— 插件 provider ABI**。剩下的才各自有独立卡点。
 
 ### 7.4 结论：**逐条「接线」已经没有空间了**
 
@@ -2025,7 +2167,7 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
 下一个可照此推进的候选：`actors.rs` 那 1 条（先查卡点）、或 `movies.rs` 里
 `MovieService` 缺的那批方法。
 
-### 7.5 两个**待拍板**项（详版）
+### 7.5 **待拍板**项（详版）
 
 1. **`system/telemetry.rs` 去留未定（★）**。骨架期把整个文件建错了概念：上游
    `TelemetryService` 是**匿名心跳上报** —— env `SAKURAMEDIA_TELEMETRY_ENABLED` 控制，
@@ -2046,6 +2188,17 @@ Qdrant 的**容量实测**（10 万向量 @1152 维：磁盘 497 MB、内存 534
    而且即便转成功也会丢掉时分秒，让 `freshness` 在同一天内失去区分度。
    已改为 `Option<NaiveDateTime>`；`heat` 一并从 `Option<i64>` 收敛成 `i64`
    （列是 `integer NOT NULL`）。
+
+3. ~~**JavDB 的 host 从哪来**~~ —— ✅ **已结案（2026-10-08）：选 (a) 硬编码**。
+   上游是**硬编码**（`metadata/factory.py:15` `JAVDB_HOST = "jdforrepam.com"`），
+   本仓原先既没常量也没配置键。两条路：
+   **(a)** 照上游硬编码成常量（最省事、与上游逐字一致，但换域名要改代码）；
+   **(b)** 补 `metadata.javdb_host` 配置键 + 默认值（部署可改，但要多写校验与文档）。
+   选 **(a)**：先对齐行为，配置化等真有人要换域名再说 —— 上游自己都没做成配置。
+   常量落在 `sm_service::system::status::JAVDB_HOST`，取舍写在它的文档注释里。
+
+   ⚠️ **它只解开 `status.rs` 那一端点，没解开 `catalog` 那 6 条** —— 那 6 条缺的是
+   「服务编排 / worker 接线」（见 §7.3），不是 host。别把本项结案误读成 catalog 也能动了。
 
 ### 7.6 纪律（照 §四，别松）
 

@@ -10,8 +10,17 @@
 //! 而这个破坏在类型层面检查不出来 —— `.fallback()` 缺席编译照样通过。
 //! 所以这里逐条覆盖：
 //!
-//! **新增一条路由时，请把它加进 [`ROUTES`]。** 那个数组是本测试的发现机制
-//! （见 `every_registered_route_appears_in_the_table`），漏了会红。
+//! **新增一条路由时，请把它加进 [`ROUTES`]。**
+//!
+//! ⚠️ 但别指望「漏了会红」：`every_registered_route_appears_in_the_table`
+//! 只断言**每个文件都含有 `.fallback(method_not_allowed)`**，它**不枚举**
+//! 路由，所以漏加条目是**静默**的。这个表目前是手工维护的（也确实漏了
+//! `/status/image-search` 与元数据源探测那条，已补）。
+//!
+//! 条目除了测 405 信封，还顺带**锁定动词**：表里放的是「该路径上未注册的
+//! 方法」，所以它必须 405。改错动词时，发那个「未注册」的方法就会命中并返回
+//! 别的码 —— 用例立刻红。这条保险是实的：我照一份**写错了动词的模块文档**
+//! 去改 `status.rs`，就是被它拦下来的（见那条的注释）。
 //!
 //! 上游出处：`src/api/exception/exception.py:36-48` —— 405 属于「其他
 //! HTTPException」，映射成 `http_error` + Starlette 的文案。
@@ -89,6 +98,14 @@ const ROUTES: &[(&str, Method)] = &[
     ("/status", Method::POST),
     ("/status/insights", Method::POST),
     ("/status/watch-trend", Method::POST),
+    ("/status/image-search", Method::POST),
+    // ★ 这一条同时是**动词回归**：该端点上游是 `@router.get`
+    // （`status.py:60`）。骨架期的模块文档把它写成 `POST`，我照文档去「修」
+    // 代码，结果把本来就对的 GET 改成了 POST —— 这条用例当时确实红了
+    // （`GET … 应当是 405`），是它把我拦下来的。
+    //
+    // 所以它锁的不是「上游怎么写」，而是「别再照文档改动词」。
+    ("/status/metadata-providers/javdb/test", Method::POST),
 ];
 
 /// 构造 router。405 与鉴权无关，所以不需要用户与令牌。

@@ -8,8 +8,13 @@
 //! | `GET /status` | `StatusService.get_status` | **已落**（本文件） |
 //! | `GET /status/insights` | `StatusService.get_insights` | **已落**（本文件） |
 //! | `GET /status/watch-trend` | `StatusService.get_watch_trend` | **已落**（本文件） |
-//! | `GET /status/image-search` | `StatusService.get_image_search_status` | 阻塞：`discovery` 域 |
-//! | `POST /status/metadata-provider/test` | `StatusService.test_metadata_provider` | 阻塞：`metadata` 域 |
+//! | `GET /status/image-search` | `StatusService.get_image_search_status` | 阻塞：探测客户端（见 handler 文档）|
+//! | `GET /status/metadata-providers/{provider}/test` | `StatusService.test_metadata_provider` | **已落**（host 照上游硬编码）|
+//!
+//! ⚠️ 上表倒数第二列原先写的是 `POST /status/metadata-provider/test` —— **两处都
+//! 错**：动词是 **GET**（上游 `status.py:60` `@router.get`），路径有 `providers`
+//! 的 `s` 且带 `{provider}` 段。代码一直是对的，错的是这张表；我照它去改代码，
+//! 反而改坏了（详见下面 handler 的文档）。**这类表要当索引看，别当规格用。**
 //!
 //! # 鉴权挂在 handler 上
 //!
@@ -29,12 +34,17 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sm_service::system::optional_services::image_search_enabled;
 use sm_service::system::status::{
-    InsightsResource, StatusResource, StatusService, TrendBucket, TrendGranularity,
-    WatchTrendRange, WatchTrendResource,
+    ImageSearchProbe, InsightsResource, StatusEmbeddingServiceSummary,
+    StatusImageSearchIndexSpaceSummary, StatusImageSearchIndexingSummary,
+    StatusImageSearchResource, StatusImageSearchVectorStoreSummary,
+    StatusMetadataProviderTestError, StatusMetadataProviderTestResource, StatusResource,
+    StatusService, TrendBucket, TrendGranularity, WatchTrendRange, WatchTrendResource,
 };
 
 use crate::auth::CurrentUser;
+use crate::config::{snapshot_or_500, string_at};
 use crate::dto::CapabilitiesResource;
 use crate::error::ErrorResponse;
 use crate::extract::Query as EnvelopeQuery;
@@ -62,6 +72,10 @@ pub fn routes() -> Router<AppState> {
             "/status/image-search",
             get(get_image_search_status).fallback(method_not_allowed),
         )
+        // 是 **GET**（上游 `status.py:60` `@router.get`）。
+        //
+        // ⚠️ 我一度把它「修」成了 POST，理由是「模块文档第 12 行写着 POST」——
+        // 而那一行文档才是错的（见文件头表格的注）。**别照文档改代码，去读上游。**
         .route(
             "/status/metadata-providers/{provider}/test",
             get(test_metadata_provider).fallback(method_not_allowed),
@@ -391,13 +405,32 @@ async fn get_capabilities(
 /// 只有图搜**未启用**（`image_search_enabled()` 为假）时才是纯静态响应
 /// （`:411-423`），不发任何网络请求。
 ///
-/// 结论：本端点**卡在 Qdrant / 嵌入服务客户端**上，不是「读张表就行」——
-/// 与 `sm_service::system::status` 模块文档的说法一致。
+/// 结论：本端点不是「读张表就行」。零件其实**都在** —— `EmbeddingClient::describe`、
+/// `DenseStore::status`、`ImageSearchIndexSpaceService::get_status` 都已零 `todo!()`，
+/// 缺的只是把它们从 `AppState` 递进服务层的那层接线（本仓没有上游那种模块级单例）。
+/// 已落地，见 [`sm_service::system::status::StatusService::get_image_search_status`]。
 async fn get_image_search_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     _user: CurrentUser,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
-    todo!("骨架：需 Qdrant / 嵌入服务探测客户端；照上游 status_service.py:410-443（未启用时为纯静态）")
+) -> Result<Json<ImageSearchStatusResource>, ErrorResponse> {
+    let snapshot = snapshot_or_500(&state)?;
+    // ★ `enabled` 取**配置开关**，不是「服务存不存在」。开关开着但
+    //   `inference_base_url` 为空时，组合根建不出服务；那种情况上游报
+    //   `enabled: true` 并把原因写进 `embedding_service.error`，而不是「没开」。
+    //   见 `ImageSearchProbe::enabled` 的文档。
+    let probe = ImageSearchProbe {
+        enabled: image_search_enabled(&snapshot),
+        service: state.image_search().map(|service| &**service),
+        // 未启用时也要回显这两个地址（上游 `:418-419` 用的是
+        // `settings.qdrant.url` 与 `QdrantThumbnailStore.COLLECTION_NAME`）。
+        inference_base_url: string_at(&snapshot, "image_search", "inference_base_url")
+            .unwrap_or_default(),
+        qdrant_url: string_at(&snapshot, "qdrant", "url").unwrap_or_default(),
+    };
+    let status = StatusService::new(state.db())
+        .get_image_search_status(probe)
+        .await?;
+    Ok(Json(status.into()))
 }
 
 /// `GET /status/metadata-providers/{provider}/test` —— 探测元数据源。
@@ -411,20 +444,241 @@ async fn get_image_search_status(
 ///
 /// 别把它做成「枚举所有已装 provider」—— 那会让「探测一个不存在的源」变成
 /// 404，而客户端需要区分「源名写错了」（422，改请求）与「源不可用」（5xx）。
+///
+/// # 曾经卡在「JavDB 的 host 从哪来」—— 已拍板照上游**硬编码**
+///
+/// 零件其实一直都在：[`sm_service::catalog::javdb::JavdbProvider`] 已实现
+/// `MetadataProvider::get_movie_by_number`（`javdb.rs:244`，零 `todo!()`）。
+/// 缺的只是 **host**：全仓没有任何生产代码构造过它，也没有 host 常量或配置键；
+/// 上游是硬编码（`metadata/factory.py:15`）。现在照抄，见
+/// [`sm_service::system::status::JAVDB_HOST`]（那里写了为什么选硬编码而不是配置键）。
+///
+/// # 失败也回 **200**
+///
+/// 这是一份**诊断报告**：`healthy: false` + `error.type` 三选一
+/// （`metadata_not_found` / `metadata_request_error` / `unexpected_error`）。
+/// 与 [`super::download_clients`] 的 `test_download_client` 同一条取舍 ——
+/// 回 5xx 会让客户端分不清「源挂了」与「本服务挂了」。形状由服务层的
+/// `probe_javdb` 给出。
 async fn test_metadata_provider(
     State(_state): State<AppState>,
     _user: CurrentUser,
     Path(provider): Path<String>,
-) -> Result<Json<serde_json::Value>, ErrorResponse> {
+) -> Result<Json<MetadataProviderTestResource>, ErrorResponse> {
     let normalized = provider.trim().to_lowercase();
     if normalized != "javdb" {
         // 显式给 422：`ErrorResponse` 没有 `validation` 便捷构造（那是
         // service 层 `ServiceError::validation` 的事），端点层一律用 `new`。
+        //
+        // `details.provider` 回显**原始**入参（上游 `{"provider": provider}` ——
+        // 是 `provider` 不是 `normalized_provider`），客户端据此看到自己到底发了
+        // 什么。骨架期漏了这个 details。
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "provider".to_owned(),
+            serde_json::Value::from(provider.as_str()),
+        );
         return Err(ErrorResponse::new(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_metadata_provider",
             format!("未知的元数据来源：{provider}"),
-        ));
+        )
+        .with_details(details));
     }
-    todo!("骨架：调 JavDB 探测；不可用时返回诊断结果而非 5xx（同 download-clients/test 的取舍）")
+    // 传**归一化**后的值（上游 `StatusService.test_metadata_provider(normalized_provider)`）。
+    Ok(Json(
+        StatusService::test_metadata_provider(&normalized)
+            .await
+            .into(),
+    ))
+}
+
+// ================================================================ 元数据源探测的响应体
+
+/// `GET /status/metadata-providers/{provider}/test` 的响应
+/// （上游 `StatusMetadataProviderTestResource`）。
+///
+/// 字段名与上游逐字一致（`SchemaModel` 没有 alias generator，就是 snake_case）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataProviderTestResource {
+    pub healthy: bool,
+    /// Pydantic `datetime` 字面量形状。
+    pub checked_at: String,
+    pub provider: String,
+    pub movie_number: String,
+    pub elapsed_ms: i64,
+    /// 健康时为 `null`。**不省略键** —— 上游 pydantic 默认就输出 `null`。
+    pub error: Option<MetadataProviderTestErrorResource>,
+    /// 以下四项只在健康时有值（同样输出 `null`，不省略）。
+    pub javdb_id: Option<String>,
+    pub title: Option<String>,
+    pub actors_count: Option<i64>,
+    pub tags_count: Option<i64>,
+}
+
+/// 探测失败的原因（上游 `StatusMetadataProviderTestError`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataProviderTestErrorResource {
+    /// 上游字段名就是 `type`。
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+    pub method: Option<String>,
+    pub url: Option<String>,
+    pub resource: Option<String>,
+    pub lookup_value: Option<String>,
+}
+
+impl From<StatusMetadataProviderTestError> for MetadataProviderTestErrorResource {
+    fn from(value: StatusMetadataProviderTestError) -> Self {
+        Self {
+            error_type: value.error_type,
+            message: value.message,
+            method: value.method,
+            url: value.url,
+            resource: value.resource,
+            lookup_value: value.lookup_value,
+        }
+    }
+}
+
+impl From<StatusMetadataProviderTestResource> for MetadataProviderTestResource {
+    fn from(value: StatusMetadataProviderTestResource) -> Self {
+        Self {
+            healthy: value.healthy,
+            checked_at: value.checked_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            provider: value.provider,
+            movie_number: value.movie_number,
+            elapsed_ms: value.elapsed_ms,
+            error: value.error.map(Into::into),
+            javdb_id: value.javdb_id,
+            title: value.title,
+            actors_count: value.actors_count,
+            tags_count: value.tags_count,
+        }
+    }
+}
+
+// ================================================================ 图搜状态的响应体
+
+/// `GET /status/image-search` 的响应（上游 `StatusImageSearchResource`）。
+///
+/// 字段名与上游逐字一致，**嵌套键也一致**（`embedding_service` /
+/// `image_search_vector_store` / `indexing` / `index_space`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSearchStatusResource {
+    pub enabled: bool,
+    pub healthy: bool,
+    /// Pydantic `datetime` 字面量形状。
+    pub checked_at: String,
+    pub embedding_service: EmbeddingServiceSummaryResource,
+    pub image_search_vector_store: ImageSearchVectorStoreSummaryResource,
+    pub indexing: ImageSearchIndexingSummaryResource,
+    pub index_space: ImageSearchIndexSpaceSummaryResource,
+}
+
+/// 推理服务探测结果（上游 `StatusEmbeddingServiceSummary`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingServiceSummaryResource {
+    pub healthy: bool,
+    pub endpoint: Option<String>,
+    pub space_id: Option<String>,
+    pub dimension: Option<u64>,
+    /// 模态，升序。没有模态时输出 `[]`，**不是** `null`。
+    pub modalities: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// 向量库探测结果（上游 `StatusImageSearchVectorStoreSummary`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSearchVectorStoreSummaryResource {
+    pub healthy: bool,
+    pub url: String,
+    pub collection_name: String,
+    pub exists: bool,
+    pub points_count: Option<u64>,
+    pub vector_size: Option<u64>,
+    pub vector_dtype: Option<String>,
+    pub collection_status: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 索引积压（上游 `StatusImageSearchIndexingSummary`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSearchIndexingSummaryResource {
+    pub pending_thumbnails: i64,
+    pub failed_thumbnails: i64,
+}
+
+/// 索引空间状态（上游 `StatusImageSearchIndexSpaceSummary`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSearchIndexSpaceSummaryResource {
+    /// `ready` / `rebuild_required` / `uninitialized` / `unavailable`。
+    pub state: String,
+    pub indexed_space_id: Option<String>,
+    pub current_space_id: Option<String>,
+    pub is_rebuilding: bool,
+}
+
+impl From<StatusImageSearchResource> for ImageSearchStatusResource {
+    fn from(value: StatusImageSearchResource) -> Self {
+        Self {
+            enabled: value.enabled,
+            healthy: value.healthy,
+            checked_at: value.checked_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            embedding_service: value.embedding_service.into(),
+            image_search_vector_store: value.image_search_vector_store.into(),
+            indexing: value.indexing.into(),
+            index_space: value.index_space.into(),
+        }
+    }
+}
+
+impl From<StatusEmbeddingServiceSummary> for EmbeddingServiceSummaryResource {
+    fn from(value: StatusEmbeddingServiceSummary) -> Self {
+        Self {
+            healthy: value.healthy,
+            endpoint: value.endpoint,
+            space_id: value.space_id,
+            dimension: value.dimension,
+            modalities: value.modalities,
+            error: value.error,
+        }
+    }
+}
+
+impl From<StatusImageSearchVectorStoreSummary> for ImageSearchVectorStoreSummaryResource {
+    fn from(value: StatusImageSearchVectorStoreSummary) -> Self {
+        Self {
+            healthy: value.healthy,
+            url: value.url,
+            collection_name: value.collection_name,
+            exists: value.exists,
+            points_count: value.points_count,
+            vector_size: value.vector_size,
+            vector_dtype: value.vector_dtype,
+            collection_status: value.collection_status,
+            error: value.error,
+        }
+    }
+}
+
+impl From<StatusImageSearchIndexingSummary> for ImageSearchIndexingSummaryResource {
+    fn from(value: StatusImageSearchIndexingSummary) -> Self {
+        Self {
+            pending_thumbnails: value.pending_thumbnails,
+            failed_thumbnails: value.failed_thumbnails,
+        }
+    }
+}
+
+impl From<StatusImageSearchIndexSpaceSummary> for ImageSearchIndexSpaceSummaryResource {
+    fn from(value: StatusImageSearchIndexSpaceSummary) -> Self {
+        Self {
+            state: value.state,
+            indexed_space_id: value.indexed_space_id,
+            current_space_id: value.current_space_id,
+            is_rebuilding: value.is_rebuilding,
+        }
+    }
 }

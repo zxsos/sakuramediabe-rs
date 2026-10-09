@@ -1,18 +1,23 @@
 //! 状态页聚合，对应上游 `src/service/system/status_service.py`（602 行）。
 //!
-//! # 本批落地三个方法，另两个被阻塞
+//! # 落地情况
 //!
 //! | 上游方法 | 端点 | 状态 |
 //! |---|---|---|
 //! | `get_status` | `GET /status` | **已落** |
 //! | `get_insights` | `GET /status/insights` | **已落**（磁盘空间那三列为 `null`） |
 //! | `get_watch_trend` | `GET /status/watch-trend` | **已落** |
-//! | `get_image_search_status` | `GET /status/image-search` | 阻塞：需要 `discovery` 域的 embedding / Qdrant 客户端 |
-//! | `test_metadata_provider` | `POST /status/metadata-provider/test` | 阻塞：需要 `metadata` 域的 JavDB provider |
+//! | `test_metadata_provider` | `GET /status/metadata-providers/{provider}/test` | **已落**（host 照上游硬编码，见 [`JAVDB_HOST`]） |
+//! | `get_image_search_status` | `GET /status/image-search` | 阻塞：需要 `discovery` 域的 embedding / Qdrant **探测客户端** |
 //!
-//! 被阻塞的两者都不是「难写」，而是**没有依赖可调** —— 它们的主体是对
-//! Qdrant 与 JavDB 发网络请求并解读响应。写一个只会返回 `unhealthy` 的
-//! 假实现比不写更糟：客户端会把它当成「服务真的挂了」。
+//! ⚠️ 上表原先写着 `test_metadata_provider` 的端点是
+//! `POST /status/metadata-provider/test`，**两处都错**（动词上游是 `GET`，
+//! `status.py:60`；路径有 `providers` 的 `s` 且带 `{provider}` 段）。那张错表
+//! 还害得另一处照着它去改代码 —— 经过见 `docs/handoff.md` §7.2h。
+//!
+//! `get_image_search_status` 仍阻塞不是「没有依赖」：图搜那套（Qdrant store 与
+//! embedding 客户端）已经落了大半，缺的是**健康探测**那一段 ——
+//! 见 `crate::discovery` 与 `sm-api` 侧 handler 的文档。
 //!
 //! # `get_insights` 的磁盘空间三列返回 `null`
 //!
@@ -29,14 +34,23 @@
 //! 本仓库的 `sm_scheduler::RuntimeTimezone` 已经存在，直接复用；
 //! 不引入「假 UTC」的分桶，否则跨时区用户的「今天」会整体偏移一天。
 
+use std::time::Instant;
+
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use sm_db::common::time::now_utc;
+use sm_db::repo::discovery::PendingImageRepository;
 use sm_db::repo::{
-    ClipCollectionRepository, MomentCollectionRepository, PlaylistRepository, StatsRepository,
-    VideoCollectionRepository,
+    BackgroundTaskRunRepository, ClipCollectionRepository, MomentCollectionRepository,
+    PlaylistRepository, StatsRepository, VideoCollectionRepository,
 };
 use sm_db::transfers::downloads::{download_state, import_status};
 use sm_db::Db;
 
+use crate::catalog::javdb::JavdbProvider;
+use crate::catalog::metadata_source::{MetadataProvider, MetadataSourceError};
+use crate::discovery::image_search::ImageSearchService;
+use crate::discovery::image_search_space::STATE_UNAVAILABLE;
+use crate::discovery::qdrant::THUMBNAIL_COLLECTION;
 use crate::error::ServiceError;
 
 /// 后端版本的环境变量名。上游 `BACKEND_VERSION_ENV_KEY`。
@@ -297,6 +311,232 @@ pub struct TrendBucket {
     pub count: i64,
 }
 
+// ================================================================ 元数据源探测
+
+/// JavDB 的 host（**不带** `https://`）。上游 `metadata/factory.py:15`
+/// `JAVDB_HOST = "jdforrepam.com"` —— **硬编码**，本仓照抄。
+///
+/// # 这是一次**拍板**，不是顺手写死
+///
+/// 上游自己就是硬编码（没做成配置），所以「照抄」= 行为与上游逐字一致。代价是
+/// 换域名要改代码 —— 真到那天再补 `metadata.javdb_host` 也不迟（那时才知道要
+/// 不要校验、要不要热更新）。反过来先配置化，就得凭空定默认值、校验规则与
+/// 文档，而这些没人要。取舍记在 `docs/handoff.md` §7.5。
+///
+/// 它同时是 `catalog` 那 6 条（`movie_metadata_refresh` / `movie_metadata_search`
+/// 等）缺的同一块东西：**全仓原本没有任何生产代码构造过 `JavdbProvider`**。
+pub const JAVDB_HOST: &str = "jdforrepam.com";
+
+/// 探测用的固定番号。上游 `status_service.py:85`
+/// `METADATA_PROVIDER_TEST_MOVIE_NUMBER = "SSNI-888"`。
+pub const METADATA_PROVIDER_TEST_MOVIE_NUMBER: &str = "SSNI-888";
+
+/// 探测失败的原因（上游 `StatusMetadataProviderTestError`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMetadataProviderTestError {
+    /// 上游字段名就是 `type`（Rust 是关键字，DTO 层 `rename`）。
+    ///
+    /// 上游三个取值：`metadata_not_found` / `metadata_request_error` /
+    /// `unexpected_error`。
+    pub error_type: String,
+    pub message: String,
+    /// 以下四个字段上游会带（请求错误带 `method` / `url`，没收录带 `resource` /
+    /// `lookup_value`），但**本仓的 [`MetadataSourceError`] 不携带这些信息**
+    /// —— 它只有一个 `String`。所以这四项恒为 `None`。
+    ///
+    /// 留着而不是删掉：字段在客户端契约里存在（上游总会输出它们，值为 `null`
+    /// 时也一样），删掉会让响应少四个键。
+    pub method: Option<String>,
+    pub url: Option<String>,
+    pub resource: Option<String>,
+    pub lookup_value: Option<String>,
+}
+
+/// 元数据源探测报告（上游 `StatusMetadataProviderTestResource`）。
+///
+/// # 不健康也是 **200**
+///
+/// 这是一份**诊断报告**，不是请求失败 —— 与 `indexer-settings/test`、
+/// `download-clients/test` 同一条取舍。返回 5xx 会让客户端无法区分
+/// 「源挂了」与「本服务挂了」。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusMetadataProviderTestResource {
+    pub healthy: bool,
+    /// naive UTC。DTO 层格式化成上游的 datetime 字面量。
+    pub checked_at: NaiveDateTime,
+    pub provider: String,
+    pub movie_number: String,
+    pub elapsed_ms: i64,
+    /// 健康时为 `None`（DTO 层输出 `null`，**不省略键**）。
+    pub error: Option<StatusMetadataProviderTestError>,
+    /// 以下四项只在健康时有值。
+    pub javdb_id: Option<String>,
+    pub title: Option<String>,
+    pub actors_count: Option<i64>,
+    pub tags_count: Option<i64>,
+}
+
+/// `GET /status/image-search` 的响应体。上游 `StatusImageSearchResource`
+/// （`schema/system/status.py:80-87`）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusImageSearchResource {
+    /// 图搜是否启用 —— 即组合根有没有建 [`ImageSearchService`]。
+    pub enabled: bool,
+    /// **只看推理服务与向量库两项**（上游 `status_service.py:432`）。
+    /// 索引空间要重建、有积压，都不影响它 —— 那些是「可查但降级」，不是故障。
+    pub healthy: bool,
+    /// naive UTC。DTO 层格式化成上游的 datetime 字面量。
+    pub checked_at: NaiveDateTime,
+    pub embedding_service: StatusEmbeddingServiceSummary,
+    pub image_search_vector_store: StatusImageSearchVectorStoreSummary,
+    pub indexing: StatusImageSearchIndexingSummary,
+    pub index_space: StatusImageSearchIndexSpaceSummary,
+}
+
+/// 推理服务探测结果。上游 `StatusEmbeddingServiceSummary`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusEmbeddingServiceSummary {
+    pub healthy: bool,
+    /// 配置里的推理服务地址。**失败时也要回** —— 客户端要能显示「连的是哪儿」。
+    pub endpoint: Option<String>,
+    pub space_id: Option<String>,
+    pub dimension: Option<u64>,
+    /// 模态，**升序**（上游那句 `sorted(...)`）。
+    pub modalities: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// 向量库探测结果。上游 `StatusImageSearchVectorStoreSummary`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusImageSearchVectorStoreSummary {
+    pub healthy: bool,
+    pub url: String,
+    pub collection_name: String,
+    pub exists: bool,
+    /// 集合不存在时为 `None`（上游早返回分支）。
+    pub points_count: Option<u64>,
+    pub vector_size: Option<u64>,
+    /// REST 风格小写串，如 `float16`。字面量来源见 `qdrant::dense::datatype_name`。
+    pub vector_dtype: Option<String>,
+    /// REST 风格小写串，如 `green`。
+    pub collection_status: Option<String>,
+    pub error: Option<String>,
+}
+
+/// 索引积压。上游 `StatusImageSearchIndexingSummary`。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusImageSearchIndexingSummary {
+    pub pending_thumbnails: i64,
+    pub failed_thumbnails: i64,
+}
+
+/// 索引空间状态。上游 `StatusImageSearchIndexSpaceSummary`。
+///
+/// 刻意**不实现 `Default`**：`state` 是四值枚举的字面量，让它能默认为 `""`
+/// 只会给未来的自己留一个能编译的错值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusImageSearchIndexSpaceSummary {
+    /// 四值之一，见 [`crate::discovery::image_search_space`] 的 `STATE_*`。
+    pub state: String,
+    pub indexed_space_id: Option<String>,
+    pub current_space_id: Option<String>,
+    /// 有 `image_search_index` 任务在队 / 在跑，且那次运行带 `reset`。
+    pub is_rebuilding: bool,
+}
+
+/// `GET /status/image-search` 需要的外部依赖。
+///
+/// 上游用模块级单例（`image_search_enabled()` / `get_embedding_client()` /
+/// `get_qdrant_thumbnail_store()`）取这几样；本仓**没有全局注册表** —— 组合根在
+/// `sm-api`，实例都挂在 `AppState` 上。所以由路由层显式传进来。
+///
+/// [`ImageSearchProbe::service`] 为 `None` 即「未启用」：组合根根本没建
+/// [`ImageSearchService`]，此时两个地址仍要照配置回显。
+pub struct ImageSearchProbe<'a> {
+    /// **配置层面**的开关，即 `image_search_enabled()`（`qdrant` 与
+    /// `image_search` 两个 `enabled` 都为真）。
+    ///
+    /// ⚠️ 刻意与 `service.is_some()` 分开：开关开着但
+    /// `image_search.inference_base_url` 为空时，组合根**建不出**服务
+    /// （`sm-server` 会 warn 后返回 `None`），而上游此时仍报 `enabled: true`。
+    /// 两者合一就会把「配置错误」谎报成「功能没开」。
+    pub enabled: bool,
+    pub service: Option<&'a ImageSearchService>,
+    /// 配置里的推理服务地址。
+    pub inference_base_url: &'a str,
+    /// 配置里的 Qdrant 地址。
+    pub qdrant_url: &'a str,
+}
+
+/// 探推理服务。上游 `_probe_embedding_service`（`status_service.py:524-546`）。
+///
+/// **从不失败**：连不上也要交出一份带 `error` 的报告 —— 那正是本端点的用途。
+///
+/// 上游把 `EmbeddingClientError`（取 `.message`）与其它异常（取 `str(exc)`）
+/// 分成两支、错误文案略不同；本仓 `EmbeddingClient::describe` 统一返回
+/// [`ServiceError`]，没有这个区分，两支并成一支。
+async fn probe_embedding_service(
+    service: &ImageSearchService,
+    endpoint: &str,
+) -> StatusEmbeddingServiceSummary {
+    match service.embedding().describe().await {
+        Ok(space) => StatusEmbeddingServiceSummary {
+            healthy: true,
+            endpoint: Some(endpoint.to_owned()),
+            space_id: Some(space.space_id),
+            dimension: Some(space.dimension as u64),
+            // `BTreeSet` 迭代本来就是升序 —— 上游那句 `sorted(...)` 在这里是免费的。
+            modalities: space.modalities.into_iter().collect(),
+            error: None,
+        },
+        Err(error) => StatusEmbeddingServiceSummary {
+            healthy: false,
+            endpoint: Some(endpoint.to_owned()),
+            // 取 `message` 而不是整个错误：上游这里用的是 `EmbeddingClientError.message`
+            // （`status_service.py:534`），响应里只放那句文案。
+            error: Some(error.api.message.clone()),
+            ..StatusEmbeddingServiceSummary::default()
+        },
+    }
+}
+
+/// 探向量库。上游 `_probe_image_search_vector_store`（`status_service.py:548-573`）。
+///
+/// **从不失败**：健康与错误都走报告。
+///
+/// ★ 集合**不存在也算健康**：那只说明首次索引还没跑，不是故障。`status()` 能用
+/// `Ok` 回来就代表 Qdrant 答了话；真连不上时它会 `Err`（见 `DenseStore::status`
+/// 里那段「刻意不复用 `exists()`」）。上游 `inspect_status` 同样只在异常时才
+/// 把健康置false。
+async fn probe_vector_store(
+    service: &ImageSearchService,
+    qdrant_url: &str,
+) -> StatusImageSearchVectorStoreSummary {
+    let store = service.store();
+    let collection_name = store.collection_name().to_owned();
+    match store.status().await {
+        Ok(status) => StatusImageSearchVectorStoreSummary {
+            healthy: true,
+            url: qdrant_url.to_owned(),
+            collection_name,
+            exists: status.exists,
+            points_count: status.exists.then_some(status.points),
+            vector_size: status.vector_size,
+            vector_dtype: status.vector_dtype,
+            collection_status: status.collection_status,
+            error: None,
+        },
+        Err(error) => StatusImageSearchVectorStoreSummary {
+            healthy: false,
+            url: qdrant_url.to_owned(),
+            collection_name,
+            exists: false,
+            error: Some(error.api.message.clone()),
+            ..StatusImageSearchVectorStoreSummary::default()
+        },
+    }
+}
+
 // ================================================================ service
 
 /// 状态页 service。
@@ -307,6 +547,10 @@ pub struct StatusService {
     video_collections: VideoCollectionRepository,
     moment_collections: MomentCollectionRepository,
     clip_collections: ClipCollectionRepository,
+    /// 图搜索引的缩略图计数（`GET /status/image-search`）。
+    pending_images: PendingImageRepository,
+    /// 图搜索引任务是否在跑（同上）。
+    task_runs: BackgroundTaskRunRepository,
 }
 
 impl StatusService {
@@ -317,9 +561,348 @@ impl StatusService {
             video_collections: VideoCollectionRepository::new(db.clone()),
             moment_collections: MomentCollectionRepository::new(db.clone()),
             clip_collections: ClipCollectionRepository::new(db.clone()),
+            pending_images: PendingImageRepository::new(db.clone()),
+            task_runs: BackgroundTaskRunRepository::new(db.clone()),
         }
     }
 
+    /// `GET /status/image-search`。
+    ///
+    /// 上游 `StatusService.get_image_search_status`（`status_service.py:409-443`）。
+    ///
+    /// # 未启用时**什么都不碰**
+    ///
+    /// `probe.service` 为 `None` 就返回一串静态值，**不探推理服务、不探 Qdrant、
+    /// 不查库**（上游同理）。但 Qdrant 地址与集合名仍要回 —— 客户端靠它们显示
+    /// 「配置指向哪儿」。
+    ///
+    /// # 与上游唯一的实质差异：依赖是注入的
+    ///
+    /// 上游 `cls._probe_*` 内部直接摸模块级单例；本仓把依赖收进
+    /// [`ImageSearchProbe`]，由路由层从 `AppState` 取。行为一致，只是没有全局态。
+    pub async fn get_image_search_status(
+        &self,
+        probe: ImageSearchProbe<'_>,
+    ) -> Result<StatusImageSearchResource, ServiceError> {
+        let checked_at = now_utc();
+        if !probe.enabled {
+            return Ok(StatusImageSearchResource {
+                enabled: false,
+                healthy: false,
+                checked_at,
+                embedding_service: StatusEmbeddingServiceSummary::default(),
+                image_search_vector_store: StatusImageSearchVectorStoreSummary {
+                    url: probe.qdrant_url.to_owned(),
+                    collection_name: THUMBNAIL_COLLECTION.to_owned(),
+                    ..StatusImageSearchVectorStoreSummary::default()
+                },
+                indexing: StatusImageSearchIndexingSummary::default(),
+                index_space: StatusImageSearchIndexSpaceSummary {
+                    state: STATE_UNAVAILABLE.to_owned(),
+                    indexed_space_id: None,
+                    current_space_id: None,
+                    is_rebuilding: false,
+                },
+            });
+        }
+
+        // 开关开着却没有服务：唯一来源是 `inference_base_url` 为空（组合根 warn
+        // 后不建）。上游此时仍会走进探测 —— 推理服务那项报错，但 Qdrant 那项
+        // **能成功**。这里没有客户端可探，只能把两项都报成失败并写明原因。
+        //
+        // ★ 这是**已知偏差**，且只出现在一种配置错误下；两种表现都指向同一件
+        // 事（去配 `inference_base_url`），比谎报 `enabled: false` 好得多。
+        let Some(service) = probe.service else {
+            return Ok(StatusImageSearchResource {
+                enabled: true,
+                healthy: false,
+                checked_at,
+                embedding_service: StatusEmbeddingServiceSummary {
+                    healthy: false,
+                    endpoint: Some(probe.inference_base_url.to_owned()),
+                    error: Some("图搜已启用但推理服务地址为空，未能建立图搜服务".to_owned()),
+                    ..StatusEmbeddingServiceSummary::default()
+                },
+                image_search_vector_store: StatusImageSearchVectorStoreSummary {
+                    url: probe.qdrant_url.to_owned(),
+                    collection_name: THUMBNAIL_COLLECTION.to_owned(),
+                    error: Some("图搜服务未建立，向量库未能探测".to_owned()),
+                    ..StatusImageSearchVectorStoreSummary::default()
+                },
+                indexing: self.image_search_indexing_summary().await?,
+                index_space: StatusImageSearchIndexSpaceSummary {
+                    state: STATE_UNAVAILABLE.to_owned(),
+                    indexed_space_id: None,
+                    current_space_id: None,
+                    is_rebuilding: false,
+                },
+            });
+        };
+
+        // 两个探测都不返回 `Err`：「连不上」也是一种要**报告**的结果，
+        // 不该把整页打成 500（同 `download-clients/test` 的取舍）。
+        let embedding_service = probe_embedding_service(service, probe.inference_base_url).await;
+        let image_search_vector_store = probe_vector_store(service, probe.qdrant_url).await;
+        // 这两个才真会失败（要查库），失败即 500 —— 与上游一致：
+        // 上游这两句没有 try/except。
+        let indexing = self.image_search_indexing_summary().await?;
+        // 推理服务不健康时不传空间号：让状态机走 `unavailable` 分支，
+        // 从而跳过那次 `has_completed_index_records`（要 EXISTS 两张表）。
+        let current_space_id = if embedding_service.healthy {
+            embedding_service.space_id.as_deref()
+        } else {
+            None
+        };
+        let space = service.space().get_status(current_space_id).await?;
+        Ok(StatusImageSearchResource {
+            enabled: true,
+            healthy: embedding_service.healthy && image_search_vector_store.healthy,
+            checked_at,
+            embedding_service,
+            image_search_vector_store,
+            indexing,
+            index_space: StatusImageSearchIndexSpaceSummary {
+                state: space.state,
+                indexed_space_id: space.indexed_space_id,
+                current_space_id: space.current_space_id,
+                is_rebuilding: self.is_image_search_rebuilding().await?,
+            },
+        })
+    }
+
+    /// 缩略图的索引积压。上游 `_indexing_status`（`status_service.py:575-590`）。
+    ///
+    /// **只数 `media_thumbnail`**：既不 join `movie`，也不并 `movie_plot_image`
+    /// —— 与 `PendingImageRepository::pending_count` 是两个口径，理由见那个方法。
+    async fn image_search_indexing_summary(
+        &self,
+    ) -> Result<StatusImageSearchIndexingSummary, ServiceError> {
+        use sm_db::playback::media::image_search_index_status::{FAILED, PENDING};
+
+        Ok(StatusImageSearchIndexingSummary {
+            pending_thumbnails: self
+                .pending_images
+                .count_thumbnails_with_status(PENDING)
+                .await?,
+            failed_thumbnails: self
+                .pending_images
+                .count_thumbnails_with_status(FAILED)
+                .await?,
+        })
+    }
+
+    /// 是否有 `image_search_index` 任务在队 / 在跑且带 `reset`。
+    /// 上游 `_is_image_search_rebuilding`（`status_service.py:592-602`）。
+    ///
+    /// 上游取的是**那一行的** `params.reset`：查询没有 `ORDER BY`，多行时取到哪
+    /// 一行由数据库决定。本仓照抄这个语义（含这点不体面），见
+    /// `BackgroundTaskRunRepository::find_active_by_task_key`。
+    ///
+    /// `params` 是 JSON 文本列；解析失败按「没有 reset」处理 —— 与上游
+    /// `(params or {}).get("reset") is True` 在 `params` 为空时同路。
+    async fn is_image_search_rebuilding(&self) -> Result<bool, ServiceError> {
+        /// 图搜索引任务的 `task_key`（上游 `status_service.py:597` 的字面量）。
+        const TASK_KEY: &str = "image_search_index";
+
+        let Some(run) = self.task_runs.find_active_by_task_key(TASK_KEY).await? else {
+            return Ok(false);
+        };
+        let reset = run
+            .params
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|params| params.get("reset").and_then(serde_json::Value::as_bool));
+        Ok(reset == Some(true))
+    }
+
+    /// `GET /status/metadata-providers/{provider}/test`。
+    ///
+    /// 上游 `StatusService.test_metadata_provider`（`status_service.py:446-483`）。
+    ///
+    /// # 不返回 `Result`
+    ///
+    /// 上游这个方法**从不抛**：三种异常全被捕成 `error` 字段里的报告。所以这里
+    /// 也用不返回 `Result` 的签名 —— 让「它一定给得出报告」这件事在类型上就成立，
+    /// 调用方不必编一个不可能发生的错误分支。
+    ///
+    /// 建 provider 失败（host 常量写坏）也走报告：那正是本端点的用途。
+    pub async fn test_metadata_provider(provider: &str) -> StatusMetadataProviderTestResource {
+        let normalized = provider.trim().to_lowercase();
+        let start = Instant::now();
+        if normalized != "javdb" {
+            // 路由层已用 422 挡住非 javdb（上游同理），所以这条是**不可达**的兜底
+            // —— 上游那个 `raise ValueError(...)` 同样只在绕过路由时才会走到。
+            return failed_report(
+                &normalized,
+                start,
+                "unexpected_error",
+                format!("不支持的元数据来源：{provider}"),
+            );
+        }
+        let client = match JavdbProvider::new(JAVDB_HOST) {
+            Ok(client) => client,
+            Err(error) => {
+                return failed_report(&normalized, start, "unexpected_error", describe(&error));
+            }
+        };
+        probe_javdb(&client, &normalized, start).await
+    }
+}
+
+/// 用**注入的** provider 探测 —— 与 [`StatusService::test_metadata_provider`] 同一
+/// 条路径，只是 provider 由调用方给。
+///
+/// # 为什么留这个缝
+///
+/// 生产那条把 host 写死在常量里（照上游），于是**没法**指向本地假 JavDB ——
+/// 而「健康时四个统计字段填对没有」只有真发一次请求才测得到。这个缝就是为此
+/// 存在，与 [`JavdbProvider::with_base_url`] 的理由一致。
+///
+/// `started` 由调用方给：让 `elapsed_ms` 覆盖「建 provider + 发请求」整段，
+/// 与上游在 `test_metadata_provider` 开头取 `start_at` 一致。
+pub async fn probe_javdb<P: MetadataProvider>(
+    client: &P,
+    provider: &str,
+    started: Instant,
+) -> StatusMetadataProviderTestResource {
+    match client
+        .get_movie_by_number(METADATA_PROVIDER_TEST_MOVIE_NUMBER)
+        .await
+    {
+        // 上游 `_test_javdb_provider`：健康时四个统计字段来自 `detail`。
+        Ok(Some(movie)) => StatusMetadataProviderTestResource {
+            healthy: true,
+            checked_at: now_utc(),
+            provider: provider.to_owned(),
+            movie_number: METADATA_PROVIDER_TEST_MOVIE_NUMBER.to_owned(),
+            elapsed_ms: elapsed_ms(started),
+            error: None,
+            javdb_id: movie
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            // 上游是 `movie.get("title") or ""` —— 恒有值（可能空串），不是 `None`。
+            title: Some(
+                movie
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            actors_count: Some(count_movie_actors(movie.get("actors"))),
+            tags_count: Some(count_movie_tags(movie.get("tags"))),
+        },
+        // 上游这里其实是抛 `MetadataNotFoundError`（`data.movie` 为空时），本仓
+        // provider 把它收成了 `Ok(None)` —— 归到同一档。
+        Ok(None) => failed_report(
+            provider,
+            started,
+            "metadata_not_found",
+            format!("JavDB 没有 {METADATA_PROVIDER_TEST_MOVIE_NUMBER}"),
+        ),
+        Err(error) => {
+            let (error_type, message) = classify(&error);
+            failed_report(provider, started, error_type, message)
+        }
+    }
+}
+
+/// 失败报告的公共部分（上游 `_build_metadata_provider_failure`）。
+fn failed_report(
+    provider: &str,
+    started: Instant,
+    error_type: &str,
+    message: String,
+) -> StatusMetadataProviderTestResource {
+    StatusMetadataProviderTestResource {
+        healthy: false,
+        checked_at: now_utc(),
+        provider: provider.to_owned(),
+        movie_number: METADATA_PROVIDER_TEST_MOVIE_NUMBER.to_owned(),
+        elapsed_ms: elapsed_ms(started),
+        error: Some(StatusMetadataProviderTestError {
+            error_type: error_type.to_owned(),
+            message,
+            // 本仓的 `MetadataSourceError` 不带这四项 —— 见字段文档。
+            method: None,
+            url: None,
+            resource: None,
+            lookup_value: None,
+        }),
+        javdb_id: None,
+        title: None,
+        actors_count: None,
+        tags_count: None,
+    }
+}
+
+/// [`MetadataSourceError`] → 上游的三个 `error.type`（`status_service.py:451-482`）。
+///
+/// - `NotFound` → `metadata_not_found`（上游 `MetadataNotFoundError`）
+/// - `RequestFailed` → `metadata_request_error`（上游 `MetadataRequestError`）
+/// - 其余 → `unexpected_error`（上游那个 `except Exception` 兜底）
+fn classify(error: &MetadataSourceError) -> (&'static str, String) {
+    match error {
+        MetadataSourceError::NotFound => (
+            "metadata_not_found",
+            format!("JavDB 没有 {METADATA_PROVIDER_TEST_MOVIE_NUMBER}"),
+        ),
+        MetadataSourceError::RequestFailed(message) => ("metadata_request_error", message.clone()),
+        MetadataSourceError::InvalidDelivery(message) | MetadataSourceError::Disabled(message) => {
+            ("unexpected_error", message.clone())
+        }
+    }
+}
+
+/// provider 构造失败时的消息（构造只可能因 host 空而失败）。
+fn describe(error: &MetadataSourceError) -> String {
+    match error {
+        MetadataSourceError::RequestFailed(message) => message.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// 数 `actors` 里**有效**的条目。上游 `_build_movie_actors`（`javdb.py:920-946`）：
+/// 非对象跳过，**`id` 为假值也跳过**。
+///
+/// 字段不是数组（或缺失）时返回 0 —— 上游 `_normalize_movie_list_field`
+/// （`javdb.py:838-860`）把「null / 不是 list」都当成空列表。
+fn count_movie_actors(value: Option<&serde_json::Value>) -> i64 {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|entry| entry.is_object() && actor_id_is_truthy(entry.get("id")))
+                .count() as i64
+        })
+}
+
+/// 上游 `if not actor_id: continue` —— Python 的假值包括 `None` / `0` / `""`。
+/// 这里覆盖实际会出现的两种：空串与非 0 数字。
+fn actor_id_is_truthy(id: Option<&serde_json::Value>) -> bool {
+    match id {
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(serde_json::Value::Number(number)) => number.as_f64().is_some_and(|n| n != 0.0),
+        _ => false,
+    }
+}
+
+/// 数 `tags` 里有效的条目。上游 `_build_movie_tags`（`javdb.py:1000-1018`）：
+/// **只跳过非对象**，不像演员那样还查 `id`（它用 `str(tag.get("id", ""))` 兜空）。
+fn count_movie_tags(value: Option<&serde_json::Value>) -> i64 {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |entries| {
+            entries.iter().filter(|entry| entry.is_object()).count() as i64
+        })
+}
+
+impl StatusService {
     /// `GET /status`。
     ///
     /// 五组标量查询。**顺序与上游一致**，虽然它们互相独立 —— 写成并发

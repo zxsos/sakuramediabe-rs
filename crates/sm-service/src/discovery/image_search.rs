@@ -301,6 +301,25 @@ impl ImageSearchService {
         }
     }
 
+    /// 底层向量库（`GET /status/image-search` 的探测用）。
+    ///
+    /// 上游靠模块级单例 `get_qdrant_thumbnail_store()` 取；本仓没有全局注册表，
+    /// 组合根在 `sm-api`，所以由状态页从本服务反向拿到依赖。**只读访问器**，
+    /// 拿到的引用活不过 `&self`。
+    pub fn store(&self) -> &DenseStore {
+        self.store.as_ref()
+    }
+
+    /// 嵌入客户端（同上）。
+    pub fn embedding(&self) -> &EmbeddingClient {
+        self.embedding.as_ref()
+    }
+
+    /// 索引空间状态机（同上）。
+    pub fn space(&self) -> &ImageSearchIndexSpaceService {
+        &self.space
+    }
+
     /// 建会话前的索引就绪闸门。
     ///
     /// 上游 `_ensure_searchable_index`（`:99-112`）：

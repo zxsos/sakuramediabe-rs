@@ -208,6 +208,12 @@ async fn get_image_search_results(
     // —— 那个理由是错的。`Query(min_length=1)` 属于 endpoint 自己的
     // `dependant.query_params`，在依赖之后解析。
     //
+    // ✅ 已核对于**上游锁的版本**（`pyproject.toml`: `fastapi==0.110.1`）的
+    // 源码：`solve_dependencies` 里 `for sub_dependant in dependant.dependencies`
+    // 在 `dependant.path_params` 之前（0.110.1 的 `utils.py` 中两者偏移 903 / 3381）。
+    // 写这条注释时我手上没有 FastAPI 源码，是照记忆推的 —— 那种依据不入库，
+    // 所以补了这一句可复核的来源。
+    //
     // 上游 `cursor: Query(min_length=1)` —— 空串是 **422 校验失败**，
     // 不是「没有 cursor」。而 `Option<String>` 分不出「没传」与「传了空串」
     // （`?cursor=` 会解成 `Some("")`），所以在这里显式判一次。
@@ -231,9 +237,9 @@ async fn get_image_search_results(
 
 /// `POST /image-search/text-sessions` —— **form 编码**。
 ///
-/// ⚠️ 骨架期签名收的是 `Json<SearchFilters>` —— **传输形态就错了**（上游是
-/// `Form`，字段还是 CSV 字符串，见模块文档）。实现时换成
-/// [`crate::extract::Form`] + 表单专用 DTO，别沿用 `SearchFilters`。
+/// 骨架期这里收的是 `Json<SearchFilters>` —— **传输形态就错了**：上游是
+/// `Form`，且过滤字段是 CSV 字符串而非数组。现在用 [`crate::extract::Form`]
+/// + [`TextSessionForm`]（`raw` 形态），解析成 [`SessionFilters`] 后再进服务层。
 async fn create_text_image_search_session(
     _user: CurrentUser,
     RequireImageSearch(service): RequireImageSearch,
