@@ -29,6 +29,18 @@ use sqlx::FromRow;
 pub mod image_search_status {
     /// 默认值：已就绪，可直接检索。
     pub const READY: &str = "ready";
+
+    /// 检索进行中。
+    pub const SEARCHING: &str = "searching";
+
+    /// 会话已作废。**不可再翻页。**
+    ///
+    /// 什么时候作废：嵌入空间切换（向量维度不再兼容）、查询向量解析失败、
+    /// 或客户端显式放弃。
+    ///
+    /// 作废与「过期」是**两件事** —— 过期由 `expires_at` 决定，作废由状态
+    /// 决定。一个未过期的会话也可能已作废，所以只查 `expires_at` 是不够的。
+    pub const INVALID: &str = "invalid";
 }
 
 /// `image_search_session` 表：一次图搜会话。
@@ -63,6 +75,21 @@ impl ImageSearchSession {
     /// 是否已过期。
     pub fn is_expired(&self, now: NaiveDateTime) -> bool {
         self.expires_at <= now
+    }
+
+    /// 是否处于可检索状态。
+    ///
+    /// 只认 [`image_search_status::READY`] —— 未知的状态值也判 false。
+    /// 状态列是 `varchar(32)` 而非枚举，数据库不校验取值，所以「不认识的
+    /// 状态」是**可能**出现的（上游加了新状态而这边还没跟上）。那种情况
+    /// 放行等于让会话带着未知的语义跑，所以选拒绝。
+    pub fn is_ready(&self) -> bool {
+        self.status == image_search_status::READY
+    }
+
+    /// 是否已作废。
+    pub fn is_invalid(&self) -> bool {
+        self.status == image_search_status::INVALID
     }
 
     /// 是否还有下一页。

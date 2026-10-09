@@ -4,7 +4,7 @@
 //!
 //! `sqlx` 开了 `macros` feature，但 `query!` 需要**编译期**数据库连接。
 //! 本机有 PG、CI 没有，用宏会让 CI 直接编译失败。所以全部走
-//! [`sqlx::query_as`] + [`FromRow`]（运行时解析）。
+//! `sqlx::query_as()` + `#[derive(sqlx::FromRow)]`（运行时解析）。
 //!
 //! 代价是失去编译期列名校验，补偿手段是两道验证：
 //!
@@ -13,10 +13,13 @@
 
 use sqlx::{PgPool, Postgres};
 
+use super::ctx::Ctx;
 use crate::catalog::movie::{field_owner, Movie, MovieSeries, PROTECTED_MOVIE_FIELDS};
 use crate::common::guard::{FieldGuard, WriteSource};
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "Movie";
@@ -42,16 +45,30 @@ pub struct NewMovie {
     pub title: String,
     /// 空串在写入前归一为 `None`（对应上游 `save()` 的 `or None`）。
     pub javdb_id: Option<String>,
-    pub summary: Option<String>,
+    /// `summary text NOT NULL DEFAULT ''` —— **不是 `Option`**。
+    ///
+    /// 此前声明成 `Option<String>`，`None` 会绑成 NULL 并违反 NOT NULL。
+    pub summary: String,
     pub maker_name: Option<String>,
     pub director_name: Option<String>,
     pub release_date: Option<chrono::NaiveDateTime>,
-    pub duration_minutes: Option<i32>,
-    pub score: Option<f64>,
-    pub score_number: Option<i32>,
-    pub series_id: Option<i64>,
-    pub cover_image_id: Option<i64>,
-    pub thin_cover_image_id: Option<i64>,
+    /// `integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub duration_minutes: i32,
+    /// `double precision NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub score: f64,
+    /// `integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    pub score_number: i32,
+    /// `series_id integer NULL` —— 宽度是 `i32`，与 [`Movie::series_id`] 一致。
+    ///
+    /// 此前这里是 `Option<i64>`，而同一张表的模型层是 `Option<i32>`。
+    /// sqlx 把 i64 绑进 `integer` 列会失败，所以**每次**用它写外键都会报错。
+    /// 这类漂移能活下来是因为 `NewMovie` 在对拍的豁免名单里（它是列的
+    /// 子集，不是表镜像），而豁免顺带免掉了字段类型检查。
+    pub series_id: Option<i32>,
+    /// `integer NULL`，宽度同 [`Movie::cover_image_id`]。
+    pub cover_image_id: Option<i32>,
+    /// `integer NULL`，宽度同 [`Movie::thin_cover_image_id`]。
+    pub thin_cover_image_id: Option<i32>,
     /// JSONB，默认 NULL。
     pub metadata_source: Option<serde_json::Value>,
 }
@@ -103,7 +120,39 @@ impl MovieRepository {
     /// `javdb_id` 的空串在此归一为 `None` —— 库里出现空串会让
     /// `WHERE javdb_id = ''` 命中一条「没有 JavDB 编号」的假记录，
     /// 而唯一索引把第二条例外也挡掉了。
+    ///
+    /// # 可选列必须发 DEFAULT 而不是 NULL
+    ///
+    /// DDL 里 `duration_minutes` / `score` / `heat` 等是 `NOT NULL DEFAULT 0`。
+    /// **只有不写该列才会取默认值**；写 `NULL` 就是 NULL，直接违反 NOT NULL。
+    /// 所以未提供的列在 SQL 里字面写 `DEFAULT`，由 PostgreSQL 填值 ——
+    /// 这样默认值住在 schema 里，裸 SQL 插入与仓储插入的初始状态必然一致。
+    /// 插入。
+    ///
+    /// `javdb_id` 的空串在此归一为 `None` —— 库里出现空串会让
+    /// `WHERE javdb_id = ''` 命中一条「没有 JavDB 编号」的假记录。
+    ///
+    /// # NOT NULL DEFAULT 列必须发值，不能发 NULL
+    ///
+    /// DDL 里 `duration_minutes` / `score` 等是 `NOT NULL DEFAULT 0`。
+    /// 发 `NULL` 会违反 NOT NULL —— 第一版就是这么写的，31 个集成测试全挂在
+    /// 这里（SQLSTATE 23502 not_null_violation）。
+    ///
+    /// 另一种做法是在 SQL 里写 `DEFAULT` 关键字让 PostgreSQL 自己填，但那
+    /// 会让绑定顺序与占位符编号错位：sqlx 的 `bind` 是顺序追加，没法跳过
+    /// DEFAULT 那一项，于是 $5 类型无法推断（SQLSTATE 42P18）。
+    ///
+    /// 所以用固定 SQL + Rust 侧填默认值。`insert_defaults_match_ddl` 测试
+    /// 锁定了这些默认值与 DDL 的一致性。
     pub async fn insert(&self, new: &NewMovie) -> Result<Movie, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.insert_in(&mut ctx, new).await
+    }
+
+    /// [`Self::insert`] 的事务内变体。见 [`Ctx`]。
+    ///
+    /// 「导入一部影片」用例需要它与标签 upsert、演员关联共享一个事务。
+    pub async fn insert_in(&self, ctx: &mut Ctx<'_>, new: &NewMovie) -> Result<Movie, DbError> {
         let javdb_id = new
             .javdb_id
             .as_deref()
@@ -116,6 +165,7 @@ impl MovieRepository {
             return Err(DbError::business(ENTITY, "movie_number 不能为空"));
         }
 
+        // 固定 15 个占位符 + 1 个复用的时间戳，顺序不可调换。
         let sql = "\
             INSERT INTO movie (
                 movie_number, title, javdb_id, summary, maker_name, director_name,
@@ -127,11 +177,13 @@ impl MovieRepository {
                 $15, $15
             ) RETURNING *";
 
+        let now = crate::common::time::now_utc();
         let row = sqlx::query_as::<_, Movie>(sql)
             .bind(movie_number)
             .bind(new.title.trim())
             .bind(javdb_id)
-            .bind(new.summary.as_deref().unwrap_or_default())
+            // summary 是 NOT NULL DEFAULT ''：类型已是 String，绑 trimmed 值。
+            .bind(new.summary.trim())
             .bind(new.maker_name.as_deref().map(str::trim))
             .bind(new.director_name.as_deref().map(str::trim))
             .bind(new.release_date)
@@ -142,23 +194,13 @@ impl MovieRepository {
             .bind(new.cover_image_id)
             .bind(new.thin_cover_image_id)
             .bind(new.metadata_source.as_ref())
-            .bind(crate::common::time::now_utc())
-            .fetch_one(&self.pool)
+            .bind(now)
+            .fetch_one(ctx.conn().await?.as_conn())
             .await
             .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
 
         Ok(row)
     }
-
-    /// 更新。
-    ///
-    /// 三件事按顺序发生，顺序不能调换：
-    ///
-    /// 1. **护栏校验** —— 先看这次写入合不合法
-    /// 2. **CHECK 预判** —— `is_subscribed` 与 `is_blacklisted` 不能同时为真
-    /// 3. **`touch()`** —— 强制推进 `updated_at`
-    ///
-    /// 第 2 步必须先做：CHECK 失败会返回 409，而这是**业务**上能预见的
     /// 冲突（用户同时点了订阅和屏蔽），应该返回 422 并说清原因。
     pub async fn update(
         &self,
@@ -180,27 +222,40 @@ impl MovieRepository {
         }
 
         // 3. 强制推进时间戳 —— 调用方无法绕过
+        //
+        // **空检查必须在 touch() 之前**：否则空 UpdateSet 会被 touch 填成
+        // 一个只含 updated_at 的 patch，finish() 的空检查就失效了，
+        // 最终执行 `SET updated_at = now()` —— 它合法但影响 0 行，
+        // 会被误报成 NotFound（「行不存在」），而真实原因是「没东西可改」。
+        if set.is_empty() {
+            return Err(DbError::business(ENTITY, "没有要更新的字段"));
+        }
         set.touch();
 
-        // 绑定顺序是「先 id，再各字段值」，所以字段占位符从 $2 起，
-        // 而 WHERE 的 id 是 $1 —— 顺序必须与下面 fold 的 bind 顺序一致。
-        let assignments = set.assignments(2);
+        // 占位符编号：字段从 $1 起（与 SET 子句书写顺序一致），id 放最后。
+        let assignments = set.assignments(1);
         let fields = set.finish(ENTITY)?;
-        let sql = format!("UPDATE movie SET {assignments} WHERE id = $1");
-
-        // fold 而非 for 循环：循环体里 `q = q.bind(..)` 会 use-of-moved-value
-        // （bind 消费 self），而 fold 的累加器每次只 move 一次。
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, Movie>(safe_sql(sql)).bind(id),
-            |query, (_, value)| bind_value(query, value),
+        let sql = format!(
+            "UPDATE movie SET {assignments} WHERE id = ${}",
+            fields.len() + 1
         );
 
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        // 分两步：先 UPDATE，按 rows_affected 判定命中；再单独 SELECT 读回。
+        //
+        // 不用 `UPDATE ... RETURNING *`：那种写法下 0 行命中与「解码失败」
+        // 都表现为同一个 Err，排查时看不出到底是哪个。拆开后命中判定是
+        // 一个确定的数字，NotFound 也就能和「真的没这行」区分开。
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
     }
 
     /// CHECK 预判：合并当前值与本次写入后，`is_subscribed` 与
@@ -232,21 +287,41 @@ impl MovieRepository {
         Ok(())
     }
 
-    /// 按订阅状态列出。
+    paged_list! {
+        /// 按订阅布尔值列出。**分页。**
+        ///
+        /// `total` 是该状态下的**全部**影片数，不是本页条数 —— 订阅列表页
+        /// 要显示「共 N 部」，客户端 `fetch_all_pages` 也要靠它决定拉几页。
+        ///
+        /// 两条查询跑在同一个 REPEATABLE READ 快照里，否则并发订阅/退订时
+        /// 两者会看到不同的世界，见 [`crate::common::page`] 模块文档。
+        ///
+        /// `NULLS LAST`：`subscribed_at` 对未订阅的影片是 NULL，按它倒序时
+        /// 不写这个子句，PostgreSQL 会把 NULL 排在**最前** —— 未订阅的会
+        /// 出现在列表顶部。
+        pub async fn list_by_subscription(
+            &self,
+            subscribed: bool,
+        ) -> Result<Page<Movie>, DbError> {
+            count = "SELECT COUNT(*) FROM movie WHERE is_subscribed = $1",
+            items = "SELECT * FROM movie WHERE is_subscribed = $1 \
+                     ORDER BY subscribed_at DESC NULLS LAST, id \
+                     LIMIT $2 OFFSET $3",
+        }
+    }
+
+    /// 按订阅状态列出。**分页。**
+    ///
+    /// 薄包装：把 [`SubscriptionState`] 翻成布尔再交给
+    /// [`list_by_subscription`](Self::list_by_subscription)。宏只能生成
+    /// 「参数原样 bind」的方法，所以类型转换必须留在外面 —— 否则调用方
+    /// 可能传一个裸 `bool` 而绕过这个枚举。
     pub async fn list_by_subscription_state(
         &self,
         state: SubscriptionState,
-        limit: i64,
-    ) -> Result<Vec<Movie>, DbError> {
-        let state = state.as_str();
-        let rows = sqlx::query_as::<_, Movie>(
-            "SELECT * FROM movie WHERE is_subscribed = $1 ORDER BY subscribed_at DESC NULLS LAST, id LIMIT $2",
-        )
-        .bind(state == SubscriptionState::Subscribed.as_str())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        page: PageRequest,
+    ) -> Result<Page<Movie>, DbError> {
+        self.list_by_subscription(state.as_bool(), page).await
     }
 
     /// 认领一条待刮削的影片。
@@ -318,15 +393,13 @@ pub enum SubscriptionState {
 
 impl SubscriptionState {
     /// 该状态对应的 `is_subscribed` 布尔值。
+    ///
+    /// 列本身是 boolean，所以只保留这一个转换。
+    /// 曾经还有一个 `as_str() -> "true" / "false"`，用来把状态转成字符串
+    /// 再跟 `"true"` 比较 —— 那绕了一圈布尔，而列要的是 `bool`。
+    /// 现在查询直接绑 `as_bool()`。
     pub fn as_bool(&self) -> bool {
         matches!(self, Self::Subscribed)
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Subscribed => "true",
-            Self::NotSubscribed => "false",
-        }
     }
 }
 
@@ -335,46 +408,67 @@ fn as_bool(value: &crate::common::update::Value<'_>) -> bool {
     matches!(&*value.0, crate::common::update::ValueInner::Bool(true))
 }
 
-/// 把 UpdateSet 的值绑到查询上。
+/// 生成「把 [`UpdateSet`](crate::common::update::UpdateSet) 的值绑到
+/// 查询上」的两个函数。
 ///
-/// sqlx 的 `bind` 是泛型方法，这里必须按运行时类型分派 —— 这正是
-/// 「不用 `query!` 宏」的直接成本：宏能生成静态绑定代码，手写就得
-/// 自己维护这个 `match`。
+/// sqlx 的 `bind` 是泛型方法且**按类型静态分发**，所以无返回行的 `Query`
+/// 与有返回行的 `QueryAs` 各要一份签名。它们的 `match` 逻辑完全相同 ——
+/// 写两遍的话，加一个 [`ValueInner`] 变体就可能只改一处，而漏掉的那处
+/// 会在编译期不报错（因为 match 仍然穷尽）、运行时才崩。
 ///
-/// 新增 [`crate::common::update::ValueInner`] 变体时，这个函数是**唯一**
-/// 需要跟着改的地方，编译器会在变体不匹配时报错。
-pub(crate) fn bind_value<'q, O>(
-    query: sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments>,
-    value: &crate::common::update::Value<'_>,
-) -> sqlx::query::QueryAs<'q, Postgres, O, sqlx::postgres::PgArguments> {
-    use crate::common::update::ValueInner;
-    match &*value.0 {
-        ValueInner::Null => query.bind(Option::<String>::None),
-        ValueInner::Bool(v) => query.bind(*v),
-        ValueInner::Int(v) => query.bind(*v),
-        ValueInner::Float(v) => query.bind(*v),
-        ValueInner::Text(v) => query.bind(v.clone()),
-        ValueInner::Timestamp(v) => query.bind(*v),
-        ValueInner::Json(v) => query.bind(v.clone()),
-    }
+/// 用宏生成保证两份永远同步。编译器会在变体不匹配时报错。
+///
+/// `$generics` 给的是额外的类型参数：`Query` 没有输出类型，所以传 `[]`；
+/// 而 `QueryAs` 需要一个 `O` 表示返回的行类型。
+///
+/// 目前只有 `Query` 那一个实例存活 —— `task.rs` 的 `update_metadata`
+/// 曾经用 `QueryAs` 版本，但那条路径因为 `RETURNING *` 会把「0 行命中」
+/// 与「解码失败」压成同一个 Err 而改用了 `execute` + `rows_affected`。
+/// 宏保留着，因为下一个需要动态 SET 子句并读回结果的地方会立刻用上；
+/// 只有一个实例时它看起来多余，但删掉之后 `ValueInner` 一旦新增变体，
+/// 两处（这里 + 未来的那处）就要各改一次，而漏掉的那处编译期不报错。
+macro_rules! impl_bind_value {
+    ($name:ident, [$($gen:ident),*], $query:ty, $doc:literal) => {
+        #[doc = $doc]
+        pub(crate) fn $name<'q, $($gen),*>(
+            query: $query,
+            value: &crate::common::update::Value<'_>,
+        ) -> $query {
+            use crate::common::update::ValueInner;
+            match &*value.0 {
+                ValueInner::Null => query.bind(Option::<String>::None),
+                ValueInner::Bool(v) => query.bind(*v),
+                ValueInner::Int(v) => query.bind(*v),
+                ValueInner::Float(v) => query.bind(*v),
+                ValueInner::Text(v) => query.bind(v.clone()),
+                ValueInner::Timestamp(v) => query.bind(*v),
+                ValueInner::Json(v) => query.bind(v.clone()),
+            }
+        }
+    };
 }
+
+impl_bind_value!(
+    bind_value_exec,
+    [],
+    sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
+    "把值绑到无返回行的 `query` 上。"
+);
 
 /// 把受控的动态 SQL 交给 sqlx 0.9。
 ///
-/// sqlx 0.9 新增了编译期注入防护：`query_as` 的 SQL 参数必须实现
+/// sqlx 0.9 新增了编译期注入防护：`query` / `query_as` 的 SQL 参数必须实现
 /// [`sqlx::SqlSafeStr`]，而 `&String` **不实现**它 —— 想用动态 SQL 就
 /// 必须显式声明「我已确认这段 SQL 安全」。
 ///
 /// 确认依据：列名全部来自 [`UpdateSet`]，而调用方只能通过 `set()` 传入
 /// 字面量列名，没有任何路径能把用户输入拼进 SQL。占位符数量由
 /// `assignments()` 按字段数生成，与 bind 数量严格一致。
-///
-/// 如果将来引入了接受外部列名的入口，这里就是唯一需要重新审计的地方。
-pub(crate) fn safe_sql(sql: String) -> sqlx::AssertSqlSafe<String> {
-    sqlx::AssertSqlSafe(sql)
+pub(crate) fn safe_sql(sql: impl Into<String>) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(sql.into())
 }
 
-/// 影片系列仓储。
+/// `movie_series` 表仓储。
 #[derive(Debug, Clone)]
 pub struct MovieSeriesRepository {
     pool: PgPool,
@@ -393,78 +487,5 @@ impl MovieSeriesRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn subscription_state_maps_to_boolean() {
-        assert!(SubscriptionState::Subscribed.as_bool());
-        assert!(!SubscriptionState::NotSubscribed.as_bool());
-        assert_eq!(SubscriptionState::Subscribed.as_str(), "true");
-    }
-
-    #[test]
-    fn guard_rejects_plugin_writes_to_counters() {
-        // 计数器不在受保护白名单里，插件不该能改。
-        let guard = guard();
-        let plugin = WriteSource::Plugin { plugin_id: "p" };
-        assert!(guard.allows("title", plugin));
-        assert!(!guard.allows("watched_count", plugin));
-        assert!(!guard.allows("field_owners", plugin));
-    }
-
-    #[test]
-    fn blacklist_precheck_merges_current_and_pending() {
-        // 只改其中一个位时，要用另一个位的**当前值**来判断。
-        let subscribed = Movie {
-            id: 1,
-            javdb_id: None,
-            metadata_source: None,
-            javdb_next_check_at: None,
-            movie_number: "ABC-001".to_owned(),
-            title: "t".to_owned(),
-            release_date: None,
-            duration_minutes: 0,
-            score: 0.0,
-            score_number: 0,
-            watched_count: 0,
-            cover_image_id: None,
-            thin_cover_image_id: None,
-            summary: String::new(),
-            series_id: None,
-            maker_name: None,
-            director_name: None,
-            want_watch_count: 0,
-            comment_count: 0,
-            interaction_synced_at: None,
-            heat: 0,
-            is_collection: false,
-            is_subscribed: true,
-            is_blacklisted: false,
-            subscribed_at: None,
-            subscription_search_state: "pending".to_owned(),
-            subscription_search_attempt_count: 0,
-            subscription_search_retry_round: 0,
-            subscription_search_last_attempted_at: None,
-            subscription_search_last_succeeded_at: None,
-            subscription_search_next_retry_at: None,
-            subscription_search_error_code: None,
-            subscription_search_last_error: None,
-            subscription_search_last_error_at: None,
-            field_owners: serde_json::json!({}),
-            mutation_revision: 0,
-            created_at: None,
-            updated_at: None,
-        };
-        assert!(subscribed.satisfies_blacklist_constraint());
-
-        // 再写 is_blacklisted = true 就冲突了
-        let mut conflict = subscribed.clone();
-        conflict.is_blacklisted = true;
-        assert!(!conflict.satisfies_blacklist_constraint());
     }
 }

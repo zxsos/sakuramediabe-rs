@@ -12,7 +12,7 @@
 //! # 迁移影响
 //!
 //! **既有 bcrypt 哈希无法用 Argon2 验证**，因此存量用户首次登录会失败。
-//! 处理方式见 [`PasswordHash::needs_rehash`]：识别出 bcrypt 前缀时，
+//! 处理方式见 [`needs_rehash`]：识别出 bcrypt 前缀时，
 //! 应在验证成功后用 Argon2 重新哈希并回写，实现无感升级。
 //!
 

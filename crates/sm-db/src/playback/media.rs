@@ -88,7 +88,10 @@ pub struct Media {
     pub movie_number: Option<String>,
     /// 指向 `VideoItem.id`。
     pub video_item_id: Option<i32>,
-    pub library_id: i64,
+    /// DDL 是 integer（与 media_library.id 同宽），所以是 i32 而非 i64。
+    /// 写成 i64 时对拍查不出来（它只看列名/可空性/规范化类型名的映射），
+    /// 只有集成测试真解码才会报 ColumnDecode。
+    pub library_id: i32,
 
     /// 不透明存储引用，结构由 provider 定义。`JsonTextField`。
     pub storage_ref: Option<String>,
@@ -170,8 +173,8 @@ pub mod image_search_index_status {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaThumbnail {
     pub id: i32,
-    pub media_id: i64,
-    pub image_id: i64,
+    pub media_id: i32,
+    pub image_id: i32,
     /// 距片头的秒数。
     pub offset: i32,
     pub image_search_index_status: i32,
@@ -185,7 +188,7 @@ pub struct MediaThumbnail {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaProgress {
     pub id: i32,
-    pub media_id: i64,
+    pub media_id: i32,
     pub position_seconds: i32,
     pub last_watched_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
@@ -206,10 +209,10 @@ pub struct MediaProgress {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaPoint {
     pub id: i32,
-    pub media_id: Option<i64>,
-    pub thumbnail_id: Option<i64>,
+    pub media_id: Option<i32>,
+    pub thumbnail_id: Option<i32>,
     /// 删图会被数据库拒绝（RESTRICT）。
-    pub image_id: i64,
+    pub image_id: i32,
     /// 来源快照，无外键。
     pub movie_number: Option<String>,
     /// 来源快照，无外键。
@@ -228,7 +231,7 @@ pub struct MediaPoint {
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaClip {
     pub id: i32,
-    pub media_id: Option<i64>,
+    pub media_id: Option<i32>,
     /// 来源快照，便于来源删除后仍可归属与展示。
     pub movie_number: Option<String>,
     pub start_offset_seconds: i32,

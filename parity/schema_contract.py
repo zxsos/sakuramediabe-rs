@@ -81,10 +81,22 @@ IMPLICIT_COLUMNS = {
 # 隐式列的具体类型与额外属性。
 IMPLICIT_COLUMN_TYPES = {
     # Peewee: class AutoField(IntegerField)，AUTO 在 PG 上落 INTEGER
-    "id": {"type": "int4", "primary_key": True, "auto_increment": True},
+    # 主键必然 NOT NULL —— 显式写出来，不让它落到 UNKNOWN_NULLABLE。
+    "id": {"type": "int4", "primary_key": True, "auto_increment": True, "nullable": False},
     "created_at": {"type": "timestamp", "nullable": True},
     "updated_at": {"type": "timestamp", "nullable": True},
 }
+
+# 「这条列的可空性没能从源码解析出来」的哨兵值。
+#
+# 刻意**不**用 None：那与「Peewee 默认 NOT NULL」在真假判断里无法区分，
+# 而把两者混同正是可空性对拍一直空转的原因（None is False 为假，于是
+# 省略 null= 的列全部免检）。
+#
+# 任何以 UNKNOWN_NULLABLE 为可空性的列都会让对拍失败，直到有人查清上游
+# 到底怎么声明的。这比「猜 NOT NULL 然后静默」安全：前者会问你，后者
+# 只是让一个 Option<String> 混进模型层，等到插入时才炸。
+UNKNOWN_NULLABLE = "unknown"
 
 
 def snake_case(name: str) -> str:
@@ -119,7 +131,28 @@ def dotted_name(node) -> str:
 
 
 def literal(node):
-    """尽力求值字面量；求不出返回 None。"""
+    """尽力求值字面量；求不出返回 None。
+
+    `ast.literal_eval` 不认裸名字，而 peewee 的 JSON 字段默认值恰恰写成
+    名字 —— `JsonTextField(default=dict)` / `JsonbField(default=list)`。
+    这些名字在这里显式映射成对应的空 JSON 值，否则默认值会被整个丢掉，
+    DDL 里就出现 `NOT NULL` 而没有 DEFAULT。
+
+    丢掉的后果不是「少一个默认值」那么轻：列变成 NOT NULL 且无默认，
+    任何 INSERT 都必须显式传值，连「留空」都做不到。
+    """
+    if isinstance(node, ast.Name):
+        # 只认 JSON 语义里明确的空容器，不做通用名字解析 ——
+        # 把 `default=some_constant` 猜成字面量会造出错误的 schema。
+        builtin = {
+            "dict": {},
+            "list": [],
+            "str": "",
+            "int": 0,
+            "float": 0.0,
+            "bool": False,
+        }
+        return builtin.get(node.id)
     try:
         return ast.literal_eval(node)
     except Exception:
@@ -321,7 +354,7 @@ def parse_model_file(path: str) -> list:
                     "name": col,
                     "type": spec.get("type", "implicit"),
                     "field": col,
-                    "nullable": spec.get("nullable"),
+                    "nullable": spec.get("nullable", UNKNOWN_NULLABLE),
                     "unique": bool(spec.get("primary_key")),
                     "index": False,
                     "default": None,
@@ -351,7 +384,25 @@ def parse_model_file(path: str) -> list:
                         "name": actual,
                         "type": kind,
                         "field": fname,
-                        "nullable": None,
+                        # 默认 False，不是 None。
+                        #
+                        # Peewee 的 Field 默认 null=False，所以省略 null= 的列
+                        # **确实**是 NOT NULL —— 这是完全确定的，不是「解析
+                        # 不出来」。之前这里填 None，而 compare_schema.py 的
+                        # 判定是 `if py_nullable is False and optional`：
+                        # None 不是 False，于是省略 null= 的列全部免检。
+                        #
+                        # 代价是整个可空性对拍形同虚设：actor 表 26 列里 9 列
+                        # 属于这种情况，包括 javdb_id。Rust 侧把它声明成
+                        # Option<String>，归一化时空串变 None，插入必然违反
+                        # NOT NULL —— 而对拍报 0 problems，集成测试还断言
+                        # 这次插入成功。
+                        #
+                        # 真正「解析不出来」的情形用 UNKNOWN_NULLABLE 表达，
+                        # 与 False 区分开：那会让对拍失败并要求有人查清上游，
+                        # 而不是猜一个值蒙混过关。
+                        "nullable": False,
+                        "primary_key": False,
                         "unique": False,
                         "index": False,
                         "default": None,
@@ -364,6 +415,27 @@ def parse_model_file(path: str) -> list:
                     for kw in stmt.value.keywords:
                         if kw.arg == "null":
                             entry["nullable"] = literal(kw.value)
+                        elif kw.arg == "primary_key":
+                            # **这个分支此前不存在。**
+                            #
+                            # 上游 `image_search_index_state` 显式声明
+                            # `id = peewee.IntegerField(primary_key=True, default=1)`。
+                            # `primary_key=True` 不在下面的白名单里，于是被
+                            # **静默忽略** —— 契约里那列的 `primary_key` 是
+                            # `None`，`gen_ddl.py:90` 的 `if col.get("primary_key")`
+                            # 判假，于是 DDL 里**没有 PRIMARY KEY**。
+                            #
+                            # 后果不只是 DDL 少一句：那张表变成了全库唯一
+                            # 一张既无主键也无唯一约束的表，于是
+                            # `ON CONFLICT (id)` 报
+                            # `42P10 there is no unique or exclusion constraint
+                            # matching the ON CONFLICT specification`，
+                            # 而「单例」这个约定**没有任何数据库层面的保障**。
+                            #
+                            # 这是本仓库第四次遇到同一形状的缺陷：解析器在
+                            # 无法判断时选择了沉默。不在白名单里的 kwarg
+                            # 应当**可见**，而不是被当成「没这回事」。
+                            entry["primary_key"] = bool(literal(kw.value))
                         elif kw.arg == "unique":
                             entry["unique"] = bool(literal(kw.value))
                         elif kw.arg == "index":
@@ -383,6 +455,7 @@ def parse_model_file(path: str) -> list:
                         # ForeignKeyField(Model, ...) 第一个位置参数是目标模型。
                         # 自引用写成字符串 "self"（Actor.merged_into 就是这样），
                         # 用 ast.Constant 而非 ast.Name，必须单独处理。
+                        explicit_field = None
                         if stmt.value.args:
                             target = stmt.value.args[0]
                             if isinstance(target, ast.Name):
@@ -392,7 +465,40 @@ def parse_model_file(path: str) -> list:
                             elif isinstance(target, ast.Constant) and target.value == "self":
                                 entry["ref_model"] = node.name
                                 entry["self_ref"] = True
-                        entry["ref_field"] = actual
+                        # field= 显式指定被引用字段时才用它。
+                        #
+                        # 两种写法都要认：
+                        #   field="movie_number"          -> ast.Constant
+                        #   field=Movie.movie_number      -> ast.Attribute
+                        # 后者在 Media 上是主力写法（media.movie 指向
+                        # Movie.movie_number 而不是 Movie.id），literal() 处理不了
+                        # ast.Attribute，早期因此把它当成「没写 field=」，
+                        # 生成的 DDL 变成 REFERENCES movie (id) —— 类型也对不上，
+                        # PostgreSQL 报 "foreign key constraint cannot be
+                        # implemented"。
+                        for kw in stmt.value.keywords:
+                            if kw.arg != "field":
+                                continue
+                            if isinstance(kw.value, ast.Attribute):
+                                explicit_field = kw.value.attr
+                            elif isinstance(kw.value, ast.Constant):
+                                explicit_field = kw.value.value
+                            else:
+                                explicit_field = literal(kw.value)
+                        # **默认值是目标模型的主键名，不是源列名。**
+                        #
+                        # Peewee 的 ForeignKeyField(Model) 不带 field= 时指向
+                        # Model.id。早期这里错写成 entry["ref_field"] = actual
+                        # （源列名），于是 media.library_id 生成的 DDL 是
+                        # `REFERENCES media_library (library_id)` —— 目标表根本没
+                        # 这一列。而且因为 media.movie_number 的目标字段恰好同名，
+                        # 只有它看起来是对的，把问题掩盖住了。
+                        #
+                        # 这个 bug 靠静态检查发现不了：契约自洽、DDL 能生成、
+                        # 对拍也过（对拍只比对 Rust 结构体与 Peewee 字段，不校验
+                        # 外键指向）。只有真正 CREATE TABLE 时 PostgreSQL 才报错。
+                        entry["ref_field"] = explicit_field
+                        entry["ref_field_explicit"] = explicit_field is not None
                     columns[actual] = entry
             elif isinstance(stmt, ast.ClassDef) and stmt.name == "Meta":
                 for meta in stmt.body:

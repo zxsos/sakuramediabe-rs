@@ -35,16 +35,16 @@ pub struct Tag {
 #[derive(Debug, Clone, FromRow)]
 pub struct MovieActor {
     pub id: i32,
-    pub movie_id: i64,
-    pub actor_id: i64,
+    pub movie_id: i32,
+    pub actor_id: i32,
 }
 
 /// `movie_tag` 关联表。`(movie_id, tag_id)` 唯一。
 #[derive(Debug, Clone, FromRow)]
 pub struct MovieTag {
     pub id: i32,
-    pub movie_id: i64,
-    pub tag_id: i64,
+    pub movie_id: i32,
+    pub tag_id: i32,
 }
 
 /// `movie_plot_image` 关联表。
@@ -54,8 +54,8 @@ pub struct MovieTag {
 #[derive(Debug, Clone, FromRow)]
 pub struct MoviePlotImage {
     pub id: i32,
-    pub movie_id: i64,
-    pub image_id: i64,
+    pub movie_id: i32,
+    pub image_id: i32,
     /// 图搜索引状态。0 待处理 / 1 失败 / 2 成功。
     pub image_search_index_status: i32,
 }
@@ -81,7 +81,7 @@ pub mod image_search_index_status {
 #[derive(Debug, Clone, FromRow)]
 pub struct Subtitle {
     pub id: i32,
-    pub movie_id: i64,
+    pub movie_id: i32,
     /// 字幕文件路径。
     pub file_path: String,
     pub created_at: Option<NaiveDateTime>,

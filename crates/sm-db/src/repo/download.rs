@@ -24,11 +24,13 @@
 
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::transfers::downloads::{download_state, import_status, DownloadTask};
 
-use super::movie::{bind_value, safe_sql};
+use super::movie::{bind_value_exec, safe_sql};
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "DownloadTask";
@@ -85,6 +87,13 @@ impl DownloadTaskRepository {
     ///
     /// 唯一索引 `(client, remote_id)` 让重复提交命中约束而非产生第二条
     /// —— 这是幂等提交的基础，所以**先查后插**在这里是安全的。
+    /// 按主键查询，未命中返回 [`DbError::NotFound`]。
+    pub async fn require_by_id(&self, id: i32) -> Result<DownloadTask, DbError> {
+        self.find_by_id(id)
+            .await?
+            .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
     pub async fn find_by_remote(
         &self,
         client_id: i32,
@@ -211,54 +220,66 @@ impl DownloadTaskRepository {
     /// 则会重复领取。
     pub async fn claim_queued(&self) -> Result<Option<DownloadTask>, DbError> {
         let now = crate::common::time::now_utc();
+
+        // 三个占位符**必须分开**。曾经把子查询的过滤条件也写成 $1，
+        // 而 $1 绑的是 'submitted'（写入目标），于是子查询在找「已提交」
+        // 的任务而不是排队中的 —— 永远返回 None，不报任何错。
+        // 队列非空却领不到任务，排查起来极其困难。
         let row = sqlx::query_as::<_, DownloadTask>(
             "UPDATE download_task SET state = $1, updated_at = $2 \
              WHERE id = ( \
-                SELECT id FROM download_task WHERE state = $1 \
+                SELECT id FROM download_task WHERE state = $3 \
                 ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING *",
         )
         .bind(download_state::SUBMITTED)
         .bind(now)
+        .bind(download_state::QUEUED)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    /// 列出「下载完成但导入失败」的任务。
-    ///
-    /// 这个组合只有把两个状态机分开建模才表达得了，是最需要人工介入的
-    /// 一类卡住。
-    pub async fn list_stuck_after_download(&self) -> Result<Vec<DownloadTask>, DbError> {
-        let rows = sqlx::query_as::<_, DownloadTask>(
-            "SELECT * FROM download_task WHERE state = $1 AND import_status = $2 ORDER BY updated_at",
-        )
-        .bind(download_state::COMPLETED)
-        .bind(import_status::FAILED)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+    paged_list! {
+        /// 列出「下载完成但导入失败」的任务。**分页。**
+        ///
+        /// 分页让告警能报出准确数量，而不是「至少 N 条」。
+        pub async fn list_stuck_after_download(
+            &self,
+            state: &str,
+            import_status_value: &str,
+        ) -> Result<Page<DownloadTask>, DbError> {
+            count = "SELECT COUNT(*) FROM download_task \
+                     WHERE state = $1 AND import_status = $2",
+            items = "SELECT * FROM download_task \
+                     WHERE state = $1 AND import_status = $2 \
+                     ORDER BY updated_at LIMIT $3 OFFSET $4",
+        }
     }
 
     /// 通用更新。仅供本模块内部使用 —— 它不区分状态机，
     /// 所以**不导出**。
     async fn persist(&self, id: i32, mut set: UpdateSet<'_>) -> Result<DownloadTask, DbError> {
         set.touch();
-        let assignments = set.assignments(2);
+        // 字段从 $1 起、id 放最后 —— 与 SET/WHERE 的书写顺序一致。
+        let assignments = set.assignments(1);
         let fields = set.finish(ENTITY)?;
-        let sql = format!("UPDATE download_task SET {assignments} WHERE id = $1");
-
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, DownloadTask>(safe_sql(sql)).bind(id),
-            |query, (_, value)| bind_value(query, value),
+        let sql = format!(
+            "UPDATE download_task SET {assignments} WHERE id = ${}",
+            fields.len() + 1
         );
 
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
     }
 }
 

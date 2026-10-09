@@ -300,3 +300,88 @@ PostgreSQL 上是安全的 widening，不会出错——但**契约就是契约*
 映射阶段已正确区分，对拍工具也按此归类。
 
 **当前结果：40/40 张表通过。**
+
+## 真实 PostgreSQL 验证（L2）
+
+DDL 生成正确不等于仓储正确。`crates/sm-db/tests/` 下的集成测试在真实
+PG 16 上跑，这是唯一能发现「契约自洽但数据库拒绝」这类缺陷的层次。
+
+### 怎么跑
+
+```text
+# 本地 PG 16（原生即可，不依赖容器）
+initdb -D data -U sakuramedia --auth-local=trust --auth-host=trust -E UTF8
+# postgresql.conf: port = 5433 / timezone = 'UTC'
+
+python parity/gen_ddl.py --out docker/schema.sql
+psql -h localhost -p 5433 -U sakuramedia -d sakuramedia_test -v ON_ERROR_STOP=1 -f schema.sql
+
+$env:SMDB_TEST_DATABASE_URL = "postgres://sakuramedia@localhost:5433/sakuramedia_test"
+cargo test -p sm-db --test repo_integration --test gateway_integration
+```
+
+无 `DATABASE_URL` 时测试**跳过而非失败**，所以没起库的环境 `cargo test`
+仍然是全绿。
+
+### 只有真实数据库能发现的六类缺陷
+
+全部由集成测试首次执行时暴露，静态检查（对拍 + clippy + 单测）一个都看不到。
+
+| # | 缺陷 | 症状 | 修复 |
+|---|---|---|---|
+| 1 | 保留字列名未加引号 | `media_thumbnail.offset` 建表语法错误 | `RESERVED_WORDS` + `quote_ident()` |
+| 2 | 外键指向源列名 | `REFERENCES media_library (library_id)` —— 该列不存在 | 从目标表主键解析 |
+| 3 | `field=Model.attr` 解析失败 | 外键退化成 `movie(id)`，类型不匹配 | 认 `ast.Attribute` |
+| 4 | `default=dict` 丢失 | 列变 `NOT NULL` 且无默认值 | 裸名字映射为空 JSON 值 |
+| 5 | `NOT NULL DEFAULT` 列发 NULL | 23502 not_null_violation | Rust 侧填默认值 |
+| 6 | 空 `UpdateSet` 绕过检查 | 报 NotFound（真实原因是「没东西可改」） | 检查移到 `touch()` 之前 |
+
+第 2 条最隐蔽：只有 `media.movie_number` 碰巧对（目标字段恰好同名），
+把 bug 掩盖住了。第 4 条影响上游 5 列。
+
+### 两条不能重试的弯路
+
+**① 在 SQL 里写 `DEFAULT` 关键字让数据库填默认值**
+
+看起来更「正确」，但 sqlx 的 `bind` 按位置追加、**跳不过 `DEFAULT` 那一项**，
+占位符编号随即错位，`$5` 类型无法推断（42P18）。最终选择 Rust 侧填默认值，
+并在此记录以免重试。
+
+**② `UPDATE ... RETURNING *`**
+
+0 行命中与解码失败在那里都表现为同一个 `Err`，排查时无法区分。三个
+update 路径改为「先 UPDATE 查 `rows_affected`，再单独 SELECT」，命中判定
+变成一个确定的数字。
+
+## 仓储层约定
+
+### 字段主权网关（`repo/gateway.rs`）
+
+受保护字段的**唯一**写入口，四个方法语义各不相同，且都必须是**单条原子
+UPDATE** —— 拆成「先 SELECT 判断再 UPDATE」会丢原子性：
+
+| 方法 | 谁能写 | 原子性靠什么 | 返回 |
+|---|---|---|---|
+| `patch_plugin` | 插件 | `mutation_revision` CAS + 字段级 owner 条件 | 是否命中 |
+| `update_host_unowned` | 宿主 | 字段级 `CASE` 放 SET 内 | 受影响行数 |
+| `update_host_manual` | 人工 | 批量 `IN`，无条件覆盖 | 受影响行数 |
+| `release_plugin_owners` | 管理员 | `jsonb_each_text` 重建映射 | 受影响行数 |
+
+三个容易写错的细节：
+
+- **owner 条件必须放 `SET` 的 `CASE` 里**。放 `WHERE` 里的话，一个字段被
+  接管就会让整条跳过，其他未接管字段也写不进去。
+- **NULL-safe 变化检测**（`IS DISTINCT FROM`）—— 值没变就不递增
+  `mutation_revision`、不刷新 `updated_at`。
+- **不能用连续减法摘 owner**。上游记录了这个陷阱：`jsonb - NULL` 左结合
+  会把整条结果污染成 NULL，必须逐 key 过滤重建。
+
+`MOVIE_FIELD_CODECS` 里没有 codec 的受保护字段会被**拒绝**而非默认放行 ——
+上游约定是「补了类型校验才加入白名单」，默认放行等于让字段绕过校验落库。
+
+### 占位符编号约定
+
+**字段从 `$1` 起，`WHERE` 条件放最后。** 与 SQL 书写顺序一致，读者不需要
+在脑子里做逆序映射。三个 update 路径早期都写成「`id=$1`、字段从 `$2` 起」，
+这个反直觉设计是编号错位的温床。
+

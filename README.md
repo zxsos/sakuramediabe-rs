@@ -26,10 +26,11 @@ SakuraMedia 后端的 Rust 重写实现。
 | `media-file-hash` | `media-file-hash-v1` 采样指纹 | 两个 provider 里的重复实现 | 9 |
 | `svc-hash` | BT info hash 解析 | **`libtorrent`** | 32 |
 | `sm-core` | JWT / Argon2 / 统一错误信封 | — | 72 |
-| `sm-db` | **40 张表的模型映射（40/40 ✅）** | `model/` + 部分 Peewee → sqlx | 65 |
+| `sm-db` | **模型映射 40/40 + 仓储层 + DDL 生成器** | `model/` + 部分 Peewee → sqlx | 107 |
 | `parity-cli` | 对拍入口（开发工具） | — | — |
 
-- `cargo test`：**192 passed / 0 failed，零编译警告**
+- `cargo test`：**284 passed / 0 failed，零编译警告**
+  （含 **49 个集成测试**，跑在真实 PostgreSQL 16 上）
 - `python parity/compare.py`：**44/44** Rust 与 Python 逐条一致
 - `python parity/compare_core.py`：**64/64** 核心原语逐条一致
 

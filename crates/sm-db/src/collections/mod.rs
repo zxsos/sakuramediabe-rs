@@ -143,10 +143,10 @@ pub fn is_system_playlist_kind(kind: &str) -> bool {
 #[derive(Debug, Clone, FromRow)]
 pub struct PlaylistMovie {
     pub id: i32,
-    pub playlist_id: i64,
+    pub playlist_id: i32,
     /// 指向 `Movie`（JAV 影片）。注意 `Movie` 有 `movie_number` 字段，
     /// 但这个外键指向的是它的 `id`。
-    pub movie_id: i64,
+    pub movie_id: i32,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -162,14 +162,33 @@ impl PlaylistMovie {
 }
 
 /// 生成两个结构相同的合集成员表模型。
+///
+/// # 字段宽度：`i32` 而不是 `i64`
+///
+/// 这三个外键列在 DDL 里都是 `integer`：
+///
+/// ```sql
+/// collection_id integer NOT NULL,   -- -> moment_collection(id)
+/// point_id      integer NOT NULL,   -- -> media_point(id)
+/// ```
+///
+/// 此前这里写的是 `i64`，那么每次插入都会得到
+/// `column "collection_id" is of type integer but expression is of type bigint`。
+///
+/// 它能活下来是因为 `declare!` 宏只导出 `COLUMNS`（列名），
+/// `parse_rust` 读到的是 `COLUMNS_CONST` 而没有类型信息，对拍因此跳过
+/// 这些列 —— 而它当时给出的理由是「类型正确性由编译与 collections
+/// 模块自身的单元测试保证」。那个理由不成立：i64 赋给 integer 列是
+/// **运行时**错误，编译期发现不了；单元测试只是构造 struct，也不会碰到
+/// 数据库。
 macro_rules! ordered_collection_item {
     ($name:ident, $field:ident, $doc:expr) => {
         #[doc = $doc]
         #[derive(Debug, Clone, FromRow)]
         pub struct $name {
             pub id: i32,
-            pub collection_id: i64,
-            pub $field: i64,
+            pub collection_id: i32,
+            pub $field: i32,
             /// 显式播放顺序。
             pub position: i32,
             pub created_at: Option<NaiveDateTime>,

@@ -27,7 +27,7 @@ pub struct VideoItem {
     pub title: String,
     pub summary: String,
     /// 封面图。删图时置空而非级联删除条目。
-    pub cover_image_id: Option<i64>,
+    pub cover_image_id: Option<i32>,
     /// 发布时间。
     pub release_date: Option<NaiveDateTime>,
     /// `JsonTextField`，默认 NULL。
@@ -71,7 +71,7 @@ impl VideoCollection {
 #[derive(Debug, Clone, FromRow)]
 pub struct VideoCollectionItem {
     pub id: i32,
-    pub collection_id: i64,
+    pub collection_id: i32,
     pub video_item_id: i32,
     /// 显式播放顺序。JAV 侧的 `PlaylistMovie` 缺此字段。
     pub position: i32,

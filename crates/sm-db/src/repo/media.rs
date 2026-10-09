@@ -21,11 +21,14 @@
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
 
+use crate::common::page::{Page, PageRequest};
 use crate::common::update::UpdateSet;
 use crate::error::DbError;
+use crate::paged_list;
 use crate::playback::media::{thumbnail_state, Media};
 
-use super::movie::{bind_value, safe_sql};
+use super::ctx::Ctx;
+use super::movie::{bind_value_exec, safe_sql};
 
 /// 实体名，用于错误分类。
 const ENTITY: &str = "Media";
@@ -46,13 +49,31 @@ pub struct NewMedia {
     /// `media-file-hash-v1:<40 hex>`。
     pub file_hash: Option<String>,
     pub import_source_identity: Option<String>,
-    /// DDL 里是 `integer`，模型是 `i32` —— 与 `Media` 结构体保持一致。
-    pub duration_seconds: Option<i32>,
+    /// `duration_seconds integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    ///
+    /// 0 就是「未知时长」，与列的 DEFAULT 一致。此前声明成 `Option<i32>`
+    /// 且 `insert` 直接 `.bind(new.duration_seconds)`，`None` 会绑成 NULL
+    /// 并违反 NOT NULL。
+    pub duration_seconds: i32,
     /// `JsonTextField`，写入时序列化为文本。
     pub video_info: Option<serde_json::Value>,
 }
 
 impl NewMedia {
+    /// 写入前的全部业务校验。
+    ///
+    /// 两项都归到这里而不是散在 `insert` 里：原先空文件名检查内联在
+    /// `insert` 中，导致单元测试只能测到 `str::trim`，实际拒绝逻辑
+    /// 一行都没被执行过。合成一个入口后，测试可以直接断言错误类型。
+    fn validate(&self) -> Result<(), DbError> {
+        self.check_owner()?;
+
+        if self.file_name.trim().is_empty() {
+            return Err(DbError::business(ENTITY, "file_name 不能为空"));
+        }
+        Ok(())
+    }
+
     /// 校验 XOR 归属，返回业务错误。
     fn check_owner(&self) -> Result<(), DbError> {
         if self.movie_number.is_some() == self.video_item_id.is_some() {
@@ -83,6 +104,54 @@ impl MediaRepository {
         &self.pool
     }
 
+    /// 按内容哈希查找。
+    ///
+    /// `file_hash` 的模型注释写明它是「跨存储识别重复文件的依据」——
+    /// 同一个文件在两个 storage 里各有一份时，靠这个认出它们是同一个。
+    ///
+    /// 返回 `Vec` 而非 `Option`：同一个哈希对应多条**是可能的**（同一
+    /// 文件被导入到两个库），真出现多条说明导入逻辑有问题，但仓储不该
+    /// 因此拒绝回答「有哪几条」—— 那会让调用方既拿不到数据、又拿不到
+    /// 错误。
+    ///
+    /// **不分页**：这是去重检查而不是列表，调用方要的是「有哪几条」这个
+    /// 完整答案。分页会让它拿到一个不完整的结论而误判「没有重复」。
+    pub async fn find_by_file_hash(&self, hash: &str) -> Result<Vec<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE file_hash = $1 ORDER BY id")
+                .bind(hash.trim())
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    paged_list! {
+        /// 列出某个库的全部媒体。**分页。**
+        ///
+        /// 库可以装上万部影片，所以分页不是可选项。
+        pub async fn list_by_library(
+            &self,
+            library_id: i32,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE library_id = $1",
+            items = "SELECT * FROM media WHERE library_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
+    }
+
+    paged_list! {
+        /// 按影片番号列出媒体。**分页。**
+        ///
+        /// 「JAV 影片详情页列出所有正片」的主查询。一部影片可能有多个版本
+        /// （不同分辨率、不同来源），但数量有界。
+        pub async fn list_by_movie_number(
+            &self,
+            movie_number: &str,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE movie_number = $1",
+            items = "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
+    }
+
     /// 按主键查询。
     pub async fn find_by_id(&self, id: i32) -> Result<Option<Media>, DbError> {
         Ok(
@@ -100,13 +169,9 @@ impl MediaRepository {
             .ok_or_else(|| DbError::not_found(ENTITY, id))
     }
 
-    /// 插入。**写入前校验 XOR 归属。**
+    /// 插入。**写入前校验 XOR 归属与文件名。**
     pub async fn insert(&self, new: &NewMedia) -> Result<Media, DbError> {
-        new.check_owner()?;
-
-        if new.file_name.trim().is_empty() {
-            return Err(DbError::business(ENTITY, "file_name 不能为空"));
-        }
+        new.validate()?;
 
         let sql = "\
             INSERT INTO media (
@@ -122,7 +187,13 @@ impl MediaRepository {
             .bind(new.movie_number.as_deref().map(str::trim))
             .bind(new.video_item_id)
             .bind(new.library_id)
-            .bind(new.storage_ref.as_deref())
+            // `storage_ref` 是 `text NOT NULL DEFAULT '{}'`（上游
+            // `JsonTextField(default=dict)`，没有 `null=True`）。
+            // 绑 `as_deref()` 会在 None 时写 NULL，直接违反 NOT NULL。
+            // 缺失时写 DEFAULT 对应的 '{}'，与 task.rs 对 `result_summary`
+            // 的处理一致 —— `Option` 在这里表达「调用方没提供」，而不是
+            // 「允许存 NULL」。
+            .bind(new.storage_ref.as_deref().unwrap_or("{}"))
             .bind(new.file_name.trim())
             .bind(new.resolution.as_deref())
             .bind(new.file_size_bytes)
@@ -181,28 +252,33 @@ impl MediaRepository {
                 resolution: None,
                 file_hash: None,
                 import_source_identity: None,
-                duration_seconds: None,
+                duration_seconds: 0,
                 video_info: None,
             };
             probe.check_owner()?;
         }
 
         set.touch();
-        let assignments = set.assignments(2);
+        // 字段从 $1 起、id 放最后 —— 与 SET/WHERE 的书写顺序一致，
+        // 读者不需要在脑子里做逆序映射。
+        let assignments = set.assignments(1);
         let fields = set.finish(ENTITY)?;
-        let sql = format!("UPDATE media SET {assignments} WHERE id = $1");
-
-        let query = fields.iter().fold(
-            sqlx::query_as::<_, Media>(safe_sql(sql)).bind(id),
-            |query, (_, value)| bind_value(query, value),
+        let sql = format!(
+            "UPDATE media SET {assignments} WHERE id = ${}",
+            fields.len() + 1
         );
 
-        let row = query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
 
-        row.ok_or_else(|| DbError::not_found(ENTITY, id))
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
     }
 
     /// 列出待生成缩略图的媒体。
@@ -210,6 +286,15 @@ impl MediaRepository {
     /// 索引是 `(thumbnail_generation_state, thumbnail_next_retry_at)`，
     /// 所以只有 `retry_wait` 且已到期的行会被这个查询命中 —— 与
     /// [`thumbnail_state::is_retryable`] 的口径一致。
+    ///
+    /// **刻意不分页。** 这是 worker 循环驱动的队列扫描，语义是
+    /// 「给我 N 条待办」而不是「第 N 页待办」：
+    ///
+    /// - 分页会让 worker 反复取第 1 页，而队列是持续增长的
+    /// - `total` 对它毫无用处——没人要显示「共 N 个待办」
+    /// - 队列深度由 `limit` 与 `updated_at` 退避共同控制，不需要总数
+    ///
+    /// 真正需要分页的是给人看的列表（见 [`list_by_library`](Self::list_by_library)）。
     pub async fn list_pending_thumbnails(&self, limit: i64) -> Result<Vec<Media>, DbError> {
         let now = crate::common::time::now_utc();
         let rows = sqlx::query_as::<_, Media>(
@@ -237,6 +322,19 @@ impl MediaRepository {
         error_code: &str,
         next_retry_at: NaiveDateTime,
     ) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_failure_in(&mut ctx, id, error_code, next_retry_at)
+            .await
+    }
+
+    /// [`Self::record_thumbnail_failure`] 的事务内变体。见 [`Ctx`]。
+    pub async fn record_thumbnail_failure_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
         let row = sqlx::query_as::<_, Media>(
             "UPDATE media SET \
                 thumbnail_generation_state = $2, \
@@ -252,7 +350,7 @@ impl MediaRepository {
         .bind(error_code)
         .bind(next_retry_at)
         .bind(crate::common::time::now_utc())
-        .fetch_optional(&self.pool)
+        .fetch_optional(ctx.conn().await?.as_conn())
         .await?
         .ok_or_else(|| DbError::not_found(ENTITY, id))?;
 
@@ -261,6 +359,20 @@ impl MediaRepository {
 
     /// 标记缩略图生成成功（进入终态）。
     pub async fn record_thumbnail_success(&self, id: i32) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_success_in(&mut ctx, id).await
+    }
+
+    /// [`Self::record_thumbnail_success`] 的事务内变体。见 [`Ctx`]。
+    ///
+    /// 「缩略图生成」用例需要它与
+    /// [`MediaThumbnailRepository::upsert_in`](super::playback::MediaThumbnailRepository::upsert_in)
+    /// 在同一事务里 —— 见 [`super::UnitOfWork`]。
+    pub async fn record_thumbnail_success_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+    ) -> Result<Media, DbError> {
         let row = sqlx::query_as::<_, Media>(
             "UPDATE media SET \
                 thumbnail_generation_state = $2, \
@@ -274,7 +386,7 @@ impl MediaRepository {
         .bind(id)
         .bind(thumbnail_state::SUCCEEDED)
         .bind(crate::common::time::now_utc())
-        .fetch_optional(&self.pool)
+        .fetch_optional(ctx.conn().await?.as_conn())
         .await?
         .ok_or_else(|| DbError::not_found(ENTITY, id))?;
 
@@ -313,7 +425,7 @@ mod tests {
             resolution: None,
             file_hash: None,
             import_source_identity: None,
-            duration_seconds: None,
+            duration_seconds: 0,
             video_info: None,
         }
     }
@@ -334,9 +446,26 @@ mod tests {
 
     #[test]
     fn empty_file_name_is_rejected_before_touching_db() {
+        // 断言的是 `validate()` 的行为，不是 `str::trim` 的行为。
+        // 原先这里只写了 `assert!(m.file_name.trim().is_empty())` ——
+        // 一个恒真断言，`insert` 里的拒绝逻辑从未被执行过。
         let mut m = new_media(Some("ABC-001"), None);
         m.file_name = "   ".to_owned();
-        assert!(m.file_name.trim().is_empty());
+        let err = m.validate().expect_err("空白 file_name 应被拒绝");
+        assert!(matches!(err, DbError::Business { .. }), "应为业务错误(422)");
+        assert!(err.to_string().contains("file_name"), "{err}");
+
+        // 归属错误优先于文件名错误：XOR 是更根本的不变量。
+        let mut both = new_media(Some("ABC-001"), Some(7));
+        both.file_name = "  ".to_owned();
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("恰好归属"));
+
+        // 正常输入通过
+        assert!(new_media(Some("ABC-001"), None).validate().is_ok());
     }
 
     #[test]
