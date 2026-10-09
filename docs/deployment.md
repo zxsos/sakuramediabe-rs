@@ -217,9 +217,9 @@ def _parse_torrent_hash(payload: bytes) -> str:
 | 插件 | 体量（py，不含 tests） | 状态 | 难度 |
 |---|---|---|---|
 | `sakuramedia_javbus_metadata` | 12 KB | ✅ **已完成 Rust 移植** | — |
-| `sakuramedia_judge_collecttion_movie` | 5.7 KB | ⬜ | 最小 |
+| `sakuramedia_judge_collecttion_movie` | 5.7 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-judge-collecttion-movie`）| — |
 | `sakuramedia_javdb_ranking` | 10 KB | ⬜ | 小 |
-| `sakuramedia_subtitlecat` | 23 KB | ⬜ | 中（HTTP 抓取 + 解析） |
+| `sakuramedia_subtitlecat` | 23 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-subtitlecat`）| — |
 | `sakuramedia-actor-metadata` | 30 KB | ⬜ | 中 |
 | `sakuramedia_local_provider` | **172 KB** | ⬜ | **难 —— 分水岭** |
 | `sakuramedia_115_provider` | **251 KB** | ⬜ | **最难 —— 最后一关** |
@@ -240,6 +240,22 @@ def _parse_torrent_hash(payload: bytes) -> str:
 
 **判据**：每个插件都有 `<plugin_id>` 二进制、宿主能拉起、扩展点声明被
 `collect_extensions` 收下。已有样板：`plugin-ref-local` 与 `javbus-metadata`。
+
+**进度（2026-10-08）**：两个已移植，各在新仓里自带 46 / 49 项测试（都**真的拉起
+本仓二进制**跑完整流程）：
+
+- `judge_collecttion_movie` → `sakuramedia-judge-collecttion-movie`，它要的宿主能力
+  **也已接线**（`ListMovies` / `PatchMovie`，身份走「每个插件一个能力出口端点」，
+  见 [`plugin-abi.md`](plugin-abi.md) 的已知缺口；快照补齐 6 个可写字段）。
+- `subtitlecat` → `sakuramedia-subtitlecat`，抓取/解析自足，**宿主侧的
+  `ImportSubtitle` 也已接线**（转发 `sm-service` 的 `SubtitleAssetService`：查影片 →
+  扩展名白名单 → 内容 sha256 去重 → 落盘 → 登记）。跨仓冒烟里它跑完了整条链路：
+  宿主拉起二进制 → 插件去假站点抓 → 回调 `ImportSubtitle` → 库里多一行字幕、文件落在
+  图片根下面。
+
+剩两个各有前提：`actor-metadata` 要演员那组 rpc（与影片侧同构），`javdb_ranking`
+要宿主提供的 JavDB 客户端（或把抓取整段搬进插件）。逐条清单见
+[`handoff.md`](handoff.md) §8.2 表后的块。
 
 ### 阶段 B · **入库路径**（让插件产出真的有用）
 

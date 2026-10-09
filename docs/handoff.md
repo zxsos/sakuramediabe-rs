@@ -2404,12 +2404,51 @@ provider 插件上**。剩下 18 条各自有独立卡点。
 | # | 做什么 | 为什么先它 | 完成判据 |
 |---|---|---|---|
 | ① | **修契约分叉**（详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md)）。~~原先写的是「proto 三个缺口决策」~~ —— 核对后发现 **P1-1 / P1-3 / P1-4 都已在本仓落地**，剩下的是「两仓契约不同步」：宿主的 `proto/` 与 `src/` 已前进，而契约仓 tag `v0.1.0` 是旧版，`ABI_MAJOR` 两边还都是 1 | 旧插件**能编译但跑不通**：`GenerateThumbnails` 两侧消息类型不同（旧 `stream ProgressEvent` vs 新 `stream GenerateThumbnailsResponse`），`field 2` 的 wire type 不匹配 → 宿主报「解码失败」，而真实原因在日志里看不到 | ✅ **已做完**（2026-10-08）。契约仓改放 GitHub [`zxsos/sakuramedia-plugin-api`](https://github.com/zxsos/sakuramedia-plugin-api)（public；`main` + `v0.1.0` + `v0.2.0`；本地 `cnb.cool` 远端**已删除**，发布源改指 GitHub）→ 两个插件改指 `v0.2.0` → `plugin-ref-local` 的 `done` 帧按**宿主内置副本**镜像过去（宿主侧早已实现，`GAP:` 注释删掉）。判据：两插件 `cargo test` 绿（`ref-local` 13 项 / `javbus` 33 项）、`parity/check_contract_sync.py` 报 9 个受管文件一致。详版见 [`tasks/proto-p1-gaps.md`](tasks/proto-p1-gaps.md) §零 |
-| ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有两个 | 二进制 `<plugin_id>` 能被宿主拉起；扩展点被 `collect_extensions` 收下；`run_job` 有实现（不返回 `unimplemented`） |
+| ② | **小插件扫尾**：`judge_collecttion_movie`(5.7KB) → `javdb_ranking`(10KB) → `subtitlecat`(23KB) → `actor-metadata`(30KB) | 每个插件都要缴一遍「生命周期协议 + 注册 + 交付校验」的税；**小插件把这笔税缴完**，后面的大插件才只处理业务逻辑。样板已有两个 | ⚠️ **2/4 已完成**（2026-10-08）。`judge_collecttion_movie` → 新仓 `sakuramedia-judge-collecttion-movie`（`9726828`，46 项测试绿，宿主侧两个 rpc 已接）；`subtitlecat` → 新仓 `sakuramedia-subtitlecat`（`b7131db`，49 项测试绿，两个任务与本地假站点/假宿主全跑通）。两个都是「只有后台任务、没有扩展点」，且两条都已在跨仓冒烟里对着**真宿主 + 真库**跑通（`plugin_launch_smoke`）。**另两个各有 ABI 前提没齐**，别照前两个的样子硬套 —— 逐条见下表后的块 |
 | ③ | **入库路径**（`catalog` 域的「插件元数据 → 库表」） | **当前最被低估的缺口**：`docs/tasks/javbus-metadata.md` §二 写着「拿到校验过的结果也没处写」。不补，② 的插件全是空转 | ⚠️ **第一段已通**（`aeff054`）：`import_by_number` + 窄接口补 `find_movie_id` / `import_plugin_movie` + 4 单测 + 3 个真库测试。**剩 `impl MovieMetadataImporter`** —— 卡在接口冲突（那个 trait 的方法签名**没有 config**，而 `fetch` / `fetch_plugin` 要看 `plugins.enabled` 的顺序），两条走法待拍板 |
 | ④ | **P1-2 决策**：`PlaybackPlan` 加 `local_path` delivery | 同域反证：`OpenCoverSourceResponse` 早有 `oneof { local_path, url }`，唯独播放计划没有。**必须在阶段 ⑤ 之前定**，否则 `local_provider` 要先按 `file://` 写一遍再改 | `PlaybackPlan.oneof delivery` 有 `LocalPathPlan local_path = 3`；`docs/plugin-abi.md` 写明三种 delivery 的适用场景 |
 | ⑤ | **`svc-probe`（ffprobe）** | 解锁 4 个文件（`media_metadata_probe` 338 / `media_video_info_backfill` 232 / `thumbnails/artifacts` 204 / `video_cover`）。上游对 PyAV 缺失是**降级**，所以它不阻塞「能用」但阻塞「完整」 | 上述文件的 `todo!()` 清零；媒体时长/分辨率被真写入 |
 | ⑥ | **`local_provider` 的 Rust 版**（172KB，**分水岭**） | 做完同时发生三件事：本地库+播放闭环、**`libtorrent` 整条可扔**（`deployment.md` §3.1：三处用法全是「种子 → info hash」，`svc-hash` 已覆盖）、宿主第一次承载真干活的 provider | `Browse` / `PlanPlayback` / `GenerateThumbnails` / `ScanImportSource` 四大能力可用；`playback` 域能接上 |
 | ⑦ | **`115_provider` 的 Rust 版**（251KB，**最后一关**） | 含 HLS 读取 / range reader / 加密 / 离线下载。**只有它完成，Python 运行时才能从部署里删掉**。只影响网盘用户，故最后 | `deployment.md` §五 的判据清单**全部勾上** |
+
+> **② 剩下三个各自的 ABI 前提**（2026-10-08 核对，逐条给落点）：
+>
+> | 插件 | 它要的宿主能力 | 现状 |
+> |---|---|---|
+> | `judge_collecttion_movie` | `ListMovies` / `PatchMovie`，且快照要带 `is_collection` | ✅ **已接**（2026-10-08）：两个 rpc 落地（游标分页 / 主权网关）+ 快照补上全部 6 个可写字段；真库测试 `sm-server/tests/plugin_host_integration.rs` |
+> | `javdb_ranking` | 上游 `context.build_javdb_provider(username, password)` —— **宿主提供的 JavDB 客户端**；另有单榜同步入口 | 前者 ABI 里**没有对等物**：要么给一条宿主 API，要么把 JavDB 抓取整段搬进插件（那就不再是「小插件」）。后者 `host.proto` 只有 `SyncRankingSources`（批量），没有单榜那条 |
+> | `subtitlecat` | `ImportSubtitle`（**不是** `ListSubtitles` —— 读过源码订正过：它抓回字幕直接导入，不查已有字幕）| ✅ **已接**：宿主侧只是转发 `SubtitleAssetService::import_subtitle_content`（上游逐行对拍的那份），四个状态是**结果**不是错误；真库测试 `import_subtitle_*` 四例 + 跨仓冒烟里跑完整条链路 |
+> | `actor-metadata` | `ListActors` / `PatchActor` | 同为 `unwired!`。注意它 manifest 里的 `host_api_version: 6` 是 **Python 侧**的版本号，别当 ABI 用 |
+>
+> **两个新发现的契约缺口**（都不在 `tasks/proto-p1-gaps.md` 的 P1 清单里）：
+>
+> 1. ~~**写操作没有「调用方是谁」的通道**~~ → ✅ **已定并落地**（2026-10-08）：
+>    不动契约，改成**每个插件一个能力出口端点** —— `plugin_host::serve_for(db,
+>    plugin_id)`，组合根为 `enabled` 里的每个插件各起一个；`PluginConfig` 的
+>    `host_endpoint` 随之变成 `host_endpoints: plugin_id -> 端点` 的映射。
+>    理由：契约 v0.2.0 的 `PatchMovieRequest` 里没有身份字段，而**自报不如分配**
+>    （宿主知道谁连上来的，不必相信它说的）；往请求里加字段那条路要动契约仓 +
+>    版本闸门，留到「真要跨进程复用同一个端点」时再说。判据：
+>    `sm-server/tests/plugin_host_integration.rs` 的
+>    `another_plugins_endpoint_cannot_overwrite_the_field`（换个服务实例就写不动）。
+> 2. **`MovieSnapshot.owners` 是去重后的 owner 列表**，不是「字段 → owner」。
+>    上游判定类插件用 `owners.get("is_collection")` 判「这个字段归谁」，在 ABI 下
+>    没有对等物 —— 拿列表做判断会过度跳过（人工改过标题的影片永远不被判为合集）。
+>    移植时的处置（不做预检、把安全交给主权网关、被拒记 `patch_failed`）写在新仓
+>    README 与 `src/judge.rs` 的模块文档里。
+
+> **「宿主拉起插件」这一格怎么复现**：`cargo test -p sm-server --test
+> plugin_launch_smoke` —— 四个用例真拉起插件仓编译出的二进制并跑 `RunJob`：
+>
+> | 用例 | 断言 |
+> |---|---|
+> | 组合根 × 两个插件 | `Plugins::load` 能拉起它们、任务进任务目录 |
+> | judge 的任务 | 库里 `is_collection` 被写上、owner 是 `plugin:<id>`、版本 +1 |
+> | subtitlecat 的任务 | 插件去**假站点**（wiremock）抓到字幕 → 回调 `ImportSubtitle` → 库里多一行字幕、文件落在图片根下面 |
+>
+> 先按该文件的模块文档把插件产物摆到 `SM_SMOKE_PLUGIN_ROOT`（**两种缺法都响亮跳过**
+> 并说明原因，不装成通过）。两侧各自的测试只覆盖自己那半边，这条是唯一把 ABI 两边
+> 接起来的。
 
 ### 8.3 与后端域的并行关系
 

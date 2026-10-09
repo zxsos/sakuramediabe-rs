@@ -25,6 +25,7 @@
 //! 在构造时定死。所以重启后「这个插件新加的 cron 任务」要等下次进程启动才生效；
 //! 已经在调度表里的那些不受影响（入队照旧，能不能跑取决于插件活着没有）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,9 +61,15 @@ pub struct PluginConfig {
     pub settings: Map<String, Value>,
     /// `plugins.job_crons`：`plugin_id -> (task_key -> cron)`。
     pub job_crons: Map<String, Value>,
-    /// 宿主能力出口（`PluginHost`）的端点。`Plugins::load` 之前由
-    /// [`crate::plugin_host::serve`] 起好；`None` 时插件拿不到这个环境变量。
-    pub host_endpoint: Option<String>,
+    /// 宿主能力出口（`PluginHost`）的端点，**每个插件一个**：
+    /// `plugin_id -> 属于它的端点`。
+    ///
+    /// `Plugins::load` 之前由 [`crate::plugin_host::serve_for`] 起好；
+    /// 表里没有的插件拿不到这个环境变量（= 它这次不能回调宿主）。
+    ///
+    /// 一对一而不是共用一个：写操作的 owner 由「为谁起的那个端点」决定，
+    /// 见 `plugin_host` 模块文档的「身份由宿主分配」一节。
+    pub host_endpoints: HashMap<String, String>,
 }
 
 impl PluginConfig {
@@ -89,9 +96,9 @@ impl PluginConfig {
             enabled,
             settings: object_at(plugins, "settings"),
             job_crons: object_at(plugins, "job_crons"),
-            // 不从配置读：它是**宿主自己起的服务**的地址，由
-            // `crate::plugin_host::serve` 在拉起插件之前填进来。
-            host_endpoint: None,
+            // 不从配置读：它们是**宿主自己起的服务**的地址，由
+            // `crate::plugin_host::serve_for` 在拉起插件之前逐个填进来。
+            host_endpoints: HashMap::new(),
         }
     }
 
@@ -139,7 +146,9 @@ impl PluginConfig {
             args: Vec::new(),
             data_dir: self.data_dir_for(plugin_id),
             settings: self.settings_for(plugin_id),
-            host_endpoint: self.host_endpoint.clone(),
+            // 没起成功（或不在 `enabled` 里）就不给这个变量 —— 插件据此判断
+            // 「这次不能回调宿主」，而不是拿到一个必然连不上的地址。
+            host_endpoint: self.host_endpoints.get(plugin_id).cloned(),
             settings_path: None,
             ready_timeout: READY_TIMEOUT,
         }

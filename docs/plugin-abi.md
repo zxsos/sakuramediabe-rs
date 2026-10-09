@@ -70,10 +70,22 @@
 
 ## 已知缺口（贡献前请先看）
 
-- `PluginHost`（`proto/host.proto`）36 个 rpc 里**只有 3 个接了线**
-  （`GetMovie` / `FindMoviesByNumbers` / `GetActor`），其余返回
-  `Unimplemented`。缺口表见 `crates/sm-server/src/plugin_host.rs` 模块文档。
+- `PluginHost`（`proto/host.proto`）36 个 rpc 里**接了 6 个**
+  （`GetMovie` / `FindMoviesByNumbers` / `GetActor` / `ListMovies` /
+  `PatchMovie` / `ImportSubtitle`），其余返回 `Unimplemented`。缺口表见
+  `crates/sm-server/src/plugin_host.rs` 模块文档。
 - 注册期**不**校验「声明的能力 ↔ 是否 serve 了对应 service」——
   所以**虚报能力不会被发现**，请勿声明没实现的东西。
+- **写操作的身份是「端点」而不是请求字段**：`PatchMovieRequest` 里没有
+  `plugin_id`，而写入口要带 `owner = plugin:{id}`（`sm-db/src/repo/gateway.rs`
+  的 `patch_plugin`）。所以宿主为**每个启用的插件各起一个** `PluginHost`
+  （`sm-server/src/plugin_host.rs` 的 `serve_for`），插件连的那个端点定义了它是
+  谁 —— 宿主是**分配**身份，不是**相信**声明。往请求里加字段那条路要动契约仓与
+  版本闸门，留到「真要跨进程复用同一个端点」时再说。
+- **`MovieSnapshot.owners` 是去重后的 owner 列表**（「谁动过这行」），不是
+  「字段 → owner」。要判「某个字段归谁」的插件拿不到字段级信息 —— 那件事由
+  写入口（主权网关）兜住，不靠插件读快照。值的这一侧已经给全：快照带上
+  `PROTECTED_MOVIE_FIELDS` 的**全部 6 个字段**（含 `is_collection` /
+  `is_blacklisted`），判据是「**可写就得可读**」。
 - 契约仓还没拆成独立 git 仓库（`docs/plugin-api-split.md`），
   第三方暂时按 workspace 路径依赖。

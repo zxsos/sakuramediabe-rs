@@ -1370,6 +1370,29 @@ impl MovieRepository {
         .await?)
     }
 
+    /// 按 `id` 游标取一页，**升序**。语义：只取 `id > after_id` 的行。
+    ///
+    /// 插件能力出口的 `ListMovies` 用它（`crates/sm-server/src/plugin_host.rs`）。
+    /// 用游标而不是 `OFFSET`：判定/回写类插件会**边扫边写**，而写会改
+    /// `updated_at`（有的还会改排序键）—— `OFFSET` 在那种场景下会漏行或重扫。
+    ///
+    /// `limit` 是「最多几条」。调用方想判「还有下一页」，传 `limit + 1` 再看
+    /// 回来的条数有没有超：比 `OFFSET` 稳，也不必额外跑一次 `COUNT`，更不会
+    /// 因为恰好取满而多走一趟空查询。
+    pub async fn list_page_after_id(
+        &self,
+        after_id: i32,
+        limit: i64,
+    ) -> Result<Vec<Movie>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Movie>("SELECT * FROM movie WHERE id > $1 ORDER BY id LIMIT $2")
+                .bind(after_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
     /// 订阅：写订阅位，可选地同时把九列检索状态重置成「待抓取」。
     ///
     /// # 为什么手写 SQL 而不是 `UpdateSet`

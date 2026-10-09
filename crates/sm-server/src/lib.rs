@@ -143,9 +143,29 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // 4a. 宿主能力出口（`PluginHost`）。**必须在拉起插件之前** —— 端点靠环境变量
     //     注入，插件起来时它就得是能连的；反过来的话插件会拿到一个连不上的
     //     地址（或者干脆没有这个变量，而它分不清「宿主没起」和「我该重试」）。
-    match plugin_host::serve(&pool).await {
-        Ok(endpoint) => plugin_config.host_endpoint = Some(endpoint),
-        Err(error) => tracing::warn!(%error, "PluginHost 未能起服务：插件这次不能回调宿主"),
+    //
+    //     **每个启用的插件各起一个**：那个端点定义了写操作的 owner
+    //     （`plugin_host` 模块文档的「身份由宿主分配」）。只给 `enabled` 里的
+    //     插件起 —— 没被启用的插件根本不会被拉起，多一个监听只是白占端口。
+    for plugin_id in plugin_config.enabled.clone() {
+        // `&config_service`：能力出口里几件事要看配置 —— 现在是字幕落盘的位置
+        // （`media.import_image_root_path` 下面的 `<图片根>/movies/<shard>/<番号>/subtitles`）。
+        match plugin_host::serve_for(&pool, &config_service, &plugin_id).await {
+            Ok(endpoint) => {
+                plugin_config
+                    .host_endpoints
+                    .insert(plugin_id.clone(), endpoint);
+            }
+            Err(error) => {
+                // 单个插件起不来不影响别的：它这次拿不到这个变量，
+                // 于是「不能回调宿主」是**明确**的，而不是连一个空地址。
+                tracing::warn!(
+                    plugin_id,
+                    %error,
+                    "PluginHost 未能起服务：该插件这次不能回调宿主"
+                );
+            }
+        }
     }
     let loaded_plugins = plugins::Plugins::load(plugin_config).await;
     let plugin_specs = loaded_plugins.scheduler_specs();

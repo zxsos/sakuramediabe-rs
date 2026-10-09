@@ -53,3 +53,6 @@ sm-db = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+# 跨仓冒烟（tests/plugin_launch_smoke.rs）要给 `sakuramedia_subtitlecat` 一个**假
+# SubtitleCat 站点** —— 那条链路真的会去抓站点，而测试不许联网。
+wiremock = "0.6"
