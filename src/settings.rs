@@ -285,10 +285,15 @@ mod tests {
 
     #[test]
     fn the_translation_base_url_gets_a_v1_suffix() {
-        let mut s = Settings::default();
-        s.base_url = "https://api.example.com".to_owned();
+        let s = Settings {
+            base_url: "https://api.example.com".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(s.translation_base_url(), "https://api.example.com/v1");
-        s.base_url = "https://api.example.com/v1".to_owned();
+        let s = Settings {
+            base_url: "https://api.example.com/v1".to_owned(),
+            ..Default::default()
+        };
         assert_eq!(s.translation_base_url(), "https://api.example.com/v1");
         s.base_url = "https://api.example.com/v1/".to_owned();
         assert_eq!(s.translation_base_url(), "https://api.example.com/v1");

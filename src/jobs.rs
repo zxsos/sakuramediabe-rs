@@ -628,8 +628,10 @@ mod tests {
     #[derive(Default)]
     struct MemStore {
         movies: Mutex<HashMap<i64, MovieRef>>,
-        patched: Mutex<Vec<(i64, Option<String>, Option<String>)>>,
+        patched: Mutex<Vec<PatchedEntry>>,
     }
+
+    type PatchedEntry = (i64, Option<String>, Option<String>);
 
     impl MemStore {}
 
