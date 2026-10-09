@@ -202,8 +202,11 @@ def _parse_torrent_hash(payload: bytes) -> str:
 - [x] `sm-server` 单进程替代 uvicorn + aps（含配置、日志、优雅关闭）
 - [x] OpenCV / numpy 的用处被 `svc-image` 替代
 - [x] `libtorrent` 主后端那处被 `svc-hash` 替代
-- [ ] **`svc-probe`（ffprobe）落地** —— 解锁 `media_metadata_probe_service`(338)、
-      `media_video_info_backfill_service`(232)、`video_cover_service`
+- [x] **`svc-probe`（ffprobe）落地**（2026-10-09，`crates/svc-probe`：真跑 `ffprobe`
+      CLI + JSON 解析 + 远端 reader 落盘；`media_metadata_probe` 那处接缝已换上）。
+      消费方进度：`media_file_hash_backfill` / `media_video_info_backfill` /
+      `media_validity_scan` 已接（2026-10-09，4 + 5 + 3 项集成测试）；
+      `video_cover_service` 仍是 `todo!()`
 - [ ] **zip 实现** —— 解锁 `media_thumbnail_pack_backfill_service`(216)（仓库当前无 zip crate）
 - [ ] `catalog` 入库路径（插件元数据 → 库表），见 §6 第 3 条
 - [ ] 剩余域推进到「客户端用到的路径都有实现」（`playback` 16 / `catalog` 9 / `transfers` 10 个文件）
@@ -218,9 +221,9 @@ def _parse_torrent_hash(payload: bytes) -> str:
 |---|---|---|---|
 | `sakuramedia_javbus_metadata` | 12 KB | ✅ **已完成 Rust 移植** | — |
 | `sakuramedia_judge_collecttion_movie` | 5.7 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-judge-collecttion-movie`）| — |
-| `sakuramedia_javdb_ranking` | 10 KB | ⬜ | 小 |
+| `sakuramedia_javdb_ranking` | 10 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-javdb-ranking`）| — |
 | `sakuramedia_subtitlecat` | 23 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-subtitlecat`）| — |
-| `sakuramedia-actor-metadata` | 30 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-actor-metadata`）| — |
+| `sakuramedia_actor_metadata` | 30 KB | ✅ **已完成 Rust 移植**（独立仓 `sakuramedia-actor-metadata`）| — |
 | `sakuramedia_local_provider` | **172 KB** | ⬜ | **难 —— 分水岭** |
 | `sakuramedia_115_provider` | **251 KB** | ⬜ | **最难 —— 最后一关** |
 

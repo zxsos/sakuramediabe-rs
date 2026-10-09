@@ -58,7 +58,8 @@ use sm_plugin_api::v1::storage_provider_client::StorageProviderClient;
 use sm_plugin_api::v1::{
     generate_thumbnails_response, AbortImportRequest, ComputeFileHashRequest,
     DeleteImportFileRequest, DeleteMediaRequest, FinalizeImportRequest, GenerateThumbnailsRequest,
-    LibraryHandle, MediaHandle, ProviderErrorCode, ScanImportSourceRequest, SourceDisposition,
+    LibraryHandle, ManagedMediaRefKeyRequest, MediaHandle, ProbeVideoInfoRequest,
+    ProviderErrorCode, ScanImportSourceRequest, ScanManagedMediaRefKeysRequest, SourceDisposition,
     StageImportFileRequest, ThumbnailGeneration,
 };
 use tonic::transport::Channel;
@@ -562,6 +563,73 @@ pub async fn compute_file_hash_call(
         .map_err(|status| classify_status(provider_key, "compute_file_hash", status))?
         .into_inner()
         .file_hash)
+}
+
+/// 探测媒体的完整技术信息。上游 `StorageProvider.probe_video_info`。
+///
+/// 返回的是 provider 自己的探测字典（`{"container": …, "video": …}`）转成的
+/// JSON —— **宿主不解释它的结构**，取 `container.duration_seconds` /
+/// `video.width|height` 是服务层（`media_video_info_backfill`）的事。
+///
+/// `None` = provider 明确回了「没有信息」（proto 里 `optional` 未设）。
+/// 这与「不支持探测」（`unsupported` 状态码）是两回事。
+pub async fn probe_video_info_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    media: MediaHandle,
+) -> Result<Option<serde_json::Value>, ProviderOperationError> {
+    let info = client
+        .probe_video_info(ProbeVideoInfoRequest {
+            library: Some(library),
+            media: Some(media),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "probe_video_info", status))?
+        .into_inner()
+        .video_info;
+    Ok(info.map(|info| sm_plugin_api::json_struct::struct_to_json(Some(&info))))
+}
+
+/// provider 管理的**全量**引用 key 清单。上游
+/// `StorageProvider.scan_managed_media_ref_keys`。
+///
+/// 「管理」= provider 自己认领的媒体文件；字幕、封面、别的工具留下的文件
+/// 不在里头 —— 所以它能当**对账**的否定证据（见 `media_validity_scan`）。
+pub async fn scan_managed_media_ref_keys_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+) -> Result<Vec<String>, ProviderOperationError> {
+    Ok(client
+        .scan_managed_media_ref_keys(ScanManagedMediaRefKeysRequest {
+            library: Some(library),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "scan_managed_media_ref_keys", status))?
+        .into_inner()
+        .keys)
+}
+
+/// 单个存储引用的归一 key。上游 `StorageProvider.managed_media_ref_key`。
+///
+/// 与上面的全量清单**配对使用**：单条现算的 key 拿去清单里查成员。
+/// `media_ref` 是媒体行的 `storage_ref`（provider 的命名空间，宿主不解释）。
+pub async fn managed_media_ref_key_call(
+    client: &mut StorageProviderClient<Channel>,
+    provider_key: &str,
+    library: LibraryHandle,
+    media_ref: serde_json::Value,
+) -> Result<String, ProviderOperationError> {
+    Ok(client
+        .managed_media_ref_key(ManagedMediaRefKeyRequest {
+            library: Some(library),
+            media_ref: sm_plugin_api::json_struct::json_to_struct(&media_ref),
+        })
+        .await
+        .map_err(|status| classify_status(provider_key, "managed_media_ref_key", status))?
+        .into_inner()
+        .key)
 }
 
 /// 宿主侧的 [`ImportFileEntry`] → proto 的 `ImportFile`（回传时原样带回去）。

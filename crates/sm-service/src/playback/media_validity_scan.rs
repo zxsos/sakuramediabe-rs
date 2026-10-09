@@ -30,29 +30,52 @@
 //! 对账期间可能有导入在写同一个库。所以要拿**库锁**（见
 //! [`super::operation_locks`]），不是媒体锁。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
+use sm_db::repo::{MediaLibraryRepository, MediaRepository};
+use sm_db::Db;
+
+use crate::catalog::movie_asset_pack_backfill::ProgressSink;
 use crate::error::ServiceError;
+use crate::playback::operation_locks::MediaOperation;
+use crate::playback::provider_helpers::{
+    json_or_null, library_handle_for, LibraryRecord, StorageGateway, PROVIDER_UNSUPPORTED,
+};
 
 /// 任务键。与 `cron_spec::builtin_jobs` 里的 `media_file_scan` 一致。
 pub const TASK_KEY: &str = "media_file_scan";
 
 /// 巡检统计。
+///
+/// # 键与上游 stats 字典逐键对齐（`:73-85`）
+///
+/// `scanned_libraries` / `scanned_media` / `updated_media` / `unchanged_media` /
+/// `invalidated_media` / `revived_media` / `skipped_media` / `failed_media` /
+/// `scanned_libraries` / `failed_libraries` 十个一一对应；上游的
+/// `unsupported_libraries` 是**计数**，这里扩成**名字列表**（扩展项 ①）——
+/// 「哪些库不支持」正是本任务要给用户看的，一个数没法排障。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ValidityScanStats {
-    /// 扫了几个库。
+    /// 真正做了对账的库数。
     pub scanned_libraries: i32,
-    /// ★ **不支持**扫描的库（列在这里是为了让用户看见，见模块文档）。
+    /// ★ **不支持**扫描的库（provider_key；列出来是为了让用户看见，见模块文档）。
     pub unsupported_libraries: Vec<String>,
-    /// provider 侧报告的文件总数。
+    /// 拉清单失败的库数（与「不支持」分开：前者是坏消息，后者是合法状态）。
+    pub failed_libraries: i32,
+    /// provider 侧报告的文件总数（扩展项 ②）。
     pub remote_file_count: i64,
-    /// ★ 被判定为失效的媒体数（**确定**不在清单里）。
-    pub marked_invalid: i32,
-    /// ★ 库里有、但 provider 清单里没有的存储引用数。
-    pub missing_from_remote: i32,
-    /// ★ 重新标记为有效的数量。
-    pub marked_valid: i32,
-    /// 各库的错误（**不中断**整批）。
+    pub scanned_media: i32,
+    pub updated_media: i32,
+    pub unchanged_media: i32,
+    pub invalidated_media: i32,
+    pub revived_media: i32,
+    pub skipped_media: i32,
+    pub failed_media: i32,
+    /// ★ 库里有、但 provider 清单里没有的**去重** key 数（扩展项 ③：上游没有
+    /// 这个计数；只报不改，理由见 [`reconcile`] 的文档）。
+    pub missing_from_remote: i64,
+    /// 拉清单失败的库的 `(库, 原因)`（与 `failed_libraries` 配套）。
     pub library_errors: Vec<(String, String)>,
 }
 
@@ -125,16 +148,250 @@ pub struct ReconcileOutcome {
 }
 
 /// 有效性巡检服务。
-pub struct MediaValidityScanService;
+///
+/// # 依赖是注入的
+///
+/// 与 [`super::media_file_hash_backfill`] 同一取向：[`StorageGateway`] 是
+/// trait，组合根注入真的 `ProviderGateway`，测试注入可编程的桩。
+pub struct MediaValidityScanService {
+    db: Db,
+    storage: Arc<dyn StorageGateway>,
+    media: MediaRepository,
+    libraries: MediaLibraryRepository,
+}
 
 impl MediaValidityScanService {
-    /// ★ 跑一轮。任务执行体。
+    /// 构造。
+    pub fn new(db: &Db, storage: Arc<dyn StorageGateway>) -> Self {
+        Self {
+            db: db.clone(),
+            storage,
+            media: MediaRepository::new(db.clone()),
+            libraries: MediaLibraryRepository::new(db.clone()),
+        }
+    }
+
+    /// ★ 跑一轮。任务执行体。上游 `scan_media_validity(cls, *, reporter)`。
     ///
-    /// 逐库：能力探测 -> 拿**库锁** -> 拉 provider 全量清单 -> 对账 -> 释放锁。
+    /// 逐库：拿**库锁**（被占 = 整库跳过）-> 重读库行 -> 拉库内媒体 ->
+    /// 能力探测（拉全量清单）-> 逐条算 key -> 对账 -> 批量落库 -> 释放锁。
     ///
-    /// 单库失败只记入 `library_errors`，**不中断**整批。
-    pub async fn scan_media_validity(&self) -> Result<ValidityScanStats, ServiceError> {
-        todo!("骨架：逐库 -> getattr 式能力探测(不支持则记 unsupported) -> 取库锁 -> 拉清单 -> reconcile")
+    /// # 三档「这库扫不了」，去向各不相同
+    ///
+    /// | 情况 | 去向 | 上游 |
+    /// |---|---|---|
+    /// | 两个能力方法缺一个 | `unsupported_libraries` | `:135-136` |
+    /// | 拉清单失败（网络/权限） | `failed_libraries` + `library_errors` | `:125-133` |
+    /// | 库锁被占 | 整库媒体计入 `skipped_media` | `:182-186` |
+    ///
+    /// # 单条 key 现算，成批对账
+    ///
+    /// `managed_media_ref_key` 逐条调（`storage_ref` 是 provider 的命名空间，
+    /// 脏数据它有权拒）→ 失败计入 `failed_media`；算出的 `(media_id, key)`
+    /// 成批交给 [`reconcile`]，再按 `valid_before` 分桶批量落库 ——
+    /// 上游是逐条 UPDATE（`:167-171`），批量版语义相同（WHERE 带旧状态），
+    /// 一个十万行的库少十万次往返。
+    pub async fn scan_media_validity(
+        &self,
+        mut progress: Option<ProgressSink<'_>>,
+    ) -> Result<ValidityScanStats, ServiceError> {
+        let mut stats = ValidityScanStats::default();
+        let mut completed = 0i64;
+
+        for library in self.libraries.list_ordered().await? {
+            let lock = match MediaOperation::try_library(&self.db, library.id).await {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    // 库锁被占（导入正在写这个库）：整库跳过，不排队
+                    // （上游 `:182-186`）。
+                    let skipped = self
+                        .media
+                        .list_scan_items_by_library(library.id)
+                        .await?
+                        .len();
+                    stats.skipped_media += i32::try_from(skipped).unwrap_or(i32::MAX);
+                    completed += skipped as i64;
+                    Self::emit(progress.as_mut(), completed, &stats).await;
+                    continue;
+                }
+                // 取锁失败是 DB 层的问题：传播出去让任务以失败结束。
+                Err(error) => return Err(error),
+            };
+
+            // 库行可能刚被删（锁等到了，库没了）：上游 `:117-119` 同样重读。
+            let outcome = match self.libraries.find_by_id(library.id).await? {
+                None => Ok(()),
+                Some(library) => {
+                    let items = self.media.list_scan_items_by_library(library.id).await?;
+                    if items.is_empty() {
+                        // 空库连能力探测都不做（上游 `:121-122`）。
+                        Ok(())
+                    } else {
+                        self.scan_one_library(
+                            &library,
+                            items,
+                            &mut stats,
+                            &mut completed,
+                            &mut progress,
+                        )
+                        .await
+                    }
+                }
+            };
+            lock.release().await;
+            outcome?;
+        }
+
+        Ok(stats)
+    }
+
+    /// 对一个库做完整巡检。`Err` 只表示**这一库**失败，调用方记入
+    /// `library_errors` 后继续。
+    async fn scan_one_library(
+        &self,
+        library: &sm_db::MediaLibrary,
+        items: Vec<(i32, bool, Option<String>)>,
+        stats: &mut ValidityScanStats,
+        completed: &mut i64,
+        progress: &mut Option<ProgressSink<'_>>,
+    ) -> Result<(), ServiceError> {
+        // 能力探测 = 拉全量清单。两个方法**配对**（缺单条 key 计算也一样算不支持），
+        // 这里拉清单失败就整体按「不支持」档处理 —— 上游 `:44-48` 与 `:123-136`。
+        let handle = library_handle_for(&LibraryRecord {
+            id: i64::from(library.id),
+            provider_key: library.provider_key.clone(),
+            provider_config: json_or_null(library.provider_config.as_deref()),
+            account_key: library.account_key.clone(),
+        });
+        let remote = match self.storage.scan_managed_media_ref_keys(&handle).await {
+            Ok(keys) => {
+                stats.scanned_libraries += 1;
+                stats.remote_file_count += keys.len() as i64;
+                BTreeSet::from_iter(keys)
+            }
+            Err(failure) => {
+                let label = format!("{}#{}", library.provider_key, library.id);
+                if failure.code == PROVIDER_UNSUPPORTED {
+                    stats.unsupported_libraries.push(label);
+                } else {
+                    stats.failed_libraries += 1;
+                    stats
+                        .library_errors
+                        .push((label.clone(), failure.safe_message.clone()));
+                    tracing::warn!(
+                        library_id = library.id,
+                        provider_key = %library.provider_key,
+                        code = %failure.code,
+                        "媒体有效性巡检：拉取 provider 清单失败"
+                    );
+                }
+                // 这库的媒体一条都没检查，但**不是失败**（unsupported）/
+                // 不是逐条失败（拉清单失败是库级故障）—— 都计入 skipped。
+                stats.skipped_media += i32::try_from(items.len()).unwrap_or(i32::MAX);
+                *completed += items.len() as i64;
+                Self::emit(progress.as_mut(), *completed, stats).await;
+                return Ok(());
+            }
+        };
+
+        // 逐条算 key；算不出的（脏 storage_ref）计入 failed_media，不进对账。
+        let mut valid_before = HashMap::new();
+        let mut local: Vec<(i64, String)> = Vec::with_capacity(items.len());
+        for (media_id, was_valid, storage_ref) in &items {
+            *completed += 1;
+            let media_ref = json_or_null(storage_ref.as_deref());
+            let usable = media_ref.is_null()
+                || storage_ref
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty();
+            let key = if usable {
+                None
+            } else {
+                self.storage
+                    .managed_media_ref_key(&handle, media_ref)
+                    .await
+                    .ok()
+            };
+            match key {
+                Some(key) => {
+                    stats.scanned_media += 1;
+                    valid_before.insert(i64::from(*media_id), *was_valid);
+                    local.push((i64::from(*media_id), key));
+                }
+                None => {
+                    // provider 拒绝这条引用（或行根本没有 storage_ref）：
+                    // 它的有效性**没法判**，标失效会是冤案。
+                    stats.failed_media += 1;
+                    tracing::warn!(
+                        media_id,
+                        library_id = library.id,
+                        "storage_ref 无法归一成引用 key，跳过有效性判定"
+                    );
+                }
+            }
+            Self::emit(progress.as_mut(), *completed, stats).await;
+        }
+
+        let outcome = reconcile(&local, &remote);
+        stats.missing_from_remote += outcome.missing_from_remote;
+
+        // 按 valid_before 分桶：目标状态与现状相同的进 unchanged，不同的才落库。
+        let mut to_revive = Vec::new();
+        let mut to_invalidate = Vec::new();
+        for media_id in &outcome.mark_valid {
+            match valid_before.get(media_id) {
+                Some(false) => to_revive.push(*media_id as i32),
+                _ => stats.unchanged_media += 1,
+            }
+        }
+        for media_id in &outcome.mark_invalid {
+            match valid_before.get(media_id) {
+                Some(true) => to_invalidate.push(*media_id as i32),
+                _ => stats.unchanged_media += 1,
+            }
+        }
+
+        let revived = self.media.set_validity(&to_revive, true, true).await?;
+        let invalidated = self
+            .media
+            .set_validity(&to_invalidate, false, false)
+            .await?;
+        stats.revived_media += i32::try_from(revived).unwrap_or(i32::MAX);
+        stats.invalidated_media += i32::try_from(invalidated).unwrap_or(i32::MAX);
+        stats.updated_media += stats.revived_media + stats.invalidated_media;
+        // 批量 UPDATE 少于预期的部分 = 并发改了状态（WHERE 没命中）→ skipped。
+        let raced = (to_revive.len() + to_invalidate.len())
+            .saturating_sub((revived + invalidated) as usize);
+        stats.skipped_media += i32::try_from(raced).unwrap_or(i32::MAX);
+        Ok(())
+    }
+
+    /// 进度上报。上游 `emit_progress`（`:90-112`）的形状；sink 失败只 warn。
+    async fn emit(
+        progress: Option<&mut ProgressSink<'_>>,
+        completed: i64,
+        stats: &ValidityScanStats,
+    ) {
+        let Some(progress) = progress else {
+            return;
+        };
+        let summary = serde_json::to_value(stats).ok();
+        let text = format!(
+            "媒体文件巡检 · 已检查 {completed} · 未变化 {} · 失效 {} · 恢复 {} · 失败 {}",
+            stats.unchanged_media, stats.invalidated_media, stats.revived_media, stats.failed_media
+        );
+        if let Err(error) = progress(
+            Some(i32::try_from(completed).unwrap_or(i32::MAX)),
+            None,
+            &text,
+            summary.as_ref(),
+        )
+        .await
+        {
+            tracing::warn!(error = %error, "媒体有效性巡检的进度上报失败");
+        }
     }
 }
 

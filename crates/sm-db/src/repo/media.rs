@@ -268,6 +268,211 @@ impl MediaRepository {
         )
     }
 
+    /// 缺 `file_hash` 的媒体 id（`IS NULL` **或**空串），按 id 排序。
+    ///
+    /// 上游 `_candidate_ids`（`media_file_hash_backfill_service.py:21-34`）的
+    /// 条件是 `is_null(True) | (== "")`。**空串也算缺** —— 空串不是 NULL，
+    /// 只查 `IS NULL` 会漏掉「provider 曾回过空哈希」的行，而那种行恰恰
+    /// 是最该重算的（见 [`Self::set_file_hash`] 的说明）。
+    ///
+    /// `ORDER BY id`：让同一媒体库里的文件尽量相邻（id 是导入顺序的近似），
+    /// 对同一个远端存储的连续读取友好。上游同样按 id 排。
+    pub async fn list_missing_file_hash_ids(&self) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM media \
+                 WHERE file_hash IS NULL OR file_hash = '' \
+                 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 只更新 `file_hash` 一列。上游 `media.save(only=[Media.file_hash])`。
+    ///
+    /// # 只写这一列，却仍刷 `updated_at`
+    ///
+    /// 与本仓其它 `UPDATE` 一致（`updated_at = now()`）。上游 peewee 的
+    /// `save(only=...)` 是否顺带动 `modified_at` 取决于模型钩子，**不核对就
+    /// 别假装逐字一致** —— 但「列表页按更新时间排序」把回填完的片子顶到最前
+    /// 是无害的（它确实刚被改过），而漏刷会让增量同步漏掉它，方向相反。
+    pub async fn set_file_hash(&self, id: i32, file_hash: &str) -> Result<Media, DbError> {
+        sqlx::query_as::<_, Media>(
+            "UPDATE media SET file_hash = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(file_hash.trim())
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
+    /// 缺技术信息的媒体 id（`valid` 且 `video_info` 为空 / 时长 ≤ 0 / 分辨率空）。
+    ///
+    /// 上游 `_candidate_ids`（`media_video_info_backfill_service.py:100-109`）的
+    /// 三段条件。⚠️ 与 [`Self::list_missing_file_hash_ids`] 不同，这里**多了
+    /// `valid`**：无效媒体（已删除但行还在）不参与探测 —— 那是上游
+    /// `Media.valid == True` 逐字搬的。
+    ///
+    /// `video_info IS NULL` **是**判据之一（和哈希回填「别用它」的注释相反）：
+    /// 上游这条任务的候选就是三段条件的**或** —— 一行可以「时长分辨率都有、
+    /// 只缺完整探测结果」，补的就是那一格。
+    pub async fn list_missing_video_info_ids(&self) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM media \
+                 WHERE valid \
+                   AND (video_info IS NULL \
+                        OR duration_seconds <= 0 \
+                        OR resolution IS NULL \
+                        OR btrim(resolution) = '') \
+                 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按「**条件化三连写**」落探测结果，返回是否有任何一行真的更新了。
+    ///
+    /// 上游 `_save_missing_info`（`:62-97`）的语义逐条对齐：
+    ///
+    /// | 字段 | 写入条件（WHERE 里带，不是先查后写） |
+    /// |---|---|
+    /// | `video_info` | 现值**仍是**传入的旧值（`IS NOT DISTINCT FROM`）—— 旧值为 NULL 时天然只写「还没有」的行 |
+    /// | `duration_seconds` | 仍 ≤ 0，且新值 > 0 |
+    /// | `resolution` | 仍为空 |
+    ///
+    /// 条件放进 WHERE 而不是「查出来再判断」：条件化更新在并发下是原子的，
+    /// 「查-改-写」不是。返回 `updated` 让调用方区分「写进去了」与「没写进但
+    /// 也已经不缺了」（上游用同一个 `count > 0` 判断）。
+    ///
+    /// `video_info` 列是 `text`（可能是**脏文本**，见 `NewMedia` 的注释），
+    /// 所以旧值按 `Option<&str>` 传，序列化由调用方做完。
+    pub async fn save_missing_video_info(
+        &self,
+        id: i32,
+        existing_video_info: Option<&str>,
+        video_info: Option<&serde_json::Value>,
+        duration_seconds: Option<i64>,
+        resolution: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        let mut guard = ctx.conn().await?;
+        let now = crate::common::time::now_utc();
+        let mut updated = false;
+
+        if let Some(info) = video_info {
+            let count = sqlx::query(
+                "UPDATE media SET video_info = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND video_info IS NOT DISTINCT FROM $4",
+            )
+            .bind(id)
+            .bind(serde_json::to_string(info).unwrap_or_default())
+            .bind(now)
+            .bind(existing_video_info)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        if let Some(duration) = duration_seconds.filter(|duration| *duration > 0) {
+            let count = sqlx::query(
+                "UPDATE media SET duration_seconds = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND duration_seconds <= 0",
+            )
+            .bind(id)
+            .bind(i32::try_from(duration).unwrap_or(i32::MAX))
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        if let Some(resolution) = resolution {
+            let count = sqlx::query(
+                "UPDATE media SET resolution = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND (resolution IS NULL OR btrim(resolution) = '')",
+            )
+            .bind(id)
+            .bind(resolution)
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        Ok(updated)
+    }
+
+    /// 有效性巡检用的最小投影：`(id, valid, storage_ref)`，全量不分页。
+    ///
+    /// 上游 `_library_media_query`（`media_validity_scan_service.py:34-39`）
+    /// 拉整库媒体，但巡检只读这三列 —— 投影收窄让「扫描一个十万行的库」
+    /// 不必搬运二十个用不上的列。
+    pub async fn list_scan_items_by_library(
+        &self,
+        library_id: i32,
+    ) -> Result<Vec<(i32, bool, Option<String>)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, valid, storage_ref FROM media \
+                 WHERE library_id = $1 ORDER BY id",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 批量改 `valid`（失效 / 复活），返回**真的改了**的行数。
+    ///
+    /// `WHERE valid <> $2` 是上游 `Media.valid == valid_before`（`:169`）的
+    /// 集合版：已经是对的目标状态的行**不重写** —— 那会让 `updated_at` 全表
+    /// 刷新，也会把「没变化」数成「更新了」。
+    ///
+    /// `revive = true` 时顺带重置缩略图状态（上游 `_revival_thumbnail_values`
+    /// `:50-67`）：有缩略图 → `succeeded`，没有 → `pending`，计数清零、错误与
+    /// 终态时间戳清空 —— 文件回来了，之前的「生成失败」记录已过时，得让
+    /// 生成任务重新看它一眼。失效分支不动缩略图列（文件没了不该顺手抹历史）。
+    pub async fn set_validity(
+        &self,
+        ids: &[i32],
+        valid: bool,
+        revive: bool,
+    ) -> Result<u64, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        let mut guard = ctx.conn().await?;
+        let now = crate::common::time::now_utc();
+        let count = if revive && valid {
+            sqlx::query(
+                "UPDATE media SET \
+                    valid = $2, \
+                    updated_at = $3, \
+                    thumbnail_generation_state = CASE WHEN EXISTS (\
+                        SELECT 1 FROM media_thumbnail WHERE media_thumbnail.media_id = media.id\
+                    ) THEN $4 ELSE $5 END, \
+                    thumbnail_attempt_count = 0, \
+                    thumbnail_deferred_count = 0, \
+                    thumbnail_next_retry_at = NULL, \
+                    thumbnail_last_error_code = NULL, \
+                    thumbnail_last_error = NULL, \
+                    thumbnail_terminal_at = NULL \
+                 WHERE id = ANY($1) AND valid <> $2",
+            )
+            .bind(ids)
+            .bind(valid)
+            .bind(now)
+            .bind(thumbnail_state::SUCCEEDED)
+            .bind(thumbnail_state::PENDING)
+            .execute(guard.as_conn())
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE media SET valid = $2, updated_at = $3 WHERE id = ANY($1) AND valid <> $2",
+            )
+            .bind(ids)
+            .bind(valid)
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?
+        };
+        Ok(count.rows_affected())
+    }
+
     /// 列出符合筛选条件的媒体。**排序由调用方给的 SQL 片段决定。**
     ///
     /// # 为什么用 `QueryBuilder` 而不是拼占位符

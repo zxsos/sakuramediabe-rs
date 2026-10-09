@@ -67,40 +67,42 @@ impl MediaMetadataProbeService {
     /// **部署检查**：宿主启动时调一次，为假就在任务摘要里显式报
     /// 「未安装媒体探测依赖」。见模块文档的两类跳过。
     ///
-    /// # 当前恒为 `false`，而这不是占位
-    ///
-    /// 逐条核实过（2026-10-08）：
+    /// # 后端：`ffprobe` CLI（`svc-probe`，2026-10-09 接入）
     ///
     /// | 上游手段 | 本仓对应物 |
     /// |---|---|
-    /// | `import av`（PyAV） | **无** —— workspace 里没有 ffmpeg 绑定 |
-    /// | 用 `av.open()` 读源 | **无** —— 也没有调用 `ffmpeg` / `ffprobe` CLI 的地方 |
+    /// | `import av`（PyAV） | [`svc_probe::backend_available`] —— 真跑一次 `ffprobe -version` |
+    /// | 用 `av.open()` 读源 | [`svc_probe::probe_file`] / [`svc_probe::probe_reader`] |
     ///
-    /// `media_clip` 那个模块里有 `media_clip_ffmpeg_timeout_seconds` 配置键，
-    /// 但**只是超时配置**，没有实际调用 —— 别把它当「已有 ffmpeg 通路」的证据。
+    /// **真的探测一次**而不是查 PATH —— 名字在而文件坏了、架构不对、缺动态库，
+    /// 都过得了「存在性检查」却在真探测时失败。
     ///
-    /// 所以 `false` 是**如实反映后端不存在**，对应上游 `av = None` 那一档：
-    /// 上游 pyav 没装时 `probe_file` 同样返回空结果、不报错。两条路径的
-    /// 可观察行为因此一致 —— 不是「Rust 侧还没写」，而是「部署缺依赖」。
-    ///
-    /// ★ 接入后端时**只改这一处**。调用方（`media_video_info_backfill` /
-    /// `media_validity_scan` / `media_file_hash_backfill`）只该问这个函数，
-    /// 各自去 `which ffmpeg` 的话会出现「摘要说没有、实际探测跑起来了」。
-    pub fn probe_backend_available() -> bool {
-        false
+    /// ★ 调用方（`media_video_info_backfill` / `media_validity_scan` /
+    /// `media_file_hash_backfill`）只该问这个函数，各自去 `which ffprobe` 的话
+    /// 会出现「摘要说没有、实际探测跑起来了」。
+    pub async fn probe_backend_available() -> bool {
+        svc_probe::backend_available().await
     }
 
     /// ★ 探测一个本地文件。
     ///
     /// 上游 `probe_file(cls, file_path) -> MediaMetadataProbeResult`。
-    /// `pyav` 缺失时返回 [`MediaMetadataProbeResult::empty`]（**不报错**）。
+    /// 后端缺失**或**探测失败时返回 [`MediaMetadataProbeResult::empty`]
+    /// （**不报错**）—— 与上游「pyav 没装 → 空结果」同一档。
     ///
-    /// 当前恒为空结果，原因见 [`Self::probe_backend_available`]。
+    /// # 失败要留痕
+    ///
+    /// 「空结果」与「探测失败」在返回类型上分不出来（上游就这样），但排查
+    /// 时必须分得开 —— 所以失败在 `warn` 里留 path 与原因，再回空结果。
+    /// 静默吞掉会让「回填了 0 条」看起来像「没有缺时长的媒体」。
     pub async fn probe_file(file_path: &std::path::Path) -> MediaMetadataProbeResult {
-        // 参数不用是因为**后端不存在**，不是「还没接」—— 真接上时这里要读它。
-        // 保留 `let _` 是为了让签名与文档继续成立（clippy 也满意）。
-        let _ = file_path;
-        MediaMetadataProbeResult::empty()
+        match svc_probe::probe_file(file_path).await {
+            Ok(probe) => probe.into(),
+            Err(error) => {
+                tracing::warn!(path = %file_path.display(), error = %error, "媒体探测失败");
+                MediaMetadataProbeResult::empty()
+            }
+        }
     }
 
     /// ★ 探测一个「可读的源」—— 路径**或**远端 Range reader。
@@ -111,14 +113,39 @@ impl MediaMetadataProbeService {
     /// 「远端 Range reader」—— 这正是 `playback_deliveries` 旁路需要的
     /// （远端媒体不必先下载到本地就能探测）。
     ///
+    /// # ⚠️ 本仓的实现是**先落盘**再探
+    ///
+    /// 上游直接把 file-like 喂给 `av.open()`；`ffprobe` 读管道**不能 seek**，
+    /// 而 mp4 的 `moov` 常在文件尾 —— 走管道会假失败。代价与取舍见
+    /// `svc_probe` 的模块文档第 2 条。
+    ///
+    /// `file_size_bytes` 只进日志（上游拿它校验 reader 的长度），**不参与逻辑**。
     /// `source_label` 只进错误信息，**别用它做逻辑判断**。
-    pub async fn probe_source<S: std::io::Read + Send>(
+    pub async fn probe_source<S: std::io::Read + Send + 'static>(
         source: S,
         file_size_bytes: i64,
         source_label: &str,
     ) -> MediaMetadataProbeResult {
-        let _ = (source, file_size_bytes, source_label);
-        MediaMetadataProbeResult::empty()
+        let _ = file_size_bytes;
+        match svc_probe::probe_reader(source, source_label).await {
+            Ok(probe) => probe.into(),
+            Err(error) => {
+                tracing::warn!(source = %source_label, error = %error, "媒体探测失败");
+                MediaMetadataProbeResult::empty()
+            }
+        }
+    }
+}
+
+/// `svc-probe` 的结果 → 本仓的类型。字段一一对应，没有换算。
+impl From<svc_probe::VideoProbe> for MediaMetadataProbeResult {
+    fn from(probe: svc_probe::VideoProbe) -> Self {
+        Self {
+            resolution: probe.resolution,
+            duration_seconds: probe.duration_seconds,
+            video_info: probe.video_info,
+            creation_time: probe.creation_time,
+        }
     }
 }
 

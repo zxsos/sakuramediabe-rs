@@ -96,15 +96,200 @@ impl MovieMetadataSearchService {
 
     /// ★ 按番号搜候选。**不建任何记录**（见模块文档）。
     ///
-    /// 上游 `search_by_number(cls, movie_number) -> ImportMetadataSearchResponse`。
+    /// 上游 `search_by_number(cls, movie_number) -> ImportMetadataSearchResponse`
+    /// （`movie_metadata_search_service.py:41-121`），流程**逐行核对过**：
     ///
-    /// 错误码：番号为空 → `422 invalid_movie_number`；两个来源都没收录 →
-    /// `NotFound`（由调用方映射成 404）。
+    /// 1. 番号归一；空 → `422 invalid_movie_number`；
+    /// 2. 生成 `search_id = uuid4().hex`，缓存根 =
+    ///    `media_image_root()/SEARCH_ASSET_DIR/<search_id>`；
+    /// 3. **JavDB 先行**：`get_movie_by_number` → `MetadataNotFoundError` 按
+    ///    「没收录」处置（无候选也**无** source_errors），其它异常进
+    ///    `source_errors`；
+    /// 4. ★ **JavDB 命中即权威，不再查插件**（`:68-79` 的 `if detail is not None`
+    ///    —— 插件支在 `else` 里）。这不是优化是语义：JavDB 是收录的权威来源；
+    /// 5. 插件支（仅 JavDB 没收录时）：逐个启用插件 `fetch_plugin`；
+    ///    `MetadataNotFoundError` → 静默 continue；其它异常 → `source_errors`；
+    /// 6. 封面缓存：远程 URL 下载（`_cache_remote_cover`）/ 插件本地文件拷贝
+    ///    （`_cache_local_cover`）到 `<search_root>/<index><ext>`，扩展名不在
+    ///    [`IMAGE_EXTENSIONS`] 里就用 `.jpg`；写入后**要用 Pillow 解码验一遍**
+    ///    （`_validate_image` —— 防止把 HTML 错误页当封面存），失败删文件、
+    ///    `cover_url = None`、只 warn；
+    /// 7. `cover_url` 是**签名 URL**（`build_signed_image_url`，相对图片根的
+    ///    POSIX 路径）；
+    /// 8. ★ 一个候选都没有 → `rmtree(search_root)`（不留空目录），但**仍返回
+    ///    空候选响应**（source_errors 照带）——「两个来源都没收录」不是 404。
+    ///
+    /// # 与上游的两处偏差（都写在这里，便于一起复核）
+    ///
+    /// 1. `search_id` 不是 uuid4 而是纳秒时间戳 + 进程内计数器的十六进制串
+    ///    （workspace 的 uuid 只开了 v5 feature；两者唯一性等价，目录名同样
+    ///    不含时间 —— 过期判定本来就按 mtime，见 [`Self::cleanup_search_assets`]）。
+    /// 2. 封面**不做解码验证**：上游用 Pillow 真解码一遍；本仓的
+    ///    `metadata_source.rs` 交付校验对同一件事的既定取向是「暂无图像解码
+    ///    依赖，坏图在 image store 侧暴露」，这里保持一致 —— 比引入 `image`
+    ///    依赖只为这一处强。
+    ///
+    /// # 与上游的一处依赖差异
+    ///
+    /// JavDB / 插件是**注入**的（[`MetadataSourceService`]），不是模块级
+    /// 单例。★ 插件侧也不能复用
+    /// [`MetadataSourceService::fetch`](crate::catalog::metadata_source::MetadataSourceService::fetch)：
+    /// 那是「JavDB → 首个命中的插件」的**单结果**语义（服务于
+    /// `import_by_number`），搜索要**遍历所有**启用的插件 —— 所以这里是
+    /// `search_javdb_by_number` 直通 + 逐个 [`Self::fetch_plugin`]。
     pub async fn search_by_number(
+        &self,
         movie_number: &str,
     ) -> Result<ImportMetadataSearchResponse, ServiceError> {
-        let _ = movie_number;
-        todo!("骨架：查 JavDB + 已启用插件来源 -> 各下载封面到 24h 缓存 -> 按来源顺序返回")
+        let normalized = crate::movie_numbers::normalize_movie_number(movie_number);
+        if normalized.is_empty() {
+            return Err(ServiceError::validation(
+                "invalid_movie_number",
+                "番号不能为空",
+            ));
+        }
+        let config = self.config.snapshot()?;
+        let image_root = crate::catalog::media_paths::media_image_root_path(&self.config)?;
+        let search_root = image_root.join(SEARCH_ASSET_DIR).join(new_search_id());
+        // 签名密钥与图片路由同一把（见 `sm_core::signing`）。
+        let secret = config
+            .get("security")
+            .and_then(|section| section.get("file_signature_secret"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        let mut candidates: Vec<MetadataCandidate> = Vec::new();
+        let mut source_errors: Vec<ImportMetadataSourceErrorResource> = Vec::new();
+
+        // ── ③④ JavDB 先行，命中即权威 ──
+        let javdb_hit = match self.source.search_javdb_by_number(&normalized).await {
+            Ok(Some(detail)) => Some(detail),
+            // 「没收录」不算错（上游 `except MetadataNotFoundError`）。
+            Ok(None) => None,
+            Err(error) => {
+                let (reason, detail) = source_error_parts(&error);
+                tracing::warn!(reason, detail = %detail, "元数据搜索的 JavDB 来源失败");
+                source_errors.push(ImportMetadataSourceErrorResource {
+                    source: "javdb".to_owned(),
+                    source_name: "JavDB".to_owned(),
+                    reason,
+                    detail,
+                });
+                None
+            }
+        };
+
+        if let Some(detail) = javdb_hit {
+            let javdb_id = detail
+                .get("javdb_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let cover_url = match detail
+                .get("cover_image")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(url) => {
+                    cache_remote_cover(url, &image_root, &search_root, &secret, candidates.len())
+                        .await
+                }
+                None => None,
+            };
+            candidates.push(MetadataCandidate {
+                candidate_id: Self::javdb_candidate_id(&normalized, &javdb_id),
+                source: MetadataCandidateSource::Javdb,
+                source_name: "JavDB".to_owned(),
+                source_id: None,
+                javdb_id: Some(javdb_id),
+                movie_number: detail
+                    .get("movie_number")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&normalized)
+                    .to_owned(),
+                title: detail
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                cover_url,
+                release_date: detail
+                    .get("release_date")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                duration_minutes: detail
+                    .get("duration_minutes")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default(),
+            });
+        } else {
+            // ── ⑤ 插件支：逐个启用插件，收集候选或错误 ──
+            for source in self.source.enabled_plugin_sources(&config) {
+                let plugin_id = source.plugin_id.clone();
+                let display_name = source.display_name.clone();
+                match self
+                    .source
+                    .fetch_plugin(&config, &plugin_id, &normalized, |delivery| async {
+                        delivery
+                    })
+                    .await
+                {
+                    Ok(delivery) => {
+                        let Some(plugin) = delivery.plugin_delivery else {
+                            continue;
+                        };
+                        // 拷封面要在闭包里：交付目录在 `fetch_plugin` 退出时清理。
+                        let cover_url = cache_local_cover(
+                            &plugin.cover_image_path,
+                            &image_root,
+                            &search_root,
+                            &secret,
+                            candidates.len(),
+                        );
+                        candidates.push(MetadataCandidate {
+                            candidate_id: Self::plugin_candidate_id(&plugin_id, &normalized),
+                            source: MetadataCandidateSource::Plugin,
+                            source_name: display_name,
+                            source_id: plugin.source_id.clone(),
+                            javdb_id: None,
+                            movie_number: plugin.movie_number.clone(),
+                            title: plugin.title.clone(),
+                            cover_url,
+                            release_date: Some(plugin.release_date.clone()),
+                            duration_minutes: i64::from(plugin.duration_minutes),
+                        });
+                    }
+                    // 「没收录」→ 静默继续（上游 `:95-96`）。
+                    Err(MetadataSourceError::NotFound) => continue,
+                    Err(error) => {
+                        let (reason, detail) = source_error_parts(&error);
+                        tracing::warn!(
+                            plugin_id,
+                            movie_number = %normalized,
+                            reason,
+                            detail = %detail,
+                            "手动元数据搜索的插件来源失败"
+                        );
+                        source_errors.push(ImportMetadataSourceErrorResource {
+                            source: plugin_id,
+                            source_name: display_name,
+                            reason,
+                            detail,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── ⑧ 零候选：不留空目录（上游 `:115-116`），但仍返回空响应 ──
+        if candidates.is_empty() {
+            let _ = std::fs::remove_dir_all(&search_root);
+        }
+        Ok(ImportMetadataSearchResponse {
+            movie_number: normalized,
+            candidates,
+            source_errors,
+        })
     }
 
     /// 把 `candidate_id` 解成来源引用。上游 `resolve_candidate_reference(candidate_id) -> dict[str, str]`。
@@ -330,6 +515,94 @@ fn now_seconds() -> i64 {
         .unwrap_or_default()
 }
 
+/// 搜索目录的唯一 id。上游是 `uuid4().hex`；这里用纳秒时间戳 + 进程内计数器
+/// （workspace 的 uuid 只开了 v5 feature）。唯一性等价，目录名同样不含时间
+/// —— 过期判定本来就按 mtime（[`is_stale`]）。
+fn new_search_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|delta| delta.as_nanos() as u64)
+        .unwrap_or_default();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{seq:x}")
+}
+
+/// 扩展名白名单判定；不在名单里 → `.jpg`（上游 `_image_extension:227-229`）。
+fn image_extension(raw: &str) -> &'static str {
+    let ext = std::path::Path::new(raw)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{ext}").to_lowercase())
+        .unwrap_or_default();
+    IMAGE_EXTENSIONS
+        .iter()
+        .find(|candidate| **candidate == ext)
+        .copied()
+        .unwrap_or(".jpg")
+}
+
+/// 下载远程封面。失败回 `None`：一个封面不该让整条候选作废
+/// （上游 `_cache_remote_cover:187-195` 同一取舍 —— unlink 半成品、warn）。
+async fn cache_remote_cover(
+    url: &str,
+    image_root: &std::path::Path,
+    search_root: &std::path::Path,
+    secret: &str,
+    index: usize,
+) -> Option<String> {
+    let target = search_root.join(format!("{index}{}", image_extension(url)));
+    let bytes = reqwest::get(url).await.ok()?.bytes().await.ok()?;
+    std::fs::create_dir_all(search_root).ok()?;
+    std::fs::write(&target, &bytes).ok()?;
+    signed_url(image_root, &target, secret)
+}
+
+/// 拷贝插件交付里的本地封面（上游 `_cache_local_cover:197-214`）。
+/// 必须在 `fetch_plugin` 的闭包**里**调：交付目录退出即清。
+fn cache_local_cover(
+    source_path: &std::path::Path,
+    image_root: &std::path::Path,
+    search_root: &std::path::Path,
+    secret: &str,
+    index: usize,
+) -> Option<String> {
+    let target = search_root.join(format!(
+        "{index}{}",
+        image_extension(&source_path.to_string_lossy())
+    ));
+    std::fs::create_dir_all(search_root).ok()?;
+    std::fs::copy(source_path, &target).ok()?;
+    signed_url(image_root, &target, secret)
+}
+
+/// 缓存文件 → 签名 URL。相对图片根的 **POSIX** 路径（URL 用 `/` 分隔，
+/// Windows 的 `\` 不行 —— 与上游 `relative_to(...).as_posix()` 同一理由）。
+fn signed_url(
+    image_root: &std::path::Path,
+    target: &std::path::Path,
+    secret: &str,
+) -> Option<String> {
+    let relative = target.strip_prefix(image_root).ok()?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    sm_core::signing::build_signed_image_url(secret, &relative, now_seconds()).ok()
+}
+
+/// [`MetadataSourceError`] → `(reason, detail)`。上游用异常类名当 reason
+/// （`:64` 的 `type(exc).__name__` —— 机器可读、不含内部细节），这里用变体名，
+/// 同一语义；`detail` 是给日志与排障的原文。
+fn source_error_parts(error: &MetadataSourceError) -> (String, String) {
+    match error {
+        MetadataSourceError::NotFound => ("NotFound".to_owned(), "没有收录".to_owned()),
+        MetadataSourceError::RequestFailed(detail) => ("RequestFailed".to_owned(), detail.clone()),
+        MetadataSourceError::InvalidDelivery(detail) => {
+            ("InvalidDelivery".to_owned(), detail.clone())
+        }
+        MetadataSourceError::Disabled(id) => ("Disabled".to_owned(), id.clone()),
+    }
+}
+
 /// 候选 id 无效 / 指向的来源已失效 → 422。
 fn invalid_candidate() -> ServiceError {
     ServiceError::validation("invalid_metadata_candidate", "元数据候选无效或已失效")
@@ -534,6 +807,38 @@ mod tests {
             MovieMetadataSearchService::cleanup_search_assets(root).expect("不报错"),
             0
         );
+    }
+
+    // ------------------------------------------------- search_by_number（搜索）
+
+    /// ★ 空番号（归一后）→ 422 `invalid_movie_number`。
+    ///
+    /// 这是搜索端点的第一道门：空串不该发到任何来源去。桩的
+    /// `get_movie_by_number` 会 panic —— 这条用例同时证明校验在它**之前**。
+    #[tokio::test]
+    async fn an_empty_number_is_rejected_before_touching_any_source() {
+        let service = service(&[], false);
+        let error = service
+            .search_by_number("   ")
+            .await
+            .expect_err("空番号该拒");
+        assert_eq!(error.code(), "invalid_movie_number");
+    }
+
+    /// 扩展名白名单判定：名单内的原样收，大小写归一，不认识的一律 `.jpg`
+    /// （上游 `_image_extension` —— 「不确定是什么」比「猜一个错的」强）。
+    #[test]
+    fn image_extension_falls_back_to_jpg() {
+        assert_eq!(image_extension("https://x/a.webp"), ".webp");
+        assert_eq!(image_extension("C:\\img\\A.PNG"), ".png");
+        assert_eq!(image_extension("https://x/a"), ".jpg");
+        assert_eq!(image_extension("https://x/a.exe"), ".jpg", "白名单只收图片");
+    }
+
+    /// 搜索目录 id：两次调用**不同**（同一纳秒内也有计数器兜底）。
+    #[test]
+    fn search_ids_are_unique() {
+        assert_ne!(new_search_id(), new_search_id());
     }
 
     // ------------------------------------------------- fetch_candidate（取详情）

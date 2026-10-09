@@ -212,6 +212,27 @@ impl MetadataSourceService {
     }
 
     /// 该插件来源是否启用。
+    /// ★ 按番号问 JavDB（**搜索**用）。`Ok(None)` = 没收录或没配 provider。
+    ///
+    /// # 为什么搜索不走 [`Self::fetch`](crate::catalog::metadata_source::MetadataSourceService::fetch)
+    ///
+    /// `fetch` 是「JavDB → **首个**命中的插件」的单结果语义（服务于
+    /// `import_by_number`）；搜索要**遍历**所有启用的插件收集候选与错误
+    /// （`movie_metadata_search_service.py:80-111`）。所以 JavDB 这一支给搜索
+    /// 一个直通，插件侧由调用方逐个走 [`Self::fetch_plugin`]（按 plugin_id
+    /// 定位，本来就是逐个的）。
+    pub async fn search_javdb_by_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+        match &self.provider {
+            Some(provider) => provider.get_movie_by_number(movie_number).await,
+            // 没配 provider = 这个来源不存在：按「没收录」处置，不是故障
+            //（与 `fetch_candidate` 的 JavDB 支同语义）。
+            None => Ok(None),
+        }
+    }
+
     pub fn is_plugin_enabled(sources: &[RegisteredSource], plugin_id: &str) -> bool {
         sources.iter().any(|source| source.plugin_id == plugin_id)
     }

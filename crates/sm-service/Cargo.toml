@@ -50,6 +50,7 @@ sha1 = { workspace = true }
 hashing = { workspace = true }
 # 宿主侧图像原语：缩略图校验要 `is_webp`，读尺寸要 `decode`。
 svc-image = { workspace = true }
+svc-probe = { workspace = true }
 # 图片包（`assets.zip` / `thumbnails.zip`）：只写/读 STORED 条目，见根 Cargo.toml。
 zip = { workspace = true }
 # 遥测心跳的 CPU 型号与内存总量（替代上游 psutil 的 `virtual_memory().total`）。

@@ -133,6 +133,38 @@ impl StorageGateway for NoopGateway {
         // 这套夹具不验缩略图生成（那要一个能往 workspace 写产物的桩）。
         unimplemented!("NoopGateway 不生成缩略图")
     }
+
+    fn compute_file_hash(
+        &self,
+        _handle: &MediaHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ProviderFailure>> + Send + '_>> {
+        // 哈希回填有自己的桩（回填值要能被断言），删除类用例用不到这里。
+        unimplemented!("NoopGateway 不算哈希")
+    }
+
+    fn probe_video_info(
+        &self,
+        _handle: &MediaHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ProviderFailure>> + Send + '_>> {
+        // 信息回填有自己的桩，删除类用例用不到这里。
+        unimplemented!("NoopGateway 不探测")
+    }
+
+    fn scan_managed_media_ref_keys(
+        &self,
+        _library: &sm_service::playback::provider_helpers::LibraryHandle,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ProviderFailure>> + Send + '_>> {
+        // 有效性巡检有自己的桩，删除类用例用不到这里。
+        unimplemented!("NoopGateway 不对账")
+    }
+
+    fn managed_media_ref_key(
+        &self,
+        _library: &sm_service::playback::provider_helpers::LibraryHandle,
+        _media_ref: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ProviderFailure>> + Send + '_>> {
+        unimplemented!("NoopGateway 不对账")
+    }
 }
 
 /// 带桩网关的媒体服务。删除类用例用它构造。

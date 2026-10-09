@@ -5,6 +5,7 @@ members = [
     "crates/media-file-hash",
     "crates/svc-hash",
     "crates/svc-image",
+    "crates/svc-probe",
     "crates/parity-cli",
     "crates/plugin-ref-local",
     "crates/sm-core",
@@ -31,6 +32,7 @@ hashing = { path = "crates/hashing" }
 media-file-hash = { path = "crates/media-file-hash" }
 svc-hash = { path = "crates/svc-hash" }
 svc-image = { path = "crates/svc-image" }
+svc-probe = { path = "crates/svc-probe" }
 plugin-ref-local = { path = "crates/plugin-ref-local" }
 sm-core = { path = "crates/sm-core" }
 sm-db = { path = "crates/sm-db" }

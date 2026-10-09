@@ -2823,6 +2823,7 @@ dependencies = [
  "sqlx",
  "svc-hash",
  "svc-image",
+ "svc-probe",
  "sysinfo",
  "tokio",
  "toml",
@@ -3085,6 +3086,16 @@ version = "0.1.0"
 dependencies = [
  "image",
  "sha1 0.10.7",
+]
+
+[[package]]
+name = "svc-probe"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -198,6 +198,80 @@ pub trait StorageGateway: Send + Sync {
                 + '_,
         >,
     >;
+
+    /// 算**采样文件指纹**。上游 `StorageProvider.compute_file_hash`。
+    ///
+    /// 返回形如 `media-file-hash-v1:<40 hex>`（`storage.proto:172`）。
+    /// 它的用途是**去重**（同一文件在两个库里各一份），所以格式必须与宿主
+    /// 内置实现（`media-file-hash` crate）同源 —— 格式不一致会让同一文件
+    /// 算出两个不同的哈希，去重静默失效（没有报错可看）。
+    ///
+    /// # 为什么它必须回 `Result` 而 `has_provider` 不用
+    ///
+    /// 算哈希要读整个文件（IO 密集），读失败、provider 不支持（`unsupported`）、
+    /// 暂时不可达（`unavailable`）都是**运行期**的事；调用方
+    /// （`media_file_hash_backfill`）对这三者的反应不同（跳过 vs 记 failed）。
+    fn compute_file_hash(
+        &self,
+        handle: &MediaHandle,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, ProviderFailure>> + Send + '_>,
+    >;
+
+    /// 探测媒体的完整技术信息（**可选能力**）。上游
+    /// `StorageProvider.probe_video_info`。
+    ///
+    /// 返回 provider 自己的探测字典（`{"container": …, "video": …}`），
+    /// 宿主不解释其结构 —— 取时长/分辨率是 `media_video_info_backfill` 的事。
+    ///
+    /// # 为什么单独一个方法而并进 `compute_file_hash` 的返回里
+    ///
+    /// 它是**可选能力**：很多存储 provider（115 网盘）拿不到容器级信息，
+    /// 探测是本地库才有的奢侈品。塞进必需方法会让每个不支持者在测试替身里
+    /// 写 `unimplemented!()`，把「不支持」编成 panic —— 与 [`PlaybackGateway`]
+    /// 不并进本 trait 是同一条理由（`docs/adr/2026-10-08-provider-seam.md` D1）。
+    ///
+    /// 「不支持」以 [`PROVIDER_UNSUPPORTED`] 码出现在 `Err` 里；
+    /// `Ok(Value::Null)` / 空对象表示「支持但探不到」。
+    fn probe_video_info(
+        &self,
+        handle: &MediaHandle,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<serde_json::Value, ProviderFailure>>
+                + Send
+                + '_,
+        >,
+    >;
+
+    /// provider 管理的**全量**引用 key 清单（**可选能力**）。上游
+    /// `StorageProvider.scan_managed_media_ref_keys`。
+    ///
+    /// 「管理」= provider 自己认领的媒体文件；字幕、封面、别的工具留下的
+    /// 不在里头 —— 所以它能当有效性对账的**否定证据**（provider 说没有
+    /// → 才判失效）。
+    ///
+    /// 与 [`Self::managed_media_ref_key`] **配对使用**，能力探测要两个都在
+    /// （上游 `media_validity_scan_service.py:44-47`）。
+    fn scan_managed_media_ref_keys(
+        &self,
+        library: &LibraryHandle,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderFailure>> + Send + '_>,
+    >;
+
+    /// 单个存储引用的归一 key（**可选能力**）。上游
+    /// `StorageProvider.managed_media_ref_key`。
+    ///
+    /// 逐条现算、会失败（storage_ref 是 provider 的命名空间，宿主侧的脏数据
+    /// 它有权拒）—— 所以签名是逐条的 `Result`，由调用方按条计数。
+    fn managed_media_ref_key(
+        &self,
+        library: &LibraryHandle,
+        media_ref: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, ProviderFailure>> + Send + '_>,
+    >;
 }
 
 /// 能力缺失（provider 在，但**不支持这个操作**）。

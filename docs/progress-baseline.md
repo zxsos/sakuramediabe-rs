@@ -2,13 +2,13 @@
 
 | 指标 | 现在 |
 |---|---|
-| 未实现的方法体（`todo!()`） | **43** 处（`sm-service` 26 + 路由 17）|
+| 未实现的方法体（`todo!()`） | **39** 处（`sm-service` 22 + 路由 17）|
 | 端点（方法级） | 175 / 177 已注册，**其中 17 条仍是 `todo!()`** |
 | 端点（路径级） | 136 / 136（未注册的方法级端点 2 条）|
-| 完成的域 | `collections`、`system`、`videos`（3/7 个域） |
-| 待办最多的域 | `transfers` 16 · `catalog` 5 · `playback` 3 |
+| 完成的域 | `collections`、`playback`、`system`、`videos`（4/7 个域） |
+| 待办最多的域 | `transfers` 16 · `catalog` 4 · `discovery` 2 |
 | worker handler | 6 / 21 |
-| 基线提交 | `2a7da87`（生成时的 HEAD）|
+| 基线提交 | `2360e75`（生成时的 HEAD）|
 
 > 数字由 `pwsh -File scripts/progress.ps1 -Write` 生成（**不要手数**：手数三次错过
 > 分母，126 应为 177）。改完代码就跑 `-Write` 并提交本文件 —— 门禁里有 `-Diff`，
@@ -18,12 +18,12 @@
 
 口径：`todo!(` / `unimplemented!(` 出现次数（剥掉注释）。与「注册了多少」是两件事。
 
-- 全仓合计：**43** 处
+- 全仓合计：**39** 处
 - 其中 `crates/sm-api/src/routes/*.rs`：**17** 处（= 已注册但**未实现**的端点 / 辅助函数）
 
 | crate | `todo!()` |
 |---|---|
-| `sm-service` | 26 |
+| `sm-service` | 22 |
 | `sm-api` | 17 |
 
 ### 按模块目录
@@ -32,8 +32,7 @@
 |---|---|
 | `sm-api/routes` | 17 |
 | `sm-service/transfers` | 16 |
-| `sm-service/catalog` | 5 |
-| `sm-service/playback` | 3 |
+| `sm-service/catalog` | 4 |
 | `sm-service/discovery` | 2 |
 
 ### `sm-service` 按文件（降序）
@@ -46,10 +45,6 @@
 | `transfers\import_task.rs` | 3 |
 | `discovery\moment_recommendation.rs` | 2 |
 | `catalog\catalog_import.rs` | 1 |
-| `catalog\movie_metadata_search.rs` | 1 |
-| `playback\media_file_hash_backfill.rs` | 1 |
-| `playback\media_validity_scan.rs` | 1 |
-| `playback\media_video_info_backfill.rs` | 1 |
 | `transfers\auto_download.rs` | 1 |
 | `transfers\download_common.rs` | 1 |
 | `transfers\download_request.rs` | 1 |
@@ -130,14 +125,14 @@
 
 | 域 | Rust 文件 | Rust 行 | 上游文件 | 上游行 |
 |---|---|---|---|---|
-| catalog | 28 | 13803 | 27 | 7556 |
+| catalog | 28 | 14129 | 27 | 7556 |
 | collections | 4 | 2062 | 5 | 1292 |
 | discovery | 17 | 8376 | 16 | 4485 |
-| playback | 22 | 8857 | 19 | 3741 |
+| playback | 22 | 9827 | 19 | 3741 |
 | system | 20 | 6655 | 19 | 2935 |
 | transfers | 17 | 7807 | 23 | 4248 |
 | videos | 3 | 1874 | 4 | 927 |
-| **合计** | **111** | **49434** | **113** | **25184** |
+| **合计** | **111** | **50730** | **113** | **25184** |
 
 > ⚠️ **行数比不是完成度**（本仓注释占大头）；看上面的 `todo!()`。
 

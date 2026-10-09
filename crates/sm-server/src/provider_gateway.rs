@@ -36,8 +36,8 @@ use prost_types::{Struct, Value as PbValue};
 use sm_plugins::provider_calls::{self, ProviderOperationError};
 use sm_plugins::registry::ProviderRegistry;
 use sm_service::playback::provider_helpers::{
-    DeliveryTarget, MediaHandle, PlaybackGateway, PlaybackPlan, ProviderFailure, RequestedDelivery,
-    StorageGateway, ThumbnailJobArtifact, ThumbnailJobResult,
+    DeliveryTarget, LibraryHandle, MediaHandle, PlaybackGateway, PlaybackPlan, ProviderFailure,
+    RequestedDelivery, StorageGateway, ThumbnailJobArtifact, ThumbnailJobResult,
 };
 
 /// 未被插件声明时的失败码。
@@ -106,6 +106,131 @@ impl StorageGateway for ProviderGateway {
             provider_calls::delete_media(&mut client, &handle.provider_key, library, media)
                 .await
                 .map_err(|error| to_failure(&error))
+        })
+    }
+
+    fn compute_file_hash(
+        &self,
+        handle: &MediaHandle,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ProviderFailure>> + Send + '_>>
+    {
+        let handle = handle.clone();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&handle.provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &handle.provider_key,
+                &endpoint,
+                "compute_file_hash",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            let (library, media) = proto_handles(&handle);
+            provider_calls::compute_file_hash_call(
+                &mut client,
+                &handle.provider_key,
+                library,
+                media,
+            )
+            .await
+            .map_err(|error| to_failure(&error))
+        })
+    }
+
+    fn probe_video_info(
+        &self,
+        handle: &MediaHandle,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = Result<serde_json::Value, ProviderFailure>>
+                + Send
+                + '_,
+        >,
+    > {
+        let handle = handle.clone();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&handle.provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &handle.provider_key,
+                &endpoint,
+                "probe_video_info",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            let (library, media) = proto_handles(&handle);
+            let info = provider_calls::probe_video_info_call(
+                &mut client,
+                &handle.provider_key,
+                library,
+                media,
+            )
+            .await
+            .map_err(|error| to_failure(&error))?;
+            // 「未设」与「设了但为 null」在服务层都按「探不到」处理。
+            Ok(info.unwrap_or(serde_json::Value::Null))
+        })
+    }
+
+    fn scan_managed_media_ref_keys(
+        &self,
+        library: &LibraryHandle,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<String>, ProviderFailure>> + Send + '_>>
+    {
+        let library = library.clone();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&library.provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &library.provider_key,
+                &endpoint,
+                "scan_managed_media_ref_keys",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            provider_calls::scan_managed_media_ref_keys_call(
+                &mut client,
+                &library.provider_key,
+                library_handle_proto(&library),
+            )
+            .await
+            .map_err(|error| to_failure(&error))
+        })
+    }
+
+    fn managed_media_ref_key(
+        &self,
+        library: &LibraryHandle,
+        media_ref: serde_json::Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<String, ProviderFailure>> + Send + '_>>
+    {
+        let library = library.clone();
+        Box::pin(async move {
+            let endpoint = self.endpoint_for(&library.provider_key)?;
+            let mut client = match provider_calls::connect_storage(
+                &library.provider_key,
+                &endpoint,
+                "managed_media_ref_key",
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => return Err(to_failure(&error)),
+            };
+            provider_calls::managed_media_ref_key_call(
+                &mut client,
+                &library.provider_key,
+                library_handle_proto(&library),
+                media_ref,
+            )
+            .await
+            .map_err(|error| to_failure(&error))
         })
     }
 
@@ -473,6 +598,18 @@ fn proto_handles(
         duration_seconds: i64::from(handle.duration_seconds),
     };
     (library, media)
+}
+
+/// 宿主侧的 [`LibraryHandle`] → proto 的 `LibraryHandle`。
+///
+/// 与 [`proto_handles`] 的库半边**同源** —— 字段清单只此一份。
+fn library_handle_proto(library: &LibraryHandle) -> sm_plugin_api::v1::LibraryHandle {
+    sm_plugin_api::v1::LibraryHandle {
+        library_id: library.library_id,
+        provider_key: library.provider_key.clone(),
+        provider_config: json_to_struct(&library.provider_config),
+        account_key: library.account_key.clone(),
+    }
 }
 
 /// `serde_json::Value` → proto 的 `google.protobuf.Struct`。
