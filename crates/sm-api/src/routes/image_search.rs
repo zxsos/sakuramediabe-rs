@@ -1,0 +1,201 @@
+//! `/image-search*` —— 图搜与剧情图搜的六个端点。
+//!
+//! # 与上游 `src/api/routers/discovery/image_search.py` 的对应
+//!
+//! | 上游端点 | 编码 | 依赖 |
+//! |---|---|---|
+//! | `POST /image-search/sessions`（`:34`） | **multipart** | `sm_service::discovery::image_search` |
+//! | `GET /image-search/sessions/{session_id}/results`（`:60`） | query | 同上 |
+//! | `POST /image-search/text-sessions`（`:74`） | **form** | 同上 |
+//! | `POST /image-search/plot-sessions`（`:94`） | **multipart** | `sm_service::discovery::plot_image_search` |
+//! | `GET /image-search/plot-sessions/{session_id}/results`（`:128`） | query | 同上 |
+//! | `POST /image-search/plot-text-sessions`（`:147`） | **form** | 同上 |
+//!
+//! # 一处**必须先解掉的前置**：axum 的 `form` feature 未启用
+//!
+//! 六个端点里**四个是 form 编码**（`Form()` / `File()`），不是 JSON。而
+//! `axum::extract` 只有 `Json` / `Query` / `Multipart`，`form` feature 没开。
+//!
+//! 这正是我当初判定 `POST /auth/docs-token` **不实现**的理由（见
+//! `routes/auth.rs` 的模块文档）—— 但**那条理由在这里不成立**：
+//!
+//! | | docs-token | 这四个 |
+//! |---|---|---|
+//! | 有消费方 | ❌ 本仓库无 Swagger UI | ✅ 前端就是消费方 |
+//! | 结论 | 不实现（用没有调用方的端点凑数会让指标失真） | **必须实现**，顺带把 feature 打开 |
+//!
+//! 也就是说 docs-token 那条「不实现」的理由是**关于消费方的，不是关于 form
+//! 编码本身**。别把它误读成「form 编码在本仓库不可用」。
+//!
+//! # 错误码是 **400**，不是仓库惯例的 422
+//!
+//! 四个建会话端点都是 `except ValueError -> HTTPException(400)`，而本仓库
+//! `ServiceError::validation` 是 422。**照抄 400。**
+//!
+//! 但注意 `GET .../results` 是 `LookupError -> 404` 与 `ValueError -> 400`
+//! —— 同一个端点里 404 与 400 都可能出现，**不是所有错误都该转 422**。
+//!
+//! # `movie_ids` / `exclude_movie_ids` 是 **CSV 字符串**，不是数组
+//!
+//! 上游用 `parse_csv_positive_ints(value, name, error_code="invalid_image_search_filter")`
+//! 解析，传输形态是 `movie_ids=1,2,3`。两个要点：
+//!
+//! 1. **只收正整数**（函数名里的 `positive`）—— 0 或负数报
+//!    `invalid_image_search_filter`，**不是**当作「没有过滤」。
+//! 2. **CSV 是有意的，不是将就** —— multipart 的 form field 没有「数组」类型，
+//!    重复字段名在客户端实现上不统一。
+
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use sm_service::discovery::image_search::ImageSearchPage;
+use sm_service::discovery::plot_image_search::PlotImageSearchPage;
+
+use crate::auth::CurrentUser;
+use crate::error::ErrorResponse;
+use crate::state::AppState;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/image-search/sessions", post(create_image_search_session))
+        .route(
+            "/image-search/sessions/{session_id}/results",
+            get(get_image_search_results),
+        )
+        .route(
+            "/image-search/text-sessions",
+            post(create_text_image_search_session),
+        )
+        .route("/image-search/plot-sessions", post(create_plot_image_search_session))
+        .route(
+            "/image-search/plot-sessions/{session_id}/results",
+            get(get_plot_image_search_results),
+        )
+        .route(
+            "/image-search/plot-text-sessions",
+            post(create_plot_text_search_session),
+        )
+}
+/// 四个建会话端点**共用**的过滤/分页字段。
+///
+/// 形状照上游：`movie_ids` / `exclude_movie_ids` 是 CSV 字符串，`score_threshold`
+/// 是浮点门限，三者都可空。
+#[derive(Debug, Default, Deserialize)]
+pub struct SearchFilters {
+    #[serde(default)]
+    pub page_size: Option<i64>,
+    /// CSV 正整数。`None` 与 `Some("")` 语义不同：后者是「包含/排除零个」。
+    #[serde(default)]
+    pub movie_ids: Option<String>,
+    #[serde(default)]
+    pub exclude_movie_ids: Option<String>,
+    #[serde(default)]
+    pub score_threshold: Option<f64>,
+}
+
+/// 翻页查询。
+#[derive(Debug, Default, Deserialize)]
+pub struct ResultsQuery {
+    /// 上游 `Query(min_length=1)` —— 空串要 422。
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// 图搜会话分页响应（对应上游 `ImageSearchSessionPageResource`）。
+#[derive(Debug, Serialize)]
+pub struct ImageSearchSessionResponse {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub page: ImageSearchPage,
+}
+
+/// 剧情图搜会话分页响应（对应上游 `MoviePlotImageSearchSessionPageResource`）。
+#[derive(Debug, Serialize)]
+pub struct PlotImageSearchSessionResponse {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub page: PlotImageSearchPage,
+}
+
+/// `POST /image-search/sessions` —— multipart：文件 + 过滤条件。
+async fn create_image_search_session(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    _payload: axum::extract::Multipart,
+) -> Result<Json<ImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：需先启用 axum 的 form feature；照上游 `:34-58` 实现（ValueError -> 400）")
+}
+
+/// `GET /image-search/sessions/{session_id}/results`
+///
+/// 上游：`LookupError -> 404`、`ValueError -> 400`（`:60-72`）。
+async fn get_image_search_results(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(_session_id): Path<String>,
+    axum::extract::Query(_query): axum::extract::Query<ResultsQuery>,
+) -> Result<Json<ImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：接 ImageSearchService::list_results（404 / 400 两种错误）")
+}
+
+/// `POST /image-search/text-sessions` —— form 编码。
+async fn create_text_image_search_session(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    _payload: axum::extract::Json<SearchFilters>,
+) -> Result<Json<ImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：改用 Form 提取器（需 form feature）；照上游 `:74-92` 实现")
+}
+
+/// `POST /image-search/plot-sessions` —— multipart。
+async fn create_plot_image_search_session(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    _payload: axum::extract::Multipart,
+) -> Result<Json<PlotImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：照上游 `:94-119` 实现")
+}
+
+/// `GET /image-search/plot-sessions/{session_id}/results`
+async fn get_plot_image_search_results(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    Path(_session_id): Path<String>,
+    axum::extract::Query(_query): axum::extract::Query<ResultsQuery>,
+) -> Result<Json<PlotImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：接 MoviePlotImageSearchService::list_results")
+}
+
+/// `POST /image-search/plot-text-sessions` —— form 编码。
+async fn create_plot_text_search_session(
+    State(_state): State<AppState>,
+    _user: CurrentUser,
+    _payload: axum::extract::Json<SearchFilters>,
+) -> Result<Json<PlotImageSearchSessionResponse>, ErrorResponse> {
+    todo!("骨架：改用 Form 提取器（需 form feature）；照上游 `:147-165` 实现")
+}
+
+/// CSV 正整数解析。
+///
+/// **空串返回 `Some(vec![])` 而不是 `None`** —— 调用方据此区分「显式给了空
+/// 列表」与「没给这个过滤条件」。合并两者会让「排除全部」变成「不过滤」。
+pub fn parse_csv_positive_ints(raw: Option<&str>, field: &str) -> Result<Option<Vec<i64>>, ErrorResponse> {
+    let Some(raw) = raw else { return Ok(None) };
+    if raw.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut out = Vec::new();
+    for piece in raw.split(',') {
+        match piece.trim().parse::<i64>() {
+            Ok(value) if value > 0 => out.push(value),
+            _ => {
+                return Err(ErrorResponse::bad_request(
+                    "invalid_image_search_filter",
+                    format!("{field} 只接受逗号分隔的正整数"),
+                ));
+            }
+        }
+    }
+    Ok(Some(out))
+}

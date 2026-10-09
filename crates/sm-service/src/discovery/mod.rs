@@ -1,34 +1,53 @@
-//! `discovery` 域的 service 层。
+//! `discovery` 域：以图搜与推荐为主。
 //!
-//! # 现状：本包只做了推理客户端，Qdrant 存储层还没写
+//! 参照物：上游 `src/service/discovery/`（16 个文件 / 171.4KB）。
 //!
-//! 上游 `src/service/discovery/` 有 16 个文件，按是否碰向量库分成两半：
+//! # 进度：**文件框架 16/16 全部铺完** —— 方法体待实现
 //!
-//! | | 文件数 | 体积 | 依赖 |
+//! **本轮只铺框架**：签名、类型、错误语义、模块文档按上游定好，方法体是
+//! `todo!()`。**没有编译验证**（重构阶段，按要求不做）—— 所以下列「已就位」
+//! 指的是**类型与依赖已铺好且经代码走查确认对得上上游**，不是「验证过能跑」。
+//!
+//! | 上游文件 | 大小 | 本 crate | 外部依赖 |
 //! |---|---|---|---|
-//! | 需要 Qdrant | 11 | ~138 KB | `qdrant_client`（gRPC）+ 推理服务 |
-//! | **不需要** | 5 | ~37 KB | 只用 PostgreSQL / PIL |
+//! | `qdrant_thumbnail_store.py` | 18KB | [`qdrant::dense`] + [`qdrant::thumbnail`] | Qdrant |
+//! | `qdrant_movie_similarity_store.py` | 9.4KB | [`qdrant::similarity`] | Qdrant |
+//! | `qdrant_plot_image_store.py` | 2.9KB | [`qdrant::plot_image`] | Qdrant |
+//! | `embedding_client.py` | 5.4KB | [`embedding`] | 推理服务 |
+//! | `image_search_service.py` | 12.3KB | [`image_search`] | 推理 + Qdrant |
+//! | `image_search_index_service.py` | 19.5KB | [`image_search_index`] | 推理 + Qdrant |
+//! | `image_search_index_space_service.py` | 4.5KB | [`image_search_space`] | 无（纯 PG） |
+//! | `image_search_input.py` | 848B | [`image_search_space::normalize_image_search_query`] | 无 |
+//! | `image_search_reset_service.py` | 980B | [`image_search_reset`] | 无（纯 PG） |
+//! | `movie_plot_image_search_service.py` | 11KB | [`plot_image_search`] | 推理 + Qdrant |
+//! | `ranking_service.py` | 21.7KB | [`ranking`] | 写侧要 provider 插件 |
+//! | `hot_actress_release_service.py` | 9.3KB | [`hot_actress_release`] | 无（纯 PG） |
+//! | `recommendation_service.py` | 15.1KB | [`recommendation`] | Qdrant（稀疏） |
+//! | `moment_recommendation_service.py` | 24KB | [`moment_recommendation`] | 推理 + Qdrant + 相似影片 |
+//! | `daily_recommendation_service.py` | 18.7KB | [`daily_recommendation`] | 相似影片 + **ranking 读侧** |
 //!
-//! 本包属于**第一半里唯一不需要向量库的那一个** —— `embedding.py` 只发
-//! HTTP。另一半（`qdrant_thumbnail_store` / `qdrant_movie_similarity_store` /
-//! `qdrant_plot_image_store` 与依赖它们的 6 个 service）还没搬。
+//! # 三个「不卡 Qdrant」的文件值得单独说
 //!
-//! # 那一半其实已经不卡了（曾被误记为「缺 Qdrant 客户端」）
+//! 早期文档把整个 `discovery` 都标成「卡 Qdrant」（11 个文件），那是用关键词 grep
+//! 判定的。**按 import 段精确判定**（`handoff.md` 第 47~52 行的纪律）后，
+//! [`ranking`]、[`hot_actress_release`]、[`image_search_space`]、[`image_search_reset`]
+//! 这四个**只 import `peewee` / `src.model` / `PIL` / `optional_services`，
+//! 纯 PostgreSQL，零外部依赖** —— 其中 [`ranking`] 是整个域最大的单文件（21.7KB）。
 //!
-//! 查过 `qdrant-client` 1.19.0 的依赖：**15 个里 14 个已在 `Cargo.lock` 中**
-//! —— `tonic` 0.14.6 与 `tonic-prost` 0.14.6 **精确一致**、`prost` 0.14.4、
-//! `reqwest` 0.13.5、`parking_lot` 0.12.5、`semver` 1.0.28 全部满足，
-//! 且 lock 里 tonic/prost **各只有一个版本**（不会编两套 gRPC）。
-//! 真正的增量只有 `derive_builder` 一个 derive 宏 crate。
-//!
-//! 原先「与零依赖原则冲突」的说法也不成立：`README.md` 的「零外部依赖」一节
-//! 限定的是 `hashing` / `media-file-hash` / `svc-hash` 三个库自己实现
-//! SHA-1/Base32/bencode，**不是全仓禁用第三方 crate**（实际已有 46 个直接
-//! 依赖、382 个 crate），而 tonic/prost 本来就是插件系统带进来的。
-//!
-//! 真正还没着落的是**推理服务本身**（哪个模型、哪个地址）—— 那不是代码问题。
+//! `sm-db/src/discovery/rankings.rs`（13.4KB）早就为 [`ranking`] 写好了。
 
+pub mod daily_recommendation;
 pub mod embedding;
+pub mod hot_actress_release;
+pub mod image_search;
+pub mod image_search_index;
+pub mod image_search_reset;
+pub mod image_search_space;
+pub mod moment_recommendation;
+pub mod plot_image_search;
 pub mod qdrant;
+pub mod ranking;
+pub mod recommendation;
 
-pub use embedding::{EmbeddingClient, EmbeddingSpace};
+pub use image_search_space::{ImageSearchIndexRebuildRequired, ImageSearchIndexSpaceStatus};
+pub use qdrant::similarity::{MovieSimilarityHit, SimilarityQueryError};

@@ -24,6 +24,10 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 # discovery 域的向量库存储层。Qdrant 走 gRPC，与插件 ABI 共用同一套 tonic/prost。
 qdrant-client = { workspace = true }
+# 影片相似度的别名**原子**切换要用生成的 gRPC stub：Qdrant 封装的
+# update_aliases 是私有的，且即使公开也只接受单个 action，表达不了上游要的
+# 「删旧 + 挂新同一请求」。lock 里已是同版本，不引入第二套 gRPC 栈。
+tonic = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
 sqlx = { workspace = true }

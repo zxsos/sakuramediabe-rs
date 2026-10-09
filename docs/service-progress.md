@@ -17,7 +17,7 @@
 | `playback` | 19 | 3,738 | 进行中（见下节，**能做的已做完**） |
 | `catalog` | 27 | 7,556 | 进行中（`movie_resolution_service` 的档位部分 + `actor_service` / `actor_merge_service` / `movie_service` 的订阅状态流转均已落；两个 ownership gateway 未落） |
 | `transfers` | 23 | 4,235 | 进行中（`torznab` 客户端与 `download_service` 的候选搜索已落：解锁 `system/indexer-settings/test` 与 `GET /download-candidates`） |
-| `discovery` | 16 | 4,485 | 待做（多数需 Qdrant） |
+| `discovery` | 16 | ~48,000 | **框架 12/16 铺完**（2026-10-05），方法体待实现 |
 | **合计** | **113** | **25,169** | 2/7 域完成 + 3 域部分 |
 
 行数口径与 `crates/sm-service/src/lib.rs` 的表格一致。推进次序沿用那里的
@@ -647,9 +647,41 @@ ABI** 的那一侧 —— 这个域的大头全在 `sm-plugins` 宿主后面，�
 仓储层已就绪、可直接被这个域使用的部分：`download` / `transfer` /
 `submission` / `task`。
 
-## `discovery` —— 待做
+## `discovery` —— 框架已铺，方法体待实现
 
-尚未开工。仓储侧已有 `discovery` / `recommendation`，多数端点还要 Qdrant。
+**2026-10-05**：16 个上游文件里 **12 个的文件框架已铺**
+（`sm-service/src/discovery/`，逐文件对照表见该目录 `mod.rs`）。
+
+**本轮只铺框架** —— 签名、类型、错误语义、模块文档按上游定好，方法体是
+`todo!()`，**且未做编译验证**（重构阶段）。所以「已铺」指类型与依赖经代码
+走查对得上上游，**不是「验证过能跑」**。
+
+未铺的两个是超大文件：`moment_recommendation_service.py`（24KB）与
+`daily_recommendation_service.py`（18.7KB）—— 两者都消费
+`recommendation_service` 的产出，单独一轮。
+
+### 外部依赖：**已无阻塞**
+
+| 依赖 | 状态 |
+|---|---|
+| Qdrant 客户端 | ✅ `qdrant-client 1.19` 已接入，`discovery/qdrant/` 下稠密 + 稀疏两套齐了 |
+| Qdrant 服务端 | ✅ Podman 跑在 `127.0.0.1:6334` |
+| 推理服务 | ✅ 客户端已按上游 HTTP 契约实现（`discovery/embedding.rs`）；**服务本身待定接什么** |
+| provider 插件 | ❌ 唯一剩下的外部依赖 —— 只卡 `ranking` 的**写侧**（`RankingSyncService`）与同族的 daily/moment 推荐 |
+
+### 四个文件**从一开始就不卡任何外部服务**
+
+早期这节把整个 `discovery` 标成「卡 Qdrant」，那是关键词 grep 的结果。按
+`handoff.md` 的 import 段纪律重新判定后，以下四个只 import `peewee` /
+`src.model` / `PIL` / `optional_services` —— **纯 PostgreSQL**：
+
+- `ranking.rs`（21.7KB，**全域最大的单文件**；`sm-db` 侧 13.4KB 早写好了）
+- `hot_actress_release.rs`（9.3KB）
+- `image_search_space.rs`（4.5KB + 848B）
+- `image_search_reset.rs`（980B）
+
+所以「`discovery` 卡 Qdrant」这个说法应当作废 —— 现在卡的是**方法体**，不是
+外部依赖。
 
 ## 跨域次序：硬约束已解除，影片卡片已在 `collections` 侧定型
 
