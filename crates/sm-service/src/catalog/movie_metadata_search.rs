@@ -302,7 +302,7 @@ impl MovieMetadataSearchService {
     /// 就会出现「重试放行、取详情拒绝」这种半截状态 —— 所以只有这一个实现，
     /// 调用方不必自己拼 `enabled_plugin_sources` 的闭包。
     ///
-    /// [resolve_candidate_reference]: 纯解码那一段仍可按需单独调用
+    /// 纯解码那一段仍可按需单独调用
     /// （它不碰配置与注册表，可脱离插件栈测）。
     pub fn resolve_candidate(
         &self,

@@ -285,7 +285,7 @@ pub trait StorageGateway: Send + Sync {
     /// # 为什么它进这个 trait 而不是让路由层直接读 `sm-plugins`
     ///
     /// `sm-service` 不能依赖 `sm-plugins`（成环，见模块顶注）；而声明属于
-    /// provider 的能力面 —— 跟 [`Self::plan_merged_playback`] 是同一条缝。
+    /// provider 的能力面 —— 跟 `plan_merged_playback` 是同一条缝。
     /// `None` = 该 provider 没声明合并播放（上游的 `getattr(...) is None`）。
     fn merged_playback_format(&self, provider_key: &str) -> Option<String>;
 }

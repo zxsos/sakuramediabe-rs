@@ -972,7 +972,7 @@ impl ImportTaskService {
     ///
     /// **未结束的 TaskRun 不得再执行**（`409 import_task_not_finished`）——
     /// 那会让同一批文件被导两次。检查点在重试模式：原任务必须已是终态
-    /// （[`ensure_retryable_task`]）。单 / 批量模式下 params 里没有自己的
+    /// （`ensure_retryable_task`）。单 / 批量模式下 params 里没有自己的
     /// run id（worker 领取时只领 pending 的行，执行中途也不会有人再领同一行），
     /// 所以这里没有可查的行 —— 不是漏了检查，是签名里就没有这个信息。
     ///
@@ -1126,7 +1126,7 @@ impl ImportTaskService {
     /// `failure_item`（整条存储项，含 `source_ref` / `library_id`），worker
     /// 不回头读原任务的其它东西。
     ///
-    /// 顺序照上游：先判原任务终态（[`ensure_retryable_task`]，未终态 →
+    /// 顺序照上游：先判原任务终态（`ensure_retryable_task`，未终态 →
     /// 409 `import_task_not_finished`，否则同一批文件会被导两次）→ 调
     /// [`MediaImportService::retry_failed_file`] → 回写原任务的失败项。
     ///

@@ -218,7 +218,7 @@ impl ImageTasksBuilder for MovieImageService {
     /// - 封面一个任务；剧情图按序号逐个；演员头像按 **JavDB id 去重**（同一
     ///   演员在一部片里出现两次很正常）；
     /// - URL 为空的条目直接**跳过**（不是错误）；
-    /// - 相对路径规则**只此一份**：委托给 [`relative_path_for`]（它走
+    /// - 相对路径规则**只此一份**：委托给 `relative_path_for`（它走
     ///   `svc_image::paths`，与本仓全部落盘/读取/清理共用同一套规则）。
     fn build_movie_import_image_tasks(
         &self,
