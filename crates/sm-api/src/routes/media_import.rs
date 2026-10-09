@@ -137,11 +137,17 @@ async fn list_import_failed_items(
 /// 番号，那正是它失败的原因）。
 async fn search_import_failed_item(
     _user: CurrentUser,
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path((_task_run_id, _item_id)): Path<(i32, String)>,
-    EnvelopeJson(_payload): EnvelopeJson<ImportMetadataSearchRequest>,
+    EnvelopeJson(payload): EnvelopeJson<ImportMetadataSearchRequest>,
 ) -> Result<Json<ImportMetadataSearchResponse>, ErrorResponse> {
-    todo!("骨架：接失败项的元数据搜索（走插件 metadata_source）")
+    // 番号取**请求体**，不是失败项里存的那个（见上面的方法文档）。
+    // 空番号 422 / 来源失败进 source_errors 都在服务层。
+    let response = state
+        .metadata_search()?
+        .search_by_number(&payload.movie_number)
+        .await?;
+    Ok(Json(response))
 }
 
 /// `POST /imports/{task_run_id}/failed-items/{item_id}/retry` —— **202**。

@@ -125,6 +125,10 @@ pub struct AppState {
     /// 的连接池 —— 两者都是**网络资源**。每次请求现造等于每次请求重新建连，
     /// 与 `similarity` 那条注释同源。
     image_search: Option<Arc<sm_service::discovery::image_search::ImageSearchService>>,
+    /// 元数据搜索（人工重试的候选来源：JavDB + 启用的插件源）。
+    /// **组合根装配**；`None` = 插件平台没起。见 [`Self::metadata_search`]。
+    metadata_search:
+        Option<Arc<sm_service::catalog::movie_metadata_search::MovieMetadataSearchService>>,
     /// 剧情图搜的检索服务。理由与 `image_search` 完全一致（同一组 router 依赖）。
     plot_image_search:
         Option<Arc<sm_service::discovery::plot_image_search::MoviePlotImageSearchService>>,
@@ -148,6 +152,7 @@ impl AppState {
             similarity: None,
             image_search: None,
             plot_image_search: None,
+            metadata_search: None,
         }
     }
 
@@ -193,6 +198,28 @@ impl AppState {
     ) -> Self {
         self.image_search = Some(service);
         self
+    }
+
+    /// 挂上元数据搜索。**只有组合根会调** —— 只有它看得见插件注册表。
+    pub fn with_metadata_search(
+        mut self,
+        search: Arc<sm_service::catalog::movie_metadata_search::MovieMetadataSearchService>,
+    ) -> Self {
+        self.metadata_search = Some(search);
+        self
+    }
+
+    /// 元数据搜索服务。
+    ///
+    /// 未装配 → 503（与 [`Self::plugin_admin`] 同一取向：它依赖插件平台，
+    /// 平台没起时这个能力就不存在 —— 而不是「搜了没有」）。
+    pub fn metadata_search(
+        &self,
+    ) -> Result<&sm_service::catalog::movie_metadata_search::MovieMetadataSearchService, ServiceError>
+    {
+        self.metadata_search
+            .as_deref()
+            .ok_or_else(sm_service::system::plugins::plugin_admin_unavailable)
     }
 
     /// 图搜检索服务。`None` = 未启用。

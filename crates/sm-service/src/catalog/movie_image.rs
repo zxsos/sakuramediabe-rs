@@ -178,6 +178,90 @@ pub struct MovieImageService {
     downloader: SharedDownloader,
 }
 
+impl ImageTasksBuilder for MovieImageService {
+    /// 为一次导入构造全部图片任务。上游 `build_movie_import_image_tasks`：
+    ///
+    /// - 封面一个任务；剧情图按序号逐个；演员头像按 **JavDB id 去重**（同一
+    ///   演员在一部片里出现两次很正常）；
+    /// - URL 为空的条目直接**跳过**（不是错误）；
+    /// - 相对路径规则**只此一份**：委托给 [`relative_path_for`]（它走
+    ///   `svc_image::paths`，与本仓全部落盘/读取/清理共用同一套规则）。
+    fn build_movie_import_image_tasks(
+        &self,
+        movie_number: &str,
+        cover_image_url: Option<&str>,
+        plot_urls: &[String],
+        actors: &[serde_json::Value],
+    ) -> Result<ImageTaskSet, ServiceError> {
+        let cover = cover_image_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| {
+                relative_path_for("movie_cover", movie_number, url, None).map(|relative_path| {
+                    ImagePersistTask {
+                        owner_type: "movie_cover".to_owned(),
+                        owner_key: movie_number.to_owned(),
+                        image_url: url.to_owned(),
+                        relative_path,
+                        plot_index: None,
+                    }
+                })
+            })
+            .transpose()?;
+
+        let mut plots = Vec::with_capacity(plot_urls.len());
+        for (index, url) in plot_urls.iter().enumerate() {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            let plot_index = i32::try_from(index)
+                .map_err(|_| ServiceError::from_status(500, "internal_error", "剧情图序号溢出"))?;
+            let relative_path =
+                relative_path_for("movie_plot", movie_number, url, Some(plot_index))?;
+            plots.push(ImagePersistTask {
+                owner_type: "movie_plot".to_owned(),
+                owner_key: movie_number.to_owned(),
+                image_url: url.to_owned(),
+                relative_path,
+                plot_index: Some(plot_index),
+            });
+        }
+
+        let mut actor_avatars: Vec<(String, ImagePersistTask)> = Vec::new();
+        for actor in actors {
+            let javdb_id = actor
+                .get("javdb_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if javdb_id.is_empty() || actor_avatars.iter().any(|(id, _)| id == javdb_id) {
+                continue;
+            }
+            let Some(avatar_url) = actor.get("avatar_url").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let relative_path = relative_path_for("actor", javdb_id, avatar_url, None)?;
+            actor_avatars.push((
+                javdb_id.to_owned(),
+                ImagePersistTask {
+                    owner_type: "actor".to_owned(),
+                    owner_key: javdb_id.to_owned(),
+                    image_url: avatar_url.to_owned(),
+                    relative_path,
+                    plot_index: None,
+                },
+            ));
+        }
+
+        Ok(ImageTaskSet {
+            cover,
+            plots,
+            actor_avatars,
+        })
+    }
+}
+
 impl MovieImageService {
     /// 构造。
     pub fn new(db: &Db, root: PathBuf, downloader: ImageDownloader) -> Self {
@@ -557,5 +641,80 @@ mod tests {
             "plot_index_required"
         );
         assert!(relative_path_for("nope", "k", "https://x/y/a.jpg", None).is_err());
+    }
+
+    /// ★ 构造器级别的语义：演员按 **JavDB id 去重**、URL 为空/缺失的条目
+    /// **跳过**、封面与剧情图各自归位。
+    ///
+    /// 夹具用 lazy 池 —— 构造任务不碰数据库，`Db` 只是结构体字段。
+    fn builder_service() -> MovieImageService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://offline@127.0.0.1/offline")
+            .expect("lazy 池不需要真实库");
+        MovieImageService::new(
+            &pool,
+            std::env::temp_dir().join("sm-movie-image-builder-test"),
+            Box::new(|_, _| Ok(())),
+        )
+    }
+
+    /// ★ `#[tokio::test]` 而非 `#[test]`：`connect_lazy` 的池在创建时就要往
+    /// 当前运行时里挂维护任务 —— 同步测试没有运行时，直接 panic。
+    #[tokio::test]
+    async fn the_builder_dedupes_actors_and_skips_empty_urls() {
+        let service = builder_service();
+        let actors = [
+            serde_json::json!({"javdb_id": "a1", "avatar_url": "https://x/a1.jpg"}),
+            serde_json::json!({"javdb_id": "a1", "avatar_url": "https://x/a1-again.jpg"}),
+            serde_json::json!({"javdb_id": "a2"}),
+            serde_json::json!({"javdb_id": "a3", "avatar_url": "https://x/a3.png"}),
+        ];
+        let tasks = service
+            .build_movie_import_image_tasks(
+                "ABC-123",
+                Some("https://x/cover.jpg"),
+                &[
+                    "https://x/p0.jpg".to_owned(),
+                    String::new(),
+                    "https://x/p2.jpg".to_owned(),
+                ],
+                &actors,
+            )
+            .expect("构造成功");
+
+        assert!(tasks.cover.is_some(), "有封面 URL 就有封面任务");
+        assert_eq!(tasks.plots.len(), 2, "空 URL 的剧情图跳过");
+        assert_eq!(
+            tasks
+                .plots
+                .iter()
+                .map(|task| task.plot_index)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(2)],
+            "序号保留原位，不重排"
+        );
+        assert_eq!(
+            tasks
+                .actor_avatars
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a1", "a3"],
+            "同一演员只下一张；没有头像 URL 的跳过"
+        );
+    }
+
+    /// 全部 URL 为空 → 空任务集，**不是错误**。
+    #[tokio::test]
+    async fn an_all_empty_import_yields_an_empty_task_set() {
+        let service = builder_service();
+        let tasks = service
+            .build_movie_import_image_tasks("ABC-123", None, &[], &[])
+            .expect("构造成功");
+        assert!(tasks.cover.is_none());
+        assert!(tasks.plots.is_empty());
+        assert!(tasks.actor_avatars.is_empty());
+        assert!(tasks.flatten().is_empty());
     }
 }

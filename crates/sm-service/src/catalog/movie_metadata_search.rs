@@ -592,7 +592,10 @@ fn signed_url(
 /// [`MetadataSourceError`] → `(reason, detail)`。上游用异常类名当 reason
 /// （`:64` 的 `type(exc).__name__` —— 机器可读、不含内部细节），这里用变体名，
 /// 同一语义；`detail` 是给日志与排障的原文。
-fn source_error_parts(error: &MetadataSourceError) -> (String, String) {
+///
+/// `pub(crate)`：刷新服务（`movie_metadata_refresh`）把来源错误归成 502 时
+/// 也要区分「没收录」与「来源坏了」—— 同一份映射，别抄第二份。
+pub(crate) fn source_error_parts(error: &MetadataSourceError) -> (String, String) {
     match error {
         MetadataSourceError::NotFound => ("NotFound".to_owned(), "没有收录".to_owned()),
         MetadataSourceError::RequestFailed(detail) => ("RequestFailed".to_owned(), detail.clone()),

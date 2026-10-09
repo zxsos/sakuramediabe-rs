@@ -320,6 +320,27 @@ impl MovieRepository {
         Ok(row)
     }
 
+    /// 远端 JavDB id 是否已被**别的**本地影片占用，占用则返回那条的番号。
+    ///
+    /// 上游 `_validate_remote_movie_metadata_javdb_id`（
+    /// `movie_metadata_refresh_service.py:132-167`）的查询段：
+    /// `(javdb_id == remote) & (Movie.id != movie.id)`。「刷新」必须先过这道闸
+    /// —— 远端主键已被别的影片占用时直接拒绝，否则会把另一部影片的元数据
+    /// 覆盖过来，而用户完全看不出来。
+    pub async fn conflicting_number_by_javdb_id(
+        &self,
+        javdb_id: &str,
+        exclude_movie_id: i32,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT movie_number FROM movie WHERE javdb_id = $1 AND id <> $2 LIMIT 1",
+        )
+        .bind(javdb_id)
+        .bind(exclude_movie_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// 按一批番号**批量**查询，返回 `番号 -> Movie`。
     ///
     /// 下载任务列表用它一次把当页涉及的影片卡片取回来（上游

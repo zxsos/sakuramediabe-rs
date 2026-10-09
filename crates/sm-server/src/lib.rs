@@ -245,12 +245,65 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     > = std::sync::Arc::new(media_library_gateway::MediaLibraryGateway::new(
         loaded_plugins.provider_registry(),
     ));
+    // 元数据搜索（人工重试的候选来源）：来源 = 启用的 `metadata_source` 扩展
+    // （data_dir / endpoint 从插件配置与 provider 注册表补齐），provider = JavDB
+    // （host 照上游硬编码，见 `system::status::JAVDB_HOST` 的拍板记录）。
+    let metadata_search = {
+        let provider_registry = loaded_plugins.provider_registry();
+        // data_dir 按 `<root>/<plugin_id>/data` 约定现解（`PluginConfig` 是
+        // 注册表的输入，`Plugins::load` 已把它消费掉，这里按同一快照重建）。
+        let plugin_config =
+            plugins::PluginConfig::from_snapshot(&config_service.snapshot().map_err(|error| {
+                anyhow::anyhow!("读取配置失败（{}）：{}", error.code(), error.api.message)
+            })?);
+        let sources = loaded_plugins
+            .extension_registry()
+            .lock()
+            .expect("扩展注册表锁")
+            .metadata_sources()
+            .iter()
+            .filter_map(|entry| {
+                // 端点来自 provider 注册表（插件重启会换，搜索走注册表现取 ——
+                // 与 `provider_gateway.rs` 的「活的注册表」同一纪律）。
+                let endpoint = provider_registry
+                    .lock()
+                    .expect("provider 注册表锁")
+                    .get(&entry.plugin_id)
+                    .map(|entry| entry.plugin_endpoint.clone())?;
+                Some(sm_service::catalog::metadata_source::RegisteredSource {
+                    plugin_id: entry.plugin_id.clone(),
+                    display_name: entry.display_name.clone(),
+                    data_dir: plugin_config.data_dir_for(&entry.plugin_id),
+                    endpoint,
+                })
+            })
+            .collect::<Vec<_>>();
+        let provider = match sm_service::catalog::javdb::JavdbProvider::new(
+            sm_service::system::status::JAVDB_HOST,
+        ) {
+            Ok(provider) => Some(Box::new(provider)
+                as Box<
+                    dyn sm_service::catalog::metadata_source::MetadataProvider + Send + Sync,
+                >),
+            Err(error) => {
+                tracing::warn!(?error, "JavDB provider 构造失败：搜索只剩插件来源");
+                None
+            }
+        };
+        sm_service::catalog::movie_metadata_search::MovieMetadataSearchService::new(
+            config_service.clone(),
+            Arc::new(
+                sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider),
+            ),
+        )
+    };
     let state = sm_api::AppState::new(pool.clone(), auth, config_service.clone())
         .with_jobs(job_catalog)
         .with_ranking_sources(ranking_sources)
         .with_storage_gateway(storage_gateway)
         .with_playback_gateway(playback_gateway)
         .with_media_library_registry(media_library_gateway)
+        .with_metadata_search(Arc::new(metadata_search))
         .with_plugin_admin(plugin_admin);
     // 影片相似度的 Qdrant 存储（`GET /movies/{}/similar` 用）。
     //
