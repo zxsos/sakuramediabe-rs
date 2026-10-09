@@ -11,7 +11,7 @@
 //!
 //! `sm-service` 只认 trait（`sm-plugin-api` 是叶子 crate，不成环）；
 //! 真正的 gRPC 调用在这里；`sm-server` 在启动时把
-//! [`RegistryProviderFactory`] 塞给需要的 service。
+//! `RegistryProviderFactory` 塞给需要的 service。
 
 use std::sync::{Arc, Mutex};
 

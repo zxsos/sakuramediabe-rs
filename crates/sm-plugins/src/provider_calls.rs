@@ -17,7 +17,7 @@
 //! （`download_sync` / `download_task::delete` / `download_request::create` /
 //! `auto_download`），见 `docs/handoff.md` §7.4。
 //!
-//! ✅ `Browse` 的包装已补上（[`browse`]，单页语义）。它此前是「参考插件实现了、
+//! ✅ `Browse` 的包装已补上（`browse`，单页语义）。它此前是「参考插件实现了、
 //! 宿主一处都调不到」——`provider_browse`（浏览导入来源）与 `media_transfer`
 //! （转存挑源）都要它。注意它是**单页**的：`next_cursor` 透传给客户端，
 //! 宿主**不**循环收干（理由写在函数文档里）。
@@ -528,7 +528,7 @@ pub async fn scan_import_source_all(
     library: LibraryHandle,
     source_ref: &serde_json::Value,
 ) -> Result<Vec<ImportFileEntry>, ProviderOperationError> {
-    // ⚠️ 与 [`browse`] 同一道闸：根不是对象就当场拒，**不**降级成「没给」
+    // ⚠️ 与 `browse` 同一道闸：根不是对象就当场拒，**不**降级成「没给」
     // （对 provider 来说 `None` 是「扫整个库」，那是个看起来正常的结果）。
     require_opaque_object(provider_key, "scan_import_source", "source_ref", source_ref)?;
     let mut stream = client
