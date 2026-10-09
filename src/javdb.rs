@@ -156,8 +156,8 @@ impl JavDbSource {
         board_key: &str,
         period: &str,
     ) -> Result<Vec<String>, FetchError> {
-        let board = find_board(board_key)
-            .ok_or_else(|| FetchError::UnknownBoard(board_key.to_owned()))?;
+        let board =
+            find_board(board_key).ok_or_else(|| FetchError::UnknownBoard(board_key.to_owned()))?;
         let url = self.board_url(board, period)?;
         let html = self.client.get(url).send().await?.text().await?;
         Ok(parse_ranking_page(&html))
@@ -242,7 +242,14 @@ mod tests {
         let keys: Vec<_> = BOARDS.iter().map(|b| b.key).collect();
         assert_eq!(
             keys,
-            vec!["hot", "top_rated", "censored", "uncensored", "fc2", "top250"]
+            vec![
+                "hot",
+                "top_rated",
+                "censored",
+                "uncensored",
+                "fc2",
+                "top250"
+            ]
         );
     }
 
@@ -301,11 +308,12 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_ranking_uses_mock_server() {
-        let mut server = wiremock::MockServer::start().await;
+        let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::any())
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
-                r#"<a href="/v/AAA-001"></a><a href="/v/BBB-002/"></a>"#,
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="/v/AAA-001"></a><a href="/v/BBB-002/"></a>"#),
+            )
             .mount(&server)
             .await;
         let src = JavDbSource::new_for_test(&server.uri());

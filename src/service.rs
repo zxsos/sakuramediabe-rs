@@ -191,7 +191,14 @@ mod tests {
         let keys: Vec<_> = boards.iter().map(|b| b.board_key.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["hot", "top_rated", "censored", "uncensored", "fc2", "top250"]
+            vec![
+                "hot",
+                "top_rated",
+                "censored",
+                "uncensored",
+                "fc2",
+                "top250"
+            ]
         );
     }
 
