@@ -17,8 +17,8 @@
 use std::time::Duration;
 
 use regex::Regex;
-use reqwest::header::{COOKIE, USER_AGENT};
-use reqwest::{Client, Url};
+use reqwest::header::COOKIE;
+use reqwest::Client;
 use url::Url as UrlParse;
 
 use crate::html::{self, DmmPage};

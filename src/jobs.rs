@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use regex::Regex;
 
-use crate::dmm::{DmmClient, DmmError, DmmFetchResult};
+use crate::dmm::{DmmClient, DmmError};
 use crate::settings::Settings;
 use crate::state::{DmmState, FieldValue};
 use crate::translation::{normalize_translation, TranslationClient, TranslationError};
@@ -236,7 +236,6 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     let _lock = match try_lock_file(data_dir) {
         Some(p) => p,
         None => {
-            stats.busy = true;
             return Err(PipelineError::Busy);
         }
     };
@@ -296,7 +295,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
             }
             if movie.owners.get(host_field).and_then(|o| o.as_ref())
                 != Some(&PLUGIN_OWNER.to_owned())
-                && movie.owners.get(host_field).is_some()
+                && movie.owners.contains_key(host_field)
             {
                 // 有主且不是自己：受保护。
                 stats.writeback_blocked += 1;
@@ -397,7 +396,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                 match cache {
                     None => {
                         let blocked = ["title", "summary"].iter().all(|f| {
-                            movie.owners.get(*f).is_some()
+                            movie.owners.contains_key(*f)
                                 && movie.owners.get(*f).and_then(|o| o.as_ref())
                                     != Some(&PLUGIN_OWNER.to_owned())
                         });
@@ -580,7 +579,6 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                     stats.translation_failed += 1;
                     failed_ids.insert(movie.movie_id);
                     if e.abort_batch {
-                        stats.aborted = true;
                         return Err(PipelineError::Translation(e));
                     }
                 }
@@ -633,11 +631,7 @@ mod tests {
         patched: Mutex<Vec<(i64, Option<String>, Option<String>)>>,
     }
 
-    impl MemStore {
-        fn add(&self, movie: MovieRef) {
-            self.movies.lock().unwrap().insert(movie.movie_id, movie);
-        }
-    }
+    impl MemStore {}
 
     impl MovieStore for MemStore {
         fn find_by_number(&self, number: &str) -> Option<MovieRef> {
