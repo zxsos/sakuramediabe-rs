@@ -201,7 +201,7 @@ impl Cloud115Client {
     }
 
     async fn get_json_space(&self) -> Result<SpaceData, Cloud115Error> {
-        let mut req = self.http.get(&format!("{WEBAPI}/user/space"));
+        let mut req = self.http.get(format!("{WEBAPI}/user/space"));
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }
@@ -251,7 +251,7 @@ impl Cloud115Client {
         }
         let offset_s = offset.to_string();
         let limit_s = limit.to_string();
-        let mut req = self.http.get(&format!("{WEBAPI}/files"));
+        let mut req = self.http.get(format!("{WEBAPI}/files"));
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }
@@ -368,7 +368,7 @@ impl Cloud115Client {
 
     /// 新建目录，返回新 cid。
     pub async fn mkdir(&self, parent_cid: &str, name: &str) -> Result<String, Cloud115Error> {
-        let mut req = self.http.post(&format!("{WEBAPI}/files/add"));
+        let mut req = self.http.post(format!("{WEBAPI}/files/add"));
         for (key, value) in self.headers() {
             req = req.header(key, value);
         }

@@ -210,10 +210,7 @@ impl StorageProviderExt for Provider115 {
         self.check_library(&library)?;
 
         let cid = ref_cid(payload.source_ref.as_ref()).to_owned();
-        let client = self.client(&library).map_err(|e| {
-            // 扫描开始前就把认证错误抛出去，而不是让流里第一个 item 才报错。
-            e
-        })?;
+        let client = self.client(&library)?;
 
         // 先探活：目录不存在时直接返回 not_found，不开流。
         client
