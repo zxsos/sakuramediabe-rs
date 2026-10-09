@@ -1,0 +1,60 @@
+[package]
+name = "plugin-scrape-translate"
+version = "0.1.0"
+description = "SakuraMedia 影片文案抓取与翻译：从 DMM 抓取日文标题简介，可选翻译成中文后写回"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
+#
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖而不是
+# branch：按 branch 会让本插件与宿主静默漂移到不同版本的契约，症状是注册不上
+# 而不报错。
+#
+# tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+# run_job 的进度流。
+async-stream = "0.3"
+# JobDefinition.params_schema 与 JobEvent.result 的 Struct。
+prost-types = "0.14"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# 相对 URL 按详情页基址解析（上游 urljoin）。
+url = "2"
+# 抓取结果、译文缓存和失败次数的本地状态（上游 state.py 的 sqlite3）。
+rusqlite = { version = "0.32", features = ["bundled"] }
+# 翻译请求的 x-opencode-session 头（上游 translation.py）。
+uuid = { version = "1", features = ["v4"] }
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 上游 dmm.py 的正则（番号匹配、空白折叠）。
+regex = "1"
+# HTML 字符引用解码（上游 html.unescape）。
+html-escape = "0.2"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它。
+[[bin]]
+name = "sakuramedia_movie_scrape_translate"
+path = "src/bin/sakuramedia_movie_scrape_translate.rs"
+
+[dev-dependencies]
+# DMM 页面与翻译服务交给本地假服务，测试不许联网。
+wiremock = "0.6"
+# 测试里建 Tokio 运行时。
+tokio = { version = "1", features = ["full", "test-util"] }
