@@ -1,8 +1,13 @@
-# rust-media-io
+# sakuramediabe-rs
 
-SakuraMedia 后端的 Rust 媒体 IO 服务。目标是**渐进式**接管 `sakuramediabe`
-（Python/FastAPI）里 CPU/IO 密集的部分，让主进程逐步摆脱
-`libtorrent` / `PyAV` / `OpenCV` / `numpy` / `Pillow` 这几个重型依赖。
+SakuraMedia 后端的 Rust 重写实现。
+
+> **这是 [`sakuramediabe`](https://github.com/tinypinglite/sakuramediabe)
+> （Python/FastAPI，作者 tinypinglite）的衍生作品**，与其同以
+> **GPL-3.0** 授权。取自上游的代码范围见 [NOTICE.md](NOTICE.md)。
+> GPL-3.0 的 copyleft 条款决定了本项目**无法**以更宽松的许可证分发。
+
+采用**渐进式**策略：按模块逐个替换，客户端与 API 契约保持不变。
 
 ## 为什么渐进式而非全量重写
 
@@ -20,14 +25,31 @@ SakuraMedia 后端的 Rust 媒体 IO 服务。目标是**渐进式**接管 `saku
 | `hashing` | SHA-1 / SHA-256 / Base32 | — | 13 |
 | `media-file-hash` | `media-file-hash-v1` 采样指纹 | 两个 provider 里的重复实现 | 9 |
 | `svc-hash` | BT info hash 解析 | **`libtorrent`** | 32 |
+| `sm-core` | JWT / Argon2 / 统一错误信封 | — | 72 |
+| `sm-db` | **40 张表的模型映射（40/40 ✅）** | `model/` + 部分 Peewee → sqlx | 65 |
 | `parity-cli` | 对拍入口（开发工具） | — | — |
 
-- `cargo test`：**54 passed / 0 failed**
+- `cargo test`：**192 passed / 0 failed，零编译警告**
 - `python parity/compare.py`：**44/44** Rust 与 Python 逐条一致
+- `python parity/compare_core.py`：**64/64** 核心原语逐条一致
+
+### 重构进度
+
+| 层 | 后端规模 | 已完成 | 进度 |
+|---|---|---|---|
+| 模型 `model/` | 40 表 | 40 表 | **100% ✅** |
+| 服务 `service/` | 114 文件 | — | 0% |
+| Schema `schema/` | 44 文件 | — | 0% |
+| API `api/` | 126 端点 | — | 0% |
+| 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | — | 0% |
+
+**全部 8 个域完成**：`catalog`(9) / `playback`(6) / `collections`(6) / `videos`(3) / `transfers`(6) / `system`(5) / `discovery`(5)，共 40 表。
+详见 [docs/schema-mapping.md](docs/schema-mapping.md)。
 
 ## 零外部依赖
 
-三个库都不引入任何第三方 crate。SHA-1 / SHA-256 / Base32 / bencode 全部自实现：
+`hashing` / `media-file-hash` / `svc-hash` 三个库不引入任何第三方 crate。
+SHA-1 / SHA-256 / Base32 / bencode 全部自实现：
 
 1. 产物是塞进 `sakuramedia` 镜像的静态二进制，依赖越少交叉编译与审计面越小。
 2. 四个算法都是固定标准实现，总计约 500 行，每处都有公开测试向量兜底。

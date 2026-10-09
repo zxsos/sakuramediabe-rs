@@ -21,8 +21,6 @@
 //! 推论：**后端必须保证前三个字段永远合法**。客户端一旦收到空 token
 //x 就会直接抛异常，表现为「登录莫名失败」而不是降级。
 
-use std::str::FromStr;
-
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

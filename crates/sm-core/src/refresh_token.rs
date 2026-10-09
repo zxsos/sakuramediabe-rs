@@ -206,7 +206,8 @@ mod tests {
 
     #[test]
     fn all_rejections_share_one_error_code() {
-        // 客户端按单一 code 处理，不区分具体原因。
+        // 客户端按单一 code 处理，不区分具体原因。三种成因共享同一组
+        // 对外常量，逐个变体也必须返回相同值。
         for rejection in [
             RefreshRejection::NotFound,
             RefreshRejection::NotActive,
@@ -215,8 +216,9 @@ mod tests {
             assert_eq!(RefreshRejection::ERROR_CODE, "invalid_refresh_token");
             assert_eq!(RefreshRejection::STATUS, 401);
             assert_eq!(RefreshRejection::MESSAGE, "Refresh token is invalid");
+            // 唯一按实例变化的应是日志标签 —— 对外统一、运维可区分。
+            assert!(!rejection.log_tag().is_empty(), "{rejection:?}");
         }
-        // 三种成因共享同一组对外常量，因此循环体内无需按实例取值。
     }
 
     #[test]
