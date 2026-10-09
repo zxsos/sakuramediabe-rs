@@ -21,6 +21,8 @@ pub struct Settings {
     pub timeout_secs: u64,
     /// TOP250 是否需要账号。没配账号时跳过 TOP250 抓取（上游同行为）。
     pub top250_require_auth: bool,
+    /// JavDB 登录后的 Cookie（如 `_javdb_session=xxx`），用于绕过反爬和访问 TOP250。
+    pub cookie: String,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             base_url: "https://javdb.com".to_owned(),
             timeout_secs: 30,
             top250_require_auth: true,
+            cookie: String::new(),
         }
     }
 }
@@ -67,6 +70,15 @@ impl Settings {
                 multiline: false,
                 hint: None,
             },
+            SettingsField {
+                key: "cookie".to_owned(),
+                label: "JavDB Cookie".to_owned(),
+                input: "text".to_owned(),
+                required: false,
+                description: Some("登录后的 Cookie，用于绕过反爬和访问 TOP250".to_owned()),
+                multiline: true,
+                hint: Some("如 _javdb_session=xxx；从浏览器开发者工具复制".to_owned()),
+            },
         ]
     }
 }
@@ -81,9 +93,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_has_two_fields() {
+    fn schema_has_three_fields() {
         let fields = Settings::schema();
-        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.len(), 3);
         assert_eq!(fields[0].key, "base_url");
+        assert_eq!(fields[2].key, "cookie");
     }
 }

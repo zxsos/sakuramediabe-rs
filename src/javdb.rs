@@ -100,6 +100,8 @@ pub enum FetchError {
     UnknownBoard(String),
     #[error("周期不支持: board={0} period={1}")]
     UnsupportedPeriod(String, String),
+    #[error("Cookie 格式无效")]
+    InvalidCookie,
 }
 
 /// JavDB 榜单抓取器。
@@ -110,10 +112,20 @@ pub struct JavDbSource {
 
 impl JavDbSource {
     pub fn new(settings: &Settings) -> Result<Self, FetchError> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(settings.timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; SakuraMedia/1.0)")
-            .build()?;
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        // 配了 Cookie 就带上：绕过反爬 + TOP250 需要登录
+        if !settings.cookie.trim().is_empty() {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::COOKIE,
+                reqwest::header::HeaderValue::from_str(settings.cookie.trim())
+                    .map_err(|_| FetchError::InvalidCookie)?,
+            );
+            builder = builder.default_headers(headers);
+        }
+        let client = builder.build()?;
         let base_url = Url::parse(settings.base_url.trim_end_matches('/'))?;
         Ok(Self { client, base_url })
     }
