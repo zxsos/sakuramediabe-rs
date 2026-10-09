@@ -33,6 +33,10 @@
 pub mod config;
 pub mod error;
 pub mod logging;
+/// 宿主能力出口（`PluginHost`）的服务端。同样只在组合根：它要同时用
+/// `sm_db`（查影片/演员）与 `sm-plugin-api`（proto），而 `sm-plugins` 不该
+/// 反向依赖业务层的数据。
+pub mod plugin_host;
 pub mod plugins;
 // provider 数据面的**实现**只能在这里：`sm-service` 不能依赖 `sm-plugins`
 // （依赖方向会成环），而 `sm-server` 同时看得见两边。见模块文档。
@@ -124,10 +128,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // 第 3b 步已经保证配置读得了，所以这里**不需要** `unwrap_or_default()` ——
     // 那一行是第 6 处静默降级：配置坏了会让插件配置变成空，从而「插件全部
     // 静默禁用」，而日志里一句提示都没有。
-    let plugin_config =
+    let mut plugin_config =
         plugins::PluginConfig::from_snapshot(&config_service.snapshot().map_err(|error| {
             anyhow::anyhow!("读取配置失败（{}）：{}", error.code(), error.api.message)
         })?);
+    // 4a. 宿主能力出口（`PluginHost`）。**必须在拉起插件之前** —— 端点靠环境变量
+    //     注入，插件起来时它就得是能连的；反过来的话插件会拿到一个连不上的
+    //     地址（或者干脆没有这个变量，而它分不清「宿主没起」和「我该重试」）。
+    match plugin_host::serve(&pool).await {
+        Ok(endpoint) => plugin_config.host_endpoint = Some(endpoint),
+        Err(error) => tracing::warn!(%error, "PluginHost 未能起服务：插件这次不能回调宿主"),
+    }
     let loaded_plugins = plugins::Plugins::load(plugin_config).await;
     let plugin_specs = loaded_plugins.scheduler_specs();
     let job_catalog = loaded_plugins.catalog();

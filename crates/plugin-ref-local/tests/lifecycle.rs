@@ -33,6 +33,9 @@ fn spec(plugin_id: &str, root: &std::path::Path) -> LaunchSpec {
         data_dir: scratch_root("lifecycle-data"),
         settings: None,
         settings_path: None,
+        // 本测试不起宿主的 `PluginHost` 服务，所以插件这次**不能**回调宿主 ——
+        // 这正是协议要表达的：「没有这个变量」而不是「给一个连不上的地址」。
+        host_endpoint: None,
         ready_timeout: Duration::from_secs(10),
     }
 }
@@ -50,7 +53,14 @@ async fn the_host_launches_the_plugin_and_gets_its_registration() {
     // 回显宿主注入的 id —— 不回显就是加载失败（proto 的原话）。
     assert_eq!(registration.plugin_id, "local");
     assert_eq!(registration.abi_major, sm_plugin_api::ABI_MAJOR);
-    assert_eq!(registration.capabilities, vec![50], "声明了下载能力");
+    // ★ 本插件只 serve `StorageProvider`，所以**不声明**任何能力 ——
+    // 这里曾经断言 `vec![50]`（Download），而 `DownloadProvider` 全 crate 没有
+    // 实现：声明与实现不一致，宿主会以为能提交下载。
+    assert!(
+        registration.capabilities.is_empty(),
+        "没实现的 provider 不该声明能力：{:?}",
+        registration.capabilities
+    );
     // 声明里带着 media.provider 扩展点，宿主据此建 provider 表。
     assert_eq!(registration.extensions.len(), 1);
     assert_eq!(registration.extensions[0].key, "media.provider");

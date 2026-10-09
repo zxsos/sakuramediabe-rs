@@ -11,7 +11,7 @@
 //! 但没有任何字段声明另一个端口 —— 只有数据面才有 `data_plane_endpoint`）。
 //! 所以客户端都用控制面那条 `Channel` 建：`Client::new(channel)`。
 //!
-//! # ⚠️ 尚未闭合的 ABI 缺口：**错误码过不了线**
+//! # ✅ 已闭合的 ABI 缺口：**错误码过线了**
 //!
 //! 上游的失败是一条结构化记录：
 //!
@@ -29,35 +29,30 @@
 //! | 缩略图生成 | `unavailable` 且 `retryable` → 走**延迟轨**（不是失败轨）|
 //! | 播放 | `authentication_failed` → 401；`unavailable` → 503 |
 //!
-//! 但 `proto/common.proto` 里那个 `ProviderError` 与 `ProviderErrorCode`
-//! **没有任何 rpc 用它做错误通道**（`crates/plugin-ref-local/src/provider.rs:249`
-//! 的注释就是这么写的：「失败只有一个布尔位 `unavailable`，区分不了『文件不存在』
-//! 『无权限』『已被黑名单』，也带不了 ProviderErrorCode / retryable」）。
-//! 也就是说宿主**只拿得到 `tonic::Status`**：一个 gRPC 状态码 + 一句人话。
+//! ## 闭合方式：`ProviderError` 走 `Status` 的 `details`
 //!
-//! 后果是 `classify_status` 的映射
-//! **必然有损**，最危险的一处是：
+//! `proto/common.proto:322` 那个 `ProviderError` 之前没有任何 rpc 用它做
+//! 错误通道，宿主只拿得到 `tonic::Status`。现在它由
+//! [`sm_plugin_api::error::to_status`] 编进 `Status::details`、
+//! 由 [`sm_plugin_api::error::from_status`] 还原 —— **不改任何 rpc 签名**，
+//! 老插件（不带结构）走回落路径。
+//!
+//! ## 为什么回落路径**必须留着**
+//!
+//! 没带结构的插件（手写 `Status::unimplemented` 的那 28 个未实现 rpc 就是）
+//! 解不出 `ProviderError`。那时仍按 gRPC 码猜 `code`，`retryable` 用
+//! [`sm_plugin_api::error::default_retryable`] 的保守猜测。
+//!
+//! ## 猜的那条路**仍然有损**
+//!
+//! 最危险的一处没变，只是现在只在回落时才发生：
 //!
 //! > `Status::NotFound` 同时被「远端文件不在」与「媒体库不存在」用。
 //! > 映射成 `source_not_found` 之后，`delete_media` 会当作「远端早已删掉」
 //! > 而**继续清理本地记录** —— 那正是我们要的结果没错；但如果真实原因是
 //! > 「库没配好」，我们就**以为远端删过了**，而实际上文件还在。
 //!
-//! 另外 `retryable` **完全拿不到**，只能按码猜
-//! （见 `retryable_for`）。
-//!
-//! # 闭合它要动 proto（**这不是本模块能单独解决的**）
-//!
-//! 两条路，都不小：
-//!
-//! 1. 让 `ProviderError` 真的上错误通道 —— 用 `google.rpc.Status` 的
-//!    `details` 塞一个 protobuf 编码的 `ProviderError`（tonic 侧要引
-//!    `tonic-types`），**所有插件都要跟着改**；
-//! 2. 每个响应消息加 `optional ProviderError error = n;` —— 更直白，但要改
-//!    全部 28 个 rpc 的响应。
-//!
-//! 在那之前，本模块把有损映射**集中在一处**并标注每个分支的依据，让将来的迁移
-//! 只需要改 `classify_status` 一个函数。
+//! 所以插件作者应当调 `to_status` 报结构化错误，而不是只给一个 gRPC 码。
 
 use sm_plugin_api::v1::storage_provider_client::StorageProviderClient;
 use sm_plugin_api::v1::{
@@ -85,10 +80,14 @@ pub struct ProviderOperationError {
     /// 因为同一个 provider 的不同操作失败原因可能不同。
     pub operation: String,
     pub code: ProviderErrorCode,
-    /// 宿主生成的安全文案。**不含插件文本。**
+    /// 对外文案。**优先**用插件给的 `safe_message`（结构化错误带过来的），
+    /// 没有才用宿主自己的模板 —— 见 [`Self::retryable`] 旁边同源的说明。
     pub safe_message: String,
     /// 插件的原始文本。**只进日志。**
     pub plugin_detail: String,
+    /// provider **显式**给的「值不值得重试」。`None` = 它没说（没带结构化
+    /// 错误），此时 [`Self::retryable`] 退回按码猜。
+    pub provider_retryable: Option<bool>,
 }
 
 impl ProviderOperationError {
@@ -108,10 +107,15 @@ impl ProviderOperationError {
         &self.plugin_detail
     }
 
-    /// 是否值得重试。**宿主按码猜的**，见
-    /// `retryable_for`。
+    /// 是否值得重试。
+    ///
+    /// **优先信 provider 说的**（[`Self::provider_retryable`]）—— 上游的
+    /// `retryable` 是 provider 给的独立字段，不是从 `code` 推的
+    /// （`provider_protocol.py:661-665`：`unsupported` 显式给 `retryable=False`）。
+    /// 它没说时才退回按码猜（[`sm_plugin_api::error::default_retryable`]）。
     pub fn retryable(&self) -> bool {
-        retryable_for(self.code)
+        self.provider_retryable
+            .unwrap_or_else(|| sm_plugin_api::error::default_retryable(self.code))
     }
 }
 
@@ -133,34 +137,38 @@ pub fn provider_error_code_name(code: ProviderErrorCode) -> &'static str {
     }
 }
 
-/// 该码是否值得重试。
+/// gRPC 状态 → 上游的 provider 错误。
 ///
-/// # 这是**猜的** —— 上游的 `retryable` 是 provider 给的独立字段
+/// # 先试结构化错误，解不出才猜
 ///
-/// proto 过不了线（见模块文档），所以只能按语义近似：
+/// 插件若按契约用 [`sm_plugin_api::error::to_status`] 报错，`Status::details`
+/// 里就是一条 `ProviderError`：`code` / `safe_message` / `retryable` 三个字段
+/// 全部**无损**到达，猜的那条路一步都不走。
 ///
-/// | code | 猜 | 理由 |
-/// |---|---|---|
-/// | `unavailable` | **是** | 网络抖动、后端重启 —— 上游缩略图任务正是靠它走延迟轨 |
-/// | `source_not_found` | 否 | 远端对象不在，重试还是不在（**除非**是挂载点还没就绪 —— 那种情况上游由 provider 显式给 `retryable=true`）|
-/// | 其余 | 否 | 配置/认证/黑名单/不支持 —— 全是确定性失败 |
-///
-/// 猜错的代价是**不对称的**：把「该重试的」判成不该重试 → 差一次重试机会；
-/// 反过来把确定性失败判成该重试 → 每轮都白烧一次 provider 调用（而缩略图任务的
-/// 重试有次数上限，最终仍会进终态）。所以这里**偏保守**。
-pub fn retryable_for(code: ProviderErrorCode) -> bool {
-    matches!(code, ProviderErrorCode::Unavailable)
-}
-
-/// gRPC 状态 → 上游的 provider 错误码。**这是那个有损映射的唯一一处。**
-///
-/// 每个分支的依据都写在下面的 `match` 里；将来 proto 真的把 `ProviderError`
-/// 送上错误通道之后，这个函数会瘦成「解析 `ProviderError` + 兜底」。
+/// 只有解不出（老插件、或手写 `Status` 的插件）才进下面的 `match` 按 gRPC 码
+/// 猜 —— 那条路**必然有损**，危险的那处写在模块文档里。
 pub fn classify_status(
     provider_key: &str,
     operation: &str,
     status: Status,
 ) -> ProviderOperationError {
+    if let Some(structured) = sm_plugin_api::error::from_status(&status) {
+        let code =
+            ProviderErrorCode::try_from(structured.code).unwrap_or(ProviderErrorCode::Unspecified);
+        return ProviderOperationError {
+            provider_key: provider_key.to_owned(),
+            operation: operation.to_owned(),
+            code,
+            // 插件给的 `safe_message` 是 proto 定义的「对外展示的安全文案」；
+            // 空串时（它懒得给）仍用宿主自己的模板。
+            safe_message: match structured.safe_message.as_str() {
+                "" => safe_message_for(code).to_owned(),
+                text => text.to_owned(),
+            },
+            plugin_detail: status.message().to_owned(),
+            provider_retryable: Some(structured.retryable),
+        };
+    }
     let code = match status.code() {
         // 上游 `delete_media` / `plan_playback` 的「远端对象不在」。
         //
@@ -193,6 +201,8 @@ pub fn classify_status(
         code,
         safe_message: safe_message_for(code).to_owned(),
         plugin_detail: status.message().to_owned(),
+        // 没带结构 → provider 什么都没说，只能按码猜。
+        provider_retryable: None,
     }
 }
 
@@ -231,6 +241,9 @@ pub async fn connect_storage(
                 code: ProviderErrorCode::Unavailable,
                 safe_message: safe_message_for(ProviderErrorCode::Unavailable).to_owned(),
                 plugin_detail: format!("连接 {endpoint} 失败：{err}"),
+                // 连不上的是**宿主**自己（端点写错 / 进程没起），不是 provider
+                // 在说话。它没给 retryable，按码猜（unavailable → 值得重试）。
+                provider_retryable: None,
             }
         })?
         .connect()
@@ -241,6 +254,7 @@ pub async fn connect_storage(
             code: ProviderErrorCode::Unavailable,
             safe_message: safe_message_for(ProviderErrorCode::Unavailable).to_owned(),
             plugin_detail: format!("连接 {endpoint} 失败：{err}"),
+            provider_retryable: None,
         })?;
     Ok(StorageProviderClient::new(channel))
 }
@@ -379,6 +393,8 @@ pub async fn generate_thumbnails(
                 "缩略图流在没有 `done` 帧的情况下结束了（收到 {progress_events} 条进度）—— \
                  宿主拿不到产物清单，无法落库"
             ),
+            // 这是**宿主**判出的协议违反（流没给 `done`），不是 provider 报的错。
+            provider_retryable: None,
         });
     };
 
@@ -447,9 +463,26 @@ mod tests {
     }
 
     /// ★ 只把 `Unavailable` 当可重试 —— 缩略图任务的延迟轨靠它。
+    ///
+    /// 这是**猜测**那份（`provider` 没给 `retryable` 时）。契约仓里还有一份
+    /// 同名判据，测试在那边；这里钉的是「宿主侧退回它」这条路径。
     #[test]
-    fn only_unavailable_is_retryable() {
-        assert!(retryable_for(ProviderErrorCode::Unavailable));
+    fn only_unavailable_is_retryable_when_the_provider_said_nothing() {
+        let guess = |code| {
+            classify_status(
+                "demo",
+                "op",
+                Status::new(
+                    match code {
+                        ProviderErrorCode::Unavailable => Code::Unavailable,
+                        _ => Code::Unknown,
+                    },
+                    "x",
+                ),
+            )
+            .retryable()
+        };
+        assert!(guess(ProviderErrorCode::Unavailable));
         for code in [
             ProviderErrorCode::InvalidConfig,
             ProviderErrorCode::AuthenticationFailed,
@@ -459,8 +492,60 @@ mod tests {
             ProviderErrorCode::Unsupported,
             ProviderErrorCode::Unspecified,
         ] {
-            assert!(!retryable_for(code), "{code:?} 不该算可重试");
+            assert!(!guess(code), "{code:?} 不该算可重试");
         }
+    }
+
+    /// ★ **结构化错误优先**：provider 说的值盖过按码猜的值。
+    ///
+    /// 上游的 `retryable` 是 provider 给的独立字段（不是从 `code` 推的）；
+    /// 这条用例钉的是「它说了就算」—— 包括**说不该重试**这种反直觉的情况
+    /// （`unavailable` + `retryable=false` 要照办，不能自作主张改成 true）。
+    #[test]
+    fn a_structured_error_beats_the_guess() {
+        use sm_plugin_api::v1::ProviderError;
+
+        for retryable in [true, false] {
+            let status = sm_plugin_api::error::to_status(
+                &ProviderError {
+                    provider_key: "local".to_owned(),
+                    operation: "delete_media".to_owned(),
+                    code: ProviderErrorCode::Unavailable as i32,
+                    safe_message: "本地源正忙".to_owned(),
+                    retryable,
+                },
+                Code::Unavailable,
+            );
+            let error = classify_status("demo", "delete_media", status);
+            assert_eq!(error.code(), "unavailable");
+            assert_eq!(
+                error.retryable(),
+                retryable,
+                "provider 说了 {retryable} 就该照办"
+            );
+            // 对外文案也换成插件给的那句（它有 `safe_message`）。
+            assert_eq!(error.safe_message(), "本地源正忙");
+        }
+    }
+
+    /// 结构化错误**没给** `safe_message` 时，仍用宿主自己的模板 ——
+    /// 不能把空串当文案展示给用户。
+    #[test]
+    fn an_empty_safe_message_falls_back_to_the_host_template() {
+        use sm_plugin_api::v1::ProviderError;
+
+        let status = sm_plugin_api::error::to_status(
+            &ProviderError {
+                provider_key: "local".to_owned(),
+                operation: "op".to_owned(),
+                code: ProviderErrorCode::Unsupported as i32,
+                safe_message: String::new(),
+                retryable: false,
+            },
+            Code::Unimplemented,
+        );
+        let error = classify_status("demo", "op", status);
+        assert_eq!(error.safe_message(), "媒体提供方不支持该操作");
     }
 
     /// `delete_media` 的 `source_not_found` 分支靠这条映射 —— 而它是**有损的**。

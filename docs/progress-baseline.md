@@ -8,7 +8,7 @@
 | 完成的域 | `collections`、`videos`（2/7 个域） |
 | 待办最多的域 | `transfers` 27 · `catalog` 24 · `playback` 16 |
 | worker handler | 5 / 21 |
-| 基线提交 | `583910e`（生成时的 HEAD）|
+| 基线提交 | `22ea79e`（生成时的 HEAD）|
 
 > 数字由 `pwsh -File scripts/progress.ps1 -Write` 生成（**不要手数**：手数三次错过
 > 分母，126 应为 177）。改完代码就跑 `-Write` 并提交本文件 —— 门禁里有 `-Diff`，

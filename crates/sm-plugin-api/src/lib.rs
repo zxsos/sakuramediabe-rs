@@ -24,6 +24,15 @@ pub mod v1 {
 /// 见 [`provider`] 的模块文档（gRPC 报告的 P1-4）。
 pub mod provider;
 
+/// 结构化错误的过线方式（见模块文档：为什么用 `Status::details`）。
+pub mod error;
+
+/// 元数据交付校验。
+///
+/// **插件与宿主双方**都要遵守的规则，所以放在契约仓而不是宿主实现里：
+/// 作者在插件自己的测试里就能验一遍交出去的文件。见模块文档。
+pub mod movie_delivery;
+
 pub use provider::{DownloadProviderExt, StorageProviderExt};
 
 /// 契约包名，供代码生成与文档引用。

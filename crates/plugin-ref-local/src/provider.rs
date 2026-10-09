@@ -191,7 +191,25 @@ impl StorageProviderExt for LocalRefProvider {
         let start = self.confined_path(payload.source_ref.as_ref())?;
         match tokio::fs::metadata(&start).await {
             Ok(_) => {}
-            Err(source) => return Err(Status::not_found(format!("导入来源不存在：{source}"))),
+            // ★ **给插件作者看的示范**：失败要报**结构化**错误，而不是只给一个
+            // gRPC 码。只给 `Status::not_found` 的话，宿主只能按码猜
+            // `source_not_found`（而同一个 gRPC 码也被「媒体库不存在」用），
+            // 并且拿不到 `retryable`。
+            Err(_) => {
+                return Err(sm_plugin_api::error::to_status(
+                    &sm_plugin_api::v1::ProviderError {
+                        provider_key: self.provider_key.clone(),
+                        operation: "scan_import_source".to_owned(),
+                        code: sm_plugin_api::v1::ProviderErrorCode::SourceNotFound as i32,
+                        // 对外展示的文案：**不要**放内部路径、Cookie 或密码
+                        // （proto 注释的原话）。细节走 gRPC 的 message，宿主
+                        // 只把它写进日志。
+                        safe_message: "导入来源不存在".to_owned(),
+                        retryable: false,
+                    },
+                    Status::not_found("导入来源不存在").code(),
+                ));
+            }
         }
 
         let (sender, receiver) = mpsc::channel(STREAM_BUFFER);

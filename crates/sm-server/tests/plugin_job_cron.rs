@@ -10,6 +10,13 @@
 //!
 //! 上游出处：`src/start/aps.py:345-364`（`build_scheduler`）与
 //! `src/scheduler/contracts.py:41-60`（`_validate_cron_source`）。
+//!
+//! # 为什么这个测试住在 `sm-server` 而不是 `sm-plugins`
+//!
+//! 它同时用到**注册表**（`sm-plugins`）、**调度器**（`sm-scheduler`）与
+//! **组合根的映射**（`sm_server::plugins::job_specs`）。放在插件侧就要给
+//! `sm-plugins` 加一条 `→ sm-scheduler` 的依赖边，而那条边会把 `sm-service`
+//! 卷进依赖环。组合根是唯一同时看得见三方又不产生环的位置。
 
 use std::time::Duration;
 
@@ -18,9 +25,9 @@ use sm_db::system::activity::{task_state, QUEUE_MUTEX_PREFIX};
 use sm_db::testing::TestDb;
 use sm_plugin_api::v1::JobDefinition;
 use sm_plugins::jobs::{collect_jobs, JobRegistry};
-use sm_plugins::scheduling::scheduler_specs;
 use sm_scheduler::tick::Scheduler;
 use sm_scheduler::RuntimeTimezone;
+use sm_server::plugins::job_specs;
 
 fn job(task_key: &str, cli_help: &str, default_cron: &str, manual_only: bool) -> JobDefinition {
     JobDefinition {
@@ -51,11 +58,16 @@ fn registry_with_two_jobs() -> JobRegistry {
     registry
 }
 
+/// 没有配置覆盖时，调度声明直接取插件声明的 `default_cron`。
+fn specs_of(registry: &JobRegistry) -> Vec<sm_scheduler::JobSpec> {
+    job_specs(registry, &|_, _| None)
+}
+
 fn scheduler_with(db: &TestDb, registry: &JobRegistry) -> Scheduler {
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     Scheduler::with_timezone(
         repo,
-        scheduler_specs(registry),
+        specs_of(registry),
         RuntimeTimezone::Utc,
         Duration::from_secs(1),
     )
@@ -107,7 +119,7 @@ async fn a_plugin_cron_is_evaluated_in_the_runtime_timezone() {
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let scheduler = Scheduler::with_timezone(
         repo,
-        scheduler_specs(&registry),
+        specs_of(&registry),
         RuntimeTimezone::FixedUtcOffset(8 * 3600),
         Duration::from_secs(1),
     )
@@ -127,7 +139,7 @@ async fn plugin_jobs_sit_next_to_builtin_jobs_in_one_scheduler() {
     let db = TestDb::require().await;
     let registry = registry_with_two_jobs();
     let mut specs = sm_scheduler::builtin_jobs();
-    specs.extend(scheduler_specs(&registry));
+    specs.extend(specs_of(&registry));
 
     let repo = BackgroundTaskRunRepository::new(db.pool().clone());
     let scheduler =

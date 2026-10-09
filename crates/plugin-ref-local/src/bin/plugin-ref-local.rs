@@ -22,8 +22,7 @@ use sm_plugin_api::v1::extension::Data;
 use sm_plugin_api::v1::plugin_control_server::{PluginControl, PluginControlServer};
 use sm_plugin_api::v1::storage_provider_server::StorageProviderServer;
 use sm_plugin_api::v1::{
-    Capability, Extension, JobEvent, MediaProviderBundle, RegisterRequest, RegisterResponse,
-    RunJobRequest,
+    Extension, JobEvent, MediaProviderBundle, RegisterRequest, RegisterResponse, RunJobRequest,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -97,8 +96,16 @@ impl PluginControl for Control {
             display_name: "参考插件（本地目录）".to_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             abi_major: sm_plugin_api::ABI_MAJOR,
-            // 声明下载能力：provider 侧实现了 `DownloadProvider` 的 submit。
-            capabilities: vec![Capability::Download as i32],
+            // ⚠️ 这里**曾经**声明 `Capability::Download`，而本 crate 里根本没有
+            // `DownloadProvider` 的实现 —— 宿主会以为能提交下载，照着抄的插件
+            // 作者也会以为「声明了就算实现了」。声明必须与实现对齐：
+            // 本插件只 serve `StorageProvider`（见 `src/lib.rs`），所以不声明
+            // 任何"额外"能力。
+            //
+            // 参考：宿主侧在注册期**不**校验「声明 ↔ 是否 serve 了对应 service」
+            // （那是 `docs/adr/2026-10-06-plugin-architecture.md` 登记的缺口之一），
+            // 所以虚报不会被发现 —— 这正是它危险的地方。
+            capabilities: Vec::new(),
             extensions: vec![Extension {
                 key: "media.provider".to_owned(),
                 data: Some(Data::MediaProvider(MediaProviderBundle {

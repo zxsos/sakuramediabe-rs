@@ -13,6 +13,11 @@ prost-types = { workspace = true }
 protoc-bin-vendored = "3"
 # 默认实现层把流式 rpc 的关联类型固定为 `BoxStream`（见 src/provider.rs）。
 futures = { workspace = true }
+# 交付校验要判 `release_date` 是不是严格的 YYYY-MM-DD（proto 写在字段上的原话），
+# 以及清理失败时记 warn。这两样跟着校验规则一起住在契约仓 —— 规则搬走、
+# 依赖留下会让下一次搬迁漏掉一半。
+chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # 默认实现层的单测要直接 await 生成的 server trait。

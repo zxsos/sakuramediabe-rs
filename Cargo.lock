@@ -2690,6 +2690,7 @@ dependencies = [
 name = "sm-plugin-api"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures",
  "prost",
  "prost-types",
@@ -2698,18 +2699,17 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]
 name = "sm-plugins"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "serde_json",
  "sm-core",
  "sm-db",
  "sm-plugin-api",
- "sm-scheduler",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2752,6 +2752,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

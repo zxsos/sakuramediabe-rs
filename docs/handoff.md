@@ -718,6 +718,41 @@ JavDB provider 要插件 ABI），handler 仍未注册。
 在这两条落地之前，这 24 处只能**凭印象写** —— 与本项目「上游是唯一权威」
 的硬约束冲突，所以不做。
 
+#### 插件架构 P1–P4：契约仓成为「作者只需依赖它」的完整契约
+
+一口气做完四块（前置 P0 在 `22ea79e`）：
+
+1. **P1 交付校验迁进契约仓**：`movie_delivery`（7 类判据 + 清理 + 8 条测试）
+   从 `sm-plugins` 迁到 `sm-plugin-api`。判据是**双方都要遵守**的规则 ——
+   作者能在自己的测试里 `use sm_plugin_api::movie_delivery::*` 自检。
+   `sm-plugins` 侧改为再导出（`pub use sm_plugin_api::movie_delivery;`），
+   既有引用点不动。番号一致性校验仍不在这里（番号归一化属于业务概念）。
+2. **P2 错误码过线**，闭合 `provider_calls.rs` 自陈的缺口：
+   `ProviderError` / `ProviderErrorCode` **proto 里本来就有**
+   （`proto/common.proto:303-329`），缺的是通道 —— 现在由
+   `sm_plugin_api::error::{to_status, from_status}` 编进 `Status::details`
+   （**不改任何 rpc 签名**），`classify_status` **先试结构化**、
+   解不出才按 gRPC 码猜。`retryable` 现在**优先信 provider 说的**
+   （新增 `ProviderOperationError::provider_retryable`），猜的那份退成兜底。
+   `plugin-ref-local` 里给了一处正确示范（作者照抄）。
+3. **P3 接 `PluginHost`**（上游 `PluginContext`，proto 36 个 rpc 此前 0 引用）：
+   `sm-server::plugin_host` 起服务端，端点经
+   **`SAKURAMEDIA_HOST_GRPC_ADDR`** 注入（新增 `LaunchSpec.host_endpoint`）；
+   **只接了 3 个只读 rpc**（`GetMovie` / `FindMoviesByNumbers` / `GetActor`），
+   其余 33 个显式 `unimplemented` 并登记在模块文档的缺口表里 ——
+   剩下那些大多是**写操作**（要走主权网关 / 业务 service），
+   只读快照错了最多是空值，写错了会改坏用户数据，所以按组逐个接。
+   `owners` / `revision` 取自 `field_owners` / `mutation_revision`，不猜。
+4. **P4 贡献者物料**：修掉 `plugin-ref-local` **虚报的 Download 能力**
+   （声明了但全 crate 无 `DownloadProvider` 实现，照抄的人会被误导；
+   注册期不校验"声明 ↔ 实现"，所以虚报**不会被发现**）；
+   补 `docs/plugin-abi.md`（`sm-plugin-api/src/lib.rs` 早就引用了它，但文件不存在）
+   与 `docs/plugin-author-guide.md`（最小骨架、三扩展点、默认实现层、
+   交付目录、结构化错误、回调宿主、自检清单）。
+
+⚠️ 顺带记一条**仍存在的缺口**（登记在 `docs/plugin-abi.md`）：注册期**不**校验
+「声明的能力 ↔ 是否 serve 了对应 service」。
+
 ### 下一批：`transfers` 与 `catalog` 两块
 
 | 候选 | 备注 |

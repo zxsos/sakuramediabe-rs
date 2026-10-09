@@ -42,6 +42,10 @@ sm-plugin-api = { workspace = true }
 # 宿主侧是 `serde_json::Value`，proto 侧是 `google.protobuf.Struct` ——
 # 组合根负责这两者的互换（`src/provider_gateway.rs`）。
 prost-types = { workspace = true }
+# 组合根要 serve `PluginHost`（插件回调宿主的能力出口）：ADR
+# `2026-10-06-plugin-architecture.md` 的 P3。放在这里而不是 `sm-plugins`，
+# 是因为实现要查库（`sm-db`）而 `sm-plugins` 不该反向依赖业务数据。
+tonic = { workspace = true }
 
 [dev-dependencies]
 sm-db = { workspace = true }

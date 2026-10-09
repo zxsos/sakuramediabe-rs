@@ -7,8 +7,14 @@
 //! `@contextmanager`，消费完就删；这里拆成**校验**与**清理**两个显式动作，
 //! 因为 Rust 没有 `with` 语法糖，而「谁负责删」必须写在调用点。
 //!
-//! # 判据是 proto 给的，不是自定的
+//! # 为什么这条规则住在**契约仓**而不是宿主实现里
 //!
+//! 插件把图片放进目录、宿主去验收 —— **两边都要遵守同一套规则**。放在
+//! `sm-plugins`（宿主实现）里，插件作者就只能读文档照抄，而照抄总会漂移；
+//! 放在契约仓，作者可以在自己的测试里 `use sm_plugin_api::movie_delivery::*`
+//! 直接验一遍自己交出来的东西。
+//!
+//! 判据是 **proto 给的**，不是自定的。
 //! `FetchMovieRequest.delivery_dir` 的注释：「宿主为本次请求分配的临时目录；
 //! **元数据图片必须落在其中**」。所以边界就是宿主自己给的那个目录 —— 不需要
 //! `plugins.root_dir` 之类的额外配置（上游用
@@ -33,7 +39,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sm_plugin_api::v1::{FetchMovieRequest, FetchMovieResponse, MetadataActor};
+use crate::v1::{FetchMovieRequest, FetchMovieResponse, MetadataActor};
 
 /// 一个通过交付校验的元数据结果。
 #[derive(Debug, Clone, PartialEq)]

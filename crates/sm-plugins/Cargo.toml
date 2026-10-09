@@ -8,16 +8,16 @@ description = "插件宿主：进程管理、gRPC 客户端、能力注册表"
 sm-core = { workspace = true }
 sm-plugin-api = { workspace = true }
 sm-db = { workspace = true }
-# 只为了把插件声明的任务转成 `JobSpec` 交给 cron 调度（`src/scheduling.rs`）。
-# 依赖方向是「声明方 → 调度方」：调度器不认识插件，插件知道自己的 cron 该
-# 交给谁。反向（调度器依赖插件）会让执行期与调度期缠在一起。
-sm-scheduler = { workspace = true }
+# ⚠️ 这里曾经依赖 `sm-scheduler`（只为把插件任务转成 `JobSpec`）。那条边会把
+# `sm-service` 卷进依赖环（`sm-plugins → sm-scheduler → sm-service → sm-plugins`），
+# 于是 `sm-service` 永远引用不了插件层的任何类型。映射本身已经迁到组合根
+# （`sm_server::plugins::job_specs`）—— 它同时要用到注册表与配置覆盖，
+# 而组合根是唯一同时看得见「插件 / 调度器 / 配置」三方又不产生环的位置。
 tonic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
-# 交付校验要判 `release_date` 是不是严格的 YYYY-MM-DD（proto 写在字段上的原话）。
-chrono = { workspace = true }
+
 
 [dev-dependencies]
 # 调用面的集成测试要起真实的扩展点 server（端口交给内核分配）。

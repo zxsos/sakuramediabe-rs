@@ -59,6 +59,9 @@ pub struct PluginConfig {
     pub settings: Map<String, Value>,
     /// `plugins.job_crons`：`plugin_id -> (task_key -> cron)`。
     pub job_crons: Map<String, Value>,
+    /// 宿主能力出口（`PluginHost`）的端点。`Plugins::load` 之前由
+    /// [`crate::plugin_host::serve`] 起好；`None` 时插件拿不到这个环境变量。
+    pub host_endpoint: Option<String>,
 }
 
 impl PluginConfig {
@@ -85,6 +88,9 @@ impl PluginConfig {
             enabled,
             settings: object_at(plugins, "settings"),
             job_crons: object_at(plugins, "job_crons"),
+            // 不从配置读：它是**宿主自己起的服务**的地址，由
+            // `crate::plugin_host::serve` 在拉起插件之前填进来。
+            host_endpoint: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl PluginConfig {
             args: Vec::new(),
             data_dir: self.data_dir_for(plugin_id),
             settings: self.settings_for(plugin_id),
+            host_endpoint: self.host_endpoint.clone(),
             settings_path: None,
             ready_timeout: READY_TIMEOUT,
         }
@@ -260,31 +267,13 @@ impl Plugins {
         tracing::warn!(code = problem.code(), "插件任务声明被拒：{problem:?}");
     }
 
-    /// 交给调度器的声明：内建任务 + 全部插件的可调度任务。
+    /// 交给调度器的声明：全部插件的可调度任务（内建那份由调用方并入）。
     pub fn scheduler_specs(&self) -> Vec<JobSpec> {
-        let specs: Vec<JobSpec> = self
-            .jobs
-            .schedulable()
-            .into_iter()
-            .map(|entry| {
-                let cron = self
-                    .config
-                    .cron_override(&entry.plugin_id, &entry.task_key)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| entry.default_cron.clone());
-                JobSpec {
-                    task_key: entry.task_key.clone(),
-                    log_name: entry.log_name.clone(),
-                    cli_name: entry.cli_name.clone(),
-                    display_name: entry.cli_help.clone(),
-                    cron: Some(cron),
-                    manual_trigger_allowed: true,
-                }
-            })
-            .collect();
-        // `schedulable()` 已经排掉了 `manual_only` —— 它们没有 cron，交给调度器
-        // 也只会变成「永不触发」的条目。
-        specs
+        job_specs(&self.jobs, &|plugin_id, task_key| {
+            self.config
+                .cron_override(plugin_id, task_key)
+                .map(str::to_owned)
+        })
     }
 
     /// 任务目录：内建任务 + 全部插件任务（**含 `manual_only`**）。
@@ -518,9 +507,68 @@ fn first_exited(loaded: &mut [LoadedPlugin]) -> Option<String> {
     None
 }
 
+/// 把注册表里可调度任务转成调度器能消费的声明。
+///
+/// `cron_override(plugin_id, task_key)` **优先于**插件声明的 `default_cron`
+/// —— 上游 `resolve_job_cron_expr`（`src/start/aps.py`）就是这个顺序：先
+/// `plugins.job_crons[plugin_id][task_key]`，缺省才回退。
+///
+/// # 为什么这个函数在组合根，而不是在 `sm-plugins` 里
+///
+/// 这条映射同时要用到**注册表**（`sm-plugins`）与**配置覆盖**（本文件的
+/// [`PluginConfig`]），产出的 `JobSpec` 又属于 `sm-scheduler`。把它放在插件
+/// 侧就要给 `sm-plugins` 加一条 `→ sm-scheduler` 的依赖边，而那条边会把
+/// `sm-service` 卷进依赖环（`sm-plugins → sm-scheduler → sm-service →
+/// sm-plugins`），结果是 `sm-service` 永远不能引用插件层的任何类型。
+/// 组合根同时看得见三方，是唯一不产生环的位置。
+///
+/// # 只交「本该被调度」的那部分
+///
+/// `manual_only` 的任务不出现在这里 —— 上游 `build_scheduler` 同样跳过它们：
+/// 它们只能由任务中心 / CLI 带参数触发，挂到 cron 上没有意义。反过来，这里
+/// 每一项都**保证**能被调度器编译：`default_cron` 在注册期就用同一套规则验过
+/// （`sm_plugins::jobs::JobRegistration::cron_is_valid`），所以某个插件填错
+/// cron 不会让整个调度器起不来 —— 上游是隔离那一个插件。
+///
+/// # 展示名取 `cli_help`
+///
+/// 上游 `resolve_job_task_name` 是 `TASK_NAME_REGISTRY.get(task_key) or
+/// cli_help`；插件任务的 `task_key` 不在那张内建表里，于是落到 `cli_help`
+/// 这一路。
+///
+/// # 刻意不带 `plugin_id`
+///
+/// worker 执行时按 `task_key` 回查注册表就能拿到归属插件。声明里再存一份
+/// 就是同一事实的两处状态，改一处漏一处会指向不同的插件。
+pub fn job_specs(
+    registry: &JobRegistry,
+    cron_override: &dyn Fn(&str, &str) -> Option<String>,
+) -> Vec<JobSpec> {
+    registry
+        .schedulable()
+        .into_iter()
+        .map(|entry| JobSpec {
+            task_key: entry.task_key.clone(),
+            // 这三个名字插件都声明了（`JobDefinition` 的必填字段），原样带上 ——
+            // 任务中心要靠它们显示与定位任务。
+            log_name: entry.log_name.clone(),
+            cli_name: entry.cli_name.clone(),
+            display_name: entry.cli_help.clone(),
+            cron: Some(
+                cron_override(&entry.plugin_id, &entry.task_key)
+                    .unwrap_or_else(|| entry.default_cron.clone()),
+            ),
+            // proto 的 `JobDefinition` 没有「禁止手动触发」这一位，上游
+            // `manual_trigger_allowed` 也不是插件能声明的：一律允许。
+            manual_trigger_allowed: true,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sm_plugin_api::v1::JobDefinition;
     use std::path::Path;
 
     fn snapshot(plugins: Value) -> Value {
@@ -623,5 +671,84 @@ mod tests {
         let plugins = Plugins::load(config).await;
         assert!(plugins.loaded.is_empty());
         assert!(plugins.scheduler_specs().is_empty());
+    }
+
+    /// 从 `sm-plugins::scheduling` 迁过来的三条（`job_specs` 的映射语义）。
+    fn job(task_key: &str, cli_help: &str, default_cron: &str, manual_only: bool) -> JobDefinition {
+        JobDefinition {
+            task_key: task_key.to_owned(),
+            log_name: task_key.to_owned(),
+            cli_name: task_key.to_owned(),
+            cli_help: cli_help.to_owned(),
+            default_cron: default_cron.to_owned(),
+            manual_only,
+            params_schema: None,
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn schedulable_jobs_become_specs_carrying_cli_help_and_default_cron() {
+        let mut registry = JobRegistry::default();
+        let problems = collect_jobs(
+            &mut registry,
+            "local",
+            &[
+                job("local.cleanup", "清理本地缓存", "0 3 * * *", false),
+                job("local.migrate", "迁移旧目录", "0 4 * * *", true),
+            ],
+            &[],
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let specs = job_specs(&registry, &|_, _| None);
+        // manual_only 那条不在里面：上游 build_scheduler 同样跳过。
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].task_key, "local.cleanup");
+        assert_eq!(specs[0].display_name, "清理本地缓存", "展示名是 cli_help");
+        // 三个名字原样带上：任务中心与 CLI 靠它们定位任务。
+        assert_eq!(specs[0].log_name, "local.cleanup");
+        assert_eq!(specs[0].cli_name, "local.cleanup");
+        assert_eq!(specs[0].cron.as_deref(), Some("0 3 * * *"));
+    }
+
+    #[test]
+    fn specs_keep_the_registration_order() {
+        // 顺序是注册顺序：启动日志（`cron_info`）按这个顺序打，运维据此核对。
+        let mut registry = JobRegistry::default();
+        for key in ["b.sync", "a.sync"] {
+            let problems = collect_jobs(
+                &mut registry,
+                "p",
+                &[job(key, key, "* * * * *", false)],
+                &[],
+            );
+            assert!(problems.is_empty(), "{problems:?}");
+        }
+        let specs = job_specs(&registry, &|_, _| None);
+        let keys: Vec<&str> = specs.iter().map(|s| s.task_key.as_str()).collect();
+        assert_eq!(keys, vec!["b.sync", "a.sync"]);
+    }
+
+    /// ★ 配置里的 cron 覆盖**优先于**插件声明的 `default_cron`
+    /// （上游 `resolve_job_cron_expr` 的顺序）。
+    #[test]
+    fn a_configured_cron_beats_the_declared_default() {
+        let mut registry = JobRegistry::default();
+        let problems = collect_jobs(
+            &mut registry,
+            "local",
+            &[job("local.cleanup", "清理本地缓存", "0 3 * * *", false)],
+            &[],
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let overridden = job_specs(&registry, &|plugin_id, task_key| {
+            (plugin_id == "local" && task_key == "local.cleanup").then(|| "0 4 * * *".to_owned())
+        });
+        assert_eq!(overridden[0].cron.as_deref(), Some("0 4 * * *"));
+        // 没配的那一条仍然用插件自己声明的。
+        let untouched = job_specs(&registry, &|_, _| None);
+        assert_eq!(untouched[0].cron.as_deref(), Some("0 3 * * *"));
     }
 }

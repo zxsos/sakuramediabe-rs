@@ -46,6 +46,9 @@ pub const ID_ENV: &str = "SAKURAMEDIA_PLUGIN_ID";
 pub const DATA_DIR_ENV: &str = "SAKURAMEDIA_PLUGIN_DATA_DIR";
 /// 宿主写好的配置文件路径。**可选**：插件没声明 `settings_schema` 时不给。
 pub const SETTINGS_FILE_ENV: &str = "SAKURAMEDIA_PLUGIN_SETTINGS_FILE";
+/// 宿主的**能力出口**端点（`PluginHost`）。**可选**：宿主还没起这个服务时不给，
+/// 插件据此知道自己这次不能回调宿主（而不是连一个必然失败的地址）。
+pub const HOST_ADDR_ENV: &str = "SAKURAMEDIA_HOST_GRPC_ADDR";
 
 /// 配置文件在数据目录下的默认名字。
 ///
@@ -76,6 +79,9 @@ pub struct LaunchSpec {
     pub settings: Option<serde_json::Value>,
     /// 配置文件落点。缺省 [`SETTINGS_FILE_NAME`] 放在 `data_dir` 下。
     pub settings_path: Option<PathBuf>,
+    /// 宿主能力出口（`PluginHost`）的端点。`None` 时**不注入**环境变量 ——
+    /// 插件据此判断「这次不能回调宿主」，而不是拿到一个必然连不上的地址。
+    pub host_endpoint: Option<String>,
     /// 等就绪的上限。超时按「起不来」处理。
     pub ready_timeout: Duration,
 }
@@ -175,6 +181,13 @@ pub async fn launch(spec: &LaunchSpec) -> Result<LaunchedPlugin, LaunchError> {
                 .as_ref()
                 .map(|path| (SETTINGS_FILE_ENV, path.display().to_string())),
         )
+        // 能力出口端点同样走"宿主先备好、进程去拿" —— 插件不需要为「宿主的
+        // 地址是什么」再开一个 rpc。没有就**不给**这个变量。
+        .envs(
+            spec.host_endpoint
+                .as_ref()
+                .map(|endpoint| (HOST_ADDR_ENV, endpoint.clone())),
+        )
         // 插件不该从宿主继承 stdin；stdout/stderr 留给运维看（宿主自己的日志是
         // tracing，插件的输出混进来反而难读，所以这里**不**接管）。
         .stdin(Stdio::null())
@@ -269,10 +282,13 @@ async fn probe(
 
 /// 占一个端口再放开，给子进程用。
 ///
+/// **公开**：宿主自己也要占一个端口来 serve `PluginHost`（插件回调宿主的那一侧），
+/// 同一个"先占后放"的窗口与取舍对它同样成立。
+///
 /// **有一个极短的窗口**：放开到子进程 bind 之间，别的进程可能抢走同一个端口。
 /// 后果是插件起不来，被探活判成 `NotReady`，重拉一次即可；换成「插件自选端口
 /// 再回报」需要第二条通道（stdout 或临时文件），代价更大 —— 见 ADR 文档第 3 节。
-fn reserve_addr() -> std::io::Result<SocketAddr> {
+pub fn reserve_addr() -> std::io::Result<SocketAddr> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     drop(listener);
@@ -348,6 +364,7 @@ mod tests {
             data_dir: dir.join("data"),
             settings: Some(serde_json::json!({"timeout_seconds": 5})),
             settings_path: None,
+            host_endpoint: None,
             ready_timeout: Duration::from_secs(1),
         };
 
@@ -375,6 +392,7 @@ mod tests {
             data_dir: dir.join("data"),
             settings: None,
             settings_path: None,
+            host_endpoint: None,
             ready_timeout: Duration::from_secs(1),
         };
         assert_eq!(prepare(&spec).expect("备好"), None);
