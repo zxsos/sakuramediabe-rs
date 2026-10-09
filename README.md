@@ -52,7 +52,7 @@ SakuraMedia 后端的 Rust 重写实现。
 | Schema `schema/` | 44 文件 | DTO 随端点落地（`sm-api::dto`） | 按需 |
 | API `api/` | 126 端点 | 76 个（account 3 + activity 6 + actors 11 + auth 2 + clip-collections 9 + config 2 + downloads 1 + indexer-settings 3 + jobs 2 + media-clips 7 + movie-subscriptions 3 + movies 11 + playlists 9 + status 4 + tags 3） | **~60%** |
 | 调度 `scheduler` | 19 个内建任务 | **cron 注册 16/16 = 100%**；worker 骨架已落地；**handler 1/21** | 见下 |
-| 插件宿主 `sm-plugins` | 12 文件 / 3,090 行 | 注册 / 加载 / 执行 / 生命周期 / 扩展点 | 宿主可用，**缺真实 provider 插件** |
+| 插件宿主 `sm-plugins` | 12 文件 / 3,090 行 | 注册 / 加载 / 执行 / 生命周期 / 扩展点 | 宿主可用，**已有真实 provider 插件**（local-ref、javbus-metadata 等） |
 | 插件 ABI `provider_protocol.py` | 543 行 / 30 方法 | ⚠️ **未复核**（用户要求先不管插件） | — |
 
 > 端点口径是**方法级**（path + method 组合），统计只取 `routes()` 函数体且**剥掉注释**。
@@ -78,7 +78,7 @@ SakuraMedia 后端的 Rust 重写实现。
 > [docs/service-progress.md](docs/service-progress.md)。**为什么只有 76 个端点**
 > 与「哪些端点在等哪个域」也记在那里 —— 百分比本身看不出这些。
 >
-> 上面这张表的数字实测于 **2026-10-05**。端点一项做了逐文件交叉校验：12 个原有
+> 上面这张表的数字实测于 **2026-10-09**。端点一项做了逐文件交叉校验：12 个原有
 > 文件的计数与旧表逐个吻合（合计 65），新增 11 个（account 3 + activity 6 +
 > jobs 由 1 增至 2）。改动端点时请一并更新此表，**并用同样的口径复算** ——
 > 口径错了数字只会偏小，而偏小的进度看不出「统计本身不可信」。
