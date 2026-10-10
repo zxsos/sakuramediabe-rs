@@ -1,0 +1,45 @@
+[package]
+name = "plugin-javdb-ranking"
+version = "0.1.0"
+description = "JavDB 排行榜插件：discovery.ranking_source 扩展点的 Rust 实现（热播/高评分/有码/无码/FC2/TOP250）"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖。
+# tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# 相对 URL 按榜单页基址解析（上游 urljoin）。
+url = "2"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde_json = "1"
+# 配置反序列化。
+serde = { version = "1", features = ["derive"] }
+# 错误类型。
+thiserror = "2"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它。
+[[bin]]
+name = "sakuramedia_javdb_ranking"
+path = "src/bin/sakuramedia_javdb_ranking.rs"
+
+[dev-dependencies]
+# 榜单页交给本地假服务，测试不许联网。
+wiremock = "0.6"
+tokio = { version = "1", features = ["full"] }
