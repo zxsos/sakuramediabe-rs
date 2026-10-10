@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --bin sakuramedia_movie_scrape_translate
+
+      - name: Create manifest
+        run: |
+          cat > manifest.json << 'MANIFEST'
+          {
+            "id": "sakuramedia_movie_scrape_translate",
+            "version": "${{ github.ref_name }}",
+            "entry": "sakuramedia_movie_scrape_translate",
+            "display_name": "Scrape Translate"
+          }
+          MANIFEST
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/sakuramedia_movie_scrape_translate dist/
+          cp manifest.json dist/
+          cd dist && zip -r ../sakuramedia_movie_scrape_translate-${{ github.ref_name }}.zip manifest.json sakuramedia_movie_scrape_translate
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sakuramedia_movie_scrape_translate-${{ github.ref_name }}.zip
