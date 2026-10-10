@@ -1,0 +1,454 @@
+syntax = "proto3";
+
+package sakuramedia.v1;
+
+import "common.proto";
+import "google/protobuf/struct.proto";
+
+// ══════════════════════════════════════════════════════════════════
+// 播放交付：本次重写最关键的设计变更
+// ══════════════════════════════════════════════════════════════════
+//
+// Python 侧原签名：
+//     async def handle_playback(self, *, media, context: PlaybackContext) -> Response
+//     # PlaybackContext 含 starlette Request 与 url_for 回调
+//
+// 插件直接构造 HTTP 响应，跨进程不可行；且让每个 provider 都重新实现一遍
+// Range / 206 / Accept-Ranges 是重复劳动（local_provider 与 115 都各写了一份
+// _parse_range）。
+//
+// 新契约把职责切开：
+//   插件回答「字节从哪里来」 -> PlaybackPlan
+//   宿主回答「HTTP 怎么写」   -> 统一构造 200/206/416/302
+//
+// 因此 provider 不再需要知道 starlette 存在，宿主也只写一次 Range 逻辑。
+
+// 302 直连存储（115 / 支持直链的网盘）
+message RedirectPlan {
+  string url = 1;
+  map<string, string> headers = 2;
+}
+
+// 经宿主代理转发。endpoint 是插件暴露的 HTTP 端点，需被宿主可达。
+message ProxyPlan {
+  string endpoint = 1;
+  // 宿主拼接请求路径时使用的���缀。
+  string path_prefix = 2;
+  // 宿主转发时必须附加的请求头（如 Range 由宿主自己解析，不在此列）。
+  map<string, string> headers = 3;
+}
+
+// 宿主**自己读本地文件**（本地库 / 挂载盘 / 与宿主同机的存储）。
+//
+// 与 RedirectPlan / ProxyPlan 并列的第三种：那两种都是「字节在别处」，这一种是
+// 「字节就在宿主能直接 open 的路径上」。缺了它，本地 provider 只剩两个选择 ——
+// 拼一个 `file://` URL 走 302（客户端不认这种 scheme），或让插件自己起一个 HTTP
+// 服务端（把宿主的 HTTP 职责外移，正是本契约要消除的东西）。
+//
+// 与 OpenCoverSourceResponse.local_path 是**同一套语义**：同一个 proto 里不该有
+// 两种「本地文件在哪」的写法。
+message LocalPathPlan {
+  // 宿主能直接 open 的路径。**原样**传递 —— 这里是路径不是 URL，provider 不要做
+  // URL 转义，宿主也不做反转义（上游 local_provider 就是这个语义）。
+  string path = 1;
+}
+
+message PlaybackPlan {
+  oneof delivery {
+    RedirectPlan redirect = 1;
+    ProxyPlan proxy = 2;
+    // 宿主自己读本地文件。**provider 声明了 content_type 时以它为准**：本地库里
+    // mkv / webm 很常见，宿主按扩展名猜不到编码细节。
+    //
+    // 字段号是 7 而不是 3：同一个消息里 oneof 与普通字段**共用编号空间**，
+    // 3~6 已经被 file_name / size_bytes / content_type / unavailable 占着。
+    LocalPathPlan local_path = 7;
+  }
+  // 供宿主与客户端展示的文件名。
+  string file_name = 3;
+  optional int64 size_bytes = 4;
+  optional string content_type = 5;
+  // true 表示 provider 无法提供该资源，宿主应回退或报错。
+  bool unavailable = 6;
+}
+
+message PlanPlaybackRequest {
+  MediaHandle media = 1;
+  // 媒体子资源路径；空串表示主文件。本地存储不支持子资源。
+  string resource_path = 2;
+  PlaybackDelivery delivery = 3;
+}
+
+message PlanPlaybackResponse {
+  PlaybackPlan plan = 1;
+}
+
+// 合并播放预检：签发合并播放 URL 前校验，不通过则整体失败。
+message PreflightMergedPlaybackRequest {
+  repeated MediaHandle medias = 1;
+}
+
+message PreflightMergedPlaybackResponse {}
+
+message PlanMergedPlaybackRequest {
+  repeated MediaHandle medias = 1;
+  string resource_path = 2;
+  PlaybackDelivery delivery = 3;
+}
+
+message PlanMergedPlaybackResponse {
+  PlaybackPlan plan = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 存储请求 / 响应
+// ══════════════════════════════════════════════════════════════════
+
+message BrowseRequest {
+  LibraryHandle library = 1;
+  optional google.protobuf.Struct parent_ref = 2;
+  optional string cursor = 3;
+  int32 limit = 4;
+}
+
+message ScanImportSourceRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct source_ref = 2;
+}
+
+message ImportFileEntry {
+  ImportFile file = 1;
+}
+
+message ReadImportFileRequest {
+  LibraryHandle library = 1;
+  ImportFile source = 2;
+}
+
+message DeleteImportFileRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct receipt = 2;
+}
+
+message DeleteImportFileResponse {}
+
+message StageImportFileRequest {
+  LibraryHandle library = 1;
+  ImportFile source = 2;
+  ImportPlacement placement = 3;
+  SourceDisposition source_disposition = 4;
+  // 幂等键：同一 operation_key 重复调用必须返回同一结果。
+  string operation_key = 5;
+}
+
+message FinalizeImportRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct receipt = 2;
+}
+
+message FinalizeImportResponse {}
+
+message AbortImportRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct receipt = 2;
+}
+
+message AbortImportResponse {}
+
+message DeleteMediaRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message DeleteMediaResponse {}
+
+// 采样文件指纹。算法见 media-file-hash crate，与宿主内置实现同源。
+message ComputeFileHashRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message ComputeFileHashResponse {
+  // 形如 "media-file-hash-v1:<40 hex>"。
+  string file_hash = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 缩略图与切片
+// ══════════════════════════════════════════════════════════════════
+
+message GenerateThumbnailsRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+  // 宿主提供的工作目录（插件进程需可读写）。路径与宿主共享同一挂载。
+  string workspace = 3;
+}
+
+// 生成缩略图的流：**进度事件 + 一个终态的产物清单**。
+//
+// 修订（`docs/parallel/grpc-plugin-report.md` §4.3 的 P1-1）：原先这里只有
+// `ThumbnailGeneration generation`，而 rpc 返回的是 `stream ProgressEvent` ——
+// 产物清单**没有通道**，宿主拿不到「生成了几张、叫什么名字、该写到哪一格
+// timeline」，`ThumbnailGeneration` 成了被冷落的定义。
+//
+// 现在把两者合成一个 oneof：
+//
+// - `progress`：过程中的进度（可多次）；
+// - `done`：**流里必须有且只有一个**，且是最后一条。宿主凭它落库。
+//
+// ⚠️ 插件**必须**以 `done` 收尾。没有它的流在宿主侧按「provider 违约」处理 ——
+// 因为没有产物清单就无法 `persist`，留着半成品比报错更糟。
+message GenerateThumbnailsResponse {
+  oneof payload {
+    ProgressEvent progress = 1;
+    ThumbnailGeneration done = 2;
+  }
+}
+
+// 进度事件。Python 侧是 progress_callback(str)，这里用 server streaming
+// 把它变成有序事件流，语义更明确且不会丢事件。
+message ProgressEvent {
+  string text = 1;
+  int32 current = 2;
+  int32 total = 3;
+}
+
+message CreateClipRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+  int32 start_offset_seconds = 3;
+  int32 end_offset_seconds = 4;
+  string workspace = 5;
+}
+
+message CreateClipResponse {
+  ClipArtifact artifact = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 可选能力：探测、封面、引用扫描
+// ══════════════════════════════════════════════════════════════════
+
+message ProbeDurationRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message ProbeDurationResponse {
+  int32 duration_seconds = 1;
+}
+
+message ProbeResolutionRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message ProbeResolutionResponse {
+  // 形如 "1920x1080"；无法取得时为空。
+  string resolution = 1;
+}
+
+message ProbeVideoInfoRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message ProbeVideoInfoResponse {
+  optional google.protobuf.Struct video_info = 1;
+}
+
+// 打开封面来源。Python 侧返回 AbstractContextManager[Any]，
+// 这里退化为「返回路径或端点 + 有效期」的描述，由宿主去取。
+message OpenCoverSourceRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message OpenCoverSourceResponse {
+  // 二选一：本地路径，或可 HTTP 读取的 URL。
+  oneof source {
+    string local_path = 1;
+    string url = 2;
+  }
+  int64 size_bytes = 3;
+  optional int64 expires_at_unix = 4;
+}
+
+message ScanMediaRefsRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct source_ref = 2;
+}
+
+message ScanMediaRefsResponse {
+  repeated google.protobuf.Struct media_refs = 1;
+}
+
+message ScanManagedMediaRefKeysRequest {
+  LibraryHandle library = 1;
+}
+
+message ScanManagedMediaRefKeysResponse {
+  repeated string keys = 1;
+}
+
+message ManagedMediaRefKeyRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct media_ref = 2;
+}
+
+message ManagedMediaRefKeyResponse {
+  string key = 1;
+}
+
+// 导入来源身份：用于跳过未变化的来源。改名或移动必须产生不同标识。
+message GetImportSourceIdentityRequest {
+  LibraryHandle library = 1;
+  ImportFile source = 2;
+}
+
+message GetImportSourceIdentityResponse {
+  optional string identity = 1;
+}
+
+message GetSpaceUsageRequest {
+  LibraryHandle library = 1;
+}
+
+message GetSpaceUsageResponse {
+  StorageSpaceUsage usage = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 转存：源端
+// ══════════════════════════════════════════════════════════════════
+
+message OpenTransferSourceRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+}
+
+message OpenTransferSourceResponse {
+  TransferSourceSession session = 1;
+}
+
+message CloseTransferSourceRequest {
+  string session_id = 1;
+}
+
+message CloseTransferSourceResponse {}
+
+// 只删除当前会话对应且未变化的源文件。不得误删已被替换的源。
+message CleanupTransferSourceRequest {
+  LibraryHandle library = 1;
+  MediaHandle media = 2;
+  string session_id = 3;
+}
+
+message CleanupTransferSourceResponse {}
+
+// ══════════════════════════════════════════════════════════════════
+// 转存：目标端
+// ══════════════════════════════════════════════════════════════════
+
+message StageTransferRequest {
+  LibraryHandle library = 1;
+  TransferSourceSession source = 2;
+  ImportPlacement placement = 3;
+  // 暂存按操作键幂等。
+  string operation_key = 4;
+}
+
+message StageTransferResponse {
+  StagedMediaTransfer transfer = 1;
+}
+
+message FinalizeTransferRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct receipt = 2;
+}
+
+message FinalizeTransferResponse {}
+
+message AbortTransferRequest {
+  LibraryHandle library = 1;
+  google.protobuf.Struct receipt = 2;
+}
+
+message AbortTransferResponse {}
+
+// ══════════════════════════════════════════════════════════════════
+// Service 定义
+// ══════════════════════════════════════════════════════════════════
+
+// 存储能力。对应 STORAGE_PROVIDER_METHODS 的 12 个必需方法，
+// 其中 scan_import_source 与 generate_thumbnails 带进度流。
+service StorageProvider {
+  // ① browse
+  rpc Browse(BrowseRequest) returns (BrowsePage);
+  // ② scan_import_source（server streaming：逐个 ImportFile + 进度）
+  rpc ScanImportSource(ScanImportSourceRequest) returns (stream ImportFileEntry);
+  // ③ read_import_file
+  rpc ReadImportFile(ReadImportFileRequest) returns (ImportFileContent);
+  // ④ delete_import_file
+  rpc DeleteImportFile(DeleteImportFileRequest) returns (DeleteImportFileResponse);
+  // ⑤ stage_import_file
+  rpc StageImportFile(StageImportFileRequest) returns (StagedMedia);
+  // ⑥ finalize_import
+  rpc FinalizeImport(FinalizeImportRequest) returns (FinalizeImportResponse);
+  // ⑦ abort_import
+  rpc AbortImport(AbortImportRequest) returns (AbortImportResponse);
+  // ⑧ delete_media
+  rpc DeleteMedia(DeleteMediaRequest) returns (DeleteMediaResponse);
+  // ⑨ compute_file_hash
+  rpc ComputeFileHash(ComputeFileHashRequest) returns (ComputeFileHashResponse);
+  // ⑩ plan_playback（原 handle_playback，改为返回播放计划）
+  rpc PlanPlayback(PlanPlaybackRequest) returns (PlanPlaybackResponse);
+  // ⑪ generate_thumbnails（server streaming：进度事件 + 终态产物清单）
+  rpc GenerateThumbnails(GenerateThumbnailsRequest) returns (stream GenerateThumbnailsResponse);
+  // ⑫ create_clip
+  rpc CreateClip(CreateClipRequest) returns (CreateClipResponse);
+
+  // ── 可选能力：仅在 Register 声明对应 capability 时才会被调用 ──
+
+  rpc ProbeDurationSeconds(ProbeDurationRequest) returns (ProbeDurationResponse);
+  rpc ProbeResolution(ProbeResolutionRequest) returns (ProbeResolutionResponse);
+  rpc ProbeVideoInfo(ProbeVideoInfoRequest) returns (ProbeVideoInfoResponse);
+  rpc OpenCoverSource(OpenCoverSourceRequest) returns (OpenCoverSourceResponse);
+  rpc GetImportSourceIdentity(GetImportSourceIdentityRequest) returns (GetImportSourceIdentityResponse);
+  rpc ScanMediaRefs(ScanMediaRefsRequest) returns (ScanMediaRefsResponse);
+  rpc ScanManagedMediaRefKeys(ScanManagedMediaRefKeysRequest) returns (ScanManagedMediaRefKeysResponse);
+  rpc ManagedMediaRefKey(ManagedMediaRefKeyRequest) returns (ManagedMediaRefKeyResponse);
+  rpc GetSpaceUsage(GetSpaceUsageRequest) returns (GetSpaceUsageResponse);
+
+  // ── 合并播放（可选）──
+  rpc PlanMergedPlayback(PlanMergedPlaybackRequest) returns (PlanMergedPlaybackResponse);
+  rpc PreflightMergedPlayback(PreflightMergedPlaybackRequest) returns (PreflightMergedPlaybackResponse);
+
+  // ── 转存源端（可选）──
+  rpc OpenTransferSource(OpenTransferSourceRequest) returns (OpenTransferSourceResponse);
+  rpc ReadTransferSource(stream TransferReadRequest) returns (stream TransferReadResponse);
+  rpc AssertTransferSourceUnchanged(TransferAssertRequest) returns (TransferAssertResponse);
+  rpc CloseTransferSource(CloseTransferSourceRequest) returns (CloseTransferSourceResponse);
+  rpc CleanupTransferSource(CleanupTransferSourceRequest) returns (CleanupTransferSourceResponse);
+
+  // ── 转存目标端（可选）──
+  rpc StageTransfer(StageTransferRequest) returns (StageTransferResponse);
+  rpc FinalizeTransfer(FinalizeTransferRequest) returns (FinalizeTransferResponse);
+  rpc AbortTransfer(AbortTransferRequest) returns (AbortTransferResponse);
+
+  // ── bundle 级能力 ──
+  rpc PrepareLibrary(PrepareLibraryRequest) returns (PrepareLibraryResponse);
+}
+
+// 下载能力。对应 DOWNLOAD_PROVIDER_METHODS 的 3 个方法。
+service DownloadProvider {
+  // ① submit
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  // ② list_tasks
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  // ③ delete_task
+  rpc DeleteTask(DeleteTaskRequest) returns (DeleteTaskResponse);
+
+  rpc PrepareClient(PrepareClientRequest) returns (PrepareClientResponse);
+  rpc TestClient(TestClientRequest) returns (TestClientResponse);
+}
