@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api_key;
 pub mod auth;
 pub mod config_schema;
 pub mod crontab;

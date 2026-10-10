@@ -30,10 +30,10 @@ Python**，以及替换时怎么不出事。
 `uvicorn` + `aps` 两个进程）。本机实测（2026-10-07）：
 
 ```powershell
+# 2026-10-10 起 PostgreSQL / Qdrant 跑在 WSL Alpine 里（原生二进制，非容器），
+# dev-services.ps1 已改为转发到 Alpine 的 /root/*.sh。建表 + 建种子用户
+# （netdev/sakuramedia）发生在首次初始化；要清空重建用 purge。
 pwsh -File scripts/dev-services.ps1 up                 # PostgreSQL 5433 + Qdrant 6334
-podman cp docker/schema.sql sakuramedia-rs-pg:/tmp/schema.sql
-podman exec sakuramedia-rs-pg psql -h 127.0.0.1 -p 5433 -U sakuramedia `
-  -d sakuramedia_test -v ON_ERROR_STOP=1 -f /tmp/schema.sql     # 建 40 张表
 
 cargo build -p sm-server
 $env:SAKURAMEDIA_DATABASE_URL = 'postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test'
@@ -168,6 +168,8 @@ def _parse_torrent_hash(payload: bytes) -> str:
 > 复现脚本的形态：随机向量 + `PUT /collections/{name}` 建库（**不是** POST）
 > + `PUT /collections/{name}/points?wait=true` 写点（**也不是** POST），
 > 采样 `podman stats` 与 `podman exec … du -sm /qdrant/storage`。
+> （本地开发栈现为 Alpine 原生实例，对应读数是 `ps`/`smem` 与
+> `du -sm /var/lib/qdrant/storage`；生产仍是容器，才用得上上面两条 podman 命令。）
 
 ---
 

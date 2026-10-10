@@ -1510,6 +1510,87 @@ pub struct AccountPasswordChangeRequest {
     pub new_password: String,
 }
 
+// ---------------------------------------------------------------- API 密钥
+
+/// API 密钥列表项，字段与上游 `ApiKeyResource`
+/// （`src/schema/system/api_key.py:8-13`）一致。
+///
+/// # 刻意**没有** `key`
+///
+/// 明文只在生成响应（[`ApiKeyCreatedResource`]）里出现一次。列表项带
+/// `key_hint` 而不是 `key` —— 后者在库里根本不存在，只有 sha256。
+///
+/// # `created_at` 在这里是**必填**
+///
+/// 与 [`AccountResource`] 不同：账号的 `created_at` 上游可为 `None`，而
+/// API 密钥的建表语句里 `created_at` 是 `NOT NULL`。写成 `String` 而不是
+/// `Option<String>` 是契约的一部分，不是偷懒。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyResource {
+    pub id: i32,
+    pub name: String,
+    pub key_hint: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+impl From<&sm_db::system::api_key::ApiKey> for ApiKeyResource {
+    fn from(key: &sm_db::system::api_key::ApiKey) -> Self {
+        Self {
+            id: key.id,
+            name: key.name.clone(),
+            key_hint: key.key_hint.clone(),
+            created_at: format_timestamp(Some(key.created_at)),
+            last_used_at: format_optional_timestamp(key.last_used_at),
+        }
+    }
+}
+
+/// `POST /account/api-keys` 响应：在 [`ApiKeyResource`] 之上多一个 `key` 明文。
+///
+/// # 为什么不用 `#[serde(flatten)]` 复用基结构
+///
+/// 上游是 `class ApiKeyCreatedResource(ApiKeyResource)`（继承）。Rust 侧用
+/// flatten 表达继承会在**序列化**上工作，但这个仓库刚因为 `flatten` 踩过
+/// 一次坑（见 `routes::activity` 的模块文档）—— 同形的写法会让下一个改这
+/// 个结构体的人以为「flatten 只是省几行」。字段重复一次，代价是 4 行，
+/// 换来的是「响应里到底有哪些键」一眼可见。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyCreatedResource {
+    pub id: i32,
+    pub name: String,
+    pub key_hint: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    /// 明文，**仅此一次**。库里只有 `sha256(它)`。
+    pub key: String,
+}
+
+impl ApiKeyCreatedResource {
+    /// 由列表项 + 明文组装。明文由 `ApiKeyService::create` 返回，别处拿不到。
+    pub fn new(base: ApiKeyResource, key: String) -> Self {
+        Self {
+            id: base.id,
+            name: base.name,
+            key_hint: base.key_hint,
+            created_at: base.created_at,
+            last_used_at: base.last_used_at,
+            key,
+        }
+    }
+}
+
+/// `POST /account/api-keys` 请求体。
+///
+/// `name` 可缺省（上游 `Field(default="", max_length=64)`）—— 前端在「不填
+/// 备注名」时就是发 `{"name": ""}` 或 `{}`。长度校验在 service 层，
+/// 见 `sm_service::system::api_key`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiKeyCreateRequest {
+    #[serde(default)]
+    pub name: String,
+}
+
 // ---------------------------------------------------------------- 活动中心
 
 /// 通知，字段与上游 `NotificationResource`

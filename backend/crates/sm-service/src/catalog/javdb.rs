@@ -556,10 +556,6 @@ pub struct JavdbProvider {
 
 impl JavdbProvider {
     /// 构造。`host` **不带** `https://`（上游形状）。
-    ///
-    /// 客户端刻意用 `no_proxy()`：JavDB 是**直连公网**的目标，走环境里的
-    /// HTTP 代理会让「能不能搜」取决于代理配置 —— 那是一个与本服务无关的
-    /// 故障源。同样的理由见 `TorznabClient`。
     pub fn new(host: &str) -> Result<Self, MetadataSourceError> {
         let host = host.trim().trim_end_matches('/');
         if host.is_empty() {
@@ -578,6 +574,21 @@ impl JavdbProvider {
     /// 不可能 —— 而那正是唯一能覆盖「候选里挑番号**完全相等**的那个」与
     /// 「`success != 1` 不是 404」这两条实现级断言的办法。它也是**代理**场景
     /// 唯一说得通的入口：把 base 指到内网网关，其余代码一行不改。
+    ///
+    /// # 代理：交给环境变量，**不再硬禁用**
+    ///
+    /// 这里曾经是 `.no_proxy()`（等价于上游 httpx 的 `trust_env=False`），
+    /// 理由是「不让环境里的 HTTP 代理左右能不能搜」。
+    ///
+    /// 代价在**必须靠代理才能出网**的环境里（例如国内开发机：直连
+    /// `jdforrepam.com` 不通、走 `HTTPS_PROXY` 才通）是致命的 —— 抓取会
+    /// **整体失败**，而报错只有 `error sending request for url (...)`，
+    /// 看不出根因是「代理没走」。实测量到的症状是
+    /// `/status/metadata-providers/javdb/test` → `healthy:false, elapsed_ms≈5070`。
+    ///
+    /// 现在用 reqwest 的默认行为：读 `HTTPS_PROXY` / `HTTP_PROXY`，并按
+    /// `NO_PROXY` 跳过例外（回环的假服务、内网网关照常直连）。
+    /// **部署环境不设代理变量时，行为与从前完全一致。**
     pub fn with_base_url(base: &str) -> Result<Self, MetadataSourceError> {
         let base = base.trim().trim_end_matches('/').to_owned();
         if base.is_empty() {
@@ -586,7 +597,6 @@ impl JavdbProvider {
             ));
         }
         let client = reqwest::Client::builder()
-            .no_proxy()
             .user_agent(USER_AGENT)
             .build()
             .map_err(|error| {

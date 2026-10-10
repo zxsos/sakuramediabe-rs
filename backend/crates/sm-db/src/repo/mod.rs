@@ -194,6 +194,7 @@ pub mod video_collection;
 pub mod video_item;
 
 pub use actor::{ActorRepository, NewActor, SyncState};
+pub use api_key::ApiKeyRepository;
 pub use asset::{MovieActorRepository, MovieTagRepository, TagRepository};
 pub use collection::{
     ClipCollectionItemRepository, ClipCollectionRepository, MomentCollectionItemRepository,

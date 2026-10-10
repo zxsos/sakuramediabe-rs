@@ -22,6 +22,7 @@
 pub mod account;
 pub mod activity;
 pub mod activity_cleanup;
+pub mod api_key;
 pub mod auth;
 pub mod config;
 pub mod indexer_settings;
@@ -38,6 +39,7 @@ pub mod task_queue;
 pub mod telemetry;
 
 pub use account::AccountService;
+pub use api_key::ApiKeyService;
 pub use activity::{
     normalize_allowed_filter, normalize_string_filter, notification_category, notify_task_result,
     resolve_task_name, run_task, task_result_dedupe_key, task_state, TaskHandler,

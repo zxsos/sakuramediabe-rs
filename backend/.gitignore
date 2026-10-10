@@ -30,3 +30,7 @@ upstream
 # 本地手工联调用的临时工作目录（跑完即删，不入库）。
 # 典型内容：临时 config.toml、插件包、灌库 SQL、造包的 python 脚本。
 .tmp-*/
+
+# 本地起服务时的临时日志（scripts/run-server.ps1 与手工重定向产生，不入库）
+.build.log
+.server.log

@@ -142,14 +142,21 @@ impl Default for TorznabClient {
 }
 
 impl TorznabClient {
-    /// 默认客户端：30s 超时，**不读环境代理**。
+    /// 默认客户端：30s 超时。
     ///
-    /// `no_proxy()` 对应上游 httpx 的 `trust_env=False` —— 否则容器里一个
-    /// `HTTP_PROXY` 就会把 indexer 请求导到别处，而错误表现为「超时」。
+    /// # 代理：交给环境变量，**不再硬禁用**
+    ///
+    /// 这里曾经是 `.no_proxy()`（对应上游 httpx 的 `trust_env=False`），
+    /// 理由是「容器里一个 `HTTP_PROXY` 会把 indexer 请求导到别处，而错误
+    /// 表现为『超时』」。
+    ///
+    /// 但反过来的代价更大：在**必须靠代理才能出网**的环境里，indexer 一
+    /// 个都连不上，而错误同样是「超时」—— 两种故障在日志里长得一样，比原来
+    /// 那种更难查。现在交给 reqwest 的默认行为：读 `HTTPS_PROXY` /
+    /// `HTTP_PROXY`，按 `NO_PROXY` 跳过例外。**不设代理变量时行为不变。**
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { http }

@@ -1,11 +1,12 @@
-//! `GET /account`、`PATCH /account`、`POST /account/password`。
+//! `GET /account`、`PATCH /account`、`POST /account/password`，
+//! 以及 `/account/api-keys` 的三个端点。
 //!
-//! 对应上游 `src/api/routers/system/account.py`（**3 个端点**）。
+//! 对应上游 `src/api/routers/system/account.py`（**6 个端点**）。
 //!
-//! # 鉴权挂在 handler 上，且**只有这三个端点**
+//! # 鉴权挂在 handler 上，且**只有这六个端点**
 //!
-//! 上游 router 级只有 `db_deps`，三个端点各自声明
-//! `current_user=Depends(get_current_user)`（`account.py:15/20/26`）。这里照此
+//! 上游 router 级只有 `db_deps`，六个端点各自声明
+//! `current_user=Depends(get_current_user)`（`account.py`）。这里照此
 //! 逐个写 `CurrentUser` 提取器 —— 而不是靠一个 router 级 layer 悄悄生效，
 //! 后者会让「这个端点其实没鉴权」变得看不见。
 //!
@@ -13,6 +14,9 @@
 //!
 //! 用户身份一律取自 JWT（[`CurrentUser::id`]）。`AccountPasswordChangeRequest`
 //! 里刻意**没有** `username` 字段 —— 多一个就意味着「改别人的密码」这条路。
+//! `/account/api-keys` 同理：上游这三个 handler 拿到 `current_user` 却**不按
+//! 它过滤**（单用户部署，密钥不属于某个用户），但仍要求登录 —— 所以这里写
+//! `_user` 而不是干脆不写，让「必须登录」在签名上可见。
 //!
 //! # 改密码返回 204 且**响应体为空**
 //!
@@ -24,16 +28,31 @@
 //! `AccountService::change_password` 在写完新哈希后会吊销该用户全部 refresh
 //! token（`sm_service::system::account` 的模块文档有完整说明）。所以 204 意味
 //! 着「密码已改且所有会话已作废」，客户端应引导用户重新登录。
+//!
+//! # `/account/api-keys` 的三条契约要点
+//!
+//! | 端点 | 状态 | 要点 |
+//! |---|---|---|
+//! | `GET` | 200 | **顶层 JSON 数组**（不是分页壳）—— 客户端走 `getList` |
+//! | `POST` | 201 | 响应多一个 `key` 明文，**仅此一次** |
+//! | `DELETE /{id}` | 204 | 删不到 → 404 `api_key_not_found`（无 details） |
+//!
+//! 列表**不用分页壳**是因为上游 `response_model=list[ApiKeyResource]` 就是
+//! 裸数组，而 Flutter 的 `apiClient.getList('/account/api-keys')` 按裸数组
+//! 解析 —— 包一层 `{"items": [...]}` 客户端直接抛 "Expected JSON array"。
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
-use sm_service::system::AccountService;
+use sm_service::system::{AccountService, ApiKeyService};
 
 use crate::auth::CurrentUser;
-use crate::dto::{AccountPasswordChangeRequest, AccountResource, AccountUpdateRequest};
+use crate::dto::{
+    AccountPasswordChangeRequest, AccountResource, AccountUpdateRequest, ApiKeyCreateRequest,
+    ApiKeyCreatedResource, ApiKeyResource,
+};
 use crate::error::ErrorResponse;
 use crate::extract::Json as EnvelopeJson;
 use crate::routes::method_not_allowed;
@@ -50,6 +69,16 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/account/password",
             post(change_password).fallback(method_not_allowed),
+        )
+        .route(
+            "/account/api-keys",
+            get(list_api_keys)
+                .post(create_api_key)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/account/api-keys/{key_id}",
+            delete(delete_api_key).fallback(method_not_allowed),
         )
 }
 
@@ -96,5 +125,43 @@ async fn change_password(
     account
         .change_password(user.id, &body.current_password, &body.new_password)
         .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /account/api-keys` → `ApiKeyResource[]`（**裸数组**）
+///
+/// `_user` 只为「必须登录」而存在：上游这三个 handler 拿到 `current_user`
+/// 但不使用它（单用户部署），仍要求登录。不写这个参数就没有鉴权。
+async fn list_api_keys(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiKeyResource>>, ErrorResponse> {
+    let service = ApiKeyService::new(state.db());
+    let keys = service.list().await?;
+    Ok(Json(keys.iter().map(ApiKeyResource::from).collect()))
+}
+
+/// `POST /account/api-keys` → 201 `ApiKeyCreatedResource`
+async fn create_api_key(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    EnvelopeJson(body): EnvelopeJson<ApiKeyCreateRequest>,
+) -> Result<(StatusCode, Json<ApiKeyCreatedResource>), ErrorResponse> {
+    let service = ApiKeyService::new(state.db());
+    let (row, plain_key) = service.create(&body.name).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiKeyCreatedResource::new(ApiKeyResource::from(&row), plain_key)),
+    ))
+}
+
+/// `DELETE /account/api-keys/{key_id}` → 204 No Content
+async fn delete_api_key(
+    _user: CurrentUser,
+    State(state): State<AppState>,
+    Path(key_id): Path<i32>,
+) -> Result<StatusCode, ErrorResponse> {
+    let service = ApiKeyService::new(state.db());
+    service.delete(key_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

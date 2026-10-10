@@ -361,9 +361,10 @@ fn client(timeout: Duration, redirect: Policy) -> Result<Client, FetchError> {
     Client::builder()
         .timeout(timeout)
         .redirect(redirect)
-        // 与 `sm_service::transfers::torznab::TorznabClient` 同一个理由：环境
-        // 里的 `HTTP_PROXY` 不该把请求导到别处（测试打的是回环假服务）。
-        .no_proxy()
+        // 与 `sm_service::transfers::torznab::TorznabClient` 同一个取舍：
+        // 原来这里是 `.no_proxy()`，但在必须靠代理才能出网的环境里，
+        // javbus（公网目标）会整体抓不到。改回 reqwest 默认（读
+        // `HTTPS_PROXY` / `HTTP_PROXY`，按 `NO_PROXY` 跳过回环假服务）。
         .build()
         .map_err(|err| FetchError::Client(err.to_string()))
 }

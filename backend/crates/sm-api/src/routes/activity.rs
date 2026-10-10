@@ -122,15 +122,6 @@ async fn bootstrap(
     }))
 }
 
-/// 分页参数。缺省值照抄上游 `page=1, page_size=20`。
-#[derive(Debug, Deserialize)]
-struct PageQuery {
-    #[serde(default = "default_page")]
-    page: i64,
-    #[serde(default = "default_page_size")]
-    page_size: i64,
-}
-
 fn default_page() -> i64 {
     1
 }
@@ -140,10 +131,26 @@ fn default_page_size() -> i64 {
 }
 
 /// `GET /system/notifications` 的查询参数。
+///
+/// ⚠️ `page` / `page_size` **必须内联**，不能抽成结构体再 `#[serde(flatten)]`。
+///
+/// `#[serde(flatten)]` 会迫使 serde 先把整个 query 缓冲成 `Content`，而
+/// `serde_urlencoded` 产出的值**全是字符串**（它的 `deserialize_any` 走
+/// `visit_str`）。于是 `Content::Str("1")` 反序列化到 `i64` 必然失败：
+///
+/// ```text
+/// ?page=1  ->  invalid type: string "1", expected i64
+/// ```
+///
+/// 症状很刁：**不带参数时正常**（默认值不经过 `Content`），一带上 `page=` /
+/// `page_size=` 就 422。这不是值的问题，是字段类型与 flatten 的组合问题。
+/// 本仓其余路由一律内联书写（见 `routes::movies`、`routes::actors`）。
 #[derive(Debug, Deserialize)]
 struct ListNotificationsQuery {
-    #[serde(flatten)]
-    page: PageQuery,
+    #[serde(default = "default_page")]
+    page: i64,
+    #[serde(default = "default_page_size")]
+    page_size: i64,
     /// 分类。非法值 422 `invalid_activity_filter`。
     #[serde(default)]
     category: Option<String>,
@@ -161,8 +168,8 @@ async fn list_notifications(
         .list_notifications(
             query.category.as_deref(),
             query.is_read,
-            query.page.page,
-            query.page.page_size,
+            query.page,
+            query.page_size,
         )
         .await?;
     Ok(Json(map_page(page, |row| NotificationResource::from(row))))
@@ -208,10 +215,15 @@ async fn list_active_task_runs(
 }
 
 /// `GET /system/task-runs` 的查询参数。
+///
+/// 同 [`ListNotificationsQuery`]：`page` / `page_size` **必须内联**，
+/// `#[serde(flatten)]` 配 `serde_urlencoded` 会让带数字参数的请求必 422。
 #[derive(Debug, Deserialize)]
 struct ListTaskRunsQuery {
-    #[serde(flatten)]
-    page: PageQuery,
+    #[serde(default = "default_page")]
+    page: i64,
+    #[serde(default = "default_page_size")]
+    page_size: i64,
     /// 任务状态。非法值 422 `invalid_activity_filter`。
     #[serde(default)]
     state: Option<String>,
@@ -238,8 +250,8 @@ async fn list_task_runs(
             query.trigger_type.as_deref(),
             query.task_key.as_deref(),
             query.sort.as_deref(),
-            query.page.page,
-            query.page.page_size,
+            query.page,
+            query.page_size,
         )
         .await?;
     Ok(Json(map_page(page, |row| TaskRunResource::from(row))))
