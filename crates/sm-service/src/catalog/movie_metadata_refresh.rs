@@ -198,7 +198,12 @@ impl MovieMetadataRefreshService {
         // ② 远端详情。NotFound → 404；其余来源错误 → 502（上游
         // `_fetch_remote_movie_metadata` 的三段映射）。
         let detail = match self.source.search_javdb_by_number(&normalized).await {
-            Ok(Some(detail)) => detail,
+            Ok(Some(detail)) => {
+                // JavDB 详情可能缺 movie_number（null/缺失/空串）——与 stream
+                // upsert 同一个坑（bd74737）：先用请求的归一番号补上，否则
+                // validate_number 直接 409。
+                fill_missing_movie_number(detail, &normalized)
+            }
             Ok(None) => {
                 return Err(ServiceError::not_found_with(
                     "movie_metadata_not_found",
@@ -827,6 +832,11 @@ impl MovieMetadataRefreshService {
 ///
 /// 返回本地归一番号。远端归一后为空或不等 → 409 `movie_metadata_number_conflict`，
 /// details 带双方原始与归一番号 —— 客户端/运维要能看出「到底是哪边错了」。
+///
+/// # 调用前必须先 [`fill_missing_movie_number`]
+///
+/// JavDB 详情的 `movie_number` 可能为 null/缺失/空串（SSNI-888 实测），
+/// 直接调这里会 409 —— 那是来源的字段缺失，不是「拿 A 写 B」。
 fn validate_number(
     local_movie_number: &str,
     detail: &serde_json::Value,
@@ -862,6 +872,30 @@ fn validate_number(
         ));
     }
     Ok(local)
+}
+
+/// JavDB 详情缺 `movie_number`（null/缺失/空串/空白）时，用请求的归一番号
+/// 补上 —— 与 stream upsert 的 bd74737 同一个坑。补的是**请求方**的番号，
+/// 不是猜的，所以不破坏 validate_number「防拿 A 写 B」的语义。
+fn fill_missing_movie_number(
+    detail: serde_json::Value,
+    normalized: &str,
+) -> serde_json::Value {
+    let mut detail = detail;
+    if detail
+        .get("movie_number")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(obj) = detail.as_object_mut() {
+            obj.insert(
+                "movie_number".to_owned(),
+                serde_json::Value::String(normalized.to_owned()),
+            );
+        }
+    }
+    detail
 }
 
 /// ④ JavDB id 占用判定（纯部分）。上游 `_validate_remote_movie_metadata_javdb_id`：
@@ -1004,6 +1038,30 @@ mod tests {
         let error =
             validate_number("ABC-123", &serde_json::json!({})).expect_err("远端没给番号也该拒");
         assert_eq!(error.code(), "movie_metadata_number_conflict");
+    }
+
+    /// ★ refresh 必须先补番号再过一致性闸门：JavDB 详情的 movie_number 为
+    /// null/缺失/空串时，fill 后 validate_number 要放行（SSNI-888 刷新曾
+    /// 在这里 409 —— 来源的字段缺失，不是「拿 A 写 B」）。
+    #[test]
+    fn refresh_fills_missing_number_before_the_number_gate() {
+        for detail in [
+            serde_json::json!({ "title": "x" }),
+            serde_json::json!({ "movie_number": null, "title": "x" }),
+            serde_json::json!({ "movie_number": "", "title": "x" }),
+            serde_json::json!({ "movie_number": "   ", "title": "x" }),
+        ] {
+            let filled = fill_missing_movie_number(detail, "SSNI-888");
+            assert_eq!(filled["movie_number"], "SSNI-888", "缺番号要补上");
+            validate_number("SSNI-888", &filled).expect("补完该放行");
+        }
+        // 有番号不覆盖。
+        let intact = serde_json::json!({ "movie_number": "SSNI-888" });
+        let filled = fill_missing_movie_number(intact, "OTHER-9");
+        assert_eq!(filled["movie_number"], "SSNI-888", "有番号不该被换掉");
+        // 非对象原样返回（不 panic）。
+        let arr = serde_json::json!([1, 2]);
+        assert_eq!(fill_missing_movie_number(arr.clone(), "SSNI-888"), arr);
     }
 
     /// ④ JavDB id 闸门：远端为空或与本地相同 → 放行；不同 → 把远端 id 带给

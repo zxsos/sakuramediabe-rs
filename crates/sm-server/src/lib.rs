@@ -272,7 +272,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             plugins::PluginConfig::from_snapshot(&config_service.snapshot().map_err(|error| {
                 anyhow::anyhow!("读取配置失败（{}）：{}", error.code(), error.api.message)
             })?);
-        let sources = loaded_plugins
+        let mut sources = loaded_plugins
             .extension_registry()
             .lock()
             .expect("扩展注册表锁")
@@ -294,6 +294,28 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 })
             })
             .collect::<Vec<_>>();
+        // 进程内元数据插件：已 vendoring 的插件在 Plugins::load 里被跳过
+        // （plugins.rs::is_inprocess_plugin），扩展注册表里没有它们 —— 不在这里
+        // 补上，fetch_plugin 会报 Disabled，inprocess 网关永远走不到。
+        // 长短两种 id 都注册：仓库里两种写法混用，生产配置的 plugins.enabled
+        // 用哪个只看部署；没启用的那个会被 enabled_plugin_sources 滤掉，
+        // 不会进兜底链路。endpoint 填占位：进程内路径不用它（load_plugin 只在
+        // gRPC 分支用）。网关新增支持的插件时，这里要与
+        // InProcessMetadataGateway::supports 同步。
+        for plugin_id in [
+            "sakuramedia_javbus_metadata",
+            "javbus",
+        ] {
+            if sources.iter().any(|s| s.plugin_id == plugin_id) {
+                continue;
+            }
+            sources.push(sm_service::catalog::metadata_source::RegisteredSource {
+                plugin_id: plugin_id.to_owned(),
+                display_name: plugin_javbus_metadata::DISPLAY_NAME.to_owned(),
+                data_dir: plugin_config.data_dir_for(plugin_id),
+                endpoint: "inprocess://local".to_owned(),
+            });
+        }
         let provider = match sm_service::catalog::javdb::JavdbProvider::new(
             sm_service::system::status::JAVDB_HOST,
         ) {

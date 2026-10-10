@@ -853,6 +853,70 @@ mod tests {
         assert_eq!(error, MetadataSourceError::Disabled("a".to_owned()));
     }
 
+    /// ★ 进程内网关可达：来源已注册 + 网关支持该插件时，`load_plugin` 必须走
+    /// inprocess 分支（不起进程、不走 gRPC）。
+    ///
+    /// 回归：58442dd 只接了网关，但 vendored 插件在 `Plugins::load` 被跳过、
+    /// 扩展注册表里没有它 —— 组合根不补 `RegisteredSource` 的话 `fetch_plugin`
+    /// 直接 `Disabled`，网关是死代码（sm-server/lib.rs 的合成注册与此同步）。
+    #[tokio::test]
+    async fn inprocess_fetcher_is_used_when_the_source_is_registered() {
+        struct StubFetcher;
+        #[tonic::async_trait]
+        impl InProcessMetadataFetch for StubFetcher {
+            fn supports(&self, plugin_id: &str) -> bool {
+                plugin_id == "sakuramedia_javbus_metadata"
+            }
+            async fn fetch_movie(
+                &self,
+                _plugin_id: &str,
+                request: sm_plugin_api::v1::FetchMovieRequest,
+            ) -> Result<sm_plugin_api::v1::FetchMovieResponse, MetadataSourceError> {
+                // 按协议在交付目录下放一张"封面"。
+                let dir = std::path::PathBuf::from(&request.delivery_dir).join("req-stub");
+                std::fs::create_dir_all(&dir).unwrap();
+                let cover = dir.join("cover.jpg");
+                std::fs::write(&cover, b"fake-jpeg").unwrap();
+                Ok(sm_plugin_api::v1::FetchMovieResponse {
+                    found: true,
+                    movie_number: "ABC-123".to_owned(),
+                    title: "标题".to_owned(),
+                    release_date: "2024-03-05".to_owned(),
+                    duration_minutes: 120,
+                    cover_image_path: cover.display().to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("inprocess-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = RegisteredSource {
+            plugin_id: "sakuramedia_javbus_metadata".to_owned(),
+            display_name: "JavBus".to_owned(),
+            data_dir: root.join("data"),
+            endpoint: "inprocess://local".to_owned(),
+        };
+        let service = MetadataSourceService::new(vec![source], None)
+            .with_inprocess(std::sync::Arc::new(StubFetcher));
+        let config =
+            serde_json::json!({"plugins": {"enabled": ["sakuramedia_javbus_metadata"]}});
+        let cover = service
+            .fetch_plugin(&config, "sakuramedia_javbus_metadata", "ABC-123", |delivery: PluginDelivery| async {
+                let cover = delivery.plugin_delivery.expect("插件交付").cover_image_path;
+                assert!(cover.is_file(), "进程内网关的交付文件要真实存在");
+                cover
+            })
+            .await
+            .expect("进程内抓取该成功");
+        assert!(
+            cover.starts_with(root.join("data").join("metadata-tmp")),
+            "交付边界是 data_dir 下的 metadata-tmp"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 只有**已启用**的来源可用。
     #[test]
     fn only_enabled_sources_are_used() {
