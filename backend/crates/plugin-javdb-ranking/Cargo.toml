@@ -17,11 +17,11 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-reqwest = { workspace = true }
-url = { workspace = true }
+# 本插件不自己出网：榜单番号由宿主的 `GetJavdbRankNumbers` 取，所以没有
+# reqwest / url（详见 lib.rs 的模块文档）。
 serde_json = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-wiremock = "0.6"
+# `RunJobRequest.params` / `JobEvent.result` 的载荷类型（手写 params schema 也用）。
+prost-types = { workspace = true }
+# TOP250 的年份周期要算「当前年」（上游 `datetime.now().astimezone().year`）。
+chrono = { workspace = true }

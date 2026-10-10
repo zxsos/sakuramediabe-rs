@@ -2,33 +2,43 @@
 //!
 //! # 上游对应
 //!
-//! `tinypinglite/sakuramedia_subtitlecat`（Python）：`plugin.py` 注册、
-//! `subtitlecat.py` 搜索与下载、`settings.py` 配置、`jobs.py` 手动/订阅任务、
-//! `state.py` 抓取状态、`manifest.json`。
+//! `tinypinglite/sakuramedia_subtitlecat`（Python）：
 //!
 //! | 上游 | 这里 |
-//! |---|
+//! |---|---|
 //! | `plugin.py:register` | [`service::Control`]（`register`） |
 //! | `subtitlecat.py:SubtitleCatClient.fetch_chinese_subtitles` | [`subtitlecat::SubtitleCatClient::fetch_chinese_subtitles`] |
 //! | `subtitlecat.py:normalize_movie_number` | [`subtitlecat::normalize_movie_number`] |
 //! | `subtitlecat.py:_LinkParser` | [`html`]（本仓库手写的扫描器，见它的模块文档） |
 //! | `settings.py:SubtitleCatSettings` | [`settings::Settings`] |
-//! | `jobs.py:build_jobs` | [`service::Control::run_job`]（两个 task_key） |
-//! | `state.py:SubtitleCatFetchState` | 未移植（见下） |
+//! | `jobs.py` | [`jobs`] |
+//! | `state.py:SubtitleCatFetchState` | [`state::FetchState`] |
+//! | `manifest.json` | [`PLUGIN_ID`] / [`DISPLAY_NAME`] |
 //!
-//! # 与上游不同的地方
+//! # 宿主能力从哪来
 //!
-//! 1. **`state.py` 未移植**。上游用 SQLite 记「已抓取」避免订阅任务重复抓；
-//!    Rust 侧 `RunJob` 是无状态调用，状态应由宿主侧维护（或后续扩展点补）。
-//!    当前实现每次调用都实时抓取。
-//! 2. **配置从 `SAKURAMEDIA_PLUGIN_SETTINGS_FILE` 读**，不是 `context.settings`
+//! 上游是进程内插件，`context.movies` / `context.import_subtitle` /
+//! `context.data_dir` 直接拿。拆成 gRPC 插件后：
+//!
+//! - `context.movies.*` / `context.import_subtitle` → `PluginHost` 的
+//!   `FindMoviesByNumbers` / `ListMovies` / `ImportSubtitle`，
+//!   端点由宿主给（进程式走 `SAKURAMEDIA_HOST_GRPC_ADDR`，进程内由组合根传）；
+//! - `context.data_dir` → `RunJobRequest.data_dir`（宿主保证可读写、重装保留）
+//!   —— 抓取状态文件就落在那里。
+//!
+//! # 与上游不同的地方（汇总，细则在各模块文档里）
+//!
+//! 1. **配置从 `SAKURAMEDIA_PLUGIN_SETTINGS_FILE` 读**，不是 `context.settings`
 //!    —— 进程内插件才有后者那条通道。
-//! 3. **字幕导入走宿主 `ImportSubtitle` 回调**：`RunJob` 的结果 `Struct` 里带
-//!    回字幕字节（base64），由宿主侧落盘与入库；插件不直接写宿主库表。
+//! 2. **多一个 `base_url` 配置**（上游写死在代码里），供测试与镜像站用。
+//! 3. **进度事件不带 `summary_patch`**：proto 的 `ProgressEvent` 只有
+//!    `current / total / text`。
 
 pub mod html;
+pub mod jobs;
 pub mod service;
 pub mod settings;
+pub mod state;
 pub mod subtitlecat;
 
 /// 上游 `manifest.json` 的 `plugin_id`。宿主按
@@ -38,3 +48,31 @@ pub const PLUGIN_ID: &str = "sakuramedia_subtitlecat";
 
 /// 上游 `manifest.json` 的 `display_name`。
 pub const DISPLAY_NAME: &str = "SakuraMedia SubtitleCat 中文字幕";
+
+/// 把本插件的全部 gRPC service 起在 `addr` 上。
+///
+/// **进程式与进程内共用同一份装配**：本插件只有控制面（`PluginControl`：
+/// `register` + 两个任务），不声明扩展点。`settings` 从 `Value` 解析成
+/// [`settings::Settings`]，连 `host_endpoint` 一起交给
+/// [`service::Control::with_runtime`] —— 进程内多插件共用一份进程环境，从
+/// `SAKURAMEDIA_PLUGIN_SETTINGS_FILE` 读会互相覆盖。
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    plugin_id: String,
+    settings: serde_json::Value,
+    host_endpoint: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sm_plugin_api::v1::plugin_control_server::PluginControlServer;
+    use tonic::transport::Server;
+
+    let settings = settings::Settings::from_json(&settings);
+    Server::builder()
+        .add_service(PluginControlServer::new(service::Control::with_runtime(
+            plugin_id,
+            settings,
+            host_endpoint,
+        )))
+        .serve(addr)
+        .await?;
+    Ok(())
+}

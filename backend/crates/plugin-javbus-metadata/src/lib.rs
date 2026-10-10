@@ -41,3 +41,42 @@ pub const PLUGIN_ID: &str = "sakuramedia_javbus_metadata";
 
 /// 上游 `manifest.json` 的 `display_name`。
 pub const DISPLAY_NAME: &str = "JavBus";
+
+/// 把本插件的全部 gRPC service 起在 `addr` 上。
+///
+/// **进程式与进程内共用同一份装配**：
+///
+/// - **进程式**：可执行文件（`src/bin/sakuramedia_javbus_metadata.rs`）从
+///   `SAKURAMEDIA_PLUGIN_*` 环境变量取地址 / id / 配置文件，解析成 `settings`
+///   后调这里；
+/// - **进程内**：组合根（`sm-server`）直接把 `settings` 与 `host_endpoint`
+///   传进来，在**同一个进程**里起一个 loopback 服务 —— 不起子进程，省掉一整套
+///   运行时（约 2 MB RSS + 7 个线程）。
+///
+/// 之所以两种形态能共用一份装配：`Control` 与扩展点 service 的构造都只依赖
+/// 「配置」与「我是谁」，不依赖「我是子进程还是同进程」。把配置从进程环境变量
+/// 换成显式参数正是为此 —— 进程内只有一份进程环境，多插件会互相覆盖。
+///
+/// `host_endpoint` 本插件用不上：它是**被宿主拉过来问**的元数据来源，不反向
+/// 回调宿主。留着这个参数只为与其它插件的 `serve` 同形。
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    plugin_id: String,
+    settings: serde_json::Value,
+    _host_endpoint: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sm_plugin_api::v1::metadata_source_extension_service_server::MetadataSourceExtensionServiceServer;
+    use sm_plugin_api::v1::plugin_control_server::PluginControlServer;
+    use tonic::transport::Server;
+
+    let settings = settings::Settings::from_json(&settings);
+    let source = javbus::JavBusSource::new(&settings)?;
+    Server::builder()
+        .add_service(PluginControlServer::new(service::Control::new(plugin_id)))
+        .add_service(MetadataSourceExtensionServiceServer::new(
+            service::Metadata::new(source),
+        ))
+        .serve(addr)
+        .await?;
+    Ok(())
+}

@@ -63,6 +63,7 @@ MANAGED = [
     ("crates/sm-plugin-api/src/error.rs", "src/error.rs"),
     ("crates/sm-plugin-api/src/json_struct.rs", "src/json_struct.rs"),
     ("crates/sm-plugin-api/src/movie_delivery.rs", "src/movie_delivery.rs"),
+    ("crates/sm-plugin-api/src/host.rs", "src/host.rs"),
 ]
 
 HOST_PROTO_DIR = "proto"

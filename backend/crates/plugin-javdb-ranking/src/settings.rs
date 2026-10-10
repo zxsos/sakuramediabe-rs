@@ -1,51 +1,48 @@
-//! 插件配置：从 `SAKURAMEDIA_PLUGIN_SETTINGS_FILE` 读。
+//! 插件配置（上游 `settings.py:JavdbRankingSettings`）。
 //!
-//! # 为什么是「文件可选、字段有默认」
+//! # 只有账号两个字段
 //!
-//! 宿主在**每次拉起**时重写这个文件；插件只在启动时读一次。文件不存在
-//! （宿主没配过）就按默认跑 —— 把「没配」写成启动失败会让插件在宿主的
-//! 探活里直接判死，而默认的 javdb.com 对公开榜单本来就能匿名访问。
+//! JavDB 的出网细节（基址、UA、签名、代理）归**宿主**管 —— 插件只把账号透传
+//! 进去，宿主**不保管**任何账号（`host.proto` 的 `GetJavdbRankNumbers` 原话）。
+//! 所以这里没有基址、超时、Cookie 之类：那些是本仓早期「插件自己抓榜单」时
+//! 留下的，现在去掉了。
+//!
+//! # 账号决定 TOP250 抓不抓
+//!
+//! TOP250 要登录才看得到；未配账号时 [`Settings::account_configured`] 为假，
+//! `ResolveRankingPeriods` 对 TOP250 回空数组（本次不抓，正常结果）。
 
-use std::path::PathBuf;
-
-/// 宿主注入的配置文件路径。
-const SETTINGS_FILE_ENV: &str = "SAKURAMEDIA_PLUGIN_SETTINGS_FILE";
-
-/// 插件配置。
-#[derive(Debug, Clone, serde::Deserialize)]
+/// 插件私有配置。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// JavDB 站点基址。上游默认 `https://javdb.com`。
-    pub base_url: String,
-    /// 请求超时（秒）。
-    pub timeout_secs: u64,
-    /// TOP250 是否需要账号。没配账号时跳过 TOP250 抓取（上游同行为）。
-    pub top250_require_auth: bool,
-    /// JavDB 登录后的 Cookie（如 `_javdb_session=xxx`），用于绕过反爬和访问 TOP250。
-    pub cookie: String,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            base_url: "https://javdb.com".to_owned(),
-            timeout_secs: 30,
-            top250_require_auth: true,
-            cookie: String::new(),
-        }
-    }
+    /// JavDB 用户名。
+    pub javdb_username: String,
+    /// JavDB 密码。
+    pub javdb_password: String,
 }
 
 impl Settings {
-    /// 从环境变量指定的文件加载；没有就用默认。
-    pub fn load() -> Self {
-        let path = std::env::var(SETTINGS_FILE_ENV).ok().map(PathBuf::from);
-        let path = match path {
-            Some(p) if p.is_file() => p,
-            _ => return Self::default(),
-        };
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&text).unwrap_or_default()
+    /// 从已解析的 JSON 构造。
+    ///
+    /// **进程内组合根走这条**：它直接把 `plugins.<id>.settings` 这个 `Value`
+    /// 传进来，不经过「写文件 + 环境变量指路」那一套（进程内只有一份进程环境，
+    /// 多插件会互相覆盖）。结构体是 `#[serde(default)]`，缺键回落默认。
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        serde_json::from_value(value.clone()).unwrap_or_default()
+    }
+
+    /// 账号密码**都**非空白才算配好（上游 `account_configured` 的 `bool(...)`）。
+    ///
+    /// 首尾空白要裁掉再判断：设置页里粘一次带换行的密码，会变成「看起来配了、
+    /// 登录一直失败」。
+    pub fn account_configured(&self) -> bool {
+        !self.javdb_username.trim().is_empty() && !self.javdb_password.trim().is_empty()
+    }
+
+    /// 透传给宿主的账号（原样，不裁 —— 密码里的空白是用户的事）。
+    pub fn credentials(&self) -> (String, String) {
+        (self.javdb_username.clone(), self.javdb_password.clone())
     }
 
     /// settings 表单的字段列表（宿主渲染用）。
@@ -53,33 +50,23 @@ impl Settings {
         use sm_plugin_api::v1::SettingsField;
         vec![
             SettingsField {
-                key: "base_url".to_owned(),
-                label: "JavDB 基址".to_owned(),
+                key: "javdb_username".to_owned(),
+                label: "JavDB 用户名".to_owned(),
                 input: "text".to_owned(),
                 required: false,
-                description: Some("默认 https://javdb.com".to_owned()),
-                multiline: false,
-                hint: Some("供测试与镜像站使用".to_owned()),
-                default: Some("https://javdb.com".to_owned()),
-            },
-            SettingsField {
-                key: "timeout_secs".to_owned(),
-                label: "请求超时（秒）".to_owned(),
-                input: "text".to_owned(),
-                required: false,
-                description: Some("5 到 120，默认 30".to_owned()),
+                description: Some("用于抓取 TOP250（其余榜单无需登录）".to_owned()),
                 multiline: false,
                 hint: None,
-                default: Some("30".to_owned()),
+                default: None,
             },
             SettingsField {
-                key: "cookie".to_owned(),
-                label: "JavDB Cookie".to_owned(),
-                input: "text".to_owned(),
+                key: "javdb_password".to_owned(),
+                label: "JavDB 密码".to_owned(),
+                input: "password".to_owned(),
                 required: false,
-                description: Some("登录后的 Cookie，用于绕过反爬和访问 TOP250".to_owned()),
-                multiline: true,
-                hint: Some("如 _javdb_session=xxx；从浏览器开发者工具复制".to_owned()),
+                description: Some("同上；账号与密码都填了才会抓 TOP250".to_owned()),
+                multiline: false,
+                hint: None,
                 default: None,
             },
         ]
@@ -91,15 +78,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_base_url_is_javdb() {
-        assert_eq!(Settings::default().base_url, "https://javdb.com");
+    fn an_empty_account_is_not_configured() {
+        let settings = Settings::default();
+        assert!(!settings.account_configured());
+        assert!(!Settings::from_json(&serde_json::json!({
+            "javdb_username": "someone",
+            "javdb_password": "",
+        }))
+        .account_configured());
     }
 
     #[test]
-    fn schema_has_three_fields() {
+    fn whitespace_only_fields_do_not_count_as_configured() {
+        // 粘一次带换行的密码不该表现成「配好了」。
+        let settings = Settings::from_json(&serde_json::json!({
+            "javdb_username": " someone ",
+            "javdb_password": "\n",
+        }));
+        assert!(!settings.account_configured());
+    }
+
+    #[test]
+    fn both_fields_configured() {
+        let settings = Settings::from_json(&serde_json::json!({
+            "javdb_username": "someone",
+            "javdb_password": "secret",
+        }));
+        assert!(settings.account_configured());
+        assert_eq!(settings.credentials(), ("someone".to_owned(), "secret".to_owned()));
+    }
+
+    #[test]
+    fn schema_has_the_two_account_fields() {
         let fields = Settings::schema();
-        assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0].key, "base_url");
-        assert_eq!(fields[2].key, "cookie");
+        let keys: Vec<&str> = fields.iter().map(|field| field.key.as_str()).collect();
+        assert_eq!(keys, ["javdb_username", "javdb_password"]);
+        assert_eq!(fields[1].input, "password", "密码要遮起来");
     }
 }

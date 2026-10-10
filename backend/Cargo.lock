@@ -1959,17 +1959,15 @@ name = "plugin-javdb-ranking"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
- "reqwest",
+ "prost-types",
  "serde",
  "serde_json",
  "sm-plugin-api",
- "thiserror",
  "tokio",
  "tokio-stream",
  "tonic",
- "url",
- "wiremock",
 ]
 
 [[package]]
@@ -2051,13 +2049,16 @@ name = "plugin-subtitlecat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "prost-types",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sm-plugin-api",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3037,6 +3038,7 @@ dependencies = [
  "plugin-javdb-ranking",
  "plugin-judge-collection",
  "plugin-more-movies",
+ "plugin-ref-local",
  "plugin-scrape-translate",
  "plugin-subtitlecat",
  "prost-types",

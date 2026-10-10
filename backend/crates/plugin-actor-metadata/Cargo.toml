@@ -28,6 +28,12 @@ fs2 = "0.4"
 md-5 = "0.10"
 unicode-normalization = "0.1"
 
+# 可执行文件：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 拉起的那个进程
+# （见 docs/adr/2026-10-05-plugin-lifecycle.md）。
+[[bin]]
+name = "sakuramedia_actor_metadata"
+path = "src/bin/sakuramedia_actor_metadata.rs"
+
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"

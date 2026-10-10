@@ -66,10 +66,15 @@ impl MoreMoviesSettings {
             return Self::default();
         }
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        Self::from_value(&value)
+        Self::from_json(&value)
     }
 
-    fn from_value(v: &Value) -> Self {
+    /// 从已解析的 JSON 构造。
+    ///
+    /// **进程内组合根走这条**：它直接把 `plugins.<id>.settings` 这个 `Value`
+    /// 传进来，不经过「写文件 + 环境变量指路」那一套（进程内只有一份进程环境，
+    /// 多插件会互相覆盖）。结构体缺键回落默认。
+    pub fn from_json(v: &Value) -> Self {
         let mut s = Self::default();
         let get_u64 = |key: &str| v.get(key).and_then(Value::as_u64);
         if let Some(ms) = get_u64("page_delay_ms") {
@@ -172,6 +177,12 @@ impl RankMoviesSettings {
             return Self::default();
         }
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Self::from_json(&value)
+    }
+
+    /// 从已解析的 JSON 构造（进程内组合根走这条，理由同
+    /// [`MoreMoviesSettings::from_json`]）。
+    pub fn from_json(value: &Value) -> Self {
         let mut s = Self::default();
         if let Some(secs) = value.get("timeout_seconds").and_then(Value::as_u64) {
             s.timeout = Duration::from_secs(secs.clamp(1, 120));
@@ -232,7 +243,7 @@ mod tests {
 
     #[test]
     fn timeout_clamped() {
-        let s = MoreMoviesSettings::from_value(&serde_json::json!({"timeout_seconds": 500}));
+        let s = MoreMoviesSettings::from_json(&serde_json::json!({"timeout_seconds": 500}));
         assert_eq!(s.timeout, Duration::from_secs(120));
     }
 }

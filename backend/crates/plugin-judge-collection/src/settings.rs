@@ -108,6 +108,15 @@ impl DurationCollectionSettings {
     fn load_from(path: &Path) -> Self {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        Self::from_json(&value)
+    }
+
+    /// 从已解析的 JSON 构造。
+    ///
+    /// **进程内组合根走这条**：它直接把 `plugins.<id>.settings` 这个 `Value`
+    /// 传进来，不经过「写文件 + 环境变量指路」那一套（进程内只有一份进程环境，
+    /// 多插件会互相覆盖）。缺字段就保留缺省。
+    pub fn from_json(value: &Value) -> Self {
         let mut out = Self::default();
         if let Some(t) = value
             .get("duration_threshold_minutes")

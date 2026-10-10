@@ -36,11 +36,13 @@ pub const CLI_HELP: &str = "按影片时长、番号特征或标签判定合集�
 /// 上游 `default_cron="0 4 * * *"`（每天 04:00）。
 pub const DEFAULT_CRON: &str = "0 4 * * *";
 
-/// 宿主回调用的地址（`PluginHost` 服务）。宿主目前**不注入**这个变量
-/// （生命周期协议只给了 ADDR / ID / DATA_DIR / SETTINGS_FILE），所以缺省
-/// 时 `run_job` 直接回 `unimplemented` —— 等宿主侧把回调用地址接进来再摘
-/// 掉这层。
-pub const HOST_ADDR_ENV: &str = "SAKURAMEDIA_PLUGIN_HOST_ADDR";
+/// 宿主回调用的地址（`PluginHost` 服务）。
+///
+/// **名字必须与 `sm_plugins::supervisor::HOST_ADDR_ENV` 一致**
+/// （`SAKURAMEDIA_HOST_GRPC_ADDR`）—— 宿主拉起插件时注入的就是那个变量；这里
+/// 曾经错写成 `SAKURAMEDIA_PLUGIN_HOST_ADDR`，进程式下永远读不到宿主地址。
+/// 进程内形态则完全不看它：组合根把 host_endpoint 显式传进 [`Control::new`]。
+pub const HOST_ADDR_ENV: &str = "SAKURAMEDIA_HOST_GRPC_ADDR";
 
 /// 控制面。
 pub struct Control {
@@ -174,10 +176,10 @@ impl PluginControl for Control {
         let host = match &self.host {
             Some(h) => h.clone(),
             None => {
-                return Err(Status::unimplemented(
-                    "宿主未注入回调用地址（SAKURAMEDIA_PLUGIN_HOST_ADDR），\
-                     插件无法访问影片库；等宿主侧接好 PluginHost 回调后再启用",
-                ));
+                return Err(Status::unimplemented(format!(
+                    "宿主未注入回调用地址（{HOST_ADDR_ENV}），\
+                     插件无法访问影片库；等宿主侧接好 PluginHost 回调后再启用"
+                )));
             }
         };
         let config = self.settings.clone();

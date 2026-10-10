@@ -251,6 +251,32 @@ impl HandlerRegistry {
         self
     }
 
+    /// 把另一份注册表里的处理器与收口钩子并进来。
+    ///
+    /// 组合根用它把「内建任务 + 插件任务」合成一份（两边各自建表，合并点在
+    /// 唯一同时看得见两方的地方）。键冲突时**后者覆盖**并记一条 warn：
+    /// 正常不会冲突（插件任务撞内建键在 `JobRegistry` 层面就被拒了），
+    /// 真撞上说明同一个键被注册了两遍 —— 覆盖是唯一能继续跑的选择，
+    /// 但必须留下痕迹。
+    pub fn merge(&mut self, other: HandlerRegistry) -> &mut Self {
+        for (key, factory) in other.factories {
+            if self.factories.contains_key(&key) {
+                warn!(task_key = key.as_str(), "处理器注册表出现重复键，已覆盖");
+            }
+            self.factories.insert(key, factory);
+        }
+        for (key, recovery) in other.recoveries {
+            if self.recoveries.contains_key(&key) {
+                warn!(
+                    task_key = key.as_str(),
+                    "处理器注册表出现重复的收口钩子，已覆盖"
+                );
+            }
+            self.recoveries.insert(key, recovery);
+        }
+        self
+    }
+
     /// 该键是否已落地。
     pub fn contains(&self, task_key: &str) -> bool {
         self.factories.contains_key(task_key)

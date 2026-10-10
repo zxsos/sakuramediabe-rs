@@ -23,16 +23,10 @@
 //! - `sakuramedia_more_movies`：只有后台任务（`sakuramedia_more_movies_sync`，
 //!   cron `0 6 * * *`），不声明扩展点。
 //! - `sakuramedia_more_rank_movies`：声明 `discovery.ranking_source` 扩展点
-//!   （Minnano AV 1 个榜单 + JavLibrary 2 个榜单）与定时任务
-//!   （`sakuramedia_more_rank_movies_sync`）。
-//!
-//! # v0.2.0 契约下做不了的两件事
-//!
-//! 1. **手动单榜同步**（上游 `sakuramedia_more_rank_movies_sync_board`）：v0.2.0
-//!    没有对应的宿主 RPC（`SyncRankingBoard` 是后加的），所以不声明该任务。
-//! 2. **榜单周期集合声明**：v0.2.0 的 `RankingBoard` 只有 `board_key` +
-//!    `display_name`；周期合法性在 `fetch_ranking` 里按上游的 `MINNANO_PERIODS`
-//!    / `JAVLIBRARY_PERIODS` 校验。
+//!   （Minnano AV 1 个榜单 + JavLibrary 2 个榜单）与两个任务 —— 定时全量
+//!   （`sakuramedia_more_rank_movies_sync`）与手动单榜
+//!   （`sakuramedia_more_rank_movies_sync_board`，吃 `board_key` +
+//!   可选 `period`）。
 //!
 //! # 与上游不同的三处
 //!
@@ -62,3 +56,48 @@ pub const RANK_MOVIES_PLUGIN_ID: &str = "sakuramedia_more_rank_movies";
 /// `discovery.ranking_source` 扩展点 key（上游
 /// `src/plugins/extensions/ranking.py:RANKING_SOURCE_EXTENSION_KEY`）。
 pub const RANKING_SOURCE_KEY: &str = "discovery.ranking_source";
+
+/// 起 `sakuramedia_more_movies`（只控制面：`register` + 一个任务）。
+///
+/// **进程式与进程内共用同一份装配**：`settings` 从 `Value` 解析、宿主端点显式
+/// 传入，构造时定死，任务里不再读进程环境。
+pub async fn serve_more_movies(
+    addr: std::net::SocketAddr,
+    plugin_id: String,
+    settings: serde_json::Value,
+    host_endpoint: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sm_plugin_api::v1::plugin_control_server::PluginControlServer;
+    use tonic::transport::Server;
+
+    let settings = settings::MoreMoviesSettings::from_json(&settings);
+    let control = service::MoreMoviesControl::new(plugin_id, settings, host_endpoint)?;
+    Server::builder()
+        .add_service(PluginControlServer::new(control))
+        .serve(addr)
+        .await?;
+    Ok(())
+}
+
+/// 起 `sakuramedia_more_rank_movies`（控制面 + `discovery.ranking_source`
+/// 扩展点，同一个端口 —— 理由见 `service.rs` 的模块文档）。
+pub async fn serve_rank_movies(
+    addr: std::net::SocketAddr,
+    plugin_id: String,
+    settings: serde_json::Value,
+    host_endpoint: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sm_plugin_api::v1::plugin_control_server::PluginControlServer;
+    use sm_plugin_api::v1::ranking_source_extension_service_server::RankingSourceExtensionServiceServer;
+    use tonic::transport::Server;
+
+    let settings = settings::RankMoviesSettings::from_json(&settings);
+    let ranking = service::RankingService::new(settings.clone());
+    let control = service::RankMoviesControl::new(plugin_id, settings, host_endpoint);
+    Server::builder()
+        .add_service(PluginControlServer::new(control))
+        .add_service(RankingSourceExtensionServiceServer::new(ranking))
+        .serve(addr)
+        .await?;
+    Ok(())
+}

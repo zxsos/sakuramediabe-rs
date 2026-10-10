@@ -23,6 +23,11 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 prost-types = { workspace = true }
+# 抓取状态（`state.rs`，上游 `state.py` 用 sqlite3）：表结构与 actor-metadata 同源。
+rusqlite = { version = "0.37", features = ["bundled"] }
+# 老片判定的日历月回退 + 状态里的时间戳。
+chrono = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
+tempfile = "3"

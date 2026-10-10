@@ -136,10 +136,11 @@ pub struct DmmClient {
 
 impl DmmClient {
     pub fn new(settings: &Settings) -> Result<Self, DmmError> {
-        Self::with_base(settings, "https://www.dmm.co.jp")
+        // 基址从配置来（上游写死在代码里；提上来是为了能打本地假服务与镜像站）。
+        Self::with_base(settings, &settings.dmm_base_url)
     }
 
-    /// 测试用：把请求打到本地假服务。
+    /// 指定基址（默认见 [`Settings::dmm_base_url`]）。
     pub fn with_base(settings: &Settings, base_url: &str) -> Result<Self, DmmError> {
         let client = Client::builder()
             .timeout(Duration::from_secs_f64(settings.request_timeout_seconds))

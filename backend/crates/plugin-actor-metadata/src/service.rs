@@ -29,9 +29,8 @@ use futures::stream::BoxStream;
 use sm_plugin_api::v1::plugin_control_server::PluginControl;
 use sm_plugin_api::v1::plugin_host_client::PluginHostClient;
 use sm_plugin_api::v1::{
-    job_event, Capability, GetActorRequest, JobDefinition, JobEvent, ListActorsRequest,
-    ListMoviesRequest, PatchActorRequest, ProgressEvent, RegisterRequest, RegisterResponse,
-    RunJobRequest,
+    job_event, GetActorRequest, JobDefinition, JobEvent, ListActorsRequest, ListMoviesRequest,
+    PatchActorRequest, ProgressEvent, RegisterRequest, RegisterResponse, RunJobRequest,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -46,17 +45,43 @@ use crate::sources::Sources;
 use crate::state::State;
 
 /// 宿主能力出口的端点（`sm-plugins` 的 `supervisor::HOST_ADDR_ENV`）。
-const HOST_ADDR_ENV: &str = "SAKURAMEDIA_HOST_GRPC_ADDR";
+///
+/// **进程式**才从进程环境读它；**进程内**由组合根显式传进
+/// [`Control::with_runtime`] —— 进程内多插件共用一份进程环境，从那里读会互相
+/// 覆盖。公开它是为了让可执行文件与这里用同一个常量。
+pub const HOST_ADDR_ENV: &str = "SAKURAMEDIA_HOST_GRPC_ADDR";
 
 /// 控制面。
 pub struct Control {
     /// 启动参数里拿到的 id（等价于上游 manifest 声明的那个）。
     plugin_id: String,
+    /// 插件配置。**构造时定死**，任务里不再读进程环境。
+    settings: Settings,
+    /// 宿主能力出口端点。`None` = 宿主没暴露 `PluginHost`，任务直接失败。
+    host_endpoint: Option<String>,
 }
 
 impl Control {
+    /// 只有 id（配置按默认、无宿主端点）。单测与「只想注册一下」的场合用。
     pub fn new(plugin_id: String) -> Self {
-        Self { plugin_id }
+        Self {
+            plugin_id,
+            settings: Settings::default(),
+            host_endpoint: None,
+        }
+    }
+
+    /// 进程式与进程内**共用**的构造：配置与宿主端点显式传入。
+    pub fn with_runtime(
+        plugin_id: String,
+        settings: Settings,
+        host_endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            plugin_id,
+            settings,
+            host_endpoint,
+        }
     }
 }
 
@@ -77,11 +102,20 @@ impl PluginControl for Control {
             )));
         }
         let plugin_id = self.plugin_id.clone();
+        let settings = self.settings.clone();
+        let host_endpoint = self.host_endpoint.clone();
         let (tx, rx) = mpsc::channel::<Result<JobEvent, Status>>(16);
         // 任务在后台跑，流只负责把事件搬出去 —— 宿主断开流即取消。
         tokio::spawn(async move {
             let mut reporter = ChannelReporter::new(tx.clone());
-            let result = run_job_once(&plugin_id, &inner.data_dir, &mut reporter).await;
+            let result = run_job_once(
+                &plugin_id,
+                &inner.data_dir,
+                &settings,
+                host_endpoint.as_deref(),
+                &mut reporter,
+            )
+            .await;
             match result {
                 Ok(stats) => {
                     let event = JobEvent {
@@ -131,7 +165,16 @@ impl PluginControl for Control {
                 default_cron: "0 5 * * *".to_owned(),
                 manual_only: false,
                 params_schema: None,
-                required_capabilities: vec![Capability::ExtensionCatalogMetadataSource as i32],
+                // ⚠️ 这里**曾经**写 `vec![Capability::ExtensionCatalogMetadataSource]`
+                // —— 那是抄 javbus 的，与本插件的声明自相矛盾：上面的
+                // `capabilities` 是空的（上游 `PluginRegistration` 根本没有
+                // capabilities 这一项，见 plugin.py），而宿主 `collect_jobs` 会
+                // 拿任务要的能力去比插件声明的能力，比不过就**整条任务被拒**。
+                //
+                // 后果很隐蔽：插件注册成功、`Plugins::load` 也把它算成已加载，
+                // 只是它的任务永远进不了任务目录 —— 「插件接上了但没生效」。
+                // 上游的 `JobDefinition` 同样没有 `required_capabilities`。
+                required_capabilities: Vec::new(),
             }],
             // 让宿主渲染配置表单；值从 `SAKURAMEDIA_PLUGIN_SETTINGS_FILE` 读。
             settings_schema: settings::schema(),
@@ -169,6 +212,8 @@ impl ProgressReporter for ChannelReporter {
 async fn run_job_once(
     plugin_id: &str,
     data_dir: &str,
+    settings: &Settings,
+    host_endpoint: Option<&str>,
     reporter: &mut ChannelReporter,
 ) -> Result<Stats, JobError> {
     let data_dir = PathBuf::from(data_dir);
@@ -201,19 +246,27 @@ async fn run_job_once(
             ),
         );
     }
-    let settings = Settings::load();
-    let host_addr = std::env::var(HOST_ADDR_ENV).map_err(|_| {
+    let host_addr = host_endpoint.ok_or_else(|| {
         JobError::Host(format!(
-            "缺少环境变量 {HOST_ADDR_ENV}：宿主没有暴露 PluginHost"
+            "宿主没有暴露 PluginHost（{HOST_ADDR_ENV} / 进程内 host_endpoint 都没给）"
         ))
     })?;
-    let channel = Channel::from_shared(format!("http://{host_addr}"))
+    // 端点由宿主给：`serve_for`（进程内）与宿主注入的环境变量（进程式）交出来的
+    // 都是带 scheme 的完整 URL（`http://127.0.0.1:<port>`）。这里**只补不拼**：
+    // 早期版本无条件写 `format!("http://{host_addr}")`，遇到完整 URL 就成了
+    // `http://http://…` —— 报错是 `host:connect:transport error`，看不出原因。
+    let endpoint = if host_addr.starts_with("http://") || host_addr.starts_with("https://") {
+        host_addr.to_owned()
+    } else {
+        format!("http://{host_addr}")
+    };
+    let channel = Channel::from_shared(endpoint)
         .map_err(|e| JobError::Host(format!("host:bad_addr:{e}")))?
         .connect()
         .await
         .map_err(|e| JobError::Host(format!("host:connect:{e}")))?;
     let mut host = GrpcHost::new(PluginHostClient::new(channel));
-    let mut sources = Sources::new(&settings).map_err(JobError::Sources)?;
+    let mut sources = Sources::new(settings).map_err(JobError::Sources)?;
     let owner = format!("plugin:{plugin_id}");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +276,7 @@ async fn run_job_once(
         &mut host,
         &mut sources,
         &state,
-        &settings,
+        settings,
         &owner,
         Some(reporter),
         now,
@@ -277,7 +330,7 @@ impl ActorHost for GrpcHost {
                     .into_iter()
                     .map(|(k, v)| (k, HostValue::from_proto(&v)))
                     .collect(),
-                owners: a.owners,
+                field_owners: a.field_owners.into_iter().collect(),
             })
             .collect();
         Ok((actors, response.next_cursor))
@@ -293,7 +346,7 @@ impl ActorHost for GrpcHost {
                     .into_iter()
                     .map(|(k, v)| (k, HostValue::from_proto(&v)))
                     .collect(),
-                owners: a.owners,
+                field_owners: a.field_owners.into_iter().collect(),
             })),
             Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
             Err(e) => Err(HostError(format!("host:get_actor:{e}"))),

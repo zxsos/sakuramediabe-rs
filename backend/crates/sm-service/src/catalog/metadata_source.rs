@@ -165,7 +165,6 @@ pub enum DeliverySource {
     },
 }
 
-/// 元数据来源服务。
 /// 一个 JavDB 系列（上游 `JavdbSeriesResource`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavdbSeries {
@@ -188,22 +187,12 @@ pub struct JavdbMovieListItem {
     pub cover_image: Option<String>,
 }
 
-/// 进程内元数据抓取。
+/// 元数据来源服务：JavDB provider + 已启用的插件来源（兜底链路按顺序尝试）。
 ///
-/// 由宿主（sm-server）实现，直接调用 vendored 插件的 service，
-/// 不走 gRPC。`None` = 该插件不支持进程内调用，走 gRPC 路径。
-#[tonic::async_trait]
-pub trait InProcessMetadataFetch: Send + Sync {
-    /// 按插件 ID 判断是否支持进程内调用。
-    fn supports(&self, plugin_id: &str) -> bool;
-    /// 进程内执行 `FetchMovie`。
-    async fn fetch_movie(
-        &self,
-        plugin_id: &str,
-        request: sm_plugin_api::v1::FetchMovieRequest,
-    ) -> Result<sm_plugin_api::v1::FetchMovieResponse, MetadataSourceError>;
-}
-
+/// 插件来源一律走**控制面协议**（`FetchMovie` 发到插件的控制面端点）——
+/// 曾经有一条「进程内直调」的分叉（宿主直接调 vendored 插件的 service struct），
+/// 已删除：vendored 插件在宿主进程内 serve 自己的控制面，调用方不需要（也不该）
+/// 知道它跑在哪，「怎么起」的差别不该泄进调用层。
 pub struct MetadataSourceService {
     /// 已注册且已启用的插件来源（顺序见 [`Self::enabled_plugin_sources`]）。
     sources: Vec<RegisteredSource>,
@@ -215,9 +204,6 @@ pub struct MetadataSourceService {
     /// 约束整条链都装不进去。实现方（`JavdbProvider`、测试替身）本来就是
     /// `Send + Sync` —— 约束写在这里，只是别让 trait 对象把它擦掉。
     provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
-    /// 进程内元数据抓取器（vendored 插件直接调用，不走 gRPC）。
-    /// `None` = 全部走 gRPC。
-    inprocess: Option<std::sync::Arc<dyn InProcessMetadataFetch>>,
 }
 
 /// 一个已注册的插件来源。
@@ -242,20 +228,7 @@ impl MetadataSourceService {
         sources: Vec<RegisteredSource>,
         provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
     ) -> Self {
-        Self {
-            sources,
-            provider,
-            inprocess: None,
-        }
-    }
-
-    /// 设置进程内元数据抓取器（vendored 插件直接调用）。
-    pub fn with_inprocess(
-        mut self,
-        fetcher: std::sync::Arc<dyn InProcessMetadataFetch>,
-    ) -> Self {
-        self.inprocess = Some(fetcher);
-        self
+        Self { sources, provider }
     }
 
     /// 按宿主配置**过滤并排序**已注册的来源。
@@ -405,19 +378,7 @@ impl MetadataSourceService {
         };
         // 校验还要用 `request`（它带着 `delivery_dir` 这个边界），所以这里传副本
         // —— 一次 `FetchMovie` 只有两个小字段，克隆的代价远小于把边界再算一遍。
-        //
-        // 进程内优先：vendored 插件直接调用，不走 gRPC。
-        let response = if let Some(fetcher) = &self.inprocess {
-            if fetcher.supports(&source.plugin_id) {
-                fetcher
-                    .fetch_movie(&source.plugin_id, request.clone())
-                    .await?
-            } else {
-                fetch_from_plugin(&source.endpoint, request.clone()).await?
-            }
-        } else {
-            fetch_from_plugin(&source.endpoint, request.clone()).await?
-        };
+        let response = fetch_from_plugin(&source.endpoint, request.clone()).await?;
         // `found = false` 是「没收录」，不是失败 —— 上层据此试下一个来源。
         if !response.found {
             cleanup_delivery(&[]);
@@ -851,70 +812,6 @@ mod tests {
             .await
             .expect_err("没启用就该报错");
         assert_eq!(error, MetadataSourceError::Disabled("a".to_owned()));
-    }
-
-    /// ★ 进程内网关可达：来源已注册 + 网关支持该插件时，`load_plugin` 必须走
-    /// inprocess 分支（不起进程、不走 gRPC）。
-    ///
-    /// 回归：58442dd 只接了网关，但 vendored 插件在 `Plugins::load` 被跳过、
-    /// 扩展注册表里没有它 —— 组合根不补 `RegisteredSource` 的话 `fetch_plugin`
-    /// 直接 `Disabled`，网关是死代码（sm-server/lib.rs 的合成注册与此同步）。
-    #[tokio::test]
-    async fn inprocess_fetcher_is_used_when_the_source_is_registered() {
-        struct StubFetcher;
-        #[tonic::async_trait]
-        impl InProcessMetadataFetch for StubFetcher {
-            fn supports(&self, plugin_id: &str) -> bool {
-                plugin_id == "sakuramedia_javbus_metadata"
-            }
-            async fn fetch_movie(
-                &self,
-                _plugin_id: &str,
-                request: sm_plugin_api::v1::FetchMovieRequest,
-            ) -> Result<sm_plugin_api::v1::FetchMovieResponse, MetadataSourceError> {
-                // 按协议在交付目录下放一张"封面"。
-                let dir = std::path::PathBuf::from(&request.delivery_dir).join("req-stub");
-                std::fs::create_dir_all(&dir).unwrap();
-                let cover = dir.join("cover.jpg");
-                std::fs::write(&cover, b"fake-jpeg").unwrap();
-                Ok(sm_plugin_api::v1::FetchMovieResponse {
-                    found: true,
-                    movie_number: "ABC-123".to_owned(),
-                    title: "标题".to_owned(),
-                    release_date: "2024-03-05".to_owned(),
-                    duration_minutes: 120,
-                    cover_image_path: cover.display().to_string(),
-                    ..Default::default()
-                })
-            }
-        }
-
-        let root =
-            std::env::temp_dir().join(format!("inprocess-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let source = RegisteredSource {
-            plugin_id: "sakuramedia_javbus_metadata".to_owned(),
-            display_name: "JavBus".to_owned(),
-            data_dir: root.join("data"),
-            endpoint: "inprocess://local".to_owned(),
-        };
-        let service = MetadataSourceService::new(vec![source], None)
-            .with_inprocess(std::sync::Arc::new(StubFetcher));
-        let config =
-            serde_json::json!({"plugins": {"enabled": ["sakuramedia_javbus_metadata"]}});
-        let cover = service
-            .fetch_plugin(&config, "sakuramedia_javbus_metadata", "ABC-123", |delivery: PluginDelivery| async {
-                let cover = delivery.plugin_delivery.expect("插件交付").cover_image_path;
-                assert!(cover.is_file(), "进程内网关的交付文件要真实存在");
-                cover
-            })
-            .await
-            .expect("进程内抓取该成功");
-        assert!(
-            cover.starts_with(root.join("data").join("metadata-tmp")),
-            "交付边界是 data_dir 下的 metadata-tmp"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 只有**已启用**的来源可用。

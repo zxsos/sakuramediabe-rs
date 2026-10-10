@@ -1,40 +1,38 @@
-//! **跨仓**冒烟：宿主真拉起插件仓编译出的二进制，并把它声明的任务跑到底。
+//! 冒烟：宿主真拉起本仓的插件（**进程内**），并把它声明的任务跑到底。
 //!
-//! # 为什么它需要一份外部产物
+//! # 为什么不再走「插件产物」
 //!
-//! 插件住在自己的仓库里（`sakuramedia-judge-collecttion-movie` /
-//! `sakuramedia-subtitlecat` / `sakuramedia-actor-metadata`），按「插件只依赖契约」的
-//! 拆分原则，本仓不能把它们的源码引进来。所以这里走**产物**：`SM_SMOKE_PLUGIN_ROOT`
-//! 指向一个 `<root_dir>`，里面是宿主约定的 `<plugin_id>/<plugin_id>[.exe]`。
+//! 本文件此前测的是跨仓产物：`SM_SMOKE_PLUGIN_ROOT` 指向
+//! `<plugin_id>/<plugin_id>[.exe]`，由 `supervisor::launch` 起子进程。9 个 vendored
+//! 插件现在都住在本仓（`crates/plugin-*`），且宿主对它们走**进程内宿主**
+//! （[`sm_server::inprocess_host`]）—— 它们是纯 lib（只有 `serve()` 入口、没有
+//! bin），产物那条前置**永远不成立**，于是整套用例永远 SKIP（「跳过与通过长得
+//! 一样」是本仓反复修过的坑）。
+//!
+//! 现在这些用例默认**真的跑**：走 [`sm_server::inprocess_host::launch`] 起的是同一
+//! 个 `serve`、同一套等就绪判据，对着回环端点发同一个 `RunJob`。子进程那条路没有
+//! 丢 —— `plugin-ref-local/tests/lifecycle.rs` 拿 `CARGO_BIN_EXE_…` 的真二进制
+//! 覆盖它（可执行文件只有那个 crate 有，所以用例只能落在那里）。
+//!
+//! # 需要什么
+//!
+//! - **PostgreSQL**：`SMDB_TEST_DATABASE_URL`。缺了**响亮地失败**，不是跳过 ——
+//!   理由见 `TestDb::require` 的文档。
+//! - **假站点**：wiremock 就地起，不碰外网。
 //!
 //! ```text
-//! # 1) 编译插件（在各自的插件仓里）
-//! cargo build
-//! # 2) 摆成宿主约定的路径（Windows 的产物带 .exe）
-//! mkdir "$env:TEMP\sm-plugin-smoke\sakuramedia_judge_collecttion_movie"
-//! copy ...\target\debug\sakuramedia_judge_collecttion_movie.exe "$env:TEMP\..."
-//! # 3) 跑本测试
-//! $env:SM_SMOKE_PLUGIN_ROOT="$env:TEMP\sm-plugin-smoke"
 //! $env:SMDB_TEST_DATABASE_URL='postgres://sakuramedia:sakuramedia@127.0.0.1:5433/sakuramedia_test'
 //! cargo test -p sm-server --test plugin_launch_smoke -- --nocapture
 //! ```
 //!
-//! # 缺产物时**跳过**，且说明为什么
-//!
-//! 这是「可选的外部依赖探测」那一类（与 `sm_db::testing::create()` 的用途相同），
-//! 不是「库连不上」那一类 —— 后者必须响亮地失败。**两种缺法都说出来**：环境变量没
-//! 给、以及给了但里面没有那个插件的可执行文件。跳过时打一行原因（`--nocapture` 下
-//! 看得见）—— 「跳过与通过长得一样」是本仓库反复修过的问题。
-//!
 //! # 这几条测试补的是哪一格
-//!
-//! 两侧各自的测试都只覆盖自己那半边：
 //!
 //! | 测试 | 覆盖 |
 //! |---|---|
+//! | `inprocess_plugins_smoke.rs`（本仓）| 10 个进程内 id 都接上了（目录 / provider / 扩展点）、任务有处理器、端点是活的 |
 //! | `plugin_host_integration.rs`（本仓）| 影片/演员/字幕那几组 rpc 对真库的行为 |
-//! | 插件仓自己的 `tests/job_run.rs` | 它的二进制对着**假宿主** + **假站点**跑完任务 |
-//! | **本文件** | 宿主拉起**真**二进制 + **真**库 + ABI 两侧接上 |
+//! | 各插件 crate 自己的 `tests/` | 它的逻辑对着**假宿主** + **假站点**跑 |
+//! | **本文件** | 组合根拉起**真插件服务** + **真**库 + ABI 两侧接上，任务**真的改了库** |
 //!
 //! 契约一旦漂移（旧插件配新宿主），最先红的就该是它。
 
@@ -50,7 +48,10 @@ use sm_plugin_api::json_struct::json_to_struct;
 use sm_plugin_api::v1::plugin_control_client::PluginControlClient;
 use sm_plugin_api::v1::RunJobRequest;
 use sm_plugins::extensions::{collect_extensions, ExtensionRegistry};
-use sm_plugins::supervisor::{launch, LaunchSpec};
+use sm_plugins::runner::{run_job_with_progress, JobOutcome};
+use sm_plugins::supervisor::LaunchSpec;
+use sm_server::inprocess_host;
+use sm_server::metadata_import::MetadataImportSlot;
 use sm_server::plugin_host::{serve_for, serve_for_with};
 use sm_server::plugins::{self, PluginConfig, Plugins};
 use sm_server::ranking_gateway::{RankingPluginGateway, RankingSyncSlot};
@@ -67,6 +68,10 @@ const SUBTITLECAT: &str = "sakuramedia_subtitlecat";
 const SUBTITLECAT_FETCH: &str = "sakuramedia_subtitlecat_fetch";
 /// 资料补全插件：任务会**抓两个来源 + 写演员资料**（`task_key` 与 `plugin_id` 同名）。
 const ACTOR_METADATA: &str = "sakuramedia_actor_metadata";
+/// 文案抓取翻译插件：任务会**反向调宿主的影片 rpc + 抓 DMM + 写回标题/简介**。
+const SCRAPE_TRANSLATE: &str = "sakuramedia_movie_scrape_translate";
+/// 它的「按番号」手动任务。
+const SCRAPE_TRANSLATE_SYNC: &str = "sakuramedia_movie_scrape_translate_sync";
 
 /// 一个进程级的能力出口配置：字幕落盘的位置挂在 `media.import_image_root_path` 下面
 /// （`sakuramedia_subtitlecat` 会真的往那里写文件）。
@@ -94,47 +99,34 @@ fn image_root() -> PathBuf {
     std::env::temp_dir().join(format!("sm-smoke-images-{}", std::process::id()))
 }
 
-/// `<root_dir>`；环境变量没给就返回 `None`（调用方跳过并说明原因）。
-fn plugins_root() -> Option<PathBuf> {
-    let Ok(root) = std::env::var("SM_SMOKE_PLUGIN_ROOT") else {
-        eprintln!("SKIP: 未设置 SM_SMOKE_PLUGIN_ROOT —— 先编译插件仓，见本文件模块文档");
-        return None;
-    };
-    Some(PathBuf::from(root))
+/// 组合根的插件根目录：`<root>/<plugin_id>/data` 从这里长出来。
+///
+/// 进程内拉起**不看可执行文件**（那条约定只对子进程形态有意义），所以这里只要一个
+/// 可写目录、不需要摆任何产物。仍然按进程取独立目录：跑过的用例会往里落
+/// `settings-schema.json`（`Plugins::admit` 写的）。
+fn plugins_root() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("sm-smoke-plugins-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("建临时插件根");
+    root
 }
 
-/// 该插件的可执行文件。
+/// 拉起插件的规格 —— 与组合根 `PluginConfig::launch_spec` 同形（数据目录与配置
+/// 都交给宿主决定，见 [`sm_server::inprocess_host::launch`]）。
 ///
-/// 用宿主自己的 `entry_point_of`（组合根找可执行文件用的就是它）—— 它按平台探测
-/// `.exe`，所以这里不必写死扩展名，也顺带证明「宿主按约定能找着它」。
-fn program_of(root: &Path, plugin_id: &str) -> Option<PathBuf> {
-    let dir = root.join(plugin_id);
-    match sm_plugins::installer::entry_point_of(&dir, plugin_id) {
-        Some(program) => Some(program),
-        None => {
-            eprintln!(
-                "SKIP: {dir:?} 里没有 {plugin_id} 的可执行文件 —— 先编译插件仓，见本文件模块文档"
-            );
-            None
-        }
-    }
-}
-
-/// 拉起插件的规格 —— 与组合根 `PluginConfig::launch_spec` 同形（环境变量注入、
-/// 数据目录、配置落点都由 `supervisor::launch` 负责）。
+/// # `program` 是空串，**故意的**
 ///
-/// `root` 只用来找可执行文件（调用方在 `program_of` 里已经用过），数据目录是另一
-/// 回事 —— 见 [`data_dir_of`]。
+/// 进程内宿主不看它（可执行文件那条约定只对子进程形态有意义）。留空串而不是随手
+/// 填一个存在的路径：哪天宿主误把进程内插件丢给子进程那条路，报出来的会是
+/// 「找不到可执行文件」，一眼看得出是接线错了 —— 而不是静默跑起来个别的东西。
 fn launch_spec(
     plugin_id: &str,
-    program: &Path,
     host_endpoint: String,
     settings: Option<serde_json::Value>,
 ) -> LaunchSpec {
     LaunchSpec {
         plugin_id: plugin_id.to_owned(),
         manifest_id: plugin_id.to_owned(),
-        program: program.display().to_string(),
+        program: String::new(),
         args: Vec::new(),
         // 每次拉起前清空工作目录：本文件里的用例要能**反复跑**，理由见
         // [`data_dir_of`]。
@@ -150,8 +142,7 @@ fn launch_spec(
     }
 }
 
-/// 冒烟用的插件**工作目录**（即 `SAKURAMEDIA_PLUGIN_DATA_DIR`，也是任务请求里
-/// 的 `data_dir`）。
+/// 冒烟用的插件**工作目录**（任务请求里的 `data_dir`，插件按它定位状态文件）。
 ///
 /// 刻意**不**落在 `<root>/<plugin_id>/data`：那是插件的真实安装目录，跑一次就会
 /// 留下状态文件（演员插件的 `actor_metadata.json`、字幕插件的 `fetch_state.json`）。
@@ -171,21 +162,21 @@ fn data_dir_of(plugin_id: &str) -> PathBuf {
 /// （`PluginConfig` 的坏插件隔离），那正是本用例要挡住的失败。
 #[tokio::test]
 async fn the_composition_root_launches_the_judge_and_collects_its_job() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(_program) = program_of(&root, JUDGE) else {
-        return;
-    };
     let db = TestDb::require().await;
     // 排行榜同步这一轮不测（这些用例只看拉起与注册），槽留空 —— 空了那两个
     // rpc 回 `Unavailable`，不会假成功。
-    let endpoint = serve_for(db.pool(), host_config(), JUDGE, RankingSyncSlot::new())
-        .await
-        .expect("起能力出口");
+    let endpoint = serve_for(
+        db.pool(),
+        host_config(),
+        JUDGE,
+        RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
+    )
+    .await
+    .expect("起能力出口");
 
     let plugins = Plugins::load(PluginConfig {
-        root_dir: root,
+        root_dir: plugins_root(),
         enabled: vec![JUDGE.to_owned()],
         host_endpoints: HashMap::from([(JUDGE.to_owned(), endpoint)]),
         ..PluginConfig::default()
@@ -198,18 +189,12 @@ async fn the_composition_root_launches_the_judge_and_collects_its_job() {
     );
 }
 
-/// ★ **整条链路**：宿主拉起真二进制 → `RunJob` → 插件回调宿主 → 库里真的变了。
+/// ★ **整条链路**：宿主拉起真插件服务 → `RunJob` → 插件回调宿主 → 库里真的变了。
 ///
-/// 走 `supervisor::launch` 而不是 `Plugins::load`：后者把进程句柄收进私有字段，
-/// 集成测试拿不到控制面端点。两条路拉起的都是同一个二进制、同一套环境变量注入。
+/// 走 `inprocess_host::launch` 而不是 `Plugins::load`：后者把插件句柄收进私有字段，
+/// 集成测试拿不到控制面端点。两条路拉起的是**同一个** `serve`、同一套等就绪判据。
 #[tokio::test]
 async fn the_judge_job_runs_end_to_end_and_writes_the_database() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(program) = program_of(&root, JUDGE) else {
-        return;
-    };
     let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     // 时长 600 分钟 → 该被判定成合集（插件默认阈值 300）。
@@ -226,10 +211,16 @@ async fn the_judge_job_runs_end_to_end_and_writes_the_database() {
 
     // 排行榜同步这一轮不测（这些用例只看拉起与注册），槽留空 —— 空了那两个
     // rpc 回 `Unavailable`，不会假成功。
-    let endpoint = serve_for(db.pool(), host_config(), JUDGE, RankingSyncSlot::new())
-        .await
-        .expect("起能力出口");
-    let launched = launch(&launch_spec(JUDGE, &program, endpoint, None))
+    let endpoint = serve_for(
+        db.pool(),
+        host_config(),
+        JUDGE,
+        RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
+    )
+    .await
+    .expect("起能力出口");
+    let launched = inprocess_host::launch(&launch_spec(JUDGE, endpoint, None))
         .await
         .expect("宿主拉起插件");
 
@@ -241,7 +232,7 @@ async fn the_judge_job_runs_end_to_end_and_writes_the_database() {
     );
 
     let data_dir = data_dir_of(JUDGE);
-    let result = run_job_and_collect(&launched, JUDGE, None, &data_dir).await;
+    let result = run_job_and_collect(launched.plugin.endpoint(), JUDGE, None, &data_dir).await;
     assert_eq!(result["scanned"], 1.0);
     assert_eq!(result["updated"], 1.0);
 
@@ -264,24 +255,19 @@ async fn the_judge_job_runs_end_to_end_and_writes_the_database() {
 /// ★ **组合根那条路**（字幕插件）：两个任务都进目录。
 #[tokio::test]
 async fn the_composition_root_launches_the_subtitlecat_and_collects_its_jobs() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(_program) = program_of(&root, SUBTITLECAT) else {
-        return;
-    };
     let db = TestDb::require().await;
     let endpoint = serve_for(
         db.pool(),
         host_config(),
         SUBTITLECAT,
         RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
     )
     .await
     .expect("起能力出口");
 
     let plugins = Plugins::load(PluginConfig {
-        root_dir: root,
+        root_dir: plugins_root(),
         enabled: vec![SUBTITLECAT.to_owned()],
         host_endpoints: HashMap::from([(SUBTITLECAT.to_owned(), endpoint)]),
         ..PluginConfig::default()
@@ -298,19 +284,13 @@ async fn the_composition_root_launches_the_subtitlecat_and_collects_its_jobs() {
     );
 }
 
-/// ★ **整条链路**（字幕插件）：宿主拉起真二进制 → 插件去**假站点**抓 → 回调宿主
+/// ★ **整条链路**（字幕插件）：宿主拉起真插件服务 → 插件去**假站点**抓 → 回调宿主
 /// 的 `ImportSubtitle` → 库里多一行字幕、文件落在图片根下面。
 ///
-/// 这条同时是 `ImportSubtitle` 接线后的端到端判据：抓取与落盘分别在两个进程里，
-/// 中间只隔着 ABI。
+/// 这条同时是 `ImportSubtitle` 接线后的端到端判据：抓取与落盘分别在插件与宿主
+/// 两侧，中间只隔着 ABI。
 #[tokio::test]
 async fn the_subtitlecat_manual_job_fetches_and_imports_end_to_end() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(program) = program_of(&root, SUBTITLECAT) else {
-        return;
-    };
     let db = TestDb::require().await;
     let repo = MovieRepository::new(db.pool().clone());
     let inserted = repo
@@ -346,12 +326,13 @@ async fn the_subtitlecat_manual_job_fetches_and_imports_end_to_end() {
         host_config(),
         SUBTITLECAT,
         RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
     )
     .await
     .expect("起能力出口");
-    // 站点基址通过**宿主写好的配置文件**交给插件（插件只读那个文件）。
+    // 站点基址通过**宿主写好的配置**交给插件（插件只读那个文件）。
     let settings = Some(serde_json::json!({ "base_url": site.uri() }));
-    let launched = launch(&launch_spec(SUBTITLECAT, &program, endpoint, settings))
+    let launched = inprocess_host::launch(&launch_spec(SUBTITLECAT, endpoint, settings))
         .await
         .expect("宿主拉起插件");
 
@@ -360,7 +341,13 @@ async fn the_subtitlecat_manual_job_fetches_and_imports_end_to_end() {
 
     let data_dir = data_dir_of(SUBTITLECAT);
     let params = Some(serde_json::json!({ "movie_number": "SSNI-888" }));
-    let result = run_job_and_collect(&launched, SUBTITLECAT_FETCH, params, &data_dir).await;
+    let result = run_job_and_collect(
+        launched.plugin.endpoint(),
+        SUBTITLECAT_FETCH,
+        params,
+        &data_dir,
+    )
+    .await;
 
     assert_eq!(result["source_matches"], 1.0, "假站点只有一份中文字幕");
     assert_eq!(result["imported"], 1.0, "宿主该收下它");
@@ -400,7 +387,7 @@ fn rank_body(numbers: &[&str]) -> serde_json::Value {
     })
 }
 
-/// ★ **组合根那条路**：真二进制拉起来后，榜单定义要**整份**（不只是 key）进目录。
+/// ★ **组合根那条路**：真插件拉起来后，榜单定义要**整份**（不只是 key）进目录。
 ///
 /// 这条挡的是骨架期那个「接口成功但没数据」的退化：`GET /ranking-sources/{key}/boards`
 /// 曾经永远回「榜单定义尚未接入」，因为收集器读的是 provider 注册表（那里没有
@@ -408,19 +395,19 @@ fn rank_body(numbers: &[&str]) -> serde_json::Value {
 /// `Plugins::ranking_sources()`。
 #[tokio::test]
 async fn the_composition_root_collects_the_javdb_board_definitions() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(_program) = program_of(&root, RANKING) else {
-        return;
-    };
     let db = TestDb::require().await;
-    let endpoint = serve_for(db.pool(), host_config(), RANKING, RankingSyncSlot::new())
-        .await
-        .expect("起能力出口");
+    let endpoint = serve_for(
+        db.pool(),
+        host_config(),
+        RANKING,
+        RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
+    )
+    .await
+    .expect("起能力出口");
 
     let plugins = Plugins::load(PluginConfig {
-        root_dir: root,
+        root_dir: plugins_root(),
         enabled: vec![RANKING.to_owned()],
         host_endpoints: HashMap::from([(RANKING.to_owned(), endpoint)]),
         ..PluginConfig::default()
@@ -471,7 +458,7 @@ async fn the_composition_root_collects_the_javdb_board_definitions() {
 /// ★ **整条链路**：宿主拉起真插件 → 插件 `RunJob` → 宿主写侧 → 回调插件的
 /// `FetchRanking` → 插件回调宿主的 `GetJavdbRankNumbers` → **假 JavDB** → 落库。
 ///
-/// 这条链上有**四个**跨进程/跨模块的跳跃，每一跳都能单独写错而其它测试全绿：
+/// 这条链上有**四个**跨模块的跳跃，每一跳都能单独写错而其它测试全绿：
 ///
 /// | 跳 | 写错的症状 |
 /// |---|---|
@@ -481,15 +468,9 @@ async fn the_composition_root_collects_the_javdb_board_definitions() {
 /// | 宿主先删后插没在同一事务 | 中途失败留下空 scope |
 ///
 /// 打桩点在**宿主这一侧**（`serve_for_with` 的 `javdb_base`）：JavDB 客户端只在
-/// 宿主进程里实例化。
+/// 宿主那里实例化。
 #[tokio::test]
 async fn the_javdb_ranking_job_syncs_a_board_end_to_end() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(program) = program_of(&root, RANKING) else {
-        return;
-    };
     let db = TestDb::require().await;
     let movies = MovieRepository::new(db.pool().clone());
     for number in ["SMOKE-J1", "SMOKE-J2"] {
@@ -524,23 +505,25 @@ async fn the_javdb_ranking_job_syncs_a_board_end_to_end() {
         RANKING,
         slot.clone(),
         Some(&javdb.uri()),
+        MetadataImportSlot::new(),
     )
     .await
     .expect("起能力出口");
 
-    let launched = launch(&launch_spec(RANKING, &program, endpoint, None))
+    let launched = inprocess_host::launch(&launch_spec(RANKING, endpoint, None))
         .await
         .expect("宿主拉起插件");
     assert_eq!(launched.registration.plugin_id, RANKING);
     assert_eq!(launched.registration.jobs.len(), 2, "定时 + 手动各一个");
 
-    // 4b 之后：用宿主**同一条**收集函数与转换建目录（`Plugins::load` 把进程句柄
-    // 收在私有字段里，这里要拿控制面端点去跑任务，所以自己走一遍）。
+    // 用宿主**同一条**收集函数与转换建目录：这条用例要的是**注册载荷原文 + 控制面
+    // 端点**（填排行槽必须发生在跑任务之前），而 `Plugins::load` 只暴露转换后的快照
+    // 与 `job_target`，拿不到载荷原文 —— 所以这里自己走一遍拉起与收集。
     let mut registry = ExtensionRegistry::new();
     let problems = collect_extensions(
         &mut registry,
         &launched.registration,
-        &launched.process.endpoint(),
+        launched.plugin.endpoint(),
     );
     assert!(problems.is_empty(), "注册载荷该被全部收下：{problems:?}");
     let catalog = plugins::ranking_catalog(&registry);
@@ -559,7 +542,7 @@ async fn the_javdb_ranking_job_syncs_a_board_end_to_end() {
 
     let data_dir = data_dir_of(RANKING);
     let result = run_job_and_collect(
-        &launched,
+        launched.plugin.endpoint(),
         RANKING_SYNC_BOARD,
         Some(serde_json::json!({ "board_key": "playback_all", "period": "daily" })),
         &data_dir,
@@ -606,67 +589,63 @@ const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\n你好\n";
 
 /// 跑一次任务并把终态结果读成 JSON。
 ///
-/// 这里**不用** `sm_plugins::runner::run_job`：那个是宿主生产路径的消费方式，
-/// 但它只把事件收敛成结局（`Completed { has_result, progress_events }`），**不带
-/// 载荷**。本文件要断言结果里的计数（那是 ABI 两侧对「结果形状」的约定），所以直接
-/// 读流。`runner` 本身有它自己的单测。
+/// 走 `sm_plugins::runner::run_job_with_progress` —— 宿主**生产路径**的同一条调用
+/// （进度回调与事件收敛只有这一份实现）。本文件要断言结果里的计数，而结局对象现在
+/// **带着载荷**（`JobOutcome::Completed { result, .. }` 曾经只有 `has_result: bool`），
+/// 所以不必再自己读流。
+///
+/// `deadline` 给了上限：卡住的任务要在冒烟里**响亮地失败**（`Cancelled`），而不是把
+/// 整个测试挂死。
 async fn run_job_and_collect(
-    launched: &sm_plugins::supervisor::LaunchedPlugin,
+    endpoint: &str,
     task_key: &str,
     params: Option<serde_json::Value>,
     data_dir: &Path,
 ) -> serde_json::Value {
-    let mut client = PluginControlClient::connect(launched.process.endpoint())
+    let mut client = PluginControlClient::connect(endpoint.to_owned())
         .await
         .expect("连插件");
-    let mut stream = client
-        .run_job(RunJobRequest {
+    let outcome = run_job_with_progress(
+        &mut client,
+        RunJobRequest {
             run_id: "smoke".to_owned(),
             task_key: task_key.to_owned(),
             params: params.and_then(|params| json_to_struct(&params)),
             data_dir: data_dir.display().to_string(),
-        })
-        .await
-        .expect("发起任务")
-        .into_inner();
-
-    let mut result = None;
-    while let Some(event) = stream.message().await.expect("读事件") {
-        match event.event {
-            Some(sm_plugin_api::v1::job_event::Event::Progress(progress)) => {
+        },
+        Some(Duration::from_secs(120)),
+        |event| {
+            if let Some(sm_plugin_api::v1::job_event::Event::Progress(progress)) = event.event {
                 eprintln!(
                     "进度：{}（{}/{}）",
                     progress.text, progress.current, progress.total
                 );
             }
-            Some(sm_plugin_api::v1::job_event::Event::Result(payload)) => {
-                result = Some(sm_plugin_api::json_struct::struct_to_json(Some(&payload)));
-            }
-            None => panic!("收到没有变体的 JobEvent，说明两边契约不一致"),
-        }
-    }
+            std::future::ready(())
+        },
+    )
+    .await
+    .expect("读事件");
 
-    let result = result.expect("任务该以终态帧收尾");
-    eprintln!("结果：{result}");
-    // 数字经 Struct 回来是 f64（`json_struct` 的既定行为），所以断言侧按 f64 比。
-    result
+    match outcome {
+        JobOutcome::Completed { result, .. } => {
+            eprintln!("结果：{result}");
+            // 数字经 Struct 回来是 f64（`json_struct` 的既定行为），所以断言侧按 f64 比。
+            result
+        }
+        other => panic!("任务该以终态结果收尾，实际是 {other:?}"),
+    }
 }
 
 // ══════════════════════════════════════════════════════════ 女优资料补全插件
 
-/// ★ **整条链路**（资料补全插件）：宿主拉起真二进制 → 插件查**假 JavDB** → 回调宿主的
-/// `ListActors` / `PatchActor` → 库里那位演员的资料**真的被补上**。
+/// ★ **整条链路**（资料补全插件）：宿主拉起真插件服务 → 插件查**假 JavDB** → 回调
+/// 宿主的 `ListActors` / `PatchActor` → 库里那位演员的资料**真的被补上**。
 ///
 /// 这条同时钉住几件在两侧各自测试里看不到的事：`ListActors` 分页可用、`PatchActor` 的
 /// 端点身份认得上（写进去的 owner 是 `plugin:sakuramedia_actor_metadata`）、版本推进。
 #[tokio::test]
 async fn the_actor_metadata_job_fills_the_profile_end_to_end() {
-    let Some(root) = plugins_root() else {
-        return;
-    };
-    let Some(program) = program_of(&root, ACTOR_METADATA) else {
-        return;
-    };
     let db = TestDb::require().await;
     // 一位「什么都缺」的演员：只有身份与名字，九个资料字段全空。
     let actors = ActorRepository::new(db.pool().clone());
@@ -712,6 +691,7 @@ async fn the_actor_metadata_job_fills_the_profile_end_to_end() {
         host_config(),
         ACTOR_METADATA,
         RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
     )
     .await
     .expect("起能力出口");
@@ -721,7 +701,7 @@ async fn the_actor_metadata_job_fills_the_profile_end_to_end() {
         "minnanoav_base_url": site.uri(),
         "request_interval_seconds": 0.2,
     }));
-    let launched = launch(&launch_spec(ACTOR_METADATA, &program, endpoint, settings))
+    let launched = inprocess_host::launch(&launch_spec(ACTOR_METADATA, endpoint, settings))
         .await
         .expect("宿主拉起插件");
 
@@ -729,7 +709,13 @@ async fn the_actor_metadata_job_fills_the_profile_end_to_end() {
     assert_eq!(launched.registration.jobs.len(), 1, "上游只有一个后台任务");
 
     let data_dir = data_dir_of(ACTOR_METADATA);
-    let result = run_job_and_collect(&launched, ACTOR_METADATA, None, &data_dir).await;
+    let result = run_job_and_collect(
+        launched.plugin.endpoint(),
+        ACTOR_METADATA,
+        None,
+        &data_dir,
+    )
+    .await;
 
     assert_eq!(result["scanned"], 1.0);
     assert_eq!(result["attempted"], 1.0);
@@ -756,4 +742,105 @@ async fn the_actor_metadata_job_fills_the_profile_end_to_end() {
         "owner 该是这个插件（身份由宿主下发的端点决定）"
     );
     assert!(after.mutation_revision > 0, "写要推进版本");
+}
+
+// ══════════════════════════════════════════════════════════ 文案抓取翻译插件
+
+/// 假 DMM 的搜索页：标题带上番号，正文里一条详情页链接（与 `dmm.rs` 的用例同源）。
+const DMM_SEARCH_HTML: &str = r#"<html><head><title>検索結果 ABC-123</title></head><body>
+    <a href="/detail/=/cid=abc123/">商品</a></body></html>"#;
+/// 假 DMM 的详情页：日文标题 + 简介。
+const DMM_DETAIL_HTML: &str = r#"<html><head><title>商品页</title></head><body>
+    <h1 id="title">日文タイトル</h1>
+    <div class="mg-b20 lh4">これは説明文です</div></body></html>"#;
+
+/// ★ **整条链路**（文案插件）：宿主拉起真插件服务 → 插件回调宿主的
+/// `FindMoviesByNumbers` 找到影片 → 抓**假 DMM** → 回调 `PatchMovie` 把标题与
+/// 简介写回 → 库里的值真的变了。
+///
+/// 这条同时钉住 [`sm_server::plugin_host`] 上那四个 rpc 的接线：列表 / 查询 /
+/// 单查（写回前的复核）/ 写回；以及 `field_owners` 这条字段级归属——插件据此
+/// 判断「这个字段归不归我写」，写进去的 owner 是
+/// `plugin:sakuramedia_movie_scrape_translate`。
+#[tokio::test]
+async fn the_scrape_translate_job_writes_back_the_dmm_copy() {
+    let db = TestDb::require().await;
+    let repo = MovieRepository::new(db.pool().clone());
+    // 一部「还没有文案」的影片：标题与简介都是空的。
+    let inserted = repo
+        .insert(&NewMovie {
+            movie_number: "ABC-123".to_owned(),
+            title: String::new(),
+            ..NewMovie::default()
+        })
+        .await
+        .expect("insert");
+
+    let site = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search/=/searchstr=ABC-123/limit=30/sort=date/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DMM_SEARCH_HTML))
+        .mount(&site)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/detail/=/cid=abc123/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DMM_DETAIL_HTML))
+        .mount(&site)
+        .await;
+
+    let endpoint = serve_for(
+        db.pool(),
+        host_config(),
+        SCRAPE_TRANSLATE,
+        RankingSyncSlot::new(),
+        MetadataImportSlot::new(),
+    )
+    .await
+    .expect("起能力出口");
+    // DMM 基址通过**宿主写好的配置**交给插件（插件只读那个文件）。
+    let settings = Some(serde_json::json!({
+        "dmm_base_url": site.uri(),
+        "request_interval_seconds": 0.0,
+    }));
+    let launched = inprocess_host::launch(&launch_spec(SCRAPE_TRANSLATE, endpoint, settings))
+        .await
+        .expect("宿主拉起插件");
+
+    assert_eq!(launched.registration.plugin_id, SCRAPE_TRANSLATE);
+    assert_eq!(launched.registration.jobs.len(), 3, "上游声明三个任务");
+
+    let data_dir = data_dir_of(SCRAPE_TRANSLATE);
+    let params = Some(serde_json::json!({ "movie_number": "ABC-123" }));
+    let result = run_job_and_collect(
+        launched.plugin.endpoint(),
+        SCRAPE_TRANSLATE_SYNC,
+        params,
+        &data_dir,
+    )
+    .await;
+
+    assert_eq!(result["movies"], 1.0, "只有那一部：{result}");
+    assert_eq!(result["fetched"], 1.0, "DMM 抓到了：{result}");
+    assert_eq!(result["fetch_failed"], 0.0, "{result}");
+    assert_eq!(
+        result["writeback_applied"], 2.0,
+        "标题与简介各写一次：{result}"
+    );
+    assert_eq!(result["writeback_failed"], 0.0, "{result}");
+    assert_eq!(result["failed_movies"], 0.0, "{result}");
+
+    // 库里的文案真的被写上了
+    let after = repo
+        .find_by_id(inserted.id)
+        .await
+        .expect("查影片")
+        .expect("还在");
+    assert_eq!(after.title, "日文タイトル");
+    assert_eq!(after.summary, "これは説明文です");
+    assert_eq!(
+        after.field_owners["title"],
+        serde_json::json!(format!("plugin:{SCRAPE_TRANSLATE}")),
+        "owner 该是这个插件（身份由宿主下发的端点决定）"
+    );
+    assert!(after.mutation_revision >= 2, "两次写要推进两格版本");
 }

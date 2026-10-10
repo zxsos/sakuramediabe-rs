@@ -56,10 +56,13 @@ pub const HOST_ADDR_ENV: &str = "SAKURAMEDIA_HOST_GRPC_ADDR";
 /// 而且它「重装插件时保留」—— 配置跟着数据一起留下，不必再维护一个目录。
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
-/// 探活的重试间隔。
+/// 探活的重试间隔（[`await_ready`] 用）。
 ///
-/// 50ms：插件进程从 exec 到 listen 通常是几毫秒，而宿主启动时要拉起全部插件 ——
-/// 间隔太粗会让「拉 5 个插件」平白多等，太细则空转。
+/// 50ms：插件从「起来」到 listen 通常是几毫秒（进程内形态更快，只差一次
+/// `serve` 装配），而宿主启动时要拉起全部插件 —— 间隔太粗会让「拉 10 个插件」
+/// 平白多等，太细则空转。
+///
+/// **私有**：它只是 [`await_ready`] 的内部节奏，调用方不该各自决定探活多久一次。
 const PROBE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 怎么拉起一个插件。
@@ -200,27 +203,64 @@ pub async fn launch(spec: &LaunchSpec) -> Result<LaunchedPlugin, LaunchError> {
         child,
     };
 
+    let registration = await_ready(
+        &spec.plugin_id,
+        &spec.manifest_id,
+        addr,
+        spec.ready_timeout,
+        // 插件若立刻崩（可执行文件格式不对、缺依赖），不必干等到超时。
+        || match process.try_wait() {
+            Ok(Some(status)) => Some(format!("插件进程在就绪前退出，状态 {status}")),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%err, "等待插件进程失败");
+                None
+            }
+        },
+    )
+    .await?;
+
+    Ok(LaunchedPlugin {
+        registration,
+        process,
+    })
+}
+
+/// 等一个插件就绪：轮询 `Register` 探活，直到成功、超时，或 `early_exit` 报出
+/// 「还没就绪就已经结束」的原因。
+///
+/// # 进程式与进程内共用这一条
+///
+/// 两种形态**只有「怎么起」不同**（spawn 子进程 vs `tokio::spawn` 一个 `serve`
+/// 任务），而在「等就绪」这件事上判据必须逐字一致：探活就是 [`crate::loader::register`]
+/// （顺带验回显 / ABI / 能力三条契约）、`Invalid` 立即失败不重试、间隔
+/// [`PROBE_INTERVAL`]、超时按 [`LaunchError::NotReady`]。所以把这条循环留在这里，
+/// 由进程侧（[`launch`]）与组合根的进程内宿主（`sm_server::inprocess_host`）共用。
+///
+/// `early_exit` 每轮探活前问一次「它是不是已经结束了」，结束就返回原因。做成闭包
+/// 是因为两种形态的「结束」长得不一样：子进程是 `Child::try_wait`，进程内任务是
+/// `JoinHandle::is_finished`。
+pub async fn await_ready(
+    plugin_id: &str,
+    manifest_id: &str,
+    addr: SocketAddr,
+    ready_timeout: Duration,
+    mut early_exit: impl FnMut() -> Option<String>,
+) -> Result<RegisterResponse, LaunchError> {
     let started = std::time::Instant::now();
     loop {
-        // 插件若立刻崩（可执行文件格式不对、缺依赖），不必干等到超时。
-        if let Ok(Some(status)) = process.child.try_wait() {
-            return Err(LaunchError::Spawn(format!(
-                "插件进程在就绪前退出，状态 {status}"
-            )));
+        if let Some(reason) = early_exit() {
+            return Err(LaunchError::Spawn(reason));
         }
-        match probe(&spec.plugin_id, &spec.manifest_id, addr).await {
-            Ok(registration) => {
-                return Ok(LaunchedPlugin {
-                    registration,
-                    process,
-                })
-            }
+        match probe(plugin_id, manifest_id, addr).await {
+            Ok(registration) => return Ok(registration),
+            // 声明不合契约：重试还是同样的答案，立刻失败。
             Err(RegisterError::Invalid(problems)) => return Err(LaunchError::Invalid(problems)),
             // 还没 listen 起来 —— 下一轮再试。
             Err(RegisterError::Call(_)) => {}
         }
         let waited = started.elapsed();
-        if waited >= spec.ready_timeout {
+        if waited >= ready_timeout {
             return Err(LaunchError::NotReady {
                 waited_ms: waited.as_millis(),
             });

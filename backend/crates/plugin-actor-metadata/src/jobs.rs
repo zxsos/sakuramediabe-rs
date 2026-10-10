@@ -10,12 +10,10 @@
 //! 1. **宿主调用走 gRPC**。上游是进程内 `context.actors` / `context.movies`；
 //!    这里是 [`ActorHost`] trait —— 生产实现连 `SAKURAMEDIA_HOST_GRPC_ADDR`
 //!    的 `PluginHost`（见 `service.rs`），测试用内存假实现。
-//! 2. **`writable_fields` 的归属检查放宽**。上游判的是字段级归属
-//!    （`owners: {字段: owner}`，缺键 = 无人接管，可写）。Rust 契约只给出去重
-//!    后的 owner 列表（`owners_of`），字段级归属拿不到。而归属检查只对**空值**
-//!    字段有意义（非空值本来就不在 `missing` 里），空值字段又几乎没有归属
-//!    记录（导入时只给 `gender` 记 owner，见上游 `catalog_import_service.py`），
-//!    所以这里只判「值为空」—— 这正是上游最常见的分支（缺键 → 可写）。
+//! 2. **`writable_fields` 的归属检查读 `field_owners`**。「缺键 = 无人接管 =
+//!    可写、记着别人 = 受保护」照上游 `snapshot.owners.get(key)` 的语义来。
+//!    （早期契约只给「去重后的 owner 列表」，字段级归属拿不到，当时退化成
+//!    「只判值为空」；现在 `ActorSnapshot.field_owners` 把映射带出来了。）
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -39,8 +37,8 @@ pub struct HostActor {
     pub actor_id: i64,
     pub revision: i64,
     pub values: BTreeMap<String, HostValue>,
-    /// 去重后的 owner 列表（契约只给到这个粒度）。
-    pub owners: Vec<String>,
+    /// 字段级归属（`{字段: owner}`）。**无主的字段不在这里** —— 那正是「可写」。
+    pub field_owners: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -249,11 +247,16 @@ fn is_empty_field_value(name: &str, value: Option<&HostValue>) -> bool {
     }
 }
 
-/// 上游 `writable_fields`（归属检查见模块文档第 2 节）。
-fn writable_fields(snapshot: &HostActor, missing: &[String], _owner: &str) -> Vec<String> {
+/// 上游 `writable_fields`：值还空着 + 字段没被别人接管。
+fn writable_fields(snapshot: &HostActor, missing: &[String], owner: &str) -> Vec<String> {
     missing
         .iter()
         .filter(|key| is_empty_field_value(key, snapshot.values.get(*key)))
+        // 归属：缺键 = 无人接管（可写）；记着自己 = 可写；记着别人 = 受保护。
+        .filter(|key| match snapshot.field_owners.get(*key) {
+            None => true,
+            Some(current) => current == owner,
+        })
         .cloned()
         .collect()
 }
@@ -661,7 +664,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
-            owners: Vec::new(),
+            field_owners: BTreeMap::new(),
         }
     }
 
@@ -1059,5 +1062,44 @@ mod tests {
         assert!(!missing.contains(&"gender".to_owned()));
         assert!(missing.contains(&"height_cm".to_owned()));
         assert_eq!(missing.len(), PROFILE_FIELDS.len() - 2);
+    }
+
+    #[test]
+    fn a_field_owned_by_someone_else_is_not_writable() {
+        let mut snapshot = actor(1, &[]);
+        snapshot
+            .field_owners
+            .insert("birthday".to_owned(), "plugin:other".to_owned());
+        let missing = missing_fields(&snapshot.values);
+        let writable = writable_fields(&snapshot, &missing, "plugin:me");
+        assert!(!writable.contains(&"birthday".to_owned()));
+        // 其余字段无主，照旧可写。
+        assert!(writable.contains(&"height_cm".to_owned()));
+    }
+
+    #[test]
+    fn a_field_we_own_or_nobody_owns_is_writable() {
+        let mut snapshot = actor(1, &[]);
+        snapshot
+            .field_owners
+            .insert("birthday".to_owned(), "plugin:me".to_owned());
+        let missing = missing_fields(&snapshot.values);
+        let writable = writable_fields(&snapshot, &missing, "plugin:me");
+        assert!(writable.contains(&"birthday".to_owned()));
+        assert!(writable.contains(&"height_cm".to_owned()));
+        assert_eq!(writable.len(), PROFILE_FIELDS.len());
+    }
+
+    #[test]
+    fn an_ownership_record_does_not_resurrect_a_filled_field() {
+        let mut snapshot = actor(1, &[("birthday", HostValue::Str("1999-04-19".to_owned()))]);
+        snapshot
+            .field_owners
+            .insert("birthday".to_owned(), "plugin:me".to_owned());
+        let missing = missing_fields(&snapshot.values);
+        let writable = writable_fields(&snapshot, &missing, "plugin:me");
+        // 值不空 → 本来就不在 `missing` 里（上游只补空字段）。
+        assert!(!writable.contains(&"birthday".to_owned()));
+        assert_eq!(writable.len(), PROFILE_FIELDS.len() - 1);
     }
 }

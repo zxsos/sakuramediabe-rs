@@ -24,10 +24,10 @@
 //!
 //! # owner 约定
 //!
-//! 契约里 `MovieSnapshot.owners` 是 `repeated string`，Python 侧是
-//! `dict[field, owner]`。本插件按 `"<field>=<owner>"` 解析（也接受
-//! `"<field>:<owner>"`，取第一段分隔符切分），只认 `is_collection`
-//! 这一项 —— 与上游 `snapshot.owners.get("is_collection")` 同语义。
+//! `MovieSnapshot.field_owners` 就是 Python 侧的 `dict[field, owner]`：
+//! 无主的字段不在 map 里。本插件只认 `is_collection` 这一项 —— 与上游
+//! `snapshot.owners.get("is_collection")` 同语义（见
+//! [`host::collection_owner_of`]）。
 
 pub mod host;
 pub mod judge;
@@ -41,3 +41,36 @@ pub const PLUGIN_ID: &str = "sakuramedia_judge_collecttion_movie";
 
 /// 上游 `manifest.json` 的 `display_name`。
 pub const DISPLAY_NAME: &str = "按时长/番号特征/标签判定合集影片";
+
+/// 把本插件的全部 gRPC service 起在 `addr` 上。
+///
+/// **进程式与进程内共用同一份装配**：本插件只有控制面（`PluginControl`：
+/// `register` + 一个任务），不声明扩展点。
+///
+/// `host_endpoint` 本插件**用得着**：任务要反向回调宿主的 `PluginHost`
+/// （`ListMovies` / `PatchMovie`）。给了就连一个 [`host::GrpcHostMovies`] 塞进
+/// [`service::Control`]；没给则 `run_job` 回 `unimplemented`（没有宿主就没有可
+/// 判定的影片）。
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    plugin_id: String,
+    settings: serde_json::Value,
+    host_endpoint: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sm_plugin_api::v1::plugin_control_server::PluginControlServer;
+    use std::sync::Arc;
+    use tonic::transport::Server;
+
+    let settings = settings::DurationCollectionSettings::from_json(&settings);
+    let host: Option<Arc<dyn host::HostMovies>> = match host_endpoint.as_deref() {
+        Some(addr) => Some(Arc::new(host::GrpcHostMovies::connect(addr).await?)),
+        None => None,
+    };
+    Server::builder()
+        .add_service(PluginControlServer::new(service::Control::new(
+            plugin_id, settings, host,
+        )))
+        .serve(addr)
+        .await?;
+    Ok(())
+}

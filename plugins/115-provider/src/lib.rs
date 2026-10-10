@@ -13,6 +13,7 @@
 //! | `GenerateThumbnails` | 暂不支持（`unimplemented`） |
 //! | `GetSpaceUsage` | 一元 |
 //! | `PrepareLibrary` | 一元（校验 Cookie + 解析目录） |
+//! | `RunJob` | server streaming（手动清理任务，见 [`cleanup`]） |
 //!
 //! 其余 rpc 由 [`sm_plugin_api::provider::StorageProviderExt`] 的默认实现
 //! 提供（返回 `Status::unimplemented`）。
@@ -20,6 +21,7 @@
 //! 认证：115 Cookie（`web_cookie` / `device_cookie`），来源见
 //! [`config::Plugin115Config`] —— 本 crate 不硬编码任何密钥。
 
+pub mod cleanup;
 pub mod client;
 pub mod config;
 pub mod opaque;

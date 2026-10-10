@@ -169,12 +169,15 @@ impl PluginManifest {
             }
         }
 
-        let plugin_id = required_text(object, "plugin_id")
-            .or_else(|_| required_text(object, "id"))
-            .map_err(|_| ManifestProblem::InvalidField {
-                field: "plugin_id",
-                reason: "缺少字段 plugin_id（或别名 id）".to_owned(),
-            })?;
+        let plugin_id = match object.get("plugin_id") {
+            // 主字段在：按 `required_text` 的分类报 —— 缺值是 MissingField、
+            // 值不合法（空白/非字符串）是 InvalidField，两类不能混
+            // （API 的 error.code 靠它区分，tests::problems_carry_stable_codes）。
+            Some(_) => required_text(object, "plugin_id")?,
+            // 主字段不在：退回别名 id；别名也不在才是真正的「缺字段」。
+            None => required_text(object, "id")
+                .map_err(|_| ManifestProblem::MissingField("plugin_id"))?,
+        };
         if !is_valid_plugin_id(&plugin_id) {
             return Err(ManifestProblem::InvalidField {
                 field: "plugin_id",

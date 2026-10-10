@@ -54,6 +54,14 @@ pub struct MetadataSourceRegistration {
     pub plugin_id: String,
     /// 插件的 `display_name`。上游把它与来源一起存下来，供日志与提示用。
     pub display_name: String,
+    /// 那个插件的**控制面**端点。与 [`RankingSourceRegistration::plugin_endpoint`]
+    /// 同一个东西、同一个理由：元数据来源要调 `FetchMovie`，没有端点就
+    /// 「查得到声明、打不出去」。
+    ///
+    /// ⚠️ 与端点一样是**活的** —— 插件重启会换端口。消费方应在**每次需要时**
+    /// 从注册表现取（与 `RankingSourceRegistration::plugin_endpoint` 同一条
+    /// 「活的注册表」纪律），而不是拷进长生命周期对象后当快照用。
+    pub plugin_endpoint: String,
 }
 
 /// 一个榜单（`RankingBoard`）。
@@ -253,7 +261,9 @@ pub fn collect_extensions(
 
     for extension in &response.extensions {
         match extension.key.as_str() {
-            METADATA_SOURCE => collect_metadata_source(registry, response, &mut problems),
+            METADATA_SOURCE => {
+                collect_metadata_source(registry, response, endpoint, &mut problems)
+            }
             RANKING_SOURCE if ranking_rejected => {}
             RANKING_SOURCE => {
                 let Some(Data::RankingSource(bundle)) = &extension.data else {
@@ -280,6 +290,7 @@ fn has_capability(response: &RegisterResponse, value: i32) -> bool {
 fn collect_metadata_source(
     registry: &mut ExtensionRegistry,
     response: &RegisterResponse,
+    endpoint: &str,
     problems: &mut Vec<ExtensionProblem>,
 ) {
     if !has_capability(response, capability::EXTENSION_CATALOG_METADATA_SOURCE) {
@@ -292,6 +303,7 @@ fn collect_metadata_source(
     registry.insert_metadata(MetadataSourceRegistration {
         plugin_id: response.plugin_id.clone(),
         display_name: response.display_name.clone(),
+        plugin_endpoint: endpoint.to_owned(),
     });
 }
 
@@ -459,6 +471,10 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].plugin_id, "javdb");
         assert_eq!(sources[0].display_name, "javdb 插件");
+        assert_eq!(
+            sources[0].plugin_endpoint, ENDPOINT,
+            "端点要存下来 —— 与排行源同一个理由（否则调用面打不出去）"
+        );
         assert!(registry.ranking_sources().is_empty());
     }
 

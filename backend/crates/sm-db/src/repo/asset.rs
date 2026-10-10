@@ -125,6 +125,33 @@ impl TagRepository {
         }
     }
 
+    /// 一组影片的标签，`(movie_id, tag_id, name)`，**按 `(movie_id, tag_id)` 升序**。
+    ///
+    /// 影片快照要带上标签（`MovieSnapshot.tags`），而一次 `ListMovies` 可能涉及
+    /// 上千部影片 —— 逐部查 `movie_tag` 就是 N+1。形状与
+    /// [`MovieActorRepository::actor_ids_for_movies`] 同构（一次 join 出目标行），
+    /// 归组由调用方做。
+    ///
+    /// 元组而不是结构体：投影行没有上游 Peewee 模型，声明成结构体会让对拍门禁
+    /// 报 `UNCHECKED_STRUCT`（同 `TagCountRow` 的理由）。
+    pub async fn names_for_movies(
+        &self,
+        movie_ids: &[i32],
+    ) -> Result<Vec<(i32, i32, String)>, DbError> {
+        if movie_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, (i32, i32, String)>(
+            "SELECT mt.movie_id, t.id, t.name FROM movie_tag mt \
+             JOIN tag t ON t.id = mt.tag_id \
+             WHERE mt.movie_id = ANY($1) \
+             ORDER BY mt.movie_id, t.id",
+        )
+        .bind(movie_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// 删标签。返回是否真的删掉了一行。
     ///
     /// 已被 `movie_tag` 引用的标签**删不掉** —— 唯一约束之外没有

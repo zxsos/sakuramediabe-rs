@@ -108,8 +108,6 @@ struct FileItem {
     #[serde(default)]
     n: String,
     #[serde(default)]
-    fc: String,
-    #[serde(default)]
     s: u64,
     #[serde(default)]
     pc: String,
@@ -280,22 +278,34 @@ impl Cloud115Client {
         let items = payload.data.unwrap_or_default();
         let entries = items
             .into_iter()
-            .map(|item| Cloud115Entry {
-                id: if item.fc == "0" {
-                    item.fid.clone()
-                } else {
-                    item.cid.clone()
-                },
-                parent_id: item.pid,
-                name: item.n,
-                is_dir: item.fc == "0",
-                size_bytes: item.s,
-                pickcode: item.pc,
-                sha1: if item.sha.is_empty() {
-                    None
-                } else {
-                    Some(item.sha)
-                },
+            .map(|item| {
+                // 上游 `_entry`（cloud115.py:1145）的判定：**目录没有 `fid`**。
+                // 目录的 id 是 `cid`、父目录是 `pid`；文件的 id 是 `fid`、
+                // 父目录是它所在的 `cid`。此前按 `fc == "0"` 判 —— 那不是上游
+                // 的判据，真实载荷上会把文件与目录认反（`fc` 是文件分类，
+                // 上游从不看它）。
+                let is_dir = item.fid.is_empty();
+                Cloud115Entry {
+                    id: if is_dir {
+                        item.cid.clone()
+                    } else {
+                        item.fid.clone()
+                    },
+                    parent_id: if is_dir {
+                        item.pid.clone()
+                    } else {
+                        item.cid.clone()
+                    },
+                    name: item.n,
+                    is_dir,
+                    size_bytes: item.s,
+                    pickcode: item.pc,
+                    sha1: if item.sha.is_empty() {
+                        None
+                    } else {
+                        Some(item.sha)
+                    },
+                }
             })
             .collect();
         Ok((entries, total))
@@ -315,6 +325,107 @@ impl Cloud115Client {
             }
         }
         Ok(out)
+    }
+
+    /// 递归列出一个目录下的**全部文件**（115 服务端递归模式）。
+    ///
+    /// 对应上游 `iter_files_recursive`（`cloud115.py:561`）：`show_dir=0` +
+    /// `cur=0` 让 115 在服务端把整棵子树摊平，返回**只有文件** —— 子目录不产生
+    /// 请求、也不出现在结果里。「这个目录下面还有没有东西」这一问的判据是
+    /// 文件而不是目录：删除是递归的，空子目录会跟着目录一起走。
+    pub async fn list_files_recursive(
+        &self,
+        cid: &str,
+    ) -> Result<Vec<Cloud115Entry>, Cloud115Error> {
+        if cid.is_empty() {
+            return Err(Cloud115Error::Request("115 目录 id 不能为空".to_owned()));
+        }
+        let mut out = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let mut req = self.http.get(format!("{WEBAPI}/files"));
+            for (key, value) in self.headers() {
+                req = req.header(key, value);
+            }
+            let offset_s = offset.to_string();
+            let response = req
+                .query(&[
+                    ("aid", "1"),
+                    ("cid", cid),
+                    ("offset", offset_s.as_str()),
+                    ("limit", "1150"),
+                    // 服务端递归 + 不含目录：与上游同一组查询参数。
+                    ("show_dir", "0"),
+                    ("cur", "0"),
+                    ("o", "file_name"),
+                    ("asc", "1"),
+                ])
+                .send()
+                .await?;
+            let payload: ApiEnvelope<Vec<FileItem>> = response
+                .json()
+                .await
+                .map_err(|e| Cloud115Error::Request(format!("解析 115 目录失败: {e}")))?;
+            check_envelope(&payload, "files")?;
+            let total = payload.count.unwrap_or(0).max(0) as u64;
+            let items = payload.data.unwrap_or_default();
+            let count = items.len() as u64;
+            out.extend(items.into_iter().filter(|item| !item.fid.is_empty()).map(
+                |item| Cloud115Entry {
+                    id: item.fid,
+                    parent_id: item.cid,
+                    name: item.n,
+                    is_dir: false,
+                    size_bytes: item.s,
+                    pickcode: item.pc,
+                    sha1: if item.sha.is_empty() {
+                        None
+                    } else {
+                        Some(item.sha)
+                    },
+                },
+            ));
+            offset += count;
+            // 与上游同一条停机条件：翻到 `count`（总数）为止；空页也是出口。
+            if count == 0 || offset >= total {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// 删除文件 / 目录（目录**递归删除**）。
+    ///
+    /// 对应上游 `delete_files`（`cloud115.py:916`）：`POST /rb/delete`，
+    /// `fid[<i>]` 逐个编号；`parent_cid` 只是辅助定位，可不给。
+    pub async fn delete_files(
+        &self,
+        file_ids: &[String],
+        parent_cid: Option<&str>,
+    ) -> Result<(), Cloud115Error> {
+        if file_ids.is_empty() {
+            return Err(Cloud115Error::Request(
+                "115 删除需要至少一个文件 id".to_owned(),
+            ));
+        }
+        let mut form: Vec<(String, &str)> = file_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (format!("fid[{index}]"), id.as_str()))
+            .collect();
+        if let Some(parent) = parent_cid {
+            form.push(("pid".to_owned(), parent));
+        }
+        let mut req = self.http.post("https://webapi.115.com/rb/delete");
+        for (key, value) in self.headers() {
+            req = req.header(key, value);
+        }
+        let response = req.form(&form).send().await?;
+        let payload: ApiEnvelope<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| Cloud115Error::Request(format!("解析删除响应失败: {e}")))?;
+        check_envelope(&payload, "rb/delete")
     }
 
     /// 取文件直链。

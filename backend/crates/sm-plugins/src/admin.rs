@@ -751,6 +751,8 @@ mod tests {
             requires_python: None,
             author: None,
             homepage: None,
+            // 这条用例只关心 `dependencies`（在 `raw` 里），入口文件名与它无关。
+            entry: None,
             raw: json!({ "dependencies": ["libtorrent>=2.1.1,<3.0.0"] }),
         };
         assert_eq!(pending_restart_for(Some(&manifest)), vec!["container"]);

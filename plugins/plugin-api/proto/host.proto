@@ -24,6 +24,13 @@ message MovieSnapshot {
   repeated string owners = 4;
   repeated ActorSnapshot actors = 5;
   repeated TagSnapshot tags = 6;
+  // 字段级归属：`{字段: owner}`。**无主的字段不出现在 map 里**。
+  //
+  // 上面的 `owners` 是「动过这行的人」的并集（去重后的 owner 值），回答不了
+  // 「`title` 归谁」；而判定 / 写回类插件要靠这个决定某个字段能不能写
+  // （`None` 或自己 = 可写，别人 = 受保护）。Python 侧 `context.movies.get`
+  // 返回的就是 `dict[field, owner]`，这里是它的直译。
+  map<string, string> field_owners = 7;
 }
 
 message TagSnapshot {
@@ -36,6 +43,8 @@ message ActorSnapshot {
   int64 revision = 2;
   map<string, google.protobuf.Value> values = 3;
   repeated string owners = 4;
+  // 字段级归属，语义同 [`MovieSnapshot.field_owners`]。
+  map<string, string> field_owners = 5;
 }
 
 message GetMovieRequest { int64 movie_id = 1; }

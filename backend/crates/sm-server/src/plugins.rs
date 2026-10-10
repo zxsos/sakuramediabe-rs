@@ -6,6 +6,22 @@
 //! 这里换成进程模型，所以装配多出两步：拉起（[`sm_plugins::supervisor::launch`]）
 //! 与看门狗。协议见 `docs/adr/2026-10-05-plugin-lifecycle.md`。
 //!
+//! # 两种形态：子进程 与 进程内
+//!
+//! `enabled` 里的每个 id 由 [`launch_plugin`] 决定怎么起：
+//!
+//! - **进程内**（[`crate::inprocess_host`]，9 个 vendored 插件）：在本进程里
+//!   `tokio::spawn` 插件的 `serve`，仍监听一个回环端口 —— 省掉子进程的地址
+//!   空间，但下游调用面（数据面 / 排行 / 元数据 / `PluginHost`）一行都不用改。
+//! - **子进程**（[`sm_plugins::supervisor::launch`]）：其余的插件按
+//!   `<root_dir>/<plugin_id>/<plugin_id>` 拉起。
+//!
+//! 两条路**共用等就绪判据**（`await_ready`：探活 / 超时 / 声明不合契约立即失败），
+//! 差别只在「怎么起」与「怎么发现它挂了」（[`PluginHandle`]）。
+//!
+//! ⚠️ 进程内形态下插件 panic 会带走整个 `sm-server`（release 是 `panic = "abort"`），
+//! 见 [`crate::inprocess_host`] 模块文档。
+//!
 //! # 可执行文件的位置是**约定**，不是配置
 //!
 //! `<root_dir>/<plugin_id>/<plugin_id>`。`plugins` 节是 `sm_core::config_schema`
@@ -36,10 +52,12 @@ use sm_plugins::extensions::{collect_extensions, ExtensionRegistry};
 use sm_plugins::jobs::{collect_jobs, JobProblem, JobRegistry};
 use sm_plugins::loader::collect_providers;
 use sm_plugins::registry::ProviderRegistry;
-use sm_plugins::supervisor::{launch, restart_backoff, LaunchSpec, PluginProcess};
+use sm_plugins::supervisor::{launch, restart_backoff, LaunchError, LaunchSpec, PluginProcess};
 use sm_scheduler::JobSpec;
 use sm_service::system::telemetry::PluginHeartbeat;
 use sm_service::system::{JobCatalog, JobCatalogEntry};
+
+use crate::inprocess_host::{self, InProcessPlugin};
 
 /// 等插件就绪的上限。
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -219,13 +237,78 @@ fn lock_extensions(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// 一个已加载插件的**形态句柄**。
+///
+/// 两种形态只差「怎么知道它挂了」与「端点怎么取」—— 其余（注册声明、三张注册表、
+/// 重启退避）完全一样，所以收进一个 enum，而不是让 `LoadedPlugin` 长出两副结构。
+#[derive(Debug)]
+pub enum PluginHandle {
+    /// 独立子进程（[`sm_plugins::supervisor::launch`]）。
+    Process(PluginProcess),
+    /// 本进程内（[`crate::inprocess_host::launch`]）。
+    InProcess(InProcessPlugin),
+}
+
+impl PluginHandle {
+    /// 控制面端点。数据面 / 排行 / 元数据都对着它发 gRPC —— 两种形态**同形**，
+    /// 所以上层调用面不必知道自己连的是子进程还是同进程的服务。
+    fn endpoint(&self) -> String {
+        match self {
+            Self::Process(process) => process.endpoint(),
+            Self::InProcess(plugin) => plugin.endpoint().to_owned(),
+        }
+    }
+
+    /// 它退出 / 结束了吗。`Some(原因)` 表示该重启。
+    ///
+    /// 进程式看 `Child::try_wait`；进程内看 `JoinHandle::is_finished`。
+    ///
+    /// ⚠️ 进程内形态**发现不了 panic**：release 是 `panic = "abort"`，插件 panic
+    /// 会让整个 `sm-server` 一起退出，轮不到看门狗。见 [`crate::inprocess_host`]
+    /// 模块文档。
+    fn exited_reason(&mut self) -> Option<String> {
+        match self {
+            Self::Process(process) => match process.try_wait() {
+                Ok(Some(status)) => Some(format!("进程退出，状态 {status}")),
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(error = %err, "等待插件进程失败");
+                    None
+                }
+            },
+            Self::InProcess(plugin) => {
+                plugin.is_finished().then(|| "进程内任务已结束".to_owned())
+            }
+        }
+    }
+}
+
+/// 跑一个插件任务需要的东西。
+///
+/// 「归属插件 + **活的控制面端点** + 数据目录」三样凑齐才能发一次 `RunJob`。
+/// 端点必须在**调用时**现取（插件重启会换端口），所以这是一次查询的**结果**、
+/// 不是启动期的快照 —— 与 [`Plugins::provider_registry`] /
+/// [`Plugins::extension_registry`] 那条「活的注册表」纪律同一个理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginJobTarget {
+    /// 归属插件（授权与日志用）。
+    pub plugin_id: String,
+    /// 控制面端点（`http://127.0.0.1:端口`）。
+    pub endpoint: String,
+    /// 任务的工作目录（`<root_dir>/<plugin_id>/data`），透给
+    /// `RunJobRequest.data_dir`。
+    pub data_dir: PathBuf,
+}
+
 /// 一个已加载的插件。
 #[derive(Debug)]
 pub struct LoadedPlugin {
     pub plugin_id: String,
     /// `Register` 的回显 —— 重建三张注册表时还要用它。
     pub registration: RegisterResponse,
-    pub process: PluginProcess,
+    /// 怎么起的（子进程 / 进程内）。取代了原来的具体 `PluginProcess` 字段 ——
+    /// 组合根现在两种形态都能拉，见 [`PluginHandle`]。
+    pub handle: PluginHandle,
     /// 已重启次数（退避用）。
     pub restarts: u32,
 }
@@ -276,22 +359,15 @@ impl Plugins {
         };
         // `enabled` 的顺序就是优先级，不能并发拉起来打乱它。
         for plugin_id in plugins.config.enabled.clone() {
-            // 进程内插件：已 vendoring 进后端，不起进程。
-            // 9 个插件：javdb-ranking, javbus-metadata, actor-metadata,
-            // 115-provider, judge-collection, more-movies, scrape-translate,
-            // subtitlecat, plugin-ref-local
-            if is_inprocess_plugin(&plugin_id) {
-                tracing::info!(plugin_id, "插件已进程内化，跳过进程启动");
-                continue;
-            }
-            match launch(&plugins.config.launch_spec(&plugin_id)).await {
-                Ok(launched) => {
+            match launch_plugin(&plugins.config.launch_spec(&plugin_id)).await {
+                Ok((registration, handle)) => {
                     tracing::info!(plugin_id, "插件已就绪");
-                    plugins.admit(plugin_id, launched.registration, launched.process);
+                    plugins.admit(plugin_id, registration, handle);
                 }
                 Err(err) => {
                     // 起不来就跳过：一个坏插件不该让整个后端起不来
-                    // （上游 `PLUGIN_LOAD_ERRORS` 是同一个意思）。
+                    // （上游 `PLUGIN_LOAD_ERRORS` 是同一个意思）。进程内插件
+                    // 起不来同样走这一条（探活到超时 / 分派不到）。
                     tracing::warn!(
                         plugin_id,
                         code = err.code(),
@@ -304,11 +380,14 @@ impl Plugins {
         plugins
     }
 
-    fn admit(&mut self, plugin_id: String, registration: RegisterResponse, process: PluginProcess) {
+    fn admit(&mut self, plugin_id: String, registration: RegisterResponse, handle: PluginHandle) {
         // 控制面端点由**宿主**下发（proto 的注册响应里没有「我监听的地址」）——
         // provider 的 storage/download rpc 都在这条通道上，没有它就查得到声明、
         // 打不出去。见 `ProviderRegistration::plugin_endpoint`。
-        let endpoint = process.endpoint();
+        //
+        // 进程内形态的端点同样是宿主 `reserve_addr` 分配的回环端口：插件在本进程
+        // 里 serve，但调用面照旧发 gRPC —— 所以这一行两种形态不必分叉。
+        let endpoint = handle.endpoint();
         // 一个插件可以有多个 provider，多个插件各有一张表 —— 合进宿主那一张，
         // 顺序由 `insert` 按 `enabled` 顺序续在后面。
         for entry in collect_providers(&registration, &endpoint).entries() {
@@ -353,7 +432,7 @@ impl Plugins {
         self.loaded.push(LoadedPlugin {
             plugin_id,
             registration,
-            process,
+            handle,
             restarts: 0,
         });
     }
@@ -494,6 +573,43 @@ impl Plugins {
         Arc::clone(&self.extensions)
     }
 
+    /// 查一个插件任务该发给谁、往哪发、工作目录在哪。
+    ///
+    /// `None` 的三种情形：键不是插件任务（内建或不存在）、归属插件这次没
+    /// 起来（启动期就被跳过了）、插件已退出且看门狗还没把它拉回来。
+    /// 三者的正确反应都是**让这次执行失败** —— 任务在目录里而没人能跑，
+    /// 静默跳过会让队列看起来在动而任务从未执行（见 `worker` 模块文档）。
+    ///
+    /// 端点**现取**而不是启动期快照：插件重启会换端口（见
+    /// [`PluginJobTarget`] 的文档）。
+    pub fn job_target(&self, task_key: &str) -> Option<PluginJobTarget> {
+        let registration = self.jobs.get(task_key)?;
+        let plugin_id = registration.plugin_id.clone();
+        let plugin = self
+            .loaded
+            .iter()
+            .find(|plugin| plugin.plugin_id == plugin_id)?;
+        Some(PluginJobTarget {
+            endpoint: plugin.handle.endpoint(),
+            data_dir: self.config.data_dir_for(&plugin_id),
+            plugin_id,
+        })
+    }
+
+    /// 全部**插件**任务的 `(task_key, 归属插件)`。
+    ///
+    /// 与 [`Self::scheduler_specs`] 的两处差别，都是用途决定的：
+    /// - 这里**含 `manual_only`** —— worker 也要为它们注册处理器，
+    ///   否则手动触发会把它们打成「未知任务键」；
+    /// - 带归属插件（失败信息与排障要它），而 `JobSpec` 刻意不带。
+    pub fn plugin_job_entries(&self) -> Vec<(String, String)> {
+        self.jobs
+            .entries()
+            .into_iter()
+            .map(|entry| (entry.task_key.clone(), entry.plugin_id.clone()))
+            .collect()
+    }
+
     /// 已加载插件的 `{id, version}` 快照，供匿名遥测心跳用。
     ///
     /// ⚠️ **与上游有一处偏差**（登记在
@@ -533,7 +649,7 @@ impl Plugins {
         let registrations: Vec<(RegisterResponse, String)> = self
             .loaded
             .iter()
-            .map(|plugin| (plugin.registration.clone(), plugin.process.endpoint()))
+            .map(|plugin| (plugin.registration.clone(), plugin.handle.endpoint()))
             .collect();
         for (registration, endpoint) in &registrations {
             self.collect(registration, endpoint);
@@ -541,10 +657,11 @@ impl Plugins {
     }
 }
 
-/// 看门狗：轮询进程退出 → 退避重启 → 重建注册表。
+/// 看门狗：轮询插件退出（子进程退出 / 进程内任务结束）→ 退避重启 → 重建注册表。
 ///
-/// `stop` 置起后退出；退出前**不**杀插件 —— 插件进程由 [`Plugins`] 的析构带
-/// 走（[`PluginProcess`] 的 `Drop` 会 kill），杀两次没必要。
+/// `stop` 置起后退出；退出前**不**杀插件 —— 句柄由 [`Plugins`] 的析构带走
+/// （[`PluginHandle`] 的 `Drop`：子进程被 kill，进程内任务被 abort），杀两次
+/// 没必要。
 pub async fn watchdog(
     plugins: Arc<tokio::sync::Mutex<Plugins>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -581,8 +698,8 @@ pub async fn watchdog(
         };
         tokio::time::sleep(delay).await;
 
-        match launch(&spec).await {
-            Ok(launched) => {
+        match launch_plugin(&spec).await {
+            Ok((registration, handle)) => {
                 tracing::info!(plugin_id, "插件已重启");
                 let mut plugins = plugins.lock().await;
                 if let Some(slot) = plugins
@@ -590,9 +707,10 @@ pub async fn watchdog(
                     .iter_mut()
                     .find(|plugin| plugin.plugin_id == plugin_id)
                 {
-                    // 旧进程句柄被替换掉即被杀（[`PluginProcess`] 的 `Drop`）。
-                    slot.registration = launched.registration;
-                    slot.process = launched.process;
+                    // 旧句柄被替换掉即被收走（`PluginProcess` 的 `Drop` kill 子进程；
+                    // `InProcessPlugin` 的 `Drop` abort 掉 serve 任务）。
+                    slot.registration = registration;
+                    slot.handle = handle;
                     slot.restarts += 1;
                 }
                 plugins.rebuild();
@@ -618,25 +736,32 @@ pub async fn watchdog(
 
 /// 找出第一个已退出的插件。
 fn first_exited(loaded: &mut [LoadedPlugin]) -> Option<String> {
-    for plugin in loaded {
-        match plugin.process.try_wait() {
-            Ok(Some(status)) => {
-                tracing::warn!(
-                    plugin_id = plugin.plugin_id.as_str(),
-                    %status,
-                    "插件进程退出，准备重启"
-                );
-                return Some(plugin.plugin_id.clone());
-            }
-            Ok(None) => {}
-            Err(err) => tracing::warn!(
+    for plugin in loaded.iter_mut() {
+        if let Some(reason) = plugin.handle.exited_reason() {
+            tracing::warn!(
                 plugin_id = plugin.plugin_id.as_str(),
-                error = %err,
-                "等待插件进程失败"
-            ),
+                reason,
+                "插件已退出，准备重启"
+            );
+            return Some(plugin.plugin_id.clone());
         }
     }
     None
+}
+
+/// 按形态拉起一个插件：进程内 or 子进程。
+///
+/// 两条路的**注册契约与等就绪判据是同一份**（`sm_plugins::supervisor::await_ready`
+/// 里的探活 + 超时 + `Invalid` 立即失败），差别只在「怎么起」。判据分叉是这里最
+/// 该防的事：分叉后「进程内起得来、子进程起不来」这类问题会各自漂。
+async fn launch_plugin(spec: &LaunchSpec) -> Result<(RegisterResponse, PluginHandle), LaunchError> {
+    if inprocess_host::is_inprocess(&spec.plugin_id) {
+        let launched = inprocess_host::launch(spec).await?;
+        Ok((launched.registration, PluginHandle::InProcess(launched.plugin)))
+    } else {
+        let launched = launch(spec).await?;
+        Ok((launched.registration, PluginHandle::Process(launched.process)))
+    }
 }
 
 /// 把注册表里可调度任务转成调度器能消费的声明。
@@ -695,25 +820,6 @@ pub fn job_specs(
             manual_trigger_allowed: true,
         })
         .collect()
-}
-
-/// 是否为进程内插件（已 vendoring，不起进程）。
-///
-/// 9 个插件已编译进后端二进制，通过 `inprocess_plugins` 模块直接调用，
-/// 无需 spawn 独立进程。
-fn is_inprocess_plugin(plugin_id: &str) -> bool {
-    matches!(
-        plugin_id,
-        "sakuramedia_javdb_ranking"
-            | "sakuramedia_javbus_metadata"
-            | "sakuramedia_actor_metadata"
-            | "sakuramedia_115_provider"
-            | "sakuramedia_judge_collecttion_movie"
-            | "sakuramedia_more_movies"
-            | "sakuramedia_movie_scrape_translate"
-            | "sakuramedia_subtitlecat"
-            | "plugin_ref_local"
-    )
 }
 
 #[cfg(test)]

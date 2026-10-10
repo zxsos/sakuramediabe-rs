@@ -41,6 +41,7 @@ chrono = { workspace = true }
 sm-plugins = { workspace = true }
 # 进程内插件（vendored）：直接调用，不起进程、不走 gRPC。
 # 9 个插件全部 vendoring 进 workspace，共用同一份 sm-plugin-api。
+plugin-ref-local = { workspace = true }
 plugin-javdb-ranking = { workspace = true }
 plugin-javbus-metadata = { workspace = true }
 plugin-actor-metadata = { workspace = true }

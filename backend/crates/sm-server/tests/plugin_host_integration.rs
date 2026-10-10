@@ -22,18 +22,26 @@ use prost_types::Value as PbValue;
 use sm_db::repo::discovery::{NewRankingItem, RankingItemRepository};
 use sm_db::repo::gateway::{ActorOwnershipGateway, FieldPatch, HOST_JAVDB_OWNER};
 use sm_db::repo::{
-    ActorRepository, MovieActorRepository, MovieRepository, NewActor, NewMovie, SubtitleRepository,
+    ActorRepository, MovieActorRepository, MovieRepository, MovieTagRepository, NewActor, NewMovie,
+    SubtitleRepository, TagRepository,
 };
 use sm_db::testing::TestDb;
 use sm_plugin_api::v1::get_javdb_rank_numbers_request::Query;
 use sm_plugin_api::v1::plugin_host_server::PluginHost;
 use sm_plugin_api::v1::{
-    GetActorRequest, GetJavdbRankNumbersRequest, GetMovieRequest, ImportSubtitleRequest,
-    JavdbPlaybackRankQuery, JavdbTopQuery, ListActorsRequest, ListMoviesRequest, PatchActorRequest,
-    PatchMovieRequest, PatchMovieResponse, SyncRankingBoardRequest, SyncRankingSourcesRequest,
+    FindByNumbersRequest, GetActorRequest, GetJavdbRankNumbersRequest, GetMovieRequest,
+    ImportMovieByNumberRequest, ImportSubtitleRequest, JavdbPlaybackRankQuery, JavdbTopQuery,
+    ListActorsRequest, ListMoviesRequest, PatchActorRequest, PatchMovieRequest,
+    PatchMovieResponse, SyncRankingBoardRequest, SyncRankingSourcesRequest,
 };
+use sm_server::metadata_import::{MetadataImportDeps, MetadataImportSlot};
 use sm_server::plugin_host::PluginHostService;
 use sm_server::ranking_gateway::RankingSyncSlot;
+use sm_service::catalog::catalog_import::CatalogImport;
+use sm_service::catalog::metadata_source::{
+    MetadataProvider, MetadataSourceError, MetadataSourceService,
+};
+use sm_service::error::ServiceError;
 use sm_service::discovery::ranking::{
     RankingBoardDefinition, RankingCallError, RankingGateway, RankingSourceCatalog,
     RankingSourceDefinition, RankingSyncService,
@@ -958,6 +966,368 @@ async fn a_movie_snapshot_carries_its_actors_in_id_order() {
         .find(|listed| listed.movie_id == i64::from(movie.id))
         .expect("在列表里");
     assert_eq!(listed.actors.len(), 2);
+}
+
+/// ★ 影片快照带上标签：按 `tag_id` 升序，**三条读路径都带**，且不跨影片串味。
+///
+/// `judge_collecttion_movie` 的标签规则读 `snapshot.tags`。宿主以前硬写
+/// `tags: Vec::new()`，那条规则于是**静默不生效** —— 插件看到的永远是「这部影片
+/// 一个标签都没有」，不报错、不生效，最难查的那种偏差。
+#[tokio::test]
+async fn a_movie_snapshot_carries_its_tags_in_id_order() {
+    let db = TestDb::require().await;
+    let movies = MovieRepository::new(db.pool().clone());
+    let tagged = movies.insert(&movie("TAG-001")).await.expect("insert");
+    // 第二部**不挂标签**：批量读时它不能蹭到别人的标签（归组写错就会）。
+    let plain = movies.insert(&movie("TAG-002")).await.expect("insert");
+
+    let tags = TagRepository::new(db.pool().clone());
+    let first = tags.upsert_by_name("甲标签").await.expect("建甲");
+    let second = tags.upsert_by_name("乙标签").await.expect("建乙");
+    assert!(first.id < second.id, "id 由插入顺序定，下面靠它判升序");
+
+    let links = MovieTagRepository::new(db.pool().clone());
+    // 与演员那条同理：故意**反序**关联，顺序该由查询定，不由插入顺序定
+    links.link(tagged.id, second.id).await.expect("关联乙");
+    links.link(tagged.id, first.id).await.expect("关联甲");
+
+    let host = host_service(&db, PLUGIN);
+    let snapshot = host
+        .get_movie(Request::new(GetMovieRequest {
+            movie_id: i64::from(tagged.id),
+        }))
+        .await
+        .expect("取影片")
+        .into_inner()
+        .movie
+        .expect("有影片");
+    let ids: Vec<i64> = snapshot.tags.iter().map(|tag| tag.tag_id).collect();
+    assert_eq!(
+        ids,
+        vec![i64::from(first.id), i64::from(second.id)],
+        "按 tag_id 升序"
+    );
+    assert_eq!(
+        snapshot.tags[0].name, "甲标签",
+        "标签项要带名字 —— 插件的规则按名字匹配，只有 id 用不了"
+    );
+
+    // 批量定位那条路：既按**请求顺序**输出，也不跨影片串味
+    let found = host
+        .find_movies_by_numbers(Request::new(FindByNumbersRequest {
+            movie_numbers: vec!["TAG-002".to_owned(), "TAG-001".to_owned()],
+        }))
+        .await
+        .expect("批量定位")
+        .into_inner();
+    assert_eq!(found.movies.len(), 2);
+    assert_eq!(found.movies[0].movie_id, i64::from(plain.id));
+    assert!(
+        found.movies[0].tags.is_empty(),
+        "没挂标签的影片必须是空数组"
+    );
+    assert_eq!(found.movies[1].tags.len(), 2, "传进来的顺序是 2、1");
+
+    // 列表那条路（`ListMovies` 一次会带很多影片，批量 join 的那条 SQL 就是为它写的）
+    let listed = host
+        .list_movies(Request::new(ListMoviesRequest {
+            after_id: 0,
+            limit: 10,
+            filters: None,
+        }))
+        .await
+        .expect("列影片")
+        .into_inner()
+        .movies
+        .into_iter()
+        .find(|snapshot| snapshot.movie_id == i64::from(tagged.id))
+        .expect("在列表里");
+    assert_eq!(
+        listed
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["甲标签", "乙标签"]
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 按番号入库（`ImportMovieByNumber`）
+// ══════════════════════════════════════════════════════════════════
+//
+// 宿主自己不认得任何元数据来源：它把「查来源 + 写库」整段转发给
+// `MetadataSourceService` + `CatalogImport`。这组替身因此分两层 ——
+// provider 替身回答「外部有没有」，catalog 替身决定「写不写库」。
+//
+// ★ 没装配（组合根还没建 `MetadataSourceService`）必须是**响亮**的
+// `unimplemented`，不能是「找不到」—— 那会让遍历类插件把「宿主没接好」
+// 统计成「全部导入失败」，两种原因搅在一起。
+
+/// 永远「没有这部片」的 provider 替身。
+struct EmptyProvider;
+
+#[tonic::async_trait]
+impl MetadataProvider for EmptyProvider {
+    async fn get_movie_by_number(
+        &self,
+        _movie_number: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+        Ok(None)
+    }
+
+    async fn get_movie_by_javdb_id(
+        &self,
+        _javdb_id: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+        Ok(None)
+    }
+
+    async fn search_actors(
+        &self,
+        _keyword: &str,
+    ) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// 对任何番号都回一份最小详情的 provider 替身（JavDB 那一支的形状）。
+struct DetailProvider;
+
+#[tonic::async_trait]
+impl MetadataProvider for DetailProvider {
+    async fn get_movie_by_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+        Ok(Some(serde_json::json!({
+            "movie_number": movie_number,
+            "title": format!("{movie_number} 标题"),
+        })))
+    }
+
+    async fn get_movie_by_javdb_id(
+        &self,
+        _javdb_id: &str,
+    ) -> Result<Option<serde_json::Value>, MetadataSourceError> {
+        Ok(None)
+    }
+
+    async fn search_actors(
+        &self,
+        _keyword: &str,
+    ) -> Result<Vec<serde_json::Value>, MetadataSourceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// 按内存表报「已存在」的 catalog 替身 —— 模拟「番号已经在库里」。
+struct KnownCatalog {
+    number: String,
+    movie_id: i32,
+}
+
+#[tonic::async_trait]
+impl CatalogImport for KnownCatalog {
+    async fn find_movie_id(&self, movie_number: &str) -> Result<Option<i32>, ServiceError> {
+        if movie_number == self.number {
+            Ok(Some(self.movie_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn import_movie_if_missing(
+        &self,
+        _movie_number: &str,
+        _detail: &serde_json::Value,
+    ) -> Result<(i32, bool), ServiceError> {
+        Err(ServiceError::from_status(
+            500,
+            "stub_unreachable",
+            "已有的番号不该再走导入",
+        ))
+    }
+
+    async fn import_plugin_movie(
+        &self,
+        _detail: &serde_json::Value,
+        _source: &serde_json::Value,
+        _force_subscribed: bool,
+    ) -> Result<(i32, bool), ServiceError> {
+        Err(ServiceError::from_status(
+            500,
+            "stub_unreachable",
+            "已有的番号不该再走导入",
+        ))
+    }
+
+    async fn upsert_actor(&self, _actor_resource: &serde_json::Value) -> Result<i32, ServiceError> {
+        Err(ServiceError::from_status(500, "stub_unreachable", "用不到"))
+    }
+}
+
+/// 真往库里插的 catalog 替身：`import_movie_if_missing` 用 `MovieRepository`
+/// 落一部最小影片，返回「新建」。
+struct InsertingCatalog(sm_db::Db);
+
+#[tonic::async_trait]
+impl CatalogImport for InsertingCatalog {
+    async fn find_movie_id(&self, _movie_number: &str) -> Result<Option<i32>, ServiceError> {
+        Ok(None)
+    }
+
+    async fn import_movie_if_missing(
+        &self,
+        movie_number: &str,
+        _detail: &serde_json::Value,
+    ) -> Result<(i32, bool), ServiceError> {
+        let inserted = MovieRepository::new(self.0.clone())
+            .insert(&movie(movie_number))
+            .await
+            .map_err(|error| ServiceError::from_status(500, "stub_insert_failed", error.to_string()))?;
+        Ok((inserted.id, true))
+    }
+
+    async fn import_plugin_movie(
+        &self,
+        _detail: &serde_json::Value,
+        _source: &serde_json::Value,
+        _force_subscribed: bool,
+    ) -> Result<(i32, bool), ServiceError> {
+        Err(ServiceError::from_status(
+            500,
+            "stub_unreachable",
+            "JavDB 那一支用不到",
+        ))
+    }
+
+    async fn upsert_actor(&self, _actor_resource: &serde_json::Value) -> Result<i32, ServiceError> {
+        Err(ServiceError::from_status(500, "stub_unreachable", "用不到"))
+    }
+}
+
+/// 装好入库两件套的宿主实例。
+fn import_host_service(
+    db: &TestDb,
+    provider: Box<dyn MetadataProvider + Send + Sync>,
+    catalog: Arc<dyn CatalogImport + Send + Sync>,
+) -> PluginHostService {
+    let slot = MetadataImportSlot::new();
+    slot.fill(Arc::new(MetadataImportDeps {
+        source: Arc::new(MetadataSourceService::new(Vec::new(), Some(provider))),
+        catalog,
+    }));
+    host_service(db, PLUGIN).with_metadata_imports(slot)
+}
+
+fn import_request(number: &str) -> ImportMovieByNumberRequest {
+    ImportMovieByNumberRequest {
+        movie_number: number.to_owned(),
+        force_subscribed: false,
+    }
+}
+
+/// ★ 组合根没装配 → 明确 `unimplemented`，不是「找不到」。
+#[tokio::test]
+async fn an_unassembled_import_fails_loudly() {
+    let db = TestDb::require().await;
+    let host = host_service(&db, PLUGIN);
+    let error = host
+        .import_movie_by_number(Request::new(import_request("IMP-001")))
+        .await
+        .expect_err("必须失败");
+    assert_eq!(error.code(), tonic::Code::Unimplemented, "{}", error.message());
+}
+
+/// 空番号是参数错 —— 与装配与否无关（参数校验在装配检查之前）。
+#[tokio::test]
+async fn an_empty_movie_number_is_an_invalid_argument() {
+    let db = TestDb::require().await;
+    let host = host_service(&db, PLUGIN);
+    let error = host
+        .import_movie_by_number(Request::new(import_request("   ")))
+        .await
+        .expect_err("必须失败");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument, "{}", error.message());
+}
+
+/// ★ 已存在的番号**不打外部来源**直接返回（上游第一行的短路），`created = false`，
+/// 且带完整影片快照。
+#[tokio::test]
+async fn an_existing_number_returns_the_snapshot_without_hitting_sources() {
+    let db = TestDb::require().await;
+    let inserted = MovieRepository::new(db.pool().clone())
+        .insert(&movie("IMP-001"))
+        .await
+        .expect("insert");
+    let host = import_host_service(
+        &db,
+        // 若短路失效，provider 会被问到并回「没有」→ 整个 rpc 变 `NOT_FOUND`，
+        // 测试在 `expect` 上炸 —— 观测点足够。
+        Box::new(EmptyProvider),
+        Arc::new(KnownCatalog {
+            number: "IMP-001".to_owned(),
+            movie_id: inserted.id,
+        }),
+    );
+
+    let response = host
+        .import_movie_by_number(Request::new(import_request("IMP-001")))
+        .await
+        .expect("已存在的番号不该打外部来源")
+        .into_inner();
+    assert!(!response.created, "没新建");
+    let snapshot = response.movie.expect("带快照");
+    assert_eq!(snapshot.movie_id, i64::from(inserted.id));
+    assert_eq!(
+        snapshot.values["title"].kind,
+        Some(Kind::StringValue(format!("IMP-001 标题")))
+    );
+}
+
+/// ★ 新番号：JavDB 详情 → 目录写入（替身真插库）→ `created = true` + 快照。
+#[tokio::test]
+async fn a_new_number_is_imported_and_reported_as_created() {
+    let db = TestDb::require().await;
+    let host = import_host_service(
+        &db,
+        Box::new(DetailProvider),
+        Arc::new(InsertingCatalog(db.pool().clone())),
+    );
+
+    let response = host
+        .import_movie_by_number(Request::new(import_request("IMP-002")))
+        .await
+        .expect("导入成功")
+        .into_inner();
+    assert!(response.created, "新建了");
+    let snapshot = response.movie.expect("带快照");
+
+    // 不是替身随口说的 id：库里真的有这一行，且快照从**库里**读回。
+    let stored = MovieRepository::new(db.pool().clone())
+        .find_by_number("IMP-002")
+        .await
+        .expect("查回")
+        .expect("插进去了");
+    assert_eq!(snapshot.movie_id, i64::from(stored.id));
+}
+
+/// ★ 谁都没有这个番号 → `NOT_FOUND`（遍历类插件据此计入失败桶）。
+#[tokio::test]
+async fn a_number_no_source_has_is_a_not_found() {
+    let db = TestDb::require().await;
+    let host = import_host_service(
+        &db,
+        Box::new(EmptyProvider),
+        Arc::new(InsertingCatalog(db.pool().clone())),
+    );
+
+    let error = host
+        .import_movie_by_number(Request::new(import_request("IMP-404")))
+        .await
+        .expect_err("必须失败");
+    assert_eq!(error.code(), tonic::Code::NotFound, "{}", error.message());
 }
 
 // ══════════════════════════════════════════════════════════════════

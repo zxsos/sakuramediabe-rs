@@ -19,7 +19,8 @@
 //! | 字幕 | `ImportSubtitle` | **已接**（转发 `SubtitleAssetService`）|
 //! | JavDB 榜单 | `GetJavdbRankNumbers` | **已接**（只读出网，见下面「榜单那条」）|
 //! | 榜单写侧 | `SyncRankingSources` / `SyncRankingBoard` | **已接**（宿主驱动抓取 + 整榜替换入库，见 `sm_service::discovery::ranking`）|
-//! | 其余 26 个 | | ❌ 未接（见下面「为什么只接了这些」）|
+//! | 入库 | `ImportMovieByNumber` | **已接**（转发 `MetadataSourceService::import_by_number`；组合根未装配时明确 `unimplemented`）|
+//! | 其余 25 个 | | ❌ 未接（见下面「为什么只接了这些」）|
 //!
 //! ## 演员那组的语义与影片侧**不同**（照抄影片侧会错）
 //!
@@ -35,14 +36,20 @@
 //!    `merged_into_id` 解析到保留记录（`resolve_canonical`），而 `ListActors`
 //!    **不返回**墓碑。三者一致才不会出现「列不出来、但按旧 id 能写到墓碑上」。
 //!
-//! ## 影片快照里的 `actors`
+//! ## 影片快照里的 `actors` 与 `tags`
 //!
-//! `MovieSnapshot.actors` 现在**真的带演员快照**（每次调用两条批量查询：
+//! `MovieSnapshot.actors` **真的带演员快照**（每次调用两条批量查询：
 //! `movie_actor WHERE movie_id = ANY(…)` → `actor WHERE id = ANY(…)`），同一部影片内按
 //! `actor_id` 升序（与上游 `context.py:122-127` 的 `.order_by(movie, actor)` 一致）。
 //! 上游 `actor_metadata` 插件靠它算「关联的非合集影片数」来排补全顺序 —— 空数组会让
-//! 那个排序退化成「按 id 排」（不报错，但优先级失效）。`tags` 仍是空数组（要 join
-//! `movie_tag`，还没接）。
+//! 那个排序退化成「按 id 排」（不报错，但优先级失效）。
+//!
+//! `MovieSnapshot.tags` 同理由一条批量 join 填上（`movie_tag` → `tag`，按
+//! `(movie_id, tag_id)` 升序）。`judge_collecttion_movie` 那条「命中标签即判为
+//! 合集」的规则读的就是它 —— 空数组会让那条规则**静默不生效**。
+//!
+//! 分组由 `actors_by_movie` / `tags_by_movie` 各自两次查询完成，**不是**在映射
+//! 闭包里逐部查库（一页可能上千部影片，那就是 N+1）。
 //!
 //! ## 字幕导入是**转发**，业务不在这里重写
 //!
@@ -99,13 +106,16 @@
 //! ## `owners` / `revision` 不再猜
 //!
 //! 快照里这两个字段取自 `movie.field_owners` 与 `movie.mutation_revision`，
-//! 不是宿主编出来的 —— 插件拿它们做乐观并发。`actors` / `tags` 两项目前是
-//! 空数组：它们要 join `movie_actor` / `movie_tag`，本轮没接。空数组表示
-//! 「这次没带」，不是「这部片子没有演员」—— 插件别据此删数据。
+//! 不是宿主编出来的 —— 插件拿它们做乐观并发。
 //!
-//! ⚠️ `owners` 是**去重后的 owner 列表**，不是「字段 → owner」的映射
-//! （见 `owners_of`）。要判「`is_collection` 这个字段归谁」的插件拿不到
-//! 字段级信息 —— 那件事由写入口（主权网关）兜住，不靠插件读快照。
+//! ## `owners` 与 `field_owners` 是两件事
+//!
+//! `owners` 是**去重后的 owner 列表**（「动过这行的人」的并集），`field_owners`
+//! 才是 Python 侧的 `dict[字段, owner]` —— 判定 / 写回类插件要判「`is_collection`
+//! 这个字段归谁」时读**后者**（见 `field_owners_of`）。早先契约只有前者，
+//! 移植时只能把归属预检整个丢掉（`docs/handoff.md` §8.1 记的那处偏差）；
+//! 补上 `field_owners` 之后，三个插件（judge_collection / actor_metadata /
+//! scrape_translate）的归属预检回到上游语义。
 //!
 //! ## 快照给出**全部 6 个可写字段**
 //!
@@ -124,7 +134,9 @@ use prost_types::Value as PbValue;
 use sm_db::repo::gateway::{
     parse_iso_date_exact, ActorOwnershipGateway, FieldPatch, MovieOwnershipGateway,
 };
-use sm_db::repo::{ActorRepository, MovieActorRepository, MovieRepository};
+use sm_db::repo::{
+    ActorRepository, MovieActorRepository, MovieRepository, TagRepository,
+};
 use sm_db::{Db, DbError};
 use sm_plugin_api::v1::get_javdb_rank_numbers_request;
 use sm_plugin_api::v1::plugin_host_server::{PluginHost, PluginHostServer};
@@ -150,7 +162,7 @@ use sm_plugin_api::v1::{
     SetCollectionMembersRequest, SetCollectionMembersResponse, SetSubscriptionRequest,
     SetSubscriptionResponse, SubmitDownloadRequest, SubmitDownloadResponse,
     SyncRankingBoardRequest, SyncRankingBoardResponse, SyncRankingSourcesRequest,
-    SyncRankingSourcesResponse,
+    SyncRankingSourcesResponse, TagSnapshot,
 };
 use sm_service::catalog::javdb::{JavdbAccount, JavdbProvider, JavdbRankError};
 use sm_service::catalog::metadata_source::MetadataSourceError;
@@ -161,12 +173,13 @@ use sm_service::system::config::ConfigService;
 use sm_service::system::status::JAVDB_HOST;
 use tonic::transport::Server;
 
+use crate::metadata_import::MetadataImportSlot;
 use crate::ranking_gateway::RankingSyncSlot;
 use tonic::{Request, Response, Status};
 
 /// 生成一串「尚未接线」的 rpc 实现。
 ///
-/// 37 个方法里接了 11 个，剩下 26 个的形状**完全一样**（`unimplemented`）。
+/// 37 个方法里接了 12 个，剩下 25 个的形状**完全一样**（`unimplemented`）。
 ///
 /// # 为什么这里写 `Pin<Box<dyn Future>>` 而不是 `async fn`
 ///
@@ -217,6 +230,9 @@ pub struct PluginHostService {
     actor_gateway: ActorOwnershipGateway,
     /// 影片 ↔ 演员关联。影片快照要带上演员，批量查靠它（`actor_ids_for_movies`）。
     movie_actors: MovieActorRepository,
+    /// 影片 ↔ 标签关联（**只读**）。影片快照要带上标签，批量查靠它
+    /// （`TagRepository::names_for_movies`）。
+    tags: TagRepository,
     /// 字幕资产（写侧）。导入要用它：去重要读**内容指纹**，落盘要读配置里的图片根。
     subtitles: SubtitleAssetService,
     /// JavDB 榜单客户端（**只读、出网**）。一个服务实例一个 —— 连接池与 TLS
@@ -229,6 +245,12 @@ pub struct PluginHostService {
     /// 排行同步服务（写侧）。**延迟填槽** —— 端点比排行源目录先出生，理由见
     /// [`RankingSyncSlot`]。
     rankings: RankingSyncSlot,
+    /// 配置快照来源。按番号入库（`ImportMovieByNumber`）要一份 plugins 配置
+    /// 快照（启用哪些元数据来源）—— 与字幕落盘那份是同一个 `ConfigService`。
+    config: ConfigService,
+    /// 按番号入库的两件套（元数据来源 + 目录写入）。**延迟填槽** —— 端点比
+    /// `MetadataSourceService` 先出生，理由见 [`crate::metadata_import`]。
+    imports: MetadataImportSlot,
 }
 
 impl PluginHostService {
@@ -252,10 +274,22 @@ impl PluginHostService {
             gateway: MovieOwnershipGateway::new(db.clone()),
             actor_gateway: ActorOwnershipGateway::new(db.clone()),
             movie_actors: MovieActorRepository::new(db.clone()),
+            tags: TagRepository::new(db.clone()),
             subtitles: SubtitleAssetService::new(db, config),
             javdb: JavdbProvider::new(JAVDB_HOST),
             rankings,
+            config: config.clone(),
+            imports: MetadataImportSlot::new(),
         }
+    }
+
+    /// 装上按番号入库的两件套（组合根在 `MetadataSourceService` 建成后调用）。
+    ///
+    /// 不装时 `ImportMovieByNumber` 回 `unimplemented` —— 与其它未接线的 rpc
+    /// 同一纪律（不假成功）。
+    pub fn with_metadata_imports(mut self, imports: MetadataImportSlot) -> Self {
+        self.imports = imports;
+        self
     }
 
     /// 取排行同步服务。槽还没填 → `Unavailable`。
@@ -296,10 +330,12 @@ impl PluginHost for PluginHostService {
             .map_err(|_| Status::internal("读取影片失败"))?
             .ok_or_else(|| Status::not_found("影片不存在"))?;
         let mut actors = self.actors_by_movie(&[movie.id]).await?;
+        let mut tags = self.tags_by_movie(&[movie.id]).await?;
         Ok(Response::new(GetMovieResponse {
             movie: Some(movie_snapshot(
                 &movie,
                 actors.remove(&movie.id).unwrap_or_default(),
+                tags.remove(&movie.id).unwrap_or_default(),
             )),
         }))
     }
@@ -322,11 +358,20 @@ impl PluginHost for PluginHostService {
         let mut actors = self
             .actors_by_movie(&found.values().map(|movie| movie.id).collect::<Vec<_>>())
             .await?;
+        let mut tags = self
+            .tags_by_movie(&found.values().map(|movie| movie.id).collect::<Vec<_>>())
+            .await?;
         // 按**请求顺序**输出：调用方按位置对应自己传进来的番号。
         let movies = numbers
             .iter()
             .filter_map(|number| found.get(number))
-            .map(|movie| movie_snapshot(movie, actors.remove(&movie.id).unwrap_or_default()))
+            .map(|movie| {
+                movie_snapshot(
+                    movie,
+                    actors.remove(&movie.id).unwrap_or_default(),
+                    tags.remove(&movie.id).unwrap_or_default(),
+                )
+            })
             .collect();
         Ok(Response::new(FindByNumbersResponse { movies }))
     }
@@ -393,10 +438,19 @@ impl PluginHost for PluginHostService {
         let mut actors = self
             .actors_by_movie(&rows.iter().map(|movie| movie.id).collect::<Vec<_>>())
             .await?;
+        let mut tags = self
+            .tags_by_movie(&rows.iter().map(|movie| movie.id).collect::<Vec<_>>())
+            .await?;
         Ok(Response::new(ListMoviesResponse {
             movies: rows
                 .iter()
-                .map(|movie| movie_snapshot(movie, actors.remove(&movie.id).unwrap_or_default()))
+                .map(|movie| {
+                    movie_snapshot(
+                        movie,
+                        actors.remove(&movie.id).unwrap_or_default(),
+                        tags.remove(&movie.id).unwrap_or_default(),
+                    )
+                })
                 .collect(),
             next_cursor,
         }))
@@ -674,6 +728,64 @@ impl PluginHost for PluginHostService {
         }))
     }
 
+    /// 按番号入库（上游 `metadata_source_service.import_by_number`，
+    /// `metadata_source_service.py:30-44`）。
+    ///
+    /// JavDB 优先、启用的插件来源兜底；**已存在的番号不打外部来源**（上游
+    /// 第一行的短路，理由见 [`MetadataSourceService::import_by_number`] 的
+    /// 模块注释）。幂等语义对调用方表现为 `created = false`。
+    ///
+    /// # 组合根没装配时是 `unimplemented`
+    ///
+    /// [`crate::metadata_import::MetadataImportSlot`] 空 = 元数据来源服务还没
+    /// 建成。此时不退化成「返回没找到」—— 那会让遍历类插件把「宿主没接好」
+    /// 统计成「全部导入失败」，两种原因搅在一起。
+    async fn import_movie_by_number(
+        &self,
+        request: Request<ImportMovieByNumberRequest>,
+    ) -> Result<Response<ImportMovieByNumberResponse>, Status> {
+        let inner = request.into_inner();
+        let movie_number = inner.movie_number.trim();
+        if movie_number.is_empty() {
+            return Err(Status::invalid_argument("movie_number 不能为空"));
+        }
+        // 参数对但没装配 → `unimplemented`（放参数校验**之后**：参数错的报告
+        // 不该取决于装配状态）。
+        let deps = self.imports.get().ok_or_else(|| {
+            Status::unimplemented("ImportMovieByNumber 尚未接线（组合根未装配按番号入库）")
+        })?;
+
+        // plugins 配置快照：`import_by_number` 按它决定哪些插件来源参与兜底
+        // （与 transfers 域的 `CatalogMovieMetadataImporter` 同一份快照来源）。
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| Status::internal(error.api.message.clone()))?;
+        let (movie_id, created) = deps
+            .source
+            .import_by_number(&config, movie_number, deps.catalog.as_ref(), inner.force_subscribed)
+            .await
+            .map_err(metadata_status)?;
+
+        // 导入成功 → 读回完整快照（与 `GetMovie` 同一条组装路）。
+        let movie = self
+            .movies
+            .find_by_id(movie_id)
+            .await
+            .map_err(db_status)?
+            .ok_or_else(|| Status::internal("入库成功但读不回影片"))?;
+        let mut actors = self.actors_by_movie(&[movie.id]).await?;
+        let mut tags = self.tags_by_movie(&[movie.id]).await?;
+        Ok(Response::new(ImportMovieByNumberResponse {
+            movie: Some(movie_snapshot(
+                &movie,
+                actors.remove(&movie.id).unwrap_or_default(),
+                tags.remove(&movie.id).unwrap_or_default(),
+            )),
+            created,
+        }))
+    }
+
     unwired! {
         list_subscriptions(ListSubscriptionsRequest, ListSubscriptionsResponse);
         count_subscriptions_by_status(
@@ -703,7 +815,6 @@ impl PluginHost for PluginHostService {
         get_import_status(GetImportStatusRequest, GetImportStatusResponse);
         get_video(GetVideoRequest, GetVideoResponse);
         list_videos(ListVideosRequest, ListVideosResponse);
-        import_movie_by_number(ImportMovieByNumberRequest, ImportMovieByNumberResponse);
         list_existing_movie_numbers(ListMovieNumbersRequest, ListMovieNumbersResponse);
     }
 }
@@ -745,6 +856,30 @@ impl PluginHostService {
         }
         Ok(grouped)
     }
+
+    /// 一组影片各自的标签快照，同一部影片内按 `tag_id` 升序。
+    ///
+    /// **一次批量 join**（`movie_tag` → `tag`），不是每部一次 —— 一页可能上千部
+    /// 影片。形状与 [`Self::actors_by_movie`] 同构：先取关联行（已带 tag 名），
+    /// 再逐部归组。
+    async fn tags_by_movie(
+        &self,
+        movie_ids: &[i32],
+    ) -> Result<HashMap<i32, Vec<TagSnapshot>>, Status> {
+        let rows = self
+            .tags
+            .names_for_movies(movie_ids)
+            .await
+            .map_err(db_status)?;
+        let mut grouped: HashMap<i32, Vec<TagSnapshot>> = HashMap::new();
+        for (movie_id, tag_id, name) in rows {
+            grouped.entry(movie_id).or_default().push(TagSnapshot {
+                tag_id: i64::from(tag_id),
+                name,
+            });
+        }
+        Ok(grouped)
+    }
 }
 
 /// 起一个 `PluginHost` 服务端，返回插件要用的端点串。
@@ -768,8 +903,9 @@ pub async fn serve_for(
     config: &ConfigService,
     plugin_id: &str,
     rankings: RankingSyncSlot,
+    imports: MetadataImportSlot,
 ) -> Result<String, std::io::Error> {
-    serve_for_with(db, config, plugin_id, rankings, None).await
+    serve_for_with(db, config, plugin_id, rankings, None, imports).await
 }
 
 /// 同 [`serve_for`]，外加一个**打桩用的** JavDB 基地址。
@@ -786,11 +922,15 @@ pub async fn serve_for_with(
     plugin_id: &str,
     rankings: RankingSyncSlot,
     javdb_base: Option<&str>,
+    imports: MetadataImportSlot,
 ) -> Result<String, std::io::Error> {
     let addr: SocketAddr = sm_plugins::supervisor::reserve_addr()?;
     let service = match javdb_base {
-        Some(base) => PluginHostService::new(db, config, plugin_id, rankings).with_javdb_base(base),
-        None => PluginHostService::new(db, config, plugin_id, rankings),
+        Some(base) => PluginHostService::new(db, config, plugin_id, rankings)
+            .with_javdb_base(base)
+            .with_metadata_imports(imports),
+        None => PluginHostService::new(db, config, plugin_id, rankings)
+            .with_metadata_imports(imports),
     };
     tokio::spawn(async move {
         if let Err(error) = Server::builder()
@@ -806,18 +946,22 @@ pub async fn serve_for_with(
 
 /// 影片快照。
 ///
-/// `actors` 由调用方**批量**取好传进来（[`PluginHostService::actors_by_movie`]）——
-/// 一页可能有上千部影片，在映射闭包里逐部查库就是 N+1。
-fn movie_snapshot(movie: &sm_db::Movie, actors: Vec<ActorSnapshot>) -> MovieSnapshot {
+/// `actors` / `tags` 由调用方**批量**取好传进来（[`PluginHostService::actors_by_movie`]
+/// / [`PluginHostService::tags_by_movie`]）—— 一页可能有上千部影片，在映射闭包里
+/// 逐部查库就是 N+1。
+fn movie_snapshot(
+    movie: &sm_db::Movie,
+    actors: Vec<ActorSnapshot>,
+    tags: Vec<TagSnapshot>,
+) -> MovieSnapshot {
     MovieSnapshot {
         movie_id: i64::from(movie.id),
         revision: movie.mutation_revision,
         values: movie_values(movie),
         owners: owners_of(&movie.field_owners),
+        field_owners: field_owners_of(&movie.field_owners),
         actors,
-        // `tags` 仍要 join `movie_tag`，还没接 —— **空数组**表示「这次没带」，
-        // 不是「这部片子没有标签」。
-        tags: Vec::new(),
+        tags,
     }
 }
 
@@ -828,6 +972,7 @@ fn actor_snapshot(actor: &sm_db::Actor) -> ActorSnapshot {
         revision: actor.mutation_revision,
         values: actor_values(actor),
         owners: owners_of(&actor.field_owners),
+        field_owners: field_owners_of(&actor.field_owners),
     }
 }
 
@@ -896,7 +1041,8 @@ fn actor_values(actor: &sm_db::Actor) -> HashMap<String, prost_types::Value> {
 /// 从 `field_owners`（`{字段: owner}`）取出**去重**后的 owner 列表。
 ///
 /// proto 的 `owners` 是 `repeated string`：它回答的是「谁动过这行」，不是
-/// 「哪个字段归谁」。所以这里取值的并集。
+/// 「哪个字段归谁」。所以这里取值的并集。**要字段级归属就用
+/// [`field_owners_of`]**（`MovieSnapshot.field_owners` / `ActorSnapshot.field_owners`）。
 fn owners_of(field_owners: &serde_json::Value) -> Vec<String> {
     let mut owners: Vec<String> = field_owners
         .as_object()
@@ -910,6 +1056,30 @@ fn owners_of(field_owners: &serde_json::Value) -> Vec<String> {
     owners.sort();
     owners.dedup();
     owners
+}
+
+/// 字段级归属，原样带出去（`{字段: owner}`）。
+///
+/// 与 [`owners_of`] 的差别是**保留字段名**：Python 侧 `context.movies.get`
+/// 返回的 `owners` 就是 `dict[field, owner]`，判定 / 写回类插件要靠它判断
+/// 「这个字段能不能写」（缺键 = 无人接管 = 可写）。压成 `repeated string`
+/// 会把这个信息丢掉，插件只能盲写再靠 `PatchMovie` 的 `updated=false` 兜底
+/// —— 那时已经分不清「版本冲突」和「字段被别人接管」了。
+///
+/// 无主的字段不进 map（与 `put_opt` 的「缺失就是空」同一语义）。
+fn field_owners_of(field_owners: &serde_json::Value) -> HashMap<String, String> {
+    field_owners
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter_map(|(field, owner)| {
+                    owner
+                        .as_str()
+                        .map(|owner| (field.clone(), owner.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `ListMovies.limit` 的上限（proto 写在字段上的原话：「游标分页，上限 1000」）。
@@ -1098,6 +1268,23 @@ fn db_status(error: DbError) -> Status {
     }
 }
 
+/// `MetadataSourceError` → `Status`。
+///
+/// 状态码由**调用方**决定（`metadata_source` 模块文档）；这里按「插件能据此
+/// 分流」取：没这部片 = `NOT_FOUND`（遍历类插件把它计入失败桶即可）；来源挂了
+/// = `UNAVAILABLE`（可重试）；交付不合法 = `INTERNAL`（宿主 / 插件契约坏了）；
+/// 来源未启用 = `FAILED_PRECONDITION`（先去配置里启用）。
+fn metadata_status(error: MetadataSourceError) -> Status {
+    match error {
+        MetadataSourceError::NotFound => Status::not_found("没有来源收录这个番号"),
+        MetadataSourceError::RequestFailed(detail) => Status::unavailable(detail),
+        MetadataSourceError::InvalidDelivery(detail) => {
+            Status::internal(format!("插件交付不合法：{detail}"))
+        }
+        MetadataSourceError::Disabled(detail) => Status::failed_precondition(detail),
+    }
+}
+
 /// `JavdbRankError` → `Status`。
 ///
 /// 四类分开不是为了好看 —— 插件要据此判**能不能重试**：
@@ -1185,6 +1372,36 @@ mod tests {
         assert_eq!(owners, vec!["host:manual", "plugin:javbus"]);
         assert!(owners_of(&serde_json::json!({})).is_empty());
         assert!(owners_of(&serde_json::Value::Null).is_empty());
+    }
+
+    /// ★ 字段级归属**保留字段名**：缺键 = 无人接管 = 可写。
+    #[test]
+    fn field_owners_keep_the_field_names() {
+        let owners = field_owners_of(&serde_json::json!({
+            "title": "plugin:javbus",
+            "summary": "plugin:javbus",
+            "score": "host:manual",
+        }));
+        assert_eq!(
+            owners.get("title").map(String::as_str),
+            Some("plugin:javbus")
+        );
+        assert_eq!(
+            owners.get("summary").map(String::as_str),
+            Some("plugin:javbus")
+        );
+        assert_eq!(
+            owners.get("score").map(String::as_str),
+            Some("host:manual")
+        );
+        assert!(
+            !owners.contains_key("duration_minutes"),
+            "无主的字段不该出现在 map 里"
+        );
+        assert!(field_owners_of(&serde_json::json!({})).is_empty());
+        assert!(field_owners_of(&serde_json::Value::Null).is_empty());
+        // 值不是字符串的条目直接丢掉（不会伪造出一个 owner）。
+        assert!(field_owners_of(&serde_json::json!({"title": 7})).is_empty());
     }
 
     /// 缺失的可选字段不进快照（见 [`put_opt`] 的注释）。

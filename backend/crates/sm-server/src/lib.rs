@@ -37,6 +37,9 @@ pub mod logging;
 /// `sm_db`（查影片/演员）与 `sm-plugin-api`（proto），而 `sm-plugins` 不该
 /// 反向依赖业务层的数据。
 pub mod media_library_gateway;
+// 按番号入库（`ImportMovieByNumber`）的延迟填槽。时序约束与 `ranking_gateway`
+// 同一条：端点起得比 `MetadataSourceService` 早。
+pub mod metadata_import;
 pub mod plugin_host;
 pub mod plugins;
 // provider 数据面的**实现**只能在这里：`sm-service` 不能依赖 `sm-plugins`
@@ -45,8 +48,15 @@ pub mod provider_gateway;
 // 排行取数网关 + 同步服务的延迟填槽。理由同 `provider_gateway`（依赖倒置），
 // 另加一条时序约束：端点起得比排行源目录早。
 pub mod ranking_gateway;
-// 进程内插件调用：vendored 插件直接实例化，不起进程、不走 gRPC。
-pub mod inprocess_plugins;
+// 进程内插件**宿主**：vendored 插件在本进程里 serve 自己的控制面（仍占一个
+// 回环端口，所以下游调用面一行都不用改），省掉 10 个子进程的地址空间。
+// 曾经有一个 `inprocess_plugins`（把插件的 service struct 当库直接调、不走
+// gRPC）—— 那条路已删除：宿主不该依赖插件的**内部类型**（插件作者改一次
+// service 形状宿主就断），进程内形态同样只走控制面协议，差别只在「怎么起」。
+pub mod inprocess_host;
+// 插件任务 → worker 处理器：没有它，插件任务会到点入队却在执行时查不到
+// 处理器，被按「未知任务键」收口为 failed。见模块文档。
+pub mod plugin_jobs;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,10 +167,20 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     //     给它一个**空槽**（`RankingSyncSlot`），4b 之后填。直接传一个空目录
     //     会让 `sync_ranking_sources` 永远算出「0 个目标」并返回成功。
     let ranking_slot = ranking_gateway::RankingSyncSlot::new();
+    // 按番号入库（`ImportMovieByNumber`）的槽，与排行槽同一时序：端点先出生，
+    // 元数据来源服务要等 4b 之后的装配步骤才建得出来（它读插件扩展点注册表）。
+    let metadata_import_slot = metadata_import::MetadataImportSlot::new();
     for plugin_id in plugin_config.enabled.clone() {
         // `&config_service`：能力出口里几件事要看配置 —— 现在是字幕落盘的位置
         // （`media.import_image_root_path` 下面的 `<图片根>/movies/<shard>/<番号>/subtitles`）。
-        match plugin_host::serve_for(&pool, &config_service, &plugin_id, ranking_slot.clone()).await
+        match plugin_host::serve_for(
+            &pool,
+            &config_service,
+            &plugin_id,
+            ranking_slot.clone(),
+            metadata_import_slot.clone(),
+        )
+        .await
         {
             Ok(endpoint) => {
                 plugin_config
@@ -204,18 +224,16 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     // 排行同步（写侧）：目录（4b 才有的快照）+ 取数网关（每次现取插件的控制面
     // 端点，所以给的是**活的注册表句柄**）。填进 4a 建的那个槽。
     //
-    // 进程内优先：javdb 已 vendoring，直接调进程内版本，不起进程、不走 gRPC；
-    // 其他源仍走 gRPC（CompositeRankingGateway 内部分流）。
+    // 全部源走控制面协议：vendored 插件现在都在**本进程内** serve 自己的控制面
+    // （`inprocess_host`），javdb 也是 —— 调用的那一层不必也不该分叉（曾经那个
+    // 「javdb 走进程内直调、其他源走 gRPC」的复合网关已删除）。
     ranking_slot.fill(std::sync::Arc::new(
         sm_service::discovery::ranking::RankingSyncService::new(
             pool.clone(),
             loaded_plugins.ranking_sources(),
         )
         .with_gateway(std::sync::Arc::new(
-            inprocess_plugins::CompositeRankingGateway::new(
-                inprocess_plugins::InProcessRankingGateway::new(),
-                ranking_gateway::RankingPluginGateway::new(loaded_plugins.extension_registry()),
-            ),
+            ranking_gateway::RankingPluginGateway::new(loaded_plugins.extension_registry()),
         )),
     ));
 
@@ -262,60 +280,34 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         loaded_plugins.provider_registry(),
     ));
     // 元数据搜索（人工重试的候选来源）：来源 = 启用的 `metadata_source` 扩展
-    // （data_dir / endpoint 从插件配置与 provider 注册表补齐），provider = JavDB
-    // （host 照上游硬编码，见 `system::status::JAVDB_HOST` 的拍板记录）。
+    // （data_dir 按插件配置约定现解，**端点随扩展点注册表**过来），provider =
+    // JavDB（host 照上游硬编码，见 `system::status::JAVDB_HOST` 的拍板记录）。
     let metadata_search = {
-        let provider_registry = loaded_plugins.provider_registry();
         // data_dir 按 `<root>/<plugin_id>/data` 约定现解（`PluginConfig` 是
         // 注册表的输入，`Plugins::load` 已把它消费掉，这里按同一快照重建）。
         let plugin_config =
             plugins::PluginConfig::from_snapshot(&config_service.snapshot().map_err(|error| {
                 anyhow::anyhow!("读取配置失败（{}）：{}", error.code(), error.api.message)
             })?);
-        let mut sources = loaded_plugins
+        // 端点直接来自扩展点注册表 —— `MetadataSourceRegistration` 现在带着
+        // `plugin_endpoint`（与 `RankingSourceRegistration` 对齐）。此前它没有
+        // 这个字段，端点要借 provider 注册表查，而 javbus 声明的是
+        // `catalog.metadata_source`、**不是** `media.provider` —— 于是这里挂过
+        // 一条「补 javbus 占位来源」的白名单（端点填 `inprocess://local`）。
+        // 那条权宜之计连同它的适用前提一起删掉了。
+        let sources = loaded_plugins
             .extension_registry()
             .lock()
             .expect("扩展注册表锁")
             .metadata_sources()
             .iter()
-            .filter_map(|entry| {
-                // 端点来自 provider 注册表（插件重启会换，搜索走注册表现取 ——
-                // 与 `provider_gateway.rs` 的「活的注册表」同一纪律）。
-                let endpoint = provider_registry
-                    .lock()
-                    .expect("provider 注册表锁")
-                    .get(&entry.plugin_id)
-                    .map(|entry| entry.plugin_endpoint.clone())?;
-                Some(sm_service::catalog::metadata_source::RegisteredSource {
-                    plugin_id: entry.plugin_id.clone(),
-                    display_name: entry.display_name.clone(),
-                    data_dir: plugin_config.data_dir_for(&entry.plugin_id),
-                    endpoint,
-                })
+            .map(|entry| sm_service::catalog::metadata_source::RegisteredSource {
+                plugin_id: entry.plugin_id.clone(),
+                display_name: entry.display_name.clone(),
+                data_dir: plugin_config.data_dir_for(&entry.plugin_id),
+                endpoint: entry.plugin_endpoint.clone(),
             })
             .collect::<Vec<_>>();
-        // 进程内元数据插件：已 vendoring 的插件在 Plugins::load 里被跳过
-        // （plugins.rs::is_inprocess_plugin），扩展注册表里没有它们 —— 不在这里
-        // 补上，fetch_plugin 会报 Disabled，inprocess 网关永远走不到。
-        // 长短两种 id 都注册：仓库里两种写法混用，生产配置的 plugins.enabled
-        // 用哪个只看部署；没启用的那个会被 enabled_plugin_sources 滤掉，
-        // 不会进兜底链路。endpoint 填占位：进程内路径不用它（load_plugin 只在
-        // gRPC 分支用）。网关新增支持的插件时，这里要与
-        // InProcessMetadataGateway::supports 同步。
-        for plugin_id in [
-            "sakuramedia_javbus_metadata",
-            "javbus",
-        ] {
-            if sources.iter().any(|s| s.plugin_id == plugin_id) {
-                continue;
-            }
-            sources.push(sm_service::catalog::metadata_source::RegisteredSource {
-                plugin_id: plugin_id.to_owned(),
-                display_name: plugin_javbus_metadata::DISPLAY_NAME.to_owned(),
-                data_dir: plugin_config.data_dir_for(plugin_id),
-                endpoint: "inprocess://local".to_owned(),
-            });
-        }
         let provider = match sm_service::catalog::javdb::JavdbProvider::new(
             sm_service::system::status::JAVDB_HOST,
         ) {
@@ -329,12 +321,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             }
         };
         let metadata_source = Arc::new(
-            sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider)
-                // 进程内优先：javbus-metadata 已 vendoring，直接调进程内版本，
-                // 不起进程、不走 gRPC。
-                .with_inprocess(std::sync::Arc::new(
-                    inprocess_plugins::InProcessMetadataGateway::new(),
-                )),
+            sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider),
         );
         // 入库服务（元数据落地的唯一入口）：图片任务管线 + 真实下载器。
         let image_root = sm_service::catalog::media_paths::media_image_root_path(&config_service)
@@ -361,6 +348,13 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
                 sm_service::catalog::movie_image::http_image_downloader(),
             )
         };
+        // 按番号入库（`ImportMovieByNumber`）的两件套填进 4a 建的那个槽 ——
+        // 第三份 `CatalogImportService` 实例。同样**无状态**（见上面的 ⚠️），
+        // 与影片刷新、演员流那两份不会各自漂移。
+        metadata_import_slot.fill(Arc::new(metadata_import::MetadataImportDeps {
+            source: Arc::clone(&metadata_source),
+            catalog: Arc::new(build_metadata_import(image_root.clone())),
+        }));
         // 搜索、刷新、演员流共用同一条来源服务 —— 三处的「JavDB + 插件」顺序
         // 与错误分类必须一致，分叉就会各漂各的。
         let metadata_refresh =
@@ -466,31 +460,38 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         //     反过来则可能让一条刚被恢复的行立刻又被领走。
         let worker = match TaskWorker::spawn(
             pool.clone(),
-            // handler 需要进程级依赖（配置里的 `image_search.*` 与 Qdrant 端点），
-            // 所以在组合根这里读出来注入 —— 组合根是唯一同时看得见
-            // `ConfigService` 与插件/外部服务配置的地方。
-            Arc::new(sm_scheduler::builtin_handlers(
-                sm_scheduler::worker::HandlerDeps {
-                    config: config_service.clone(),
-                    // `snapshot()` 返回 `Result` —— **不吞错**。读不到配置就
-                    // 让 worker 起不来并写清原因，比静默用空快照（于是所有
-                    // handler 都看到「qdrant 没配」）好排查得多。
-                    qdrant: sm_scheduler::worker::QdrantEndpoint::from_snapshot(
-                        &config_service.snapshot().map_err(|error| {
-                            anyhow::anyhow!(
-                                "读取配置失败（{}）：{}",
-                                error.code(),
-                                error.api.message
-                            )
-                        })?,
-                    ),
-                    // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
-                    // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
-                    // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
-                    // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
-                    storage: std::sync::Arc::clone(&storage_gateway),
-                },
-            )),
+            {
+                // handler 需要进程级依赖（配置里的 `image_search.*` 与 Qdrant
+                // 端点），所以在组合根这里读出来注入 —— 组合根是唯一同时看得见
+                // `ConfigService` 与插件/外部服务配置的地方。
+                let mut handlers = sm_scheduler::builtin_handlers(
+                    sm_scheduler::worker::HandlerDeps {
+                        config: config_service.clone(),
+                        // `snapshot()` 返回 `Result` —— **不吞错**。读不到配置就
+                        // 让 worker 起不来并写清原因，比静默用空快照（于是所有
+                        // handler 都看到「qdrant 没配」）好排查得多。
+                        qdrant: sm_scheduler::worker::QdrantEndpoint::from_snapshot(
+                            &config_service.snapshot().map_err(|error| {
+                                anyhow::anyhow!(
+                                    "读取配置失败（{}）：{}",
+                                    error.code(),
+                                    error.api.message
+                                )
+                            })?,
+                        ),
+                        // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
+                        // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
+                        // 数据面网关：哈希回填 / 信息回填 / 有效性巡检三个任务用。
+                        // 与播放投递**同一个实例**（活注册表句柄 —— 插件重启换端口）。
+                        storage: std::sync::Arc::clone(&storage_gateway),
+                    },
+                );
+                // 插件任务（注册响应里声明的那些）并进同一份注册表。两边各自
+                // 建表，合并点选在组合根 —— 唯一同时看得见两方的地方；少了
+                // 这一步，插件任务会在执行时被按「未知任务键」收口为 failed。
+                handlers.merge(plugin_jobs::plugin_handlers(Arc::clone(&plugins)).await);
+                Arc::new(handlers)
+            },
             WorkerConfig::default(),
             config_service.clone(),
         )

@@ -1450,12 +1450,15 @@ MEDIA_LIST_SORT_FIELD_MAP = {"file_size_bytes": Media.file_size_bytes, "heat": M
 
 ### 块 A：插件宿主（进行中，①② ③④⑥ 已完成）
 
-已完成：注册校验、能力注册表、加载器（连接 + Register + 收声明）、错误映射、任务注册表、`RunJob` 的流式执行与事件收敛、插件任务接进 cron 触发。
+已完成：注册校验、能力注册表、加载器（连接 + Register + 收声明）、错误映射、任务注册表、`RunJob` 的流式执行与事件收敛、插件任务接进 cron 触发、**插件任务接进 worker 执行**（`sm-server/src/plugin_jobs.rs`，2026-10-10）、**全部 9 个 vendored 插件走进程内宿主**（`sm-server/src/inprocess_host.rs`，2026-10-10）。
 待做（按序）：
 
 1. ~~**`RunJob` 的流式调用**~~ **已完成**（`runner.rs` + `scheduling.rs`）：`stream JobEvent` 收敛成终态，超时即 `drop(stream)` 表达取消（proto 的「宿主直接断开流」）；cron 触发那半是 `JobDefinition.default_cron` / `manual_only` → `sm_scheduler::JobSpec`，与内建任务共用同一套到点判定与 coalesce。
    组合根**已接上**（原先这里写的是「仍刻意不依赖 `sm-plugins`」，与下面第 3 步的「看门狗与组合根也已接上」自相矛盾 —— `sm-server/Cargo.toml` 里 `sm-plugins = { workspace = true }`，`sm-server/src/plugins.rs` 存在，插件任务已并进调度表）。
    剩一处刻意的局限：插件重启后**新增**的 cron 任务要等下次进程启动才生效（`Scheduler` 的任务清单构造时定死），已在表里的不受影响。
+   **执行侧已闭环**（2026-10-10，`sm-server/src/plugin_jobs.rs`）：每个插件任务注册 `HandlerFactory` —— 执行时按 `task_key` 现取**活端点**（插件重启换端口）→ `RunJob` → `Event::Progress` 实时转 `TaskRunReporter::emit`、终态 `result` 转 handler 返回值。此前任务能入队、能被手动触发，却在 `handlers.build()` 一步被判「未知任务键」收口为 failed。时限是 60 分钟的常量（`plugin_jobs::JOB_DEADLINE`，**总时长**语义、含建流）—— 值得升级成 `scheduler` 的配置键。刻意不注册 `BusinessRecovery`：插件侧半成品没有宿主可用的收口 rpc（proto 没有），宿主侧状态由 `run_task` 收口。
+   `JobOutcome::Completed` 现在**带终态载荷**（`result: Value`）—— 此前只有 `has_result: bool`，调用方拿到 `true` 还得自己从事件流里再捞一遍。
+   **进程内宿主**（2026-10-10，`sm-server/src/inprocess_host.rs`）：9 个 vendored 插件（10 个 plugin_id，more-movies 一个 crate 两条 id）**在本进程里** serve 自己的控制面（仍占回环端口，数据面 / 排行 / 元数据 / `PluginHost` 回调一行不用改），省掉 10 个子进程的地址空间。与子进程路**共用等就绪判据**（`sm_plugins::supervisor::await_ready`），差别只在「怎么起 / 怎么发现它挂了」（`PluginHandle`）。⚠️ release 是 `panic = "abort"` —— 进程内插件 panic 会带走整个后端（已写进模块文档）。
 2. **三个扩展点的调用面**：`media.provider`（已有注册表）/ `catalog.metadata_source` / `discovery.ranking_source`。
    **已完成**（`extensions.rs` + `extension_calls.rs`）：两个扩展点的载荷校验、`source_key` / `board_key` 形状、缺 capability 不收、排行榜 `source_key` 冲突时该插件的榜单全部不收（对齐 `apply_plugin_ranking_sources`）；调用面真发 rpc，并把「未收录」（`found=false`）与「调用失败」分成两类结果。
    **交付校验已补**（`movie_delivery.rs`）：图片必须落在 `FetchMovieRequest.delivery_dir` 内、是普通文件、再深一层且同一请求目录；`release_date` 严格 `YYYY-MM-DD`、`duration > 0`；用完 `cleanup_delivery`。判据是 proto 给的，不依赖 `plugins.root_dir`。

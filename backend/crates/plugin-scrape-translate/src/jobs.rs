@@ -7,10 +7,11 @@
 //!
 //! # 与上游不同的地方
 //!
-//! 1. **`context.movies` 不存在**：进程拆分后没有进程内宿主对象。影片的列举
-//!    与写回由 [`MovieStore`] trait 抽象 —— 宿主在任务编排层实现它（gRPC
-//!    插件模型下，这部分逻辑实际跑在宿主进程里，插件只提供 DMM 抓取、翻译、
-//!    状态这三块纯逻辑）。
+//! 1. **`context.movies` 变成 [`MovieStore`] trait**：进程拆分后没有进程内宿主
+//!    对象，插件的生产实现是 `service.rs` 的 `GrpcMovieStore`（反向调宿主的
+//!    `FindMoviesByNumbers` / `ListMovies` / `GetMovie` / `PatchMovie`）。
+//!    因为要等网络，trait 的整体是 async 的 —— 上游那几行同步调用在这里各自
+//!    带一个 `.await`。
 //! 2. **进度是回调**，不是 `reporter.emit`：调用方（`service.rs` 的
 //!    `run_job`）把回调接到 `JobEvent` 流上。
 //! 3. **文件锁**：上游用 `portalocker`；这里用「尝试创建锁文件 +
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use regex::Regex;
 
 use crate::dmm::{DmmClient, DmmError};
@@ -49,10 +51,16 @@ fn skip_patterns() -> Vec<Regex> {
 #[derive(Debug, Clone)]
 pub struct MovieRef {
     pub movie_id: i64,
+    /// 乐观并发用的版本号（写回时当 `expected_revision`）。
+    pub revision: i64,
     pub movie_number: String,
     pub title: String,
     pub summary: String,
     /// 字段 → owner（`None` 表示无主）。
+    ///
+    /// 由 `MovieSnapshot.field_owners` 填：**无主的字段不在这里**（不是
+    /// `Some(None)`），所以判断可写要用 `contains_key` + 值比较，见
+    /// [`field_writable`]。
     pub owners: HashMap<String, Option<String>>,
     /// 发行年份（`None` 表示未知）。
     pub release_year: Option<i32>,
@@ -64,16 +72,45 @@ pub struct MovieRef {
     pub has_subscribed_actress: bool,
 }
 
+/// 某个字段现在能不能写（上游 `movie.owners.get(field) not in (None, PLUGIN_OWNER)`）。
+pub fn field_writable(movie: &MovieRef, field: &str) -> bool {
+    match movie.owners.get(field).and_then(|owner| owner.as_deref()) {
+        // 无主。
+        None => true,
+        // 归自己。
+        Some(owner) => owner == PLUGIN_OWNER,
+    }
+}
+
 /// 宿主侧的影片存取（上游 `context.movies`）。
 ///
-/// gRPC 插件模型下这部分跑在宿主进程；插件只定义接口。
+/// 生产实现是 `service.rs` 的 `GrpcMovieStore`（gRPC 反向调用宿主），单测用
+/// 内存实现。**错误要往外抛**：把「宿主连不上」吞成「没有影片」会让任务
+/// 报成功却什么都没做。
+#[async_trait]
 pub trait MovieStore: Send + Sync {
-    /// 按番号查一部影片。
-    fn find_by_number(&self, number: &str) -> Option<MovieRef>;
-    /// 分页列举（`after_id` 为 0 从头开始；返回 (items, next_cursor)）。
-    fn list_page(&self, after_id: i64, limit: usize) -> (Vec<MovieRef>, Option<i64>);
-    /// 写回字段。返回 `false` 表示版本冲突或字段已被接管。
-    fn patch(&self, movie_id: i64, title: Option<&str>, summary: Option<&str>) -> bool;
+    /// 按番号查一部影片（上游 `context.movies.find_by_numbers` 取第一条）。
+    async fn find_by_number(&self, number: &str) -> Result<Option<MovieRef>, PipelineError>;
+    /// 分页列举（`after_id` 为 0 从头开始；返回 `(items, next_cursor)`）。
+    async fn list_page(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<(Vec<MovieRef>, Option<i64>), PipelineError>;
+    /// 写回前复核（上游 `_writable`）：重新读一次这部影片，影片没了就回 `None`。
+    ///
+    /// 上游在这一步同时判「字段归属」；这里只负责取最新快照，归属交给
+    /// [`field_writable`] —— 同一次读取，两处判断共用一份数据。
+    async fn reload(&self, movie_id: i64) -> Result<Option<MovieRef>, PipelineError>;
+    /// 写回字段（上游 `context.movies.patch(..., expected_revision=...)`）。
+    /// 返回 `false` 表示版本冲突或字段已被接管。
+    async fn patch(
+        &self,
+        movie_id: i64,
+        title: Option<&str>,
+        summary: Option<&str>,
+        expected_revision: i64,
+    ) -> Result<bool, PipelineError>;
 }
 
 /// 进度回调（上游 `_Progress`）。
@@ -135,7 +172,60 @@ impl PipelineStats {
             self.pending_writeback,
         )
     }
+
+    /// 终态 `Struct`（上游那个 `stats` dict 的键，逐个搬过去）。
+    pub fn to_struct(&self) -> prost_types::Struct {
+        sm_plugin_api::json_struct::json_to_struct(&serde_json::json!({
+            "movies": self.movies,
+            "no_work": self.no_work,
+            "pending_fetch": self.pending_fetch,
+            "pending_translation": self.pending_translation,
+            "pending_writeback": self.pending_writeback,
+            "failed_movies": self.failed_movies,
+            "translation_exhausted": self.translation_exhausted,
+            "skipped": self.skipped,
+            "movie_not_found": self.movie_not_found,
+            "fetched": self.fetched,
+            "fetch_cached": self.fetch_cached,
+            "not_found": self.not_found,
+            "fetch_failed": self.fetch_failed,
+            "fetch_exhausted": self.fetch_exhausted,
+            "translated": self.translated,
+            "translation_failed": self.translation_failed,
+            "writeback_applied": self.writeback_applied,
+            "writeback_blocked": self.writeback_blocked,
+            "writeback_failed": self.writeback_failed,
+            "aborted": self.aborted,
+            "busy": self.busy,
+        }))
+        .unwrap_or_default()
+    }
 }
+
+/// 上游 `stats` dict 的键（`to_struct` 必须一个不少）。
+pub const STAT_KEYS: [&str; 21] = [
+    "movies",
+    "no_work",
+    "pending_fetch",
+    "pending_translation",
+    "pending_writeback",
+    "failed_movies",
+    "translation_exhausted",
+    "skipped",
+    "movie_not_found",
+    "fetched",
+    "fetch_cached",
+    "not_found",
+    "fetch_failed",
+    "fetch_exhausted",
+    "translated",
+    "translation_failed",
+    "writeback_applied",
+    "writeback_blocked",
+    "writeback_failed",
+    "aborted",
+    "busy",
+];
 
 /// 管线错误。
 #[derive(Debug)]
@@ -146,6 +236,10 @@ pub enum PipelineError {
     TranslationDisabled,
     /// 任务失败（带摘要）。
     Failed(String),
+    /// 宿主调用失败（gRPC）。
+    Host(String),
+    /// 数据目录建不出来 / 锁文件动不了。
+    Io(String),
     /// DMM 错误。
     Dmm(DmmError),
     /// 翻译错误。
@@ -160,6 +254,8 @@ impl std::fmt::Display for PipelineError {
             Self::Busy => write!(f, "未执行：已有抓取翻译任务在运行"),
             Self::TranslationDisabled => write!(f, "仅翻译任务需要启用翻译"),
             Self::Failed(s) => write!(f, "抓取翻译结束，存在失败项目：{s}"),
+            Self::Host(e) => write!(f, "宿主调用失败：{e}"),
+            Self::Io(e) => write!(f, "数据目录错误：{e}"),
             Self::Dmm(e) => write!(f, "DMM 错误：{e}"),
             Self::Translation(e) => write!(f, "翻译错误：{e}"),
             Self::State(e) => write!(f, "状态库错误：{e}"),
@@ -232,6 +328,11 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     }
     let mut stats = PipelineStats::default();
 
+    // 宿主给的 `data_dir` 只承诺「重装时保留」，不承诺「已经存在」；锁文件与状态
+    // 库都要建在里面，所以先把目录建出来 —— 否则 `try_lock_file` 会因
+    // 「目录不存在」失败，被误报成 `Busy`（明明没有别的任务在跑）。
+    std::fs::create_dir_all(data_dir).map_err(|e| PipelineError::Io(e.to_string()))?;
+
     // 文件锁。
     let _lock = match try_lock_file(data_dir) {
         Some(p) => p,
@@ -293,10 +394,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
             if source.is_empty() {
                 continue;
             }
-            if movie.owners.get(host_field).and_then(|o| o.as_ref())
-                != Some(&PLUGIN_OWNER.to_owned())
-                && movie.owners.contains_key(host_field)
-            {
+            if !field_writable(movie, host_field) {
                 // 有主且不是自己：受保护。
                 stats.writeback_blocked += 1;
                 continue;
@@ -340,7 +438,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     }
 
     if let Some(number) = movie_number {
-        match store.find_by_number(number) {
+        match store.find_by_number(number).await? {
             Some(movie) => {
                 stats.movies = 1;
                 let cache = state
@@ -378,7 +476,7 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
     } else {
         let mut cursor: i64 = 0;
         loop {
-            let (items, next) = store.list_page(cursor, 500);
+            let (items, next) = store.list_page(cursor, 500).await?;
             if items.is_empty() {
                 break;
             }
@@ -395,11 +493,9 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                     .cloned();
                 match cache {
                     None => {
-                        let blocked = ["title", "summary"].iter().all(|f| {
-                            movie.owners.contains_key(*f)
-                                && movie.owners.get(*f).and_then(|o| o.as_ref())
-                                    != Some(&PLUGIN_OWNER.to_owned())
-                        });
+                        let blocked = ["title", "summary"]
+                            .iter()
+                            .all(|f| !field_writable(&movie, f));
                         if blocked {
                             stats.writeback_blocked += 2;
                         } else {
@@ -517,6 +613,16 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
                 "title" => ("title", "标题", crate::translation::TITLE_PROMPT),
                 _ => ("summary", "简介", crate::translation::DESC_PROMPT),
             };
+            // 上游 `_translate` 先复核字段还归不归自己：扫描到此刻可能已过很久，
+            // 期间字段可能被人工接管 —— 那就别白花一次翻译的钱。
+            let Some(latest) = store.reload(movie.movie_id).await? else {
+                stats.writeback_blocked += 1;
+                continue;
+            };
+            if !field_writable(&latest, host_field) {
+                stats.writeback_blocked += 1;
+                continue;
+            }
             let number = movie.movie_number.clone();
             progress.emit(idx, total, &format!("{number} · 正在翻译{label}，等待响应"));
             let client = match translator.as_mut() {
@@ -594,6 +700,25 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
         } else {
             "简介"
         };
+        // 上游 `_write` 先复核：重读快照。字段被别人接管记「受保护」而不是硬写
+        // 一次再报失败 —— 后者的 `updated=false` 分不清「版本冲突」与「被接管」。
+        let Some(latest) = store.reload(movie.movie_id).await? else {
+            stats.writeback_blocked += 1;
+            continue;
+        };
+        if !field_writable(&latest, host_field) {
+            stats.writeback_blocked += 1;
+            continue;
+        }
+        // 上游：值已经一致就什么都不做（不写、也不计数）。
+        let current = if host_field == "title" {
+            &latest.title
+        } else {
+            &latest.summary
+        };
+        if current == &value {
+            continue;
+        }
         progress.emit(
             idx,
             total,
@@ -603,7 +728,10 @@ pub async fn run_pipeline<S: MovieStore, P: Progress>(
             "title" => (Some(value.as_str()), None),
             _ => (None, Some(value.as_str())),
         };
-        if store.patch(movie.movie_id, title, summary) {
+        if store
+            .patch(movie.movie_id, title, summary, latest.revision)
+            .await?
+        {
             stats.writeback_applied += 1;
         } else {
             stats.writeback_failed += 1;
@@ -633,19 +761,23 @@ mod tests {
 
     type PatchedEntry = (i64, Option<String>, Option<String>);
 
-    impl MemStore {}
-
+    #[async_trait]
     impl MovieStore for MemStore {
-        fn find_by_number(&self, number: &str) -> Option<MovieRef> {
-            self.movies
+        async fn find_by_number(&self, number: &str) -> Result<Option<MovieRef>, PipelineError> {
+            Ok(self
+                .movies
                 .lock()
                 .unwrap()
                 .values()
                 .find(|m| m.movie_number == number)
-                .cloned()
+                .cloned())
         }
 
-        fn list_page(&self, after_id: i64, limit: usize) -> (Vec<MovieRef>, Option<i64>) {
+        async fn list_page(
+            &self,
+            after_id: i64,
+            limit: usize,
+        ) -> Result<(Vec<MovieRef>, Option<i64>), PipelineError> {
             let movies = self.movies.lock().unwrap();
             let mut ids: Vec<i64> = movies.keys().copied().filter(|id| *id > after_id).collect();
             ids.sort();
@@ -655,32 +787,48 @@ mod tests {
                 .filter_map(|id| movies.get(id).cloned())
                 .collect();
             let next = ids.get(limit).copied();
-            (items, next)
+            Ok((items, next))
         }
 
-        fn patch(&self, movie_id: i64, title: Option<&str>, summary: Option<&str>) -> bool {
+        async fn reload(&self, movie_id: i64) -> Result<Option<MovieRef>, PipelineError> {
+            Ok(self.movies.lock().unwrap().get(&movie_id).cloned())
+        }
+
+        async fn patch(
+            &self,
+            movie_id: i64,
+            title: Option<&str>,
+            summary: Option<&str>,
+            expected_revision: i64,
+        ) -> Result<bool, PipelineError> {
             self.patched.lock().unwrap().push((
                 movie_id,
                 title.map(|s| s.to_owned()),
                 summary.map(|s| s.to_owned()),
             ));
-            if let Some(movie) = self.movies.lock().unwrap().get_mut(&movie_id) {
-                if let Some(t) = title {
-                    movie.title = t.to_owned();
-                }
-                if let Some(s) = summary {
-                    movie.summary = s.to_owned();
-                }
-                true
-            } else {
-                false
+            let mut movies = self.movies.lock().unwrap();
+            let Some(movie) = movies.get_mut(&movie_id) else {
+                return Ok(false);
+            };
+            // 乐观并发：版本对不上就整次不生效（宿主网关的语义）。
+            if movie.revision != expected_revision {
+                return Ok(false);
             }
+            if let Some(t) = title {
+                movie.title = t.to_owned();
+            }
+            if let Some(s) = summary {
+                movie.summary = s.to_owned();
+            }
+            movie.revision += 1;
+            Ok(true)
         }
     }
 
     fn movie(id: i64, number: &str) -> MovieRef {
         MovieRef {
             movie_id: id,
+            revision: 1,
             movie_number: number.to_owned(),
             title: String::new(),
             summary: String::new(),

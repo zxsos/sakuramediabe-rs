@@ -33,6 +33,9 @@ pub const REQUEST_INTERVAL_MIN: f64 = 0.0;
 pub const REQUEST_INTERVAL_MAX: f64 = 60.0;
 pub const DEFAULT_REQUEST_INTERVAL: f64 = 1.0;
 
+/// DMM 站点基址（上游写死在 `dmm.py` 里）。
+pub const DEFAULT_DMM_BASE_URL: &str = "https://www.dmm.co.jp";
+
 /// 翻译超时的下界 / 上界 / 缺省（上游 `Field(default=60.0, gt=0, le=300)`）。
 pub const TRANSLATION_TIMEOUT_MIN: f64 = 0.1;
 pub const TRANSLATION_TIMEOUT_MAX: f64 = 300.0;
@@ -69,6 +72,12 @@ pub struct Settings {
     pub request_timeout_seconds: f64,
     /// DMM 请求之间的最小间隔（秒），礼貌爬取。
     pub request_interval_seconds: f64,
+    /// DMM 站点基址。
+    ///
+    /// 上游把它写死在 `dmm.py` 里（`https://www.dmm.co.jp`）。提上来是为了能
+    /// 打**本地假服务**（测试不许联网）与镜像站 —— 与 `subtitlecat` 的
+    /// `base_url` 同一理由。
+    pub dmm_base_url: String,
     /// 是否启用翻译。
     pub translation_enabled: bool,
     /// 翻译服务基址（OpenAI 兼容，不带 `/v1` 也行，构造客户端时补）。
@@ -88,6 +97,7 @@ impl Default for Settings {
         Self {
             request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT,
             request_interval_seconds: DEFAULT_REQUEST_INTERVAL,
+            dmm_base_url: DEFAULT_DMM_BASE_URL.to_owned(),
             translation_enabled: false,
             base_url: String::new(),
             api_key: String::new(),
@@ -135,6 +145,13 @@ impl Settings {
             .and_then(Value::as_f64)
         {
             s.request_interval_seconds = v.clamp(REQUEST_INTERVAL_MIN, REQUEST_INTERVAL_MAX);
+        }
+        if let Some(v) = value.get("dmm_base_url").and_then(Value::as_str) {
+            let trimmed = v.trim().trim_end_matches('/');
+            // 空串保持默认（配成空会让所有请求发不出去，那是配置事故不是意图）。
+            if !trimmed.is_empty() {
+                s.dmm_base_url = trimmed.to_owned();
+            }
         }
         if let Some(v) = value.get("translation_enabled").and_then(Value::as_bool) {
             s.translation_enabled = v;
@@ -200,6 +217,16 @@ pub fn schema() -> Vec<SettingsField> {
             )),
             multiline: false,
             hint: Some("礼貌爬取，避免被 DMM 限流".to_owned()),
+            default: None,
+        },
+        SettingsField {
+            key: "dmm_base_url".to_owned(),
+            label: "DMM 站点地址".to_owned(),
+            input: "text".to_owned(),
+            required: false,
+            description: Some(format!("默认 {DEFAULT_DMM_BASE_URL}")),
+            multiline: false,
+            hint: Some("供镜像站与测试使用".to_owned()),
             default: None,
         },
         SettingsField {
@@ -276,9 +303,19 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.request_timeout_seconds, 20.0);
         assert_eq!(s.request_interval_seconds, 1.0);
+        assert_eq!(s.dmm_base_url, "https://www.dmm.co.jp");
         assert!(!s.translation_enabled);
         assert_eq!(s.translation_timeout_seconds, 60.0);
         assert_eq!(s.api_type, ApiType::ChatCompletions);
+    }
+
+    #[test]
+    fn the_dmm_base_url_can_be_pointed_elsewhere() {
+        let s = Settings::from_json(&serde_json::json!({"dmm_base_url": "http://127.0.0.1:9/"}));
+        assert_eq!(s.dmm_base_url, "http://127.0.0.1:9");
+        // 空串保持默认。
+        let s = Settings::from_json(&serde_json::json!({"dmm_base_url": "   "}));
+        assert_eq!(s.dmm_base_url, DEFAULT_DMM_BASE_URL);
     }
 
     #[test]
@@ -338,6 +375,7 @@ mod tests {
             vec![
                 "request_timeout_seconds",
                 "request_interval_seconds",
+                "dmm_base_url",
                 "translation_enabled",
                 "base_url",
                 "api_key",
