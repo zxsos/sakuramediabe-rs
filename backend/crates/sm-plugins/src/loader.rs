@@ -1,0 +1,363 @@
+//! 加载一个插件：建通道 → 调 `Register` → 校验 → 收进注册表。
+//!
+//! # 上游对应
+//!
+//! `PluginControl.Register` 是插件生命周期的第一步：宿主注入 `plugin_id` 与
+//! `abi_major`，插件回显并附上自己的声明。proto 里写明了注册阶段的边界：
+//!
+//! > 注册阶段只应构造声明与校验本地配置：**不要联网、不要创建外部目录、
+//! > 不要启动后台线程。**
+//!
+//! # 为什么「连接」与「校验」分开
+//!
+//! 连接失败是环境问题（插件起不来 / 端口不通），校验失败是契约问题（ABI 不
+//! 匹配 / id 对不上）。两者排障方向完全不同，所以错误类型也分开。
+//!
+//! # 进程管理**不在本模块**
+//!
+//! 这里只负责「插件已经起来了、给个 endpoint」这一步。拉起进程、握端口、重启
+//! 与看门狗属于生命周期管理，留给后续 —— 本模块刻意不碰，免得把 I/O 与校验
+//! 搅在一起。
+
+use sm_plugin_api::v1::extension::Data;
+use sm_plugin_api::v1::{
+    plugin_control_client::PluginControlClient, RegisterRequest, RegisterResponse,
+};
+use tonic::transport::{Channel, Endpoint};
+
+use crate::registration::{validate_registration, RegistrationProblem};
+use crate::registry::{ConfigFieldSpec, ProviderRegistration, ProviderRegistry};
+
+/// 连接阶段的失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// endpoint 不合法（URI 解析失败）。
+    InvalidEndpoint(String),
+    /// 连不上。
+    Transport(String),
+}
+
+impl ConnectError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidEndpoint(_) => "plugin_endpoint_invalid",
+            Self::Transport(_) => "plugin_unreachable",
+        }
+    }
+}
+
+/// 注册阶段的失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterError {
+    /// gRPC 调用本身失败（含插件在注册时 panic）。
+    Call(String),
+    /// 调用成功，但声明不符合契约。
+    Invalid(Vec<RegistrationProblem>),
+}
+
+impl RegisterError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Call(_) => "plugin_register_failed",
+            Self::Invalid(_) => "plugin_registration_invalid",
+        }
+    }
+}
+
+/// 与插件的控制面建立通道。
+pub async fn connect(endpoint: Endpoint) -> Result<PluginControlClient<Channel>, ConnectError> {
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|err| ConnectError::Transport(err.to_string()))?;
+    Ok(PluginControlClient::new(channel))
+}
+
+/// 调 `Register` 并校验回显。
+///
+/// `manifest_id` 是插件包清单里声明的 `plugin_id` —— 必须与回显值一致，
+/// 否则视为加载失败（proto 注释的原话）。
+pub async fn register(
+    client: &mut PluginControlClient<Channel>,
+    plugin_id: &str,
+    manifest_id: &str,
+) -> Result<RegisterResponse, RegisterError> {
+    let request = RegisterRequest {
+        plugin_id: plugin_id.to_owned(),
+        abi_major: sm_plugin_api::ABI_MAJOR,
+    };
+    let response = client
+        .register(request)
+        .await
+        .map_err(|err| RegisterError::Call(err.to_string()))?
+        .into_inner();
+
+    // 能力是 `repeated Capability`，prost 生成为 `Vec<i32>`。
+    validate_registration(
+        plugin_id,
+        manifest_id,
+        &response.plugin_id,
+        response.abi_major,
+        &response.capabilities,
+    )
+    .map_err(RegisterError::Invalid)?;
+
+    Ok(response)
+}
+
+/// 把注册声明里的 provider 收进注册表。
+///
+/// # 只收 `media_provider` 这一个扩展点
+///
+/// `Extension` 是 oneof（`media_provider` / metadata_source / ranking_source）。
+/// 另两个扩展点有自己的声明与校验（[`crate::extensions::collect_extensions`]），
+/// 这里**显式忽略**而不是硬塞进 provider 这张表。
+///
+/// # `plugin_endpoint` 是**调用方告诉它的**，不在 `RegisterResponse` 里
+///
+/// proto 的注册响应没有「我监听的地址」这个字段（插件是被宿主拉起来的，地址
+/// 由宿主分配）。所以往下发的每个 provider 条目都要带上宿主手里那个端点 ——
+/// 否则查表只能查到声明，**打不出去**（见
+/// [`ProviderRegistration::plugin_endpoint`]）。
+pub fn collect_providers(response: &RegisterResponse, plugin_endpoint: &str) -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    for extension in &response.extensions {
+        // oneof 的变体名取**字段名**（prost 的规则），不是消息类型名。
+        let Some(Data::MediaProvider(bundle)) = &extension.data else {
+            continue;
+        };
+        registry.insert(ProviderRegistration {
+            provider_key: bundle.provider_key.clone(),
+            display_name: bundle.display_name.clone(),
+            plugin_id: response.plugin_id.clone(),
+            capabilities: response.capabilities.clone(),
+            // 数据面端点：provider 级优先，没有则退回插件级。
+            data_plane_endpoint: bundle
+                .data_plane_endpoint
+                .clone()
+                .or_else(|| response.data_plane_endpoint.clone()),
+            plugin_endpoint: plugin_endpoint.to_owned(),
+            // ★ bundle 描述符。注册期**只搬形状**，不解释语义 ——
+            // 白名单 / secret / 默认交付方式的语义在宿主服务层。
+            library_config_fields: bundle
+                .library_config_fields
+                .iter()
+                .map(config_field_spec)
+                .collect(),
+            playback_deliveries: bundle
+                .playback_deliveries
+                .iter()
+                .filter_map(|value| playback_delivery_name(*value).map(str::to_owned))
+                .collect(),
+            merged_playback_format: bundle
+                .merged_playback_format
+                .and_then(merged_playback_format_name)
+                .map(str::to_owned),
+            download_config_fields: bundle
+                .download_config_fields
+                .iter()
+                .map(config_field_spec)
+                .collect(),
+        });
+    }
+    registry
+}
+
+/// proto 的 `ConfigField` → 宿主纯值。
+///
+/// `INPUT_UNSPECIFIED` 按 `"text"` 处理：proto 里它是「没填」，而上游的
+/// `Literal["text","secret","path"]` 没有「未指定」这一档 —— 插件违约时取最中性的
+/// `text`（没有 secret 剥离、没有只读约束），不 panic。
+fn config_field_spec(field: &sm_plugin_api::v1::ConfigField) -> ConfigFieldSpec {
+    use sm_plugin_api::v1::config_field::Input;
+    let input = match Input::try_from(field.input).unwrap_or(Input::Unspecified) {
+        Input::Secret => "secret",
+        Input::Path => "path",
+        Input::Text | Input::Unspecified => "text",
+    };
+    ConfigFieldSpec {
+        key: field.key.clone(),
+        label: field.label.clone(),
+        input: input.to_owned(),
+        required: field.required,
+        description: field.description.clone(),
+        multiline: field.multiline,
+        read_only: field.read_only,
+        hint: field.hint.clone(),
+    }
+}
+
+/// proto 的 `PlaybackDelivery` → 上游字面量。`UNSPECIFIED` 丢弃（不算一种方式）。
+fn playback_delivery_name(value: i32) -> Option<&'static str> {
+    use sm_plugin_api::v1::PlaybackDelivery;
+    match PlaybackDelivery::try_from(value).ok()? {
+        PlaybackDelivery::Redirect => Some("redirect"),
+        PlaybackDelivery::Proxy => Some("proxy"),
+        PlaybackDelivery::Unspecified => None,
+    }
+}
+
+/// proto 的 `MergedPlaybackFormat` → 上游字面量。
+fn merged_playback_format_name(value: i32) -> Option<&'static str> {
+    use sm_plugin_api::v1::MergedPlaybackFormat;
+    match MergedPlaybackFormat::try_from(value).ok()? {
+        MergedPlaybackFormat::Mp4 => Some("mp4"),
+        MergedPlaybackFormat::Hls => Some("hls"),
+        MergedPlaybackFormat::Unspecified => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registration::capability;
+
+    fn media_bundle(key: &str) -> sm_plugin_api::v1::MediaProviderBundle {
+        sm_plugin_api::v1::MediaProviderBundle {
+            provider_key: key.to_owned(),
+            display_name: key.to_uppercase(),
+            ..Default::default()
+        }
+    }
+
+    fn extension_with_media(key: &str) -> sm_plugin_api::v1::Extension {
+        sm_plugin_api::v1::Extension {
+            key: "media.provider".to_owned(),
+            data: Some(Data::MediaProvider(media_bundle(key))),
+        }
+    }
+
+    #[test]
+    fn providers_are_collected_and_keep_their_plugin_and_capabilities() {
+        let response = RegisterResponse {
+            plugin_id: "local".to_owned(),
+            abi_major: sm_plugin_api::ABI_MAJOR,
+            capabilities: vec![capability::DOWNLOAD],
+            extensions: vec![extension_with_media("local_storage")],
+            ..Default::default()
+        };
+
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
+        assert_eq!(registry.len(), 1);
+
+        let entry = registry.require("local_storage").expect("应当收进去");
+        assert_eq!(entry.plugin_id, "local", "要记得来自哪个插件");
+        assert!(entry.is_download());
+        assert_eq!(
+            entry.plugin_endpoint, "http://127.0.0.1:60001",
+            "控制面端点由宿主下发 —— 没有它查表只能查到声明、打不出去"
+        );
+
+        // 插件级的数据面端点要继承下来。
+        let with_endpoint = RegisterResponse {
+            data_plane_endpoint: Some("http://127.0.0.1:50051".to_owned()),
+            ..response
+        };
+        let registry = collect_providers(&with_endpoint, "http://127.0.0.1:60001");
+        assert_eq!(
+            registry
+                .require("local_storage")
+                .unwrap()
+                .data_plane_endpoint
+                .as_deref(),
+            Some("http://127.0.0.1:50051")
+        );
+    }
+
+    #[test]
+    fn non_media_extensions_are_ignored_on_purpose() {
+        // metadata_source / ranking_source 有自己的调用面，不进这个表。
+        let response = RegisterResponse {
+            plugin_id: "extra".to_owned(),
+            abi_major: sm_plugin_api::ABI_MAJOR,
+            extensions: vec![
+                sm_plugin_api::v1::Extension {
+                    key: "catalog.metadata_source".to_owned(),
+                    data: Some(Data::MetadataSource(Default::default())),
+                },
+                sm_plugin_api::v1::Extension {
+                    key: "media.provider".to_owned(),
+                    data: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
+        assert!(registry.is_empty(), "只收 media_provider：{registry:?}");
+    }
+
+    /// ★ bundle 描述符要**原样收进注册表** —— 宿主服务层的白名单 / secret 剥离 /
+    /// 默认交付方式全指望它。丢掉不会编译报错，只会在运行期表现为「建库 422」。
+    #[test]
+    fn the_bundle_descriptor_is_collected() {
+        use sm_plugin_api::v1::config_field::Input;
+        use sm_plugin_api::v1::{ConfigField, MergedPlaybackFormat, PlaybackDelivery};
+
+        let response = RegisterResponse {
+            plugin_id: "local".to_owned(),
+            abi_major: sm_plugin_api::ABI_MAJOR,
+            extensions: vec![sm_plugin_api::v1::Extension {
+                key: "media.provider".to_owned(),
+                data: Some(Data::MediaProvider(
+                    sm_plugin_api::v1::MediaProviderBundle {
+                        provider_key: "local".to_owned(),
+                        display_name: "本地盘".to_owned(),
+                        library_config_fields: vec![ConfigField {
+                            key: "root".to_owned(),
+                            label: "根目录".to_owned(),
+                            input: Input::Path as i32,
+                            required: true,
+                            read_only: true,
+                            ..Default::default()
+                        }],
+                        playback_deliveries: vec![
+                            PlaybackDelivery::Proxy as i32,
+                            PlaybackDelivery::Redirect as i32,
+                        ],
+                        merged_playback_format: Some(MergedPlaybackFormat::Mp4 as i32),
+                        download_config_fields: vec![ConfigField {
+                            key: "token".to_owned(),
+                            input: Input::Secret as i32,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+            }],
+            ..Default::default()
+        };
+
+        let registry = collect_providers(&response, "http://127.0.0.1:60001");
+        let entry = registry.require("local").unwrap();
+
+        assert_eq!(entry.library_config_fields.len(), 1);
+        assert_eq!(entry.library_config_fields[0].input, "path");
+        assert!(entry.library_config_fields[0].read_only);
+        // 首项是默认交付方式，顺序**不能乱**。
+        assert_eq!(entry.playback_deliveries, vec!["proxy", "redirect"]);
+        assert_eq!(entry.merged_playback_format.as_deref(), Some("mp4"));
+        assert_eq!(entry.download_config_fields.len(), 1);
+        assert_eq!(entry.download_config_fields[0].input, "secret");
+    }
+
+    #[test]
+    fn error_codes_are_stable() {
+        assert_eq!(
+            ConnectError::InvalidEndpoint("x".to_owned()).code(),
+            "plugin_endpoint_invalid"
+        );
+        assert_eq!(
+            ConnectError::Transport("x".to_owned()).code(),
+            "plugin_unreachable"
+        );
+        assert_eq!(
+            RegisterError::Call("x".to_owned()).code(),
+            "plugin_register_failed"
+        );
+        assert_eq!(
+            RegisterError::Invalid(vec![]).code(),
+            "plugin_registration_invalid"
+        );
+    }
+}

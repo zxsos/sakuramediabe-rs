@@ -1,0 +1,13 @@
+[package]
+name = "hashing"
+version = "0.1.0"
+description = "SHA-1 / SHA-256 / MD5 / Base32 —— SakuraMedia 媒体 IO 服务的自包含哈希原语"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

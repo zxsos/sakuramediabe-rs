@@ -1,0 +1,24 @@
+[package]
+name = "sm-core"
+version = "0.1.0"
+edition.workspace = true
+description = "共享类型：错误信封、分页、时间、ID、配置快照"
+
+[dependencies]
+hashing = { workspace = true }
+argon2 = { workspace = true }
+# crontab 方言转换与校验（config_schema 校验 *_cron 字段、sm-scheduler 求值共用）
+cron = { workspace = true }
+# 只读：验存量用户的 bcrypt 哈希，验证成功后用 Argon2id 重哈希回写。
+# 纯 Rust（blowfish 由 cipher 实现），无 C 绑定。见 src/password.rs 模块文档。
+bcrypt = { workspace = true }
+password-hash = { workspace = true }
+percent-encoding = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }

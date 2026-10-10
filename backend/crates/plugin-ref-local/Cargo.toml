@@ -1,0 +1,35 @@
+[package]
+name = "plugin-ref-local"
+version = "0.1.0"
+description = "参考插件：以本地目录为后端的 StorageProvider gRPC 实现 —— 打通插件 ABI 数据面并量化开销"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sm-plugin-api = { workspace = true }
+async-trait = { workspace = true }
+# `BoxStream`：默认实现层把流式 rpc 的返回类型固定成它（见 sm-plugin-api::provider）。
+futures = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+# net：一把 help 我们自己建起 server 用的 TcpListenerStream（起真实 server 需要内核分配的端口）。
+tokio-stream = { workspace = true, features = ["net"] }
+chrono = { workspace = true }
+# 读宿主写好的配置文件（`SAKURAMEDIA_PLUGIN_SETTINGS_FILE`）。
+serde_json = { workspace = true }
+
+# 参考插件的**可执行文件**：宿主按生命周期协议拉起的那个进程
+# （见 docs/adr/2026-10-05-plugin-lifecycle.md）。
+[[bin]]
+name = "plugin-ref-local"
+path = "src/bin/plugin-ref-local.rs"
+
+[dev-dependencies]
+# 生命周期用例要用宿主的 supervisor 拉起上面那个可执行文件。
+sm-plugins = { workspace = true }

@@ -1,0 +1,1550 @@
+//! `media` 表仓储。
+//!
+//! # XOR 归属不变量由**仓储层**强制，不靠数据库
+//!
+//! 上游是在 Python 的 `save()` 里 `raise ValueError`：
+//!
+//! ```python
+//! if (self.movie_number is None) == (self.video_item_id is None):
+//!     raise ValueError("Media must belong to exactly one of movie / video_item")
+//! ```
+//!
+//! **DDL 里没有对应的 CHECK。** 完全可以加
+//! `CHECK ((movie_number IS NULL) <> (video_item_id IS NULL))`，
+//! 但本项目选择不加 —— schema 与上游同构优先于本地优化，校验放在
+//! 仓储层已经足够。
+//!
+//! 这样做还有个好处：报错是 [`DbError::Business`]（422）而不是
+//! [`DbError::ConstraintViolation`]（409），因为「这条 Media 没归属」
+//! 是业务错误，不是状态冲突。
+
+use std::collections::HashSet;
+
+use chrono::NaiveDateTime;
+use sqlx::PgPool;
+
+use crate::common::page::{Page, PageRequest};
+use crate::common::update::UpdateSet;
+use crate::error::DbError;
+use crate::paged_list;
+use crate::playback::media::{thumbnail_state, Media};
+
+/// 缩略图生成候选行：**`(media_id, library_id, provider_key)`**。
+///
+/// 元组而不是结构体，理由同 `movie::MovieResolutionLevelRow`：它跨
+/// `media` + `media_library` 两张表、不是任何一张表的镜像，对拍脚本认不出它的
+/// 上游模型 —— 具名类型放 `sm-service` 那边更合适（那里才需要字段含义）。
+pub type ThumbnailCandidateRow = (i32, i32, String);
+
+use super::ctx::Ctx;
+use super::movie::{bind_value_exec, safe_sql};
+
+/// 实体名，用于错误分类。
+const ENTITY: &str = "Media";
+
+/// 插入一条媒体。
+#[derive(Debug, Clone)]
+pub struct NewMedia {
+    pub library_id: i32,
+    pub file_name: String,
+    pub file_size_bytes: i64,
+    /// 指向 `Movie.movie_number`（**字符串**），与 `video_item_id` 恰好其一非空。
+    pub movie_number: Option<String>,
+    /// 指向 `VideoItem.id`。DDL 是 `integer`，所以是 `i32` 而非 `i64`。
+    pub video_item_id: Option<i32>,
+    /// 不透明存储引用，结构由 provider 定义。
+    pub storage_ref: Option<String>,
+    pub resolution: Option<String>,
+    /// `media-file-hash-v1:<40 hex>`。
+    pub file_hash: Option<String>,
+    pub import_source_identity: Option<String>,
+    /// `duration_seconds integer NOT NULL DEFAULT 0` —— **不是 `Option`**。
+    ///
+    /// 0 就是「未知时长」，与列的 DEFAULT 一致。此前声明成 `Option<i32>`
+    /// 且 `insert` 直接 `.bind(new.duration_seconds)`，`None` 会绑成 NULL
+    /// 并违反 NOT NULL。
+    pub duration_seconds: i32,
+    /// `JsonTextField`，写入时序列化为文本。
+    pub video_info: Option<serde_json::Value>,
+}
+
+impl NewMedia {
+    /// 写入前的全部业务校验。
+    ///
+    /// 两项都归到这里而不是散在 `insert` 里：原先空文件名检查内联在
+    /// `insert` 中，导致单元测试只能测到 `str::trim`，实际拒绝逻辑
+    /// 一行都没被执行过。合成一个入口后，测试可以直接断言错误类型。
+    fn validate(&self) -> Result<(), DbError> {
+        self.check_owner()?;
+
+        if self.file_name.trim().is_empty() {
+            return Err(DbError::business(ENTITY, "file_name 不能为空"));
+        }
+        Ok(())
+    }
+
+    /// 校验 XOR 归属，返回业务错误。
+    fn check_owner(&self) -> Result<(), DbError> {
+        if self.movie_number.is_some() == self.video_item_id.is_some() {
+            return Err(DbError::business(
+                ENTITY,
+                "Media 必须恰好归属 movie（JAV）或 video_item（非 JAV）之一：\
+                 两者都空或都非空都被拒绝",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 媒体列表的筛选条件。上游 `list_media`（`media_service.py:254-309`）的参数。
+///
+/// # ★ `kind` 的判据是「归属列是否为空」，不是某个枚举列
+///
+/// `jav` = `movie_number IS NOT NULL`；`video` = `video_item_id IS NOT NULL`；
+/// `all` = 不过滤。`media` 表同时装两类，靠哪个外键非空区分。
+#[derive(Debug, Clone, Default)]
+pub struct MediaListFilter<'a> {
+    /// `"jav"` / `"video"` / `"all"` / `None`。
+    pub kind: Option<&'a str>,
+    pub library_id: Option<i32>,
+    /// 演员筛选的**中间产物**：调用方先把 `actor_ids` 解析成番号列表。
+    ///
+    /// 上游把它做成 `IN` 子查询而不是 JOIN（`media_service.py:275-290`）：
+    /// JOIN 会让「多个演员都演这部片」时主查询出现**重复行**。
+    pub movie_numbers: Option<&'a [String]>,
+    pub thumbnail_generation_state: Option<&'a str>,
+    /// 只看有效 / 只看失效（`Some(false)` = 失效媒体列表）。
+    pub require_valid: Option<bool>,
+    /// 关键词。**四个字段任一命中**：影片番号 / 影片标题 / 视频标题 / 文件名
+    /// （上游 `list_invalid_media`，`:766-773`）。
+    pub search: Option<&'a str>,
+    /// 只看这几个文件哈希（重复媒体分组用）。
+    pub file_hashes: Option<&'a [String]>,
+}
+
+impl MediaListFilter<'_> {
+    /// 把 WHERE 子句推给 `QueryBuilder`。**唯一**的条件拼接处。
+    fn push_where(&self, builder: &mut sqlx::QueryBuilder<sqlx::Postgres>) {
+        // ★ 所有值都走 `push_bind`，**没有一处**把外部数据拼进 SQL 字符串。
+        builder.push(" WHERE 1 = 1");
+        let kind_fragment = match self.kind {
+            Some("jav") => Some(" AND m.movie_number IS NOT NULL"),
+            Some("video") => Some(" AND m.video_item_id IS NOT NULL"),
+            _ => None,
+        };
+        if let Some(fragment) = kind_fragment {
+            builder.push(fragment);
+        }
+        if let Some(library_id) = self.library_id {
+            builder.push(" AND m.library_id = ");
+            builder.push_bind(library_id);
+        }
+        if let Some(numbers) = self.movie_numbers {
+            // 空名单 = 命中不了任何媒体。**不能**退化成「不过滤」—— 那会把
+            // 「筛选了但没有作品的演员」显示成「全部媒体」。
+            if numbers.is_empty() {
+                builder.push(" AND FALSE");
+            } else {
+                builder.push(" AND m.movie_number = ANY(");
+                builder.push_bind(numbers.to_vec());
+                builder.push(")");
+            }
+        }
+        if let Some(state) = self.thumbnail_generation_state {
+            builder.push(" AND m.thumbnail_generation_state = ");
+            builder.push_bind(state);
+        }
+        if let Some(valid) = self.require_valid {
+            builder.push(if valid {
+                " AND m.valid"
+            } else {
+                " AND NOT m.valid"
+            });
+        }
+        if let Some(hashes) = self.file_hashes {
+            if hashes.is_empty() {
+                builder.push(" AND FALSE");
+            } else {
+                builder.push(" AND m.file_hash = ANY(");
+                builder.push_bind(hashes.to_vec());
+                builder.push(")");
+            }
+        }
+        if let Some(search) = self.search.map(str::trim).filter(|raw| !raw.is_empty()) {
+            let pattern = format!("%{search}%");
+            builder.push(" AND (mv.movie_number ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR mv.title ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR vi.title ILIKE ");
+            builder.push_bind(pattern.clone());
+            builder.push(" OR m.file_name ILIKE ");
+            builder.push_bind(pattern);
+            builder.push(")");
+        }
+    }
+}
+
+/// `media` 表仓储。
+#[derive(Debug, Clone)]
+pub struct MediaRepository {
+    pool: PgPool,
+}
+
+/// 一行媒体摘要的列。十一个，顺序见 [`MediaRepository::summaries_for_movies`]。
+///
+/// # 为什么是元组而不是具名 `pub struct`
+///
+/// schema 对拍把 `sm-db` 里每个 `pub struct` 都当成**表镜像**要求验证，
+/// 而这是聚合投影，没有对应的 Peewee 模型。声明成 `pub struct` 就要么被门禁
+/// 拦下，要么给门禁开口子 —— 两者都比元组更糟。具名类型在
+/// `sm_service::playback::media_summary::MediaSummary`。
+pub type MediaSummaryRow = (
+    String,         // movie_number
+    i32,            // media_id
+    Option<i32>,    // library_id
+    Option<String>, // library_name
+    Option<String>, // provider_key
+    String,         // file_name
+    Option<String>, // resolution
+    i64,            // file_size_bytes
+    i32,            // duration_seconds
+    Option<String>, // video_info（JsonText：可能是脏文本，不解析）
+    bool,           // valid
+);
+
+/// 一行**按视频条目分组**的媒体摘要。列与 [`MediaSummaryRow`] 相同，只是分组键
+/// 从 `movie_number` 换成 `video_item_id`。
+///
+/// # 为什么不能复用 [`MediaSummaryRow`]
+///
+/// 分组键的类型不同（`String` vs `i32`）。硬塞进同一个元组就要把 `i32` 转成
+/// 字符串，调用方再从字符串转回来 —— 那是两处只为了「少一个类型」而存在的转换。
+///
+/// 与 [`MediaSummaryRow`] 同因，声明成元组而不是具名 `pub struct`（schema 对拍）。
+pub type VideoMediaSummaryRow = (
+    i32,            // video_item_id
+    i32,            // media_id
+    Option<i32>,    // library_id
+    Option<String>, // library_name
+    Option<String>, // provider_key
+    String,         // file_name
+    Option<String>, // resolution
+    i64,            // file_size_bytes
+    i32,            // duration_seconds
+    Option<String>, // video_info（JsonText：可能是脏文本，不解析）
+    bool,           // valid
+);
+
+impl MediaRepository {
+    /// 构造仓储。
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// 底层连接池。
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// 按内容哈希查找。
+    ///
+    /// `file_hash` 的模型注释写明它是「跨存储识别重复文件的依据」——
+    /// 同一个文件在两个 storage 里各有一份时，靠这个认出它们是同一个。
+    ///
+    /// 返回 `Vec` 而非 `Option`：同一个哈希对应多条**是可能的**（同一
+    /// 文件被导入到两个库），真出现多条说明导入逻辑有问题，但仓储不该
+    /// 因此拒绝回答「有哪几条」—— 那会让调用方既拿不到数据、又拿不到
+    /// 错误。
+    ///
+    /// **不分页**：这是去重检查而不是列表，调用方要的是「有哪几条」这个
+    /// 完整答案。分页会让它拿到一个不完整的结论而误判「没有重复」。
+    pub async fn find_by_file_hash(&self, hash: &str) -> Result<Vec<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE file_hash = $1 ORDER BY id")
+                .bind(hash.trim())
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 缺 `file_hash` 的媒体 id（`IS NULL` **或**空串），按 id 排序。
+    ///
+    /// 上游 `_candidate_ids`（`media_file_hash_backfill_service.py:21-34`）的
+    /// 条件是 `is_null(True) | (== "")`。**空串也算缺** —— 空串不是 NULL，
+    /// 只查 `IS NULL` 会漏掉「provider 曾回过空哈希」的行，而那种行恰恰
+    /// 是最该重算的（见 [`Self::set_file_hash`] 的说明）。
+    ///
+    /// `ORDER BY id`：让同一媒体库里的文件尽量相邻（id 是导入顺序的近似），
+    /// 对同一个远端存储的连续读取友好。上游同样按 id 排。
+    pub async fn list_missing_file_hash_ids(&self) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM media \
+                 WHERE file_hash IS NULL OR file_hash = '' \
+                 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 只更新 `file_hash` 一列。上游 `media.save(only=[Media.file_hash])`。
+    ///
+    /// # 只写这一列，却仍刷 `updated_at`
+    ///
+    /// 与本仓其它 `UPDATE` 一致（`updated_at = now()`）。上游 peewee 的
+    /// `save(only=...)` 是否顺带动 `modified_at` 取决于模型钩子，**不核对就
+    /// 别假装逐字一致** —— 但「列表页按更新时间排序」把回填完的片子顶到最前
+    /// 是无害的（它确实刚被改过），而漏刷会让增量同步漏掉它，方向相反。
+    pub async fn set_file_hash(&self, id: i32, file_hash: &str) -> Result<Media, DbError> {
+        sqlx::query_as::<_, Media>(
+            "UPDATE media SET file_hash = $2, updated_at = $3 WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(file_hash.trim())
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
+    /// 缺技术信息的媒体 id（`valid` 且 `video_info` 为空 / 时长 ≤ 0 / 分辨率空）。
+    ///
+    /// 上游 `_candidate_ids`（`media_video_info_backfill_service.py:100-109`）的
+    /// 三段条件。⚠️ 与 [`Self::list_missing_file_hash_ids`] 不同，这里**多了
+    /// `valid`**：无效媒体（已删除但行还在）不参与探测 —— 那是上游
+    /// `Media.valid == True` 逐字搬的。
+    ///
+    /// `video_info IS NULL` **是**判据之一（和哈希回填「别用它」的注释相反）：
+    /// 上游这条任务的候选就是三段条件的**或** —— 一行可以「时长分辨率都有、
+    /// 只缺完整探测结果」，补的就是那一格。
+    pub async fn list_missing_video_info_ids(&self) -> Result<Vec<i32>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM media \
+                 WHERE valid \
+                   AND (video_info IS NULL \
+                        OR duration_seconds <= 0 \
+                        OR resolution IS NULL \
+                        OR btrim(resolution) = '') \
+                 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 按「**条件化三连写**」落探测结果，返回是否有任何一行真的更新了。
+    ///
+    /// 上游 `_save_missing_info`（`:62-97`）的语义逐条对齐：
+    ///
+    /// | 字段 | 写入条件（WHERE 里带，不是先查后写） |
+    /// |---|---|
+    /// | `video_info` | 现值**仍是**传入的旧值（`IS NOT DISTINCT FROM`）—— 旧值为 NULL 时天然只写「还没有」的行 |
+    /// | `duration_seconds` | 仍 ≤ 0，且新值 > 0 |
+    /// | `resolution` | 仍为空 |
+    ///
+    /// 条件放进 WHERE 而不是「查出来再判断」：条件化更新在并发下是原子的，
+    /// 「查-改-写」不是。返回 `updated` 让调用方区分「写进去了」与「没写进但
+    /// 也已经不缺了」（上游用同一个 `count > 0` 判断）。
+    ///
+    /// `video_info` 列是 `text`（可能是**脏文本**，见 `NewMedia` 的注释），
+    /// 所以旧值按 `Option<&str>` 传，序列化由调用方做完。
+    pub async fn save_missing_video_info(
+        &self,
+        id: i32,
+        existing_video_info: Option<&str>,
+        video_info: Option<&serde_json::Value>,
+        duration_seconds: Option<i64>,
+        resolution: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        let mut guard = ctx.conn().await?;
+        let now = crate::common::time::now_utc();
+        let mut updated = false;
+
+        if let Some(info) = video_info {
+            let count = sqlx::query(
+                "UPDATE media SET video_info = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND video_info IS NOT DISTINCT FROM $4",
+            )
+            .bind(id)
+            .bind(serde_json::to_string(info).unwrap_or_default())
+            .bind(now)
+            .bind(existing_video_info)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        if let Some(duration) = duration_seconds.filter(|duration| *duration > 0) {
+            let count = sqlx::query(
+                "UPDATE media SET duration_seconds = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND duration_seconds <= 0",
+            )
+            .bind(id)
+            .bind(i32::try_from(duration).unwrap_or(i32::MAX))
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        if let Some(resolution) = resolution {
+            let count = sqlx::query(
+                "UPDATE media SET resolution = $2, updated_at = $3 \
+                 WHERE id = $1 AND valid AND (resolution IS NULL OR btrim(resolution) = '')",
+            )
+            .bind(id)
+            .bind(resolution)
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?;
+            updated = updated || count.rows_affected() > 0;
+        }
+        Ok(updated)
+    }
+
+    /// 有效性巡检用的最小投影：`(id, valid, storage_ref)`，全量不分页。
+    ///
+    /// 上游 `_library_media_query`（`media_validity_scan_service.py:34-39`）
+    /// 拉整库媒体，但巡检只读这三列 —— 投影收窄让「扫描一个十万行的库」
+    /// 不必搬运二十个用不上的列。
+    pub async fn list_scan_items_by_library(
+        &self,
+        library_id: i32,
+    ) -> Result<Vec<(i32, bool, Option<String>)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, valid, storage_ref FROM media \
+                 WHERE library_id = $1 ORDER BY id",
+        )
+        .bind(library_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 批量改 `valid`（失效 / 复活），返回**真的改了**的行数。
+    ///
+    /// `WHERE valid <> $2` 是上游 `Media.valid == valid_before`（`:169`）的
+    /// 集合版：已经是对的目标状态的行**不重写** —— 那会让 `updated_at` 全表
+    /// 刷新，也会把「没变化」数成「更新了」。
+    ///
+    /// `revive = true` 时顺带重置缩略图状态（上游 `_revival_thumbnail_values`
+    /// `:50-67`）：有缩略图 → `succeeded`，没有 → `pending`，计数清零、错误与
+    /// 终态时间戳清空 —— 文件回来了，之前的「生成失败」记录已过时，得让
+    /// 生成任务重新看它一眼。失效分支不动缩略图列（文件没了不该顺手抹历史）。
+    pub async fn set_validity(
+        &self,
+        ids: &[i32],
+        valid: bool,
+        revive: bool,
+    ) -> Result<u64, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        let mut guard = ctx.conn().await?;
+        let now = crate::common::time::now_utc();
+        let count = if revive && valid {
+            sqlx::query(
+                "UPDATE media SET \
+                    valid = $2, \
+                    updated_at = $3, \
+                    thumbnail_generation_state = CASE WHEN EXISTS (\
+                        SELECT 1 FROM media_thumbnail WHERE media_thumbnail.media_id = media.id\
+                    ) THEN $4 ELSE $5 END, \
+                    thumbnail_attempt_count = 0, \
+                    thumbnail_deferred_count = 0, \
+                    thumbnail_next_retry_at = NULL, \
+                    thumbnail_last_error_code = NULL, \
+                    thumbnail_last_error = NULL, \
+                    thumbnail_terminal_at = NULL \
+                 WHERE id = ANY($1) AND valid <> $2",
+            )
+            .bind(ids)
+            .bind(valid)
+            .bind(now)
+            .bind(thumbnail_state::SUCCEEDED)
+            .bind(thumbnail_state::PENDING)
+            .execute(guard.as_conn())
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE media SET valid = $2, updated_at = $3 WHERE id = ANY($1) AND valid <> $2",
+            )
+            .bind(ids)
+            .bind(valid)
+            .bind(now)
+            .execute(guard.as_conn())
+            .await?
+        };
+        Ok(count.rows_affected())
+    }
+
+    /// 列出符合筛选条件的媒体。**排序由调用方给的 SQL 片段决定。**
+    ///
+    /// # 为什么用 `QueryBuilder` 而不是拼占位符
+    ///
+    /// 四个筛选条件都是可选的（`kind` / `library_id` / `movie_numbers` /
+    /// `thumbnail_generation_state`），占位符序号会随组合变化。手数 `$1..$n`
+    /// 迟早错位，而错位在编译期看不出来。
+    ///
+    /// # `order_sql` 必须是**白名单产出**
+    ///
+    /// 拼接进 SQL 的字符串不能来自请求参数 —— 调用方（服务层）先经白名单映射
+    /// 表解析，这里只负责拼。
+    pub async fn list_filtered(
+        &self,
+        filter: &MediaListFilter<'_>,
+        order_sql: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Media>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT m.* FROM media m LEFT JOIN movie mv ON mv.movie_number = m.movie_number LEFT JOIN video_item vi ON vi.id = m.video_item_id",
+        );
+        filter.push_where(&mut builder);
+        builder.push(" ORDER BY ");
+        builder.push(order_sql);
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_as::<Media>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 与 [`Self::list_filtered`] **同一份** WHERE 的计数。
+    ///
+    /// ★ 两份 WHERE 必须来自同一个 [`MediaListFilter`] —— 计数与分页各写一遍
+    /// 条件，改一处漏一处时会得到「总数 200、翻到第 3 页没东西」。
+    pub async fn count_filtered(&self, filter: &MediaListFilter<'_>) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM media m LEFT JOIN movie mv ON mv.movie_number = m.movie_number LEFT JOIN video_item vi ON vi.id = m.video_item_id",
+        );
+        filter.push_where(&mut builder);
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    /// 受管媒体的聚合：`(文件数, 总字节)`，**只算 `valid = true`**。
+    ///
+    /// 上游 `TelemetryService._managed_media_metrics`（`telemetry_service.py:164-174`）：
+    /// `COUNT(Media.id)` 与 `COALESCE(SUM(Media.file_size_bytes), 0)`，条件
+    /// `Media.valid == True`。空库返回 `(0, 0)`（COALESCE 保证）。
+    ///
+    /// ★ `SUM(bigint)` 在 PostgreSQL 里返回 **`numeric`** 而不是 `bigint`，
+    /// 直接按 `i64` 解码会失败 —— 所以这里显式 `::bigint`。上游是 Peewee 的
+    /// `fn.SUM(...)` 再由 Python `int(...)` 收敛，那一步在 Rust 侧没有，必须用 SQL 表达。
+    pub async fn valid_media_metrics(&self) -> Result<(i64, i64), DbError> {
+        Ok(sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(id)::bigint, COALESCE(SUM(file_size_bytes), 0)::bigint \
+             FROM media WHERE valid = true",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    /// ★ 同番号多文件：按番号分组，**只要 `count > 1` 的组**。
+    ///
+    /// `include_vr = false` 时上游排除**两类**（`media_service.py:323-332`）：
+    ///
+    /// 1. 番号本身含 `VR`；
+    /// 2. 影片打了名为 `vr` 的**标签**。
+    ///
+    /// 只做其中一条会漏 —— 打了 vr 标签但番号里没有 VR 的影片照样会被列出来。
+    pub async fn multi_version_movie_numbers(
+        &self,
+        include_vr: bool,
+        include_fc2: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT media.movie_number FROM media WHERE media.movie_number IS NOT NULL",
+        );
+        if !include_vr {
+            builder.push(
+                " AND media.movie_number NOT ILIKE '%vr%' AND media.movie_number NOT IN (\
+                   SELECT m.movie_number FROM movie m \
+                     JOIN movie_tag mt ON mt.movie_id = m.id \
+                     JOIN tag t ON t.id = mt.tag_id \
+                    WHERE LOWER(t.name) = 'vr')",
+            );
+        }
+        if !include_fc2 {
+            builder.push(" AND media.movie_number NOT ILIKE 'FC2%'");
+        }
+        builder.push(" GROUP BY media.movie_number HAVING COUNT(media.id) > 1");
+        builder.push(" ORDER BY MAX(media.updated_at) DESC, media.movie_number ASC");
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// ★ 重复媒体：**按文件哈希分组，只保留出现 >1 次的组**，分页返回哈希。
+    ///
+    /// 上游 `list_duplicate_media_groups`（`media_service.py:365-401`）：
+    ///
+    /// - 只算 `file_hash IS NOT NULL AND file_hash <> ''` —— 空哈希在库里是
+    ///   「还没算出来」而不是「这些文件的哈希都相同」。把它们分到一组等于
+    ///   声称一批不相关的文件重复。
+    /// - 排序按组内 `MAX(updated_at) DESC`（最近变动的组在前），再按哈希升序
+    ///   做稳定 tie-break。
+    pub async fn duplicate_hash_groups(
+        &self,
+        kind: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT m.file_hash FROM media m \
+              WHERE m.file_hash IS NOT NULL AND m.file_hash <> ''",
+        );
+        Self::push_kind(&mut builder, kind);
+        builder.push(" GROUP BY m.file_hash HAVING COUNT(m.id) > 1");
+        builder.push(" ORDER BY MAX(m.updated_at) DESC, m.file_hash ASC");
+        builder.push(" LIMIT ");
+        builder.push_bind(limit);
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+        Ok(builder
+            .build_query_scalar::<String>()
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// 上面那个分组的**总数**（用于分页的 `total`）。
+    pub async fn count_duplicate_hash_groups(&self, kind: Option<&str>) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM (\
+               SELECT m.file_hash FROM media m \
+              WHERE m.file_hash IS NOT NULL AND m.file_hash <> ''",
+        );
+        Self::push_kind(&mut builder, kind);
+        builder.push(" GROUP BY m.file_hash HAVING COUNT(m.id) > 1) AS groups");
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    /// `jav` = 有番号；`video` = 有视频条目；其余（`all`）不限。
+    fn push_kind(builder: &mut sqlx::QueryBuilder<sqlx::Postgres>, kind: Option<&str>) {
+        if let Some(fragment) = match kind {
+            Some("jav") => Some(" AND m.movie_number IS NOT NULL"),
+            Some("video") => Some(" AND m.video_item_id IS NOT NULL"),
+            _ => None,
+        } {
+            builder.push(fragment);
+        }
+    }
+
+    /// 同上分组的**总数**。
+    pub async fn count_multi_version_movies(
+        &self,
+        include_vr: bool,
+        include_fc2: bool,
+    ) -> Result<i64, DbError> {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+            "SELECT COUNT(*) FROM (\
+               SELECT media.movie_number FROM media WHERE media.movie_number IS NOT NULL",
+        );
+        if !include_vr {
+            builder.push(
+                " AND media.movie_number NOT ILIKE '%vr%' AND media.movie_number NOT IN (\
+                   SELECT m.movie_number FROM movie m \
+                     JOIN movie_tag mt ON mt.movie_id = m.id \
+                     JOIN tag t ON t.id = mt.tag_id \
+                    WHERE LOWER(t.name) = 'vr')",
+            );
+        }
+        if !include_fc2 {
+            builder.push(" AND media.movie_number NOT ILIKE 'FC2%'");
+        }
+        builder.push(" GROUP BY media.movie_number HAVING COUNT(media.id) > 1) AS groups");
+        let row: (i64,) = builder.build_query_as().fetch_one(&self.pool).await?;
+        Ok(row.0)
+    }
+
+    paged_list! {
+        /// 列出某个库的全部媒体。**分页。**
+        ///
+        /// 库可以装上万部影片，所以分页不是可选项。
+        pub async fn list_by_library(
+            &self,
+            library_id: i32,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE library_id = $1",
+            items = "SELECT * FROM media WHERE library_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
+    }
+
+    paged_list! {
+        /// 按影片番号列出媒体。**分页。**
+        ///
+        /// 「JAV 影片详情页列出所有正片」的主查询。一部影片可能有多个版本
+        /// （不同分辨率、不同来源），但数量有界。
+        pub async fn list_by_movie_number(
+            &self,
+            movie_number: &str,
+        ) -> Result<Page<Media>, DbError> {
+            count = "SELECT COUNT(*) FROM media WHERE movie_number = $1",
+            items = "SELECT * FROM media WHERE movie_number = $1 ORDER BY id LIMIT $2 OFFSET $3",
+        }
+    }
+
+    /// 一部影片的**全量**媒体，按 id 升序（不分页）。
+    ///
+    /// 合并播放的分组（`_merge_playback_groups`）要看到**整库的分段集合**：
+    /// 「这个库有 3 段、都有效」是分组判据，而分页查询会在页边界把同一组
+    /// 分段切开 —— 3 段的库在第 2 页只剩 1 段，就被误判成「不够合并」。
+    /// 所以此处刻意绕过分页宏。
+    pub async fn list_all_by_movie_number(
+        &self,
+        movie_number: &str,
+    ) -> Result<Vec<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE movie_number = $1 ORDER BY id")
+                .bind(movie_number)
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 这批番号里**有本地媒体**的那些（一次查询，去重）。
+    ///
+    /// 批量退订用它判定「有媒体就不许退订」——一次聚合查询换掉逐条的
+    /// `list_by_movie_number` 调用。
+    ///
+    /// # 参数必须传**番号**，不能传 `movie.id`
+    ///
+    /// `media.movie_number` 这个外键指向的是 `movie.movie_number`（字符串
+    /// 业务主键），不是 `movie.id`。把整数传进来会生成
+    /// `WHERE movie_number IN (1,2,3)` 而**恒不命中** —— 判定静默失效，
+    /// 表现为「有媒体也照样退订成功」。上游在同一处专门留了注释记这个坑。
+    ///
+    /// # 列可空，但 `= ANY(...)` 天然排除 NULL
+    ///
+    /// `NULL = ANY(...)` 是 NULL 而不是 TRUE，所以未关联影片的孤儿媒体
+    /// 不会进结果集，解码成 `String` 是安全的。
+    pub async fn numbers_with_media(
+        &self,
+        movie_numbers: &[String],
+    ) -> Result<HashSet<String>, DbError> {
+        if movie_numbers.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT movie_number FROM media WHERE movie_number = ANY($1)",
+        )
+        .bind(movie_numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 按主键查询。
+    /// 这些库下有多少个媒体（**不分页**）。
+    ///
+    /// 上游 `PluginRemovalService._ensure_not_in_use` 的
+    /// `Media.select().where(Media.library.in_(library_ids)).count()`
+    /// （`plugin_removal_service.py:62-64`）。
+    ///
+    /// 只用来填 409 的 `details.media_count` —— 客户端据此显示「这个插件下还有
+    /// N 个媒体」，所以它必须是**真实计数**而不是「第一页有几条」。
+    pub async fn count_in_libraries(&self, library_ids: &[i32]) -> Result<i64, DbError> {
+        if library_ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM media WHERE library_id = ANY($1)")
+                .bind(library_ids)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn find_by_id(&self, id: i32) -> Result<Option<Media>, DbError> {
+        Ok(
+            sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 按主键**批量**查询，返回 `id -> Media` 的映射。
+    ///
+    /// # 为什么是映射而不是 `Vec`
+    ///
+    /// 调用方接下来要**按自己的顺序**取值。合并播放的分段顺序由客户端给定
+    /// （且进了签名载荷），而 `WHERE id = ANY(...)` 的返回顺序**不保证**与入参
+    /// 一致 —— 直接 `zip` 会让时间轴按数据库的返回顺序拼，看起来只是「顺序有点
+    /// 怪」，实际是**签了名的顺序与实际用的顺序不一致**。
+    ///
+    /// 上游同样是先建 `{media.id: media}` 字典再按 `ordered_ids` 取值
+    /// （`media.py:335-341`）。
+    ///
+    /// 空入参直接返回空表：`= ANY('{}')` 虽然合法，但没必要跑一趟。
+    pub async fn find_by_ids(
+        &self,
+        ids: &[i32],
+    ) -> Result<std::collections::HashMap<i32, Media>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows = sqlx::query_as::<_, Media>("SELECT * FROM media WHERE id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|media| (media.id, media)).collect())
+    }
+
+    /// 按主键查询，未命中返回 [`DbError::NotFound`]。
+    pub async fn require_by_id(&self, id: i32) -> Result<Media, DbError> {
+        self.find_by_id(id)
+            .await?
+            .ok_or_else(|| DbError::not_found(ENTITY, id))
+    }
+
+    /// 删一条媒体。**连带清理由外键完成，不是这里逐表删。**
+    ///
+    /// DDL 已经把「删掉一部媒体之后该带走什么」表达清楚了：
+    ///
+    /// | 表 | 外键动作 | 上游注释 |
+    /// |---|---|---|
+    /// | `media_progress` | `CASCADE` | 进度随媒体走 |
+    /// | `media_thumbnail` | `CASCADE` | 缩略图随媒体走 |
+    /// | `moment_recommendation` | `CASCADE` | 推荐随媒体走 |
+    /// | `media_point`（时刻）| `SET NULL` | **只置空来源**，时刻点本身保留 |
+    /// | `media_clip`（切片）| `SET NULL` | 同上 |
+    ///
+    /// 所以这里**只发一条 `DELETE`**。手写一遍「先删缩略图、再删进度、再删
+    /// 媒体」不仅多余，还会与 DDL 分叉：DDL 改了这里不改，就成了漏删。
+    ///
+    /// ⚠️ 缩略图**行**被级联带走，但它们指向的 `image` **行与磁盘文件**不在此
+    /// 列 —— 那是调用方的事（`MediaService::delete_media` 在删之前先把
+    /// `image_id` 收集出来，删完交给 `ImageCleanupService`）。忘了这一步就是
+    /// 孤儿图片，而这里不会有任何报错。
+    ///
+    /// 返回是否真的删到了（并发下另一路可能已经删过）。
+    pub async fn delete(&self, id: i32) -> Result<bool, DbError> {
+        let outcome = sqlx::query("DELETE FROM media WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(outcome.rows_affected() > 0)
+    }
+
+    /// 插入。**写入前校验 XOR 归属与文件名。**
+    pub async fn insert(&self, new: &NewMedia) -> Result<Media, DbError> {
+        new.validate()?;
+
+        let sql = "\
+            INSERT INTO media (
+                movie_number, video_item_id, library_id, storage_ref, file_name,
+                resolution, file_size_bytes, file_hash, import_source_identity,
+                duration_seconds, video_info, valid,
+                thumbnail_generation_state, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14
+            ) RETURNING *";
+
+        let row = sqlx::query_as::<_, Media>(sql)
+            .bind(new.movie_number.as_deref().map(str::trim))
+            .bind(new.video_item_id)
+            .bind(new.library_id)
+            // `storage_ref` 是 `text NOT NULL DEFAULT '{}'`（上游
+            // `JsonTextField(default=dict)`，没有 `null=True`）。
+            // 绑 `as_deref()` 会在 None 时写 NULL，直接违反 NOT NULL。
+            // 缺失时写 DEFAULT 对应的 '{}'，与 task.rs 对 `result_summary`
+            // 的处理一致 —— `Option` 在这里表达「调用方没提供」，而不是
+            // 「允许存 NULL」。
+            .bind(new.storage_ref.as_deref().unwrap_or("{}"))
+            .bind(new.file_name.trim())
+            .bind(new.resolution.as_deref())
+            .bind(new.file_size_bytes)
+            .bind(new.file_hash.as_deref())
+            .bind(new.import_source_identity.as_deref())
+            .bind(new.duration_seconds)
+            // JsonTextField 是 TEXT 列：序列化成字符串，空串不写。
+            .bind(new.video_info.as_ref().map(|v| v.to_string()))
+            // `valid` 的 DB 默认值是 true，这里不重复表达。
+            .bind(true)
+            .bind(thumbnail_state::PENDING)
+            .bind(crate::common::time::now_utc())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+
+        debug_assert!(
+            row.satisfies_owner_constraint(),
+            "插入后 XOR 不变量必须成立，否则说明 check_owner 漏了"
+        );
+
+        Ok(row)
+    }
+
+    /// 更新。
+    ///
+    /// 若本次写入会碰到归属列，先做 XOR 预判再落库 —— 否则错误会以
+    /// 外键冲突（409）的形式漏出来，而不是业务错误（422）。
+    pub async fn update(&self, id: i32, mut set: UpdateSet<'_>) -> Result<Media, DbError> {
+        let touches_owner = set
+            .fields()
+            .iter()
+            .any(|(name, _)| *name == "movie_number" || *name == "video_item_id");
+
+        if touches_owner {
+            let current = self.require_by_id(id).await?;
+            let mut movie_number = current.movie_number;
+            let mut video_item_id = current.video_item_id;
+
+            for (name, value) in set.fields() {
+                match *name {
+                    "movie_number" => movie_number = as_opt_text(value),
+                    "video_item_id" => video_item_id = as_opt_int(value),
+                    _ => {}
+                }
+            }
+
+            // 与插入路径同一套判定，复用同一条消息。
+            let probe = NewMedia {
+                library_id: 0,
+                file_name: String::new(),
+                file_size_bytes: 0,
+                movie_number,
+                video_item_id,
+                storage_ref: None,
+                resolution: None,
+                file_hash: None,
+                import_source_identity: None,
+                duration_seconds: 0,
+                video_info: None,
+            };
+            probe.check_owner()?;
+        }
+
+        set.touch();
+        // 字段从 $1 起、id 放最后 —— 与 SET/WHERE 的书写顺序一致，
+        // 读者不需要在脑子里做逆序映射。
+        let assignments = set.assignments(1);
+        let fields = set.finish(ENTITY)?;
+        let sql = format!(
+            "UPDATE media SET {assignments} WHERE id = ${}",
+            fields.len() + 1
+        );
+
+        let query = fields
+            .iter()
+            .fold(sqlx::query(safe_sql(sql)), |query, (_, value)| {
+                bind_value_exec(query, value)
+            });
+        let result = query.bind(id).execute(&self.pool).await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::not_found(ENTITY, id));
+        }
+        self.require_by_id(id).await
+    }
+
+    /// 转存切换：把媒体搬到目标库（乐观并发）。
+    ///
+    /// `WHERE` 带上期望的旧值（`library_id` / `file_name` / `file_size_bytes`）——
+    /// 有人动过源就更新 0 行，调用方按「源已变化」处理。对应上游
+    /// `_switch_media` 的 `for_update` + 字段比对（那里是行锁，这里是
+    /// 单条语句的原子比较，效果等价且不需要事务）。
+    ///
+    /// `import_source_identity` 置空：新位置的身份与旧的不同。
+    /// 返回是否更新了行。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn switch_library(
+        &self,
+        id: i32,
+        expected_library_id: i32,
+        expected_file_name: &str,
+        expected_size_bytes: i64,
+        new_library_id: i32,
+        storage_ref: &str,
+        file_name: &str,
+        size_bytes: i64,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE media SET library_id = $1, storage_ref = $2, file_name = $3, \
+             file_size_bytes = $4, import_source_identity = NULL, updated_at = $5 \
+             WHERE id = $6 AND library_id = $7 AND file_name = $8 AND file_size_bytes = $9",
+        )
+        .bind(new_library_id)
+        .bind(storage_ref)
+        .bind(file_name)
+        .bind(size_bytes)
+        .bind(crate::common::time::now_utc())
+        .bind(id)
+        .bind(expected_library_id)
+        .bind(expected_file_name)
+        .bind(expected_size_bytes)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DbError::from(e).with_entity(ENTITY))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// 列出待生成缩略图的媒体。
+    ///
+    /// 索引是 `(thumbnail_generation_state, thumbnail_next_retry_at)`，
+    /// 所以只有 `retry_wait` 且已到期的行会被这个查询命中 —— 与
+    /// [`thumbnail_state::is_retryable`] 的口径一致。
+    ///
+    /// **刻意不分页。** 这是 worker 循环驱动的队列扫描，语义是
+    /// 「给我 N 条待办」而不是「第 N 页待办」：
+    ///
+    /// - 分页会让 worker 反复取第 1 页，而队列是持续增长的
+    /// - `total` 对它毫无用处——没人要显示「共 N 个待办」
+    /// - 队列深度由 `limit` 与 `updated_at` 退避共同控制，不需要总数
+    ///
+    /// 真正需要分页的是给人看的列表（见 [`list_by_library`](Self::list_by_library)）。
+    pub async fn list_pending_thumbnails(&self, limit: i64) -> Result<Vec<Media>, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query_as::<_, Media>(
+            "SELECT * FROM media \
+             WHERE thumbnail_generation_state = $1 \
+               AND (thumbnail_next_retry_at IS NULL OR thumbnail_next_retry_at <= $2) \
+             ORDER BY thumbnail_next_retry_at NULLS FIRST, id \
+             LIMIT $3",
+        )
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 缩略图生成的**候选数**。上游 `MediaThumbnailTaskService.count_pending_media`。
+    ///
+    /// # 它不是「状态为 `pending` 的数量」——骨架把它写成那样是错的
+    ///
+    /// 上游 `_candidate_query` 的条件是三条的**并**：
+    ///
+    /// ```text
+    ///   1. 状态 ∈ {pending, succeeded}          <- 含 succeeded！
+    ///   2. 或 状态 = retry_wait 且已到期
+    ///   3. 且 该媒体**一张缩略图都没有**
+    ///   4. 且 media.valid = true
+    /// ```
+    ///
+    /// 第 1 条里的 `succeeded` 是关键：状态机说「做完了」但**产物不在**（包被删、
+    /// 磁盘换了、上一次写库成功而落盘失败）时，这个媒体必须被重新扫到 ——
+    /// 否则它会永久停在 `succeeded` 而永远没有图。`list_pending_thumbnails`
+    /// （只扫 `retry_wait`）盖不到这一类。
+    ///
+    /// 第 3 条让「已成功产出」的媒体不会再进候选：即使状态是 `succeeded`。
+    ///
+    /// `JOIN media_library` 与上游一致。注意它在语义上是**恒等**的
+    /// （`media_library_id_fk` 是 `ON DELETE CASCADE` 且 `library_id` 非空，
+    /// 不可能有挂不上库的媒体）——保留它是为了与上游逐条对应。
+    pub async fn count_thumbnail_candidates(&self) -> Result<i64, DbError> {
+        let now = crate::common::time::now_utc();
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM media m \
+             JOIN media_library l ON l.id = m.library_id \
+             WHERE m.valid = true \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id) \
+               AND ( \
+                     m.thumbnail_generation_state = ANY($2) \
+                  OR ( m.thumbnail_generation_state = $3 \
+                       AND (m.thumbnail_next_retry_at IS NULL \
+                            OR m.thumbnail_next_retry_at <= $1) ) \
+               )",
+        )
+        .bind(now)
+        .bind([thumbnail_state::PENDING, thumbnail_state::SUCCEEDED])
+        .bind(thumbnail_state::RETRY_WAIT)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// 候选列表。`WHERE` 与 [`Self::count_thumbnail_candidates`] **逐字相同**
+    /// （含那三条并集与 `NOT EXISTS`），`ORDER BY id` + `LIMIT`。
+    ///
+    /// 上游 `_candidate_entries`。带 `provider_key` / `library_id` 是因为下一步
+    /// 就是「按 provider_key 找到那个插件去调」—— 只给 `media_id` 不够。
+    pub async fn list_thumbnail_candidates(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ThumbnailCandidateRow>, DbError> {
+        let now = crate::common::time::now_utc();
+        let rows = sqlx::query_as::<_, ThumbnailCandidateRow>(
+            "SELECT m.id, l.id, l.provider_key FROM media m \
+             JOIN media_library l ON l.id = m.library_id \
+             WHERE m.valid = true \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id) \
+               AND ( \
+                     m.thumbnail_generation_state = ANY($2) \
+                  OR ( m.thumbnail_generation_state = $3 \
+                       AND (m.thumbnail_next_retry_at IS NULL \
+                            OR m.thumbnail_next_retry_at <= $1) ) \
+               ) \
+             ORDER BY m.id LIMIT $4",
+        )
+        .bind(now)
+        .bind([thumbnail_state::PENDING, thumbnail_state::SUCCEEDED])
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// ★ 至少有一张缩略图的**全部** media id（去重、升序、**不分页**）。
+    ///
+    /// 上游 `MediaThumbnailPackBackfillService._candidate_media_ids`
+    /// （`media_thumbnail_pack_backfill_service.py:34-44`）：
+    ///
+    /// ```python
+    /// MediaThumbnail.select(MediaThumbnail.media).distinct()
+    /// ```
+    ///
+    /// # 为什么要全量列而不是「查缺包的那几条」
+    ///
+    /// 「缺包」这个条件**在文件系统上**（`thumbnails.zip` 存不存在），SQL 判不了。
+    /// 上游因此也是全量列出、由服务层逐个查盘 —— 这条方法照抄那个口径。
+    ///
+    /// 不分页是**刻意的**：分页会让「这一页全都已有包」时直接返回空，
+    /// 服务层看不出是「本页恰好都有」还是「全都有」，于是永远推进不到下一页。
+    pub async fn list_media_ids_with_thumbnails(&self) -> Result<Vec<i32>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT DISTINCT media_id FROM media_thumbnail ORDER BY media_id")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// 某个 media 的缩略图行：`(offset, origin)`，按 `offset` 升序。
+    ///
+    /// 上游 `_media_thumbnail_rows`（`:46-57`）—— `media_thumbnail` join `image`
+    /// 取 `origin`（包内条目名就是它，见 `catalog::media_paths`）。
+    ///
+    /// `origin` 为空的行**照样返回**（`String` 不取 Option）：让服务层去
+    /// 判「这条能不能打包」—— 判据是路径推导，不是 origin 非空
+    /// （`image.origin` 的历史数据里确实有空值，模块文档里记着）。
+    pub async fn list_thumbnail_origins(
+        &self,
+        media_id: i32,
+    ) -> Result<Vec<(i32, String)>, DbError> {
+        Ok(sqlx::query_as::<_, (i32, String)>(
+            "SELECT t.offset, i.origin FROM media_thumbnail t \
+             JOIN image i ON i.id = t.image_id \
+             WHERE t.media_id = $1 ORDER BY t.offset ASC",
+        )
+        .bind(media_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// ★ 延迟一次：源还没就绪，但**不该**算失败。
+    ///
+    /// 上游 `_mark_deferred`。与 [`Self::record_thumbnail_failure`] 的关键差别是
+    /// 它加的是 `thumbnail_deferred_count`，**不是** `thumbnail_attempt_count`
+    /// —— 两个计数是两条独立的轨道（见 `sm-service` 侧
+    /// `thumbnails::task_service` 的模块文档）。
+    ///
+    /// # 为什么不能就复用 `record_thumbnail_failure`
+    ///
+    /// 那会让「盘还没挂载」消耗**失败预算**：延迟 2 次之后，一次真正的失败就
+    /// 直接进终态 —— 而用户把盘挂上之后，它本该成功的。
+    pub async fn record_thumbnail_deferred(
+        &self,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_deferred_count = thumbnail_deferred_count + 1, \
+                thumbnail_last_error_code = $3, \
+                thumbnail_last_error = $3, \
+                thumbnail_next_retry_at = $4, \
+                updated_at = $5 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(error_code)
+        .bind(next_retry_at)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+        Ok(row)
+    }
+
+    /// ★ 把媒体推进**终态**（自动重试到此为止）。
+    ///
+    /// 上游 `_write_state(state=TERMINAL, ...)`。与
+    /// [`Self::record_thumbnail_failure`] 的差别是后者**固定**写 `RETRY_WAIT`，
+    /// 而终态是另一条路：清掉 `next_retry_at`、记 `terminal_at`。
+    ///
+    /// # 为什么必须单独一个方法
+    ///
+    /// 让调用方「传个状态字符串进去」看起来更省事，但三种终态的语义各不相同：
+    /// `succeeded` 要**清零**两个计数，`retry_wait` 要**排下一次时间**，
+    /// `terminal` 要**记下放弃的时刻**。合成一个 `set_state(state, ...)` 会让
+    /// 调用方忘掉「终态要清 next_retry_at」这类细节 —— 而忘了它，那条媒体会
+    /// 带着一个过期的时间点永远卡在队列里。
+    pub async fn record_thumbnail_terminal(
+        &self,
+        id: i32,
+        error_code: &str,
+    ) -> Result<Media, DbError> {
+        let now = crate::common::time::now_utc();
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_attempt_count = thumbnail_attempt_count + 1, \
+                thumbnail_last_error_code = $3, \
+                thumbnail_last_error = $3, \
+                thumbnail_next_retry_at = NULL, \
+                thumbnail_terminal_at = $4, \
+                updated_at = $4 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::TERMINAL)
+        .bind(error_code)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+        Ok(row)
+    }
+
+    /// 某个缩略图状态下的媒体数，**且这些媒体一张缩略图都没有**。
+    ///
+    /// 上游 `_count_state`。用于给运维显示「还有 N 部在退避 / N 部已放弃」。
+    ///
+    /// # 与 [`Self::count_thumbnail_candidates`] 的两处差别
+    ///
+    /// | | 候选数 | 本方法 |
+    /// |---|---|---|
+    /// | `valid` 过滤 | 有 | **没有**（上游也没有）|
+    /// | 状态 | 三条并集 | 单个 |
+    ///
+    /// 不加 `valid` 过滤是刻意的：这个数是给运维看的**队列深度**，无效媒体
+    /// 卡在退避里同样是问题，藏起来反而看不见。
+    pub async fn count_thumbnail_state(&self, state: &str) -> Result<i64, DbError> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM media m \
+             WHERE m.thumbnail_generation_state = $1 \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = m.id)",
+        )
+        .bind(state)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// 把指定媒体从**终态**放回 `pending`，返回受影响行数。
+    ///
+    /// 上游 `reset_terminal_media`。供「人工重试」用：终态意味着自动重试已放弃，
+    /// 而用户换了网络环境/挂回了盘之后就想重试了。
+    ///
+    /// # 三个 WHERE 条件都不能少
+    ///
+    /// | 条件 | 漏了会怎样 |
+    /// |---|---|
+    /// | `state = terminal` | 把正在退避的媒体也「重置」，等于**白送一次重试额度** |
+    /// | `valid = true` | 对一条坏媒体重置，它下一轮照样失败，只是多烧一次 |
+    /// | **无缩略图** | 把已经有产物的媒体重置成 `pending`，下一轮**重新生成一遍** |
+    ///
+    /// 计数一并清零：不清的话它下次失败时直接从「已用掉 2 次」开始，立刻又进终态 ——
+    /// 用户点了重试却什么都发生不了。
+    pub async fn reset_terminal_thumbnails(&self, media_ids: &[i32]) -> Result<u64, DbError> {
+        if media_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = crate::common::time::now_utc();
+        let result = sqlx::query(
+            "UPDATE media SET \
+                 thumbnail_generation_state = $1, \
+                 thumbnail_attempt_count = 0, \
+                 thumbnail_deferred_count = 0, \
+                 thumbnail_next_retry_at = NULL, \
+                 thumbnail_last_error_code = NULL, \
+                 thumbnail_last_error = NULL, \
+                 thumbnail_terminal_at = NULL, \
+                 updated_at = $2 \
+             WHERE id = ANY($3) \
+               AND valid = true \
+               AND thumbnail_generation_state = $4 \
+               AND NOT EXISTS (SELECT 1 FROM media_thumbnail t WHERE t.media_id = media.id)",
+        )
+        .bind(thumbnail_state::PENDING)
+        .bind(now)
+        .bind(media_ids)
+        .bind(thumbnail_state::TERMINAL)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 批量取回若干影片的媒体摘要。
+    ///
+    /// # 列是**显式列出**的，不是 `SELECT *`
+    ///
+    /// 上游的 `Media.select(...)` 逐个列了字段，这里跟着。理由：摘要用于列表
+    /// 渲染，而 `storage_ref`（可能含凭据）不该因为「顺手」被带出来。
+    ///
+    /// # `LEFT JOIN` 而不是 `JOIN` —— **跟着上游，不是为了孤儿媒体**
+    ///
+    /// 上游写的是 `JOIN.LEFT_OUTER`，这里照抄。要注意**理由不是**
+    /// 「孤儿媒体可能存在」：`media_library_id_fk` 是 `ON DELETE CASCADE`
+    /// （`docker/schema.sql:512`），所以删库会把它的媒体一起删掉 ——
+    /// **孤儿媒体在当前 DDL 下不可能出现**。集成测试
+    /// `deleting_a_library_cascades_to_its_media` 钉住了这个事实。
+    ///
+    /// 保留左连接有两个实际理由：
+    ///
+    /// 1. 与上游逐条一致（这是本仓库的第一原则）。
+    /// 2. DTO 里 `library_id` / `library_name` / `provider_key` 都声明为
+    ///    **可空**，左连接是这个声明成立的前提。改成内连接后，那三个
+    ///    `Option` 就永远不会是 `None`，而类型仍在说「可能没有」——
+    ///    于是某天有人给 `media_library_id_fk` 放宽成 `SET NULL`，
+    ///    解码会突然开始报错。
+    ///
+    /// # `ORDER BY movie_number, media.id`
+    ///
+    /// 与上游一致。`media.id` 是次级排序键 —— 同一影片的媒体按入库顺序稳定
+    /// 返回，否则两次查询可能给出不同顺序，客户端的乐观更新会闪。
+    ///
+    /// # 为什么容忍 `type_complexity`
+    ///
+    /// 三个替代方案都更差：
+    ///
+    /// 1. `pub struct` + `#[derive(FromRow)]` → 被 schema 对拍当成表镜像拦下，
+    ///    或被迫给门禁加豁免（削弱那道门禁正是它存在的反面）。
+    /// 2. 拆成两次查询（`media` + `media_library`）→ 得把 `Media` 整个读出来，
+    ///    而它含 `storage_ref`（**可能含凭据**）。把凭据读进一个「只用于渲染
+    ///    列表」的数据结构是个陷阱 —— 上游显式列字段正是为了避开它。
+    /// 3. 建中间视图 → 要改 DDL，而 DDL 必须与上游逐字节一致。
+    #[allow(clippy::type_complexity)]
+    pub async fn summaries_for_movies(
+        &self,
+        movie_numbers: &[String],
+    ) -> Result<Vec<MediaSummaryRow>, DbError> {
+        if movie_numbers.is_empty() {
+            // 空数组绑定会得到 `IN ()` 那种非法/无意义 SQL。
+            // 上游是 `if not movie_numbers: return {}`，语义一致。
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, MediaSummaryRow>(
+            "SELECT m.movie_number, m.id, m.library_id, l.name, l.provider_key, \
+                    m.file_name, m.resolution, m.file_size_bytes, \
+                    m.duration_seconds, m.video_info, m.valid \
+             FROM media m \
+             LEFT JOIN media_library l ON l.id = m.library_id \
+             WHERE m.movie_number = ANY($1) \
+             ORDER BY m.movie_number, m.id",
+        )
+        .bind(movie_numbers)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// [`Self::summaries_for_movies`] 的**按视频条目**版本：详情页的
+    /// `media_items` 要的是「这个条目的全部媒体」，而不是「这个番号的全部媒体」。
+    ///
+    /// 形状完全照抄上游 `VideoItemService::_media_items`
+    /// （`Media.select(...).join(MediaLibrary, JOIN.LEFT_OUTER).where(Media.video_item == video)
+    /// .order_by(Media.id)`）—— 一条带 `LEFT JOIN` 的查询，按 `m.id` 升序，
+    /// **不按 `valid` 过滤**（失效媒体也要出现在详情里，前端据空地址禁用播放）。
+    ///
+    /// ⚠️ 上游用的是 `IN`，这里用 `= ANY($1)`：语义相同，`sqlx` 对数组绑定更直接。
+    #[allow(clippy::type_complexity)]
+    pub async fn summaries_for_video_items(
+        &self,
+        video_ids: &[i32],
+    ) -> Result<Vec<VideoMediaSummaryRow>, DbError> {
+        if video_ids.is_empty() {
+            // 空数组绑定会得到 `IN ()` 那种非法/无意义 SQL（同 `summaries_for_movies`）。
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, VideoMediaSummaryRow>(
+            "SELECT m.video_item_id, m.id, m.library_id, l.name, l.provider_key, \
+                    m.file_name, m.resolution, m.file_size_bytes, \
+                    m.duration_seconds, m.video_info, m.valid \
+             FROM media m \
+             LEFT JOIN media_library l ON l.id = m.library_id \
+             WHERE m.video_item_id = ANY($1) \
+             ORDER BY m.video_item_id, m.id",
+        )
+        .bind(video_ids)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// 记录一次缩略图生成失败。
+    ///
+    /// 失败后退避等待重试（`retry_wait`），而不是直接进终态 ——
+    /// 网络抖动、存储暂时不可用都属于可恢复情形。
+    pub async fn record_thumbnail_failure(
+        &self,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_failure_in(&mut ctx, id, error_code, next_retry_at)
+            .await
+    }
+
+    /// [`Self::record_thumbnail_failure`] 的事务内变体。见 [`Ctx`]。
+    pub async fn record_thumbnail_failure_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+        error_code: &str,
+        next_retry_at: NaiveDateTime,
+    ) -> Result<Media, DbError> {
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_attempt_count = thumbnail_attempt_count + 1, \
+                thumbnail_last_error_code = $3, \
+                thumbnail_last_error = $3, \
+                thumbnail_next_retry_at = $4, \
+                updated_at = $5 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::RETRY_WAIT)
+        .bind(error_code)
+        .bind(next_retry_at)
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(ctx.conn().await?.as_conn())
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+
+        Ok(row)
+    }
+
+    /// 标记缩略图生成成功（进入终态）。
+    pub async fn record_thumbnail_success(&self, id: i32) -> Result<Media, DbError> {
+        let mut ctx = Ctx::over_pool(&self.pool);
+        self.record_thumbnail_success_in(&mut ctx, id).await
+    }
+
+    /// [`Self::record_thumbnail_success`] 的事务内变体。见 [`Ctx`]。
+    ///
+    /// 「缩略图生成」用例需要它与
+    /// [`MediaThumbnailRepository::upsert_in`](super::playback::MediaThumbnailRepository::upsert_in)
+    /// 在同一事务里 —— 见 [`super::UnitOfWork`]。
+    pub async fn record_thumbnail_success_in(
+        &self,
+        ctx: &mut Ctx<'_>,
+        id: i32,
+    ) -> Result<Media, DbError> {
+        let row = sqlx::query_as::<_, Media>(
+            "UPDATE media SET \
+                thumbnail_generation_state = $2, \
+                thumbnail_last_error_code = NULL, \
+                thumbnail_last_error = NULL, \
+                thumbnail_next_retry_at = NULL, \
+                thumbnail_terminal_at = $3, \
+                updated_at = $3 \
+             WHERE id = $1 RETURNING *",
+        )
+        .bind(id)
+        .bind(thumbnail_state::SUCCEEDED)
+        .bind(crate::common::time::now_utc())
+        .fetch_optional(ctx.conn().await?.as_conn())
+        .await?
+        .ok_or_else(|| DbError::not_found(ENTITY, id))?;
+
+        Ok(row)
+    }
+}
+
+/// 从 UpdateSet 的值里取可选文本。
+fn as_opt_text(value: &crate::common::update::Value<'_>) -> Option<String> {
+    match &*value.0 {
+        crate::common::update::ValueInner::Text(v) => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// 从 UpdateSet 的值里取可选整数（`video_item_id` 是 `integer` 列）。
+fn as_opt_int(value: &crate::common::update::Value<'_>) -> Option<i32> {
+    match &*value.0 {
+        crate::common::update::ValueInner::Int(v) => Some(*v as i32),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_media(movie: Option<&str>, video: Option<i32>) -> NewMedia {
+        NewMedia {
+            library_id: 1,
+            file_name: "a.mp4".to_owned(),
+            file_size_bytes: 0,
+            movie_number: movie.map(str::to_owned),
+            video_item_id: video,
+            storage_ref: None,
+            resolution: None,
+            file_hash: None,
+            import_source_identity: None,
+            duration_seconds: 0,
+            video_info: None,
+        }
+    }
+
+    #[test]
+    fn xor_rejects_both_empty_and_both_present() {
+        assert!(new_media(Some("ABC-001"), None).check_owner().is_ok());
+        assert!(new_media(None, Some(7)).check_owner().is_ok());
+
+        let both = new_media(Some("ABC-001"), Some(7));
+        let err = both.check_owner().unwrap_err();
+        assert!(matches!(err, DbError::Business { .. }), "应为业务错误(422)");
+        assert!(err.to_string().contains("恰好归属"));
+
+        let neither = new_media(None, None);
+        assert!(neither.check_owner().is_err());
+    }
+
+    #[test]
+    fn empty_file_name_is_rejected_before_touching_db() {
+        // 断言的是 `validate()` 的行为，不是 `str::trim` 的行为。
+        // 原先这里只写了 `assert!(m.file_name.trim().is_empty())` ——
+        // 一个恒真断言，`insert` 里的拒绝逻辑从未被执行过。
+        let mut m = new_media(Some("ABC-001"), None);
+        m.file_name = "   ".to_owned();
+        let err = m.validate().expect_err("空白 file_name 应被拒绝");
+        assert!(matches!(err, DbError::Business { .. }), "应为业务错误(422)");
+        assert!(err.to_string().contains("file_name"), "{err}");
+
+        // 归属错误优先于文件名错误：XOR 是更根本的不变量。
+        let mut both = new_media(Some("ABC-001"), Some(7));
+        both.file_name = "  ".to_owned();
+        assert!(both
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("恰好归属"));
+
+        // 正常输入通过
+        assert!(new_media(Some("ABC-001"), None).validate().is_ok());
+    }
+
+    #[test]
+    fn failure_keeps_media_retryable_while_success_is_terminal() {
+        // 失败进 retry_wait（可重试），成功进 succeeded（终态）。
+        assert!(thumbnail_state::is_retryable(thumbnail_state::RETRY_WAIT));
+        assert!(!thumbnail_state::is_retryable(thumbnail_state::SUCCEEDED));
+        assert!(thumbnail_state::is_valid(thumbnail_state::SUCCEEDED));
+    }
+}

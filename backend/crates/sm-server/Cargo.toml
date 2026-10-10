@@ -1,0 +1,71 @@
+[package]
+name = "sm-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "组合根：单进程同时承载 API(8000) 与调度器"
+
+[[bin]]
+name = "sm-server"
+path = "src/main.rs"
+
+[dependencies]
+sm-core = { workspace = true }
+# 配置快照的中间表示（sm_core::config_schema 的类型就是 serde_json::Value）
+serde_json = { workspace = true }
+sm-db = { workspace = true }
+sm-api = { workspace = true }
+sm-service = { workspace = true }
+sm-scheduler = { workspace = true }
+# 组合根要自己 serve：axum::serve + with_graceful_shutdown。
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# release 下滚动落盘（见 src/logging.rs：只在显式给了 log_dir 时启用）
+tracing-appender = { workspace = true }
+anyhow = { workspace = true }
+# 读配置 TOML。刻意**不用** `config` crate：它给的是「扁平键 + 环境变量
+# 覆盖」，而我们需要的恰恰是「按 `sm_core::config_schema` 的节.字段结构读」，
+# 环境变量那层由 `ServerConfig::load` 自己处理（键名是既有部署契约，不能动）。
+toml = { workspace = true }
+sqlx = { workspace = true }
+# 演员快照里的生日：`actor_values` 要把它格式化成 `YYYY-MM-DD`，而 `patch_actor`
+# 要把它解析回来（`FieldPatch::date` 收的就是 `NaiveDate`）。
+chrono = { workspace = true }
+# 插件宿主：拉起插件进程、收三张注册表、把插件任务的 cron 并进调度表。
+# 之前刻意不加（进程侧没落地，而一个不引用的依赖就是 ADR §6 说的幽灵配置——
+# 它会让「插件已接上」看起来成立）。现在拉起与看门狗都有了，加回来。
+sm-plugins = { workspace = true }
+# 进程内插件（vendored）：直接调用，不起进程、不走 gRPC。
+# 9 个插件全部 vendoring 进 workspace，共用同一份 sm-plugin-api。
+plugin-javdb-ranking = { workspace = true }
+plugin-javbus-metadata = { workspace = true }
+plugin-actor-metadata = { workspace = true }
+plugin-115-provider = { workspace = true }
+plugin-judge-collection = { workspace = true }
+plugin-more-movies = { workspace = true }
+plugin-scrape-translate = { workspace = true }
+plugin-subtitlecat = { workspace = true }
+# 插件注册响应的类型（`RegisterResponse`）来自契约层；组合根要把它留在内存里，
+# 以便插件重启后重建三张注册表。
+sm-plugin-api = { workspace = true }
+# 宿主侧是 `serde_json::Value`，proto 侧是 `google.protobuf.Struct` ——
+# 组合根负责这两者的互换（`src/provider_gateway.rs`）。
+prost-types = { workspace = true }
+# 组合根要 serve `PluginHost`（插件回调宿主的能力出口）：ADR
+# `2026-10-06-plugin-architecture.md` 的 P3。放在这里而不是 `sm-plugins`，
+# 是因为实现要查库（`sm-db`）而 `sm-plugins` 不该反向依赖业务数据。
+tonic = { workspace = true }
+
+[dev-dependencies]
+sm-db = { workspace = true }
+# 冒烟测试要真的发 HTTP 请求（tests/server_smoke.rs）。
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+# 跨仓冒烟（tests/plugin_launch_smoke.rs）要给 `sakuramedia_subtitlecat` 一个**假
+# SubtitleCat 站点** —— 那条链路真的会去抓站点，而测试不许联网。
+wiremock = "0.6"

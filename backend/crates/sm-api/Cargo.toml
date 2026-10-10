@@ -1,0 +1,56 @@
+[package]
+name = "sm-api"
+version = "0.1.0"
+description = "axum 路由层 —— 错误信封、鉴权、CORS 与端点装配"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+sm-core = { workspace = true }
+sm-service = { workspace = true }
+sm-db = { workspace = true }
+sm-plugin-api = { workspace = true }
+axum = { workspace = true }
+# 只为 `HtmlFormQuery`（重复 query 参数）—— 见 `crates/sm-api/src/extract.rs`。
+# `query` 特性在这里是**必需**的（默认不带）。
+axum-extra = { workspace = true, features = ["query"] }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+# SSE 的广播流：`BroadcastStream` 把 `broadcast::Receiver` 变成 `Stream`。
+# 只开 sync —— 其余 feature（fs、net、io-util）本模块一个都不用。
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# 签名图片端点要按扩展名推断 `Content-Type`（上游 `mimetypes.guess_type`）。
+# 这个 crate 已在依赖树里（`reqwest` 间接依赖它），这里只是显式引用，不新增下载。
+mime_guess = "2"
+
+[dev-dependencies]
+# 集成测试用 oneshot 直接驱动 Router，不起端口、不依赖运行时
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+# 慢日志测试要把 warning 抓进内存断言字段，所以需要一个可写的 subscriber。
+tracing-subscriber = { workspace = true }
+# 造前置状态与回读期望值：把媒体判死、直接数一遍表以核对聚合口径。
+# 仓储层不提供「判死」这个业务动作（它由清理流程触发），所以只能写裸 SQL。
+sqlx = { workspace = true }
+# `GET /download-candidates` 要发真请求到索引器，而 URL 来自库里的 indexer
+# 行 —— 只有真起一个回环 HTTP 服务才能覆盖到「候选怎么从 XML 长成资源」。
+# 同一个理由让 sm-service 用了它。
+wiremock = "0.6"
+# `/system/plugins` 的契约测试要挂**真实**的插件管理实现（它在 `sm-plugins`），
+# 而不是一个假实现：这样「配置里写了 `enabled`，列表就跟着变」这类跨层行为
+# 才在测试范围内。**只在 dev-dependencies** —— 生产依赖方向仍是
+# `sm-plugins → sm-service`，反向那条被刻意禁止（见 sm-plugins 的 Cargo.toml）。
+sm-plugins = { workspace = true }
+# `/system/plugins` 的上传测试要造**真的** zip：安装链路的入口就是它，
+# 用假字节走不到「解包 → 发布」那一段。zip 已在依赖树里（sm-plugins 在用）。
+zip = { workspace = true }

@@ -1,0 +1,60 @@
+# 本地开发用的 PostgreSQL 16。生产环境由 sakuramediabe 自带的 compose 负责，
+# 这里只服务 Rust 侧的集成测试。
+#
+# 启动：
+#   docker compose up -d
+#   python parity/apply_ddl.py       # 建表
+#   cargo test -p sm-db              # 跑集成测试
+#
+# 为什么 timezone=UTC 不能省：
+# 上游全项目使用 naive datetime 与数据库交互，列类型是
+# `timestamp without time zone`。容器时区若不是 UTC，PG 写入/读取的
+# timestamp 值会整体偏移，而这种偏移不会报错，只会让时间字段静默错位。
+#
+# 端口用 5433 而不是 5432：避开本机可能已有的 PostgreSQL 实例。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sakuramedia-rs-pg
+    environment:
+      POSTGRES_USER: sakuramedia
+      POSTGRES_PASSWORD: sakuramedia
+      POSTGRES_DB: sakuramedia_test
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - timezone=UTC
+      # `max_locks_per_transaction` 必须抬高，否则并发跑集成测试会**间歇性**失败。
+      #
+      # 锁表总容量 = max_locks_per_transaction x max_connections，而每个集成测试
+      # 建一个独立 schema 并对它跑一遍 40 张表的 DDL —— 那是 40 表 + ~70 索引 +
+      # ~50 外键 ≈ **200 个可锁关系**，且在 DDL 全程都被持有。
+      #
+      # 默认 64 x 100 = 6,400，于是**并发 DDL 会话上限约 32 个**。串行跑时每个
+      # 二进制内部最多 8 线程（约 1,600 锁），所以一直没撞上；一旦让多个测试
+      # 二进制并行，就会压到边界上，表现为偶发的
+      # `53200 out of shared memory`（提示 "You might need to increase
+      # max_locks_per_transaction"）—— 那种失败重跑就好，所以很容易被当成
+      # "环境抖动" 而放过。
+      #
+      # 1024 x 100 = 102,400，约为 32 会话上限的 16 倍余量。共享内存分配是
+      # 按需的（`max_locks_per_transaction * max_connections * 约 100 字节`），
+      # 抬高它不会预分配那么多。
+      - -c
+      - max_locks_per_transaction=1024
+    ports:
+      - "127.0.0.1:5433:5432"
+    healthcheck:
+      # apply_ddl.py 与 cargo test 依赖「服务已接受连接」而非「容器已创建」
+      test: ["CMD-SHELL", "pg_isready -U sakuramedia -d sakuramedia_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

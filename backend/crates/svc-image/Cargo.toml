@@ -1,0 +1,16 @@
+[package]
+name = "svc-image"
+version = "0.1.0"
+description = "宿主侧图像处理原语 —— 替代 Pillow / OpenCV 在宿主进程里的两处用法"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+image = { workspace = true }
+# 番号资产目录的分片名（`movies/<sha1 前 2 位>/<番号>`），见 src/paths.rs。
+sha1 = { workspace = true }

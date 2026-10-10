@@ -1,0 +1,292 @@
+syntax = "proto3";
+
+package sakuramedia.v1;
+
+import "common.proto";
+import "google/protobuf/struct.proto";
+import "storage.proto";
+
+// ══════════════════════════════════════════════════════════════════
+// 能力声明
+// ══════════════════════════════════════════════════════════════════
+//
+// Python 侧用 `supports_*()` 系列函数（getattr 探测）判断可选能力是否可用。
+// gRPC 没有「方法存在性」，因此改为注册时显式声明 —— 宿主据此决定是否调用，
+// 并在加载期就能报出「声明了但没实现」的错误，而不是等到第一次调用。
+
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  // ── StorageProvider 必需（12 项，无 capability 声明）──
+  // ── StorageProvider 可选 ──
+  CAPABILITY_PROBE_DURATION = 1;
+  CAPABILITY_PROBE_RESOLUTION = 2;
+  CAPABILITY_PROBE_VIDEO_INFO = 3;
+  CAPABILITY_OPEN_COVER_SOURCE = 4;
+  CAPABILITY_IMPORT_SOURCE_IDENTITY = 5;
+  CAPABILITY_SCAN_MEDIA_REFS = 6;
+  CAPABILITY_SCAN_MANAGED_MEDIA_REF_KEYS = 7;
+  CAPABILITY_MANAGED_MEDIA_REF_KEY = 8;
+  CAPABILITY_SPACE_USAGE = 9;
+  // ── 合并播放 ──
+  CAPABILITY_MERGED_PLAYBACK = 20;
+  CAPABILITY_MERGED_PLAYBACK_PREFLIGHT = 21;
+  // ── 转存：源端 ──
+  CAPABILITY_TRANSFER_SOURCE = 30;
+  CAPABILITY_TRANSFER_SOURCE_CLEANUP = 31;
+  // ── 转存：目标端 ──
+  CAPABILITY_TRANSFER_TARGET = 32;
+  // ── 扩展点 ──
+  CAPABILITY_EXTENSION_CATALOG_METADATA_SOURCE = 40;
+  CAPABILITY_EXTENSION_RANKING_SOURCE = 41;
+  // ── 下载能力 ──
+  CAPABILITY_DOWNLOAD = 50;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 插件能力声明
+// ══════════════════════════════════════════════════════════════════
+
+// media.provider 扩展点的载荷。
+message MediaProviderBundle {
+  // 全局唯一。
+  string provider_key = 1;
+  string display_name = 2;
+  repeated ConfigField library_config_fields = 3;
+  // 非空且不重复，必须包含 REDIRECT 或 PROXY；首项为默认方式。
+  repeated PlaybackDelivery playback_deliveries = 4;
+  // 合并播放的封装格式；声明 CAPABILITY_MERGED_PLAYBACK 时必填。
+  optional MergedPlaybackFormat merged_playback_format = 5;
+  // 下载组件的配置字段；声明 CAPABILITY_DOWNLOAD 时必填。
+  repeated ConfigField download_config_fields = 6;
+  // 数据面端点（可选）。声明后宿主会用它拉取 proxy 播放与转存字节流，
+  // 避免为「只有 IO 的 provider」再实现一遍 gRPC 字节流。
+  optional string data_plane_endpoint = 7;
+}
+
+// catalog.metadata_source 扩展点的载荷。
+message MetadataSourceExtension {
+  // 仅声明；实际取数由插件在 MetadataSourceExtensionService 中实现。
+  bool placeholder = 1;
+}
+
+// discovery.ranking_source 扩展点的载荷。
+message RankingBoard {
+  string board_key = 1;
+  string display_name = 2;
+  // **静态**周期集合（如 daily / weekly / monthly）。空数组意味着「只有总榜」，
+  // 不是「未知」—— 与宿主的 `RankingBoardDefinition::supported_periods` 同语义。
+  //
+  // 动态周期（TOP250 的年份逐年滚动）**不在这里**：它随年份变化、且还要看账号
+  // 是否配置，注册期给不出来。那种榜单把本字段留空并置 `dynamic_periods = true`，
+  // 周期由 `ResolveRankingPeriods` 在同步时（或读侧要展示时）现算。
+  repeated string supported_periods = 3;
+  // 未指定周期时用哪个。上游 `RankingBoardDefinition.default_period`。
+  // 有静态周期时**必须**是其中之一；动态周期的榜单给它的代表值（如 TOP250 的 "all"）。
+  string default_period = 4;
+  // 周期是否需要问 `ResolveRankingPeriods` 才知道。
+  //
+  // 上游的判据是「`supported_periods_provider is not None`」—— 本字段就是它的
+  // 对等物。为 `true` 时宿主**不能**只按 `supported_periods` 判周期合法性
+  // （那会把历史年份判成不支持），要放行任意非空周期并交给插件裁决。
+  bool dynamic_periods = 5;
+}
+
+message RankingSourceExtension {
+  // 全局唯一。
+  string source_key = 1;
+  repeated RankingBoard boards = 2;
+}
+
+message Extension {
+  // 取值对应 Python 的三个扩展点 key。
+  string key = 1;
+  oneof data {
+    MediaProviderBundle media_provider = 2;
+    MetadataSourceExtension metadata_source = 3;
+    RankingSourceExtension ranking_source = 4;
+  }
+}
+
+// 后台任务定义。Python 侧是 JobDefinition(task_key, log_name, cli_name,
+// cli_help, default_cron, manual_only, params_schema, handler)。
+message JobDefinition {
+  // 在全部内建任务与插件任务中唯一。
+  string task_key = 1;
+  string log_name = 2;
+  string cli_name = 3;
+  string cli_help = 4;
+  // 五段式 cron。宿主负责解析与调度，插件不再自带 cron 库。
+  string default_cron = 5;
+  // true 时只能由任务中心或 CLI 手动触发，不参与定时调度。
+  bool manual_only = 6;
+  // 参数的 JSON Schema；用于 CLI 与任务中心的表单渲染。
+  optional google.protobuf.Struct params_schema = 7;
+  // 声明该任务需要的能力，宿主据此做兼容性检查。
+  repeated Capability required_capabilities = 8;
+}
+
+message SettingsField {
+  string key = 1;
+  string label = 2;
+  string input = 3;  // text | secret | path
+  bool required = 4;
+  optional string description = 5;
+  bool multiline = 6;
+  optional string hint = 7;
+  // 字段默认值。设置值都是字符串（input = text | secret | path），所以
+  // default 也是字符串；缺省 = 该字段没有默认值（defaults 里不含它）。
+  optional string default = 8;
+}
+
+message RegisterRequest {
+  // 进程启动时由宿主注入，插件需原样回显。
+  string plugin_id = 1;
+  // ABI 主版本。不兼容变更时递增，宿主据此拒绝加载。
+  int32 abi_major = 2;
+}
+
+message RegisterResponse {
+  // 必须与 manifest 声明一致，否则视为加载失败。
+  string plugin_id = 3;
+  string display_name = 4;
+  string version = 5;
+  // 宿主启动时提供的 ABI 版本，插件声明的 min_abi_major 不得高于它。
+  int32 abi_major = 6;
+  repeated Capability capabilities = 7;
+  repeated Extension extensions = 8;
+  repeated JobDefinition jobs = 9;
+  // 声明 settings_model 时，宿主用这份 schema 渲染配置表单并校验保存。
+  repeated SettingsField settings_schema = 10;
+  // 数据面端点（gRPC），插件用它暴露大文件读写。
+  optional string data_plane_endpoint = 11;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 任务执行
+// ══════════════════════════════════════════════════════════════════
+
+message RunJobRequest {
+  // 本次执行的唯一 id，插件用它关联 task_run 记录。
+  string run_id = 1;
+  string task_key = 2;
+  // params 对应 JobDefinition.params_schema。
+  google.protobuf.Struct params = 3;
+  // 插件 data_dir 的绝对路径；宿主保证可读写且重装插件时保留。
+  string data_dir = 4;
+}
+
+message JobEvent {
+  oneof event {
+    ProgressEvent progress = 1;
+    // 终态摘要，结构与 Python 侧任务的 result dict 对齐。
+    google.protobuf.Struct result = 2;
+  }
+}
+
+message RunJobResponse {
+  // 任务的最终结果；与最后一个 JobEvent.result 相同，便于非流式调用方。
+  google.protobuf.Struct result = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 元数据来源扩展点
+// ══════════════════════════════════════════════════════════════════
+
+message FetchMovieRequest {
+  string movie_number = 1;
+  // 宿主为本次请求分配的临时目录；元数据图片必须落在其中。
+  string delivery_dir = 2;
+}
+
+message MetadataActor {
+  string name = 1;
+  repeated string alias_names = 2;
+}
+
+message FetchMovieResponse {
+  // 未收录时返回空响应（not found），宿主会尝试下一个来源。
+  bool found = 1;
+  string movie_number = 2;
+  string title = 3;
+  // 严格 YYYY-MM-DD。
+  string release_date = 4;
+  int32 duration_minutes = 5;
+  // 已下载到 delivery_dir 的封面本地路径，不是 URL。
+  string cover_image_path = 6;
+  optional string summary = 7;
+  optional string maker_name = 8;
+  optional string director_name = 9;
+  optional string series_name = 10;
+  repeated MetadataActor actors = 11;
+  repeated string tag_names = 12;
+  // 剧情图本地路径列表。
+  repeated string plot_image_paths = 13;
+  optional string source_url = 14;
+  optional string source_id = 15;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 排行榜来源扩展点
+// ══════════════════════════════════════════════════════════════════
+
+message FetchRankingRequest {
+  string board_key = 1;
+  // 与 Python 侧 period 语义一致（如 "daily" / "weekly"）。
+  string period = 2;
+}
+
+message FetchRankingResponse {
+  // 番号列表，顺序即排名。
+  repeated string movie_numbers = 1;
+}
+
+// 周期解析：把「这个榜此刻要抓哪些周期」这件事**留给插件**。
+//
+// 上游是 `should_fetch(period, has_items)` 回调（`ranking_service.py:36`），
+// 判据里既有插件自己的配置（TOP250 没配账号就不抓），也有宿主的库状态
+// （历史年份已有条目就不重抓 —— 否则 TOP250 每天要重拉 20×250 条）。
+// 回调过不了 gRPC，所以把它拆成「宿主提供 has_items，插件给最终列表」。
+message ResolveRankingPeriodsRequest {
+  // 服务实例已绑插件，board_key 在插件内唯一 —— 与 FetchRanking 同一条约定。
+  string board_key = 1;
+  // 宿主已知的「该榜这些周期已经有条目了」，供插件做历史周期判断。
+  repeated string periods_with_items = 2;
+}
+
+message ResolveRankingPeriodsResponse {
+  // 本次**真正要抓**的周期，顺序即抓取顺序。
+  // 空数组 = 本次不抓（如账号未配置），是正常结果不是错误。
+  repeated string periods = 1;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// Service 定义（由插件实现）
+// ══════════════════════════════════════════════════════════════════
+
+// 插件在启动后由宿主调用一次，用于声明能力。
+service PluginControl {
+  // 注册。注册阶段只应构造声明与校验本地配置：不要联网、
+  // 不要创建外部目录、不要启动后台线程。
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // 执行一个后台任务。宿主按 cron 或人工触发调用。
+  // 实现必须支持取消：宿主会在超时或重启时直接断开流。
+  rpc RunJob(RunJobRequest) returns (stream JobEvent);
+}
+
+// catalog.metadata_source 扩展点。仅在声明对应 capability 时才会被调用。
+service MetadataSourceExtensionService {
+  // 宿主先查 JavDB，仅在明确未收录时才按 plugins.enabled 顺序调用本服务。
+  // 回调内部不得再调用 import_movie_by_number，否则会重入兜底链路。
+  rpc FetchMovie(FetchMovieRequest) returns (FetchMovieResponse);
+}
+
+// discovery.ranking_source 扩展点。
+service RankingSourceExtensionService {
+  rpc FetchRanking(FetchRankingRequest) returns (FetchRankingResponse);
+
+  // 问插件「这个榜此刻要抓哪些周期」。宿主在同步前逐个榜调用。
+  rpc ResolveRankingPeriods(ResolveRankingPeriodsRequest)
+      returns (ResolveRankingPeriodsResponse);
+}
+

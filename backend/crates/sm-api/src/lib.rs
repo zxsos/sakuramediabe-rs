@@ -1,0 +1,113 @@
+//! axum 路由层。
+//!
+//! # 本批交付什么
+//!
+//! 骨架四件套，目的是让 `sm-service` 里已完成的业务规则**第一次能被 HTTP
+//! 触达并端到端验证**：
+//!
+//! | 件 | 位置 | 对齐上游 |
+//! |---|---|---|
+//! 错误信封 → 响应 | [`error::ErrorResponse`] | `src/api/exception/exception.py:29-73` |
+//! 鉴权提取器 | [`auth::CurrentUser`] | `src/service/system/auth_service.py:111-128` |
+//! CORS | [`router`] | `src/api/app.py:83-89`（`allow_* = ["*"]`） |
+//! 路由 | [`routes::auth`] | `src/api/routers/system/auth.py` |
+//! 路由 | [`routes::playlists`] | `src/api/routers/collections/playlists.py` |
+//!
+//! # 鉴权不是一个开关
+//!
+//! 端点分三类，**逐个 handler 显式声明**，不要靠 router 级 layer 悄悄生效：
+//!
+//! | 类 | 例子 | 写法 |
+//! |---|---|---|
+//! 需要 JWT | `/playlists/*`、`/auth/token-refreshes` | handler 带 `CurrentUser` 参数 |
+//! 不需要鉴权 | `/auth/tokens`、`/auth/docs-token` | 无 `CurrentUser` 参数 |
+//! **旁路签名** | `/files/*`、`/media/{id}/play/{path}` | `sm_core::signing`，不是 JWT |
+//!
+//! # 尚未接入（不要以为已经好了）
+//!
+//! - **SSE**：13 个事件 / 3 个流，用 axum 自带 `response::sse`，未接。
+//! - **`/media/{id}/play/{path}` 签名路由**：`sm_core::signing` 与 403 的
+//!   三个错误码已就位（见 [`error::ErrorResponse`] 的 `From<SignatureError>`），
+//!   但这条**旁路签名**要读 provider 的 `playback_deliveries`，属插件 ABI 那批，
+//!   仍未接。⚠️ `/files/*` 那条**已经接了**（见下），别一起列成缺失。
+//! - **multipart**：✅ 已有**运行时**调用它的路由 —— `routes::plugins` 的
+//!   install / upgrade 两个上传端点。它们走的是 [`extract::receive_to_file`]
+//!   （流式落盘，100 MiB 插件包不能全缓冲），而不是 [`extract::Multipart`]
+//!   的 8 MiB 全缓冲路径；后者仍只服务图片那类小文件（图搜端点待接）。
+//!
+//! # 已闭合的坑（别再写成缺口）
+//!
+//! **405 走信封**：axum 的方法不匹配不经过 router fallback，所以每条
+//! `MethodRouter` 都挂了 [`routes::method_not_allowed`]，回归测试见
+//! `tests/method_not_allowed_http.rs`。
+//!
+//! **`/files/*` 签名旁路已接**：`/files/images/{*path}` 与
+//! `/files/subtitles/{subtitle_id}` 都已落地（见 [`routes::files`]）——
+//! 别再把它列进「尚未接入」。留着的只有 `/media/{id}/play/{path}`。
+//!
+//! **form 提取器已用上**：`crate::extract::Form`（保留错误信封）由
+//! `/auth/docs-token` 使用 —— axum 原生 `Form` 的 415/422 是纯文本。
+
+#![forbid(unsafe_code)]
+
+pub mod auth;
+pub mod config;
+pub mod dto;
+pub mod error;
+pub mod extract;
+pub mod middleware;
+pub mod query;
+pub mod range;
+pub mod routes;
+pub mod signing;
+pub mod sse;
+pub mod state;
+
+pub use auth::CurrentUser;
+pub use error::{not_found, ErrorResponse};
+pub use state::AppState;
+
+use axum::Router;
+use tower_http::cors::CorsLayer;
+
+/// 装配完整路由。
+///
+/// `with_state` 放最后：先合并业务路由、再挂 fallback、再套 CORS 层，
+/// 顺序决定了 fallback 是否也享受 CORS —— 上游 CORS 是全站生效的。
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .merge(routes::account::routes())
+        .merge(routes::activity::routes())
+        .merge(routes::actors::routes())
+        .merge(routes::auth::routes())
+        .merge(routes::clip_collections::routes())
+        .merge(routes::config::routes())
+        .merge(routes::download_clients::routes())
+        .merge(routes::download_tasks::routes())
+        .merge(routes::downloads::routes())
+        .merge(routes::files::routes())
+        .merge(routes::image_search::routes())
+        .merge(routes::indexer_settings::routes())
+        .merge(routes::jobs::routes())
+        .merge(routes::media_clips::routes())
+        .merge(routes::media::routes())
+        .merge(routes::media_import::routes())
+        .merge(routes::media_libraries::routes())
+        .merge(routes::media_playback::routes())
+        .merge(routes::media_points::routes())
+        .merge(routes::media_transfer::routes())
+        .merge(routes::movie_subscriptions::routes())
+        .merge(routes::movies::routes())
+        .merge(routes::moment_collections::routes())
+        .merge(routes::playlists::routes())
+        .merge(routes::plugins::routes())
+        .merge(routes::ranking_sources::routes())
+        .merge(routes::recommendations::routes())
+        .merge(routes::status::routes())
+        .merge(routes::video_collections::routes())
+        .merge(routes::videos::routes())
+        .merge(routes::tags::routes())
+        .fallback(error::not_found)
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}

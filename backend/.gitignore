@@ -1,0 +1,32 @@
+target/
+
+# Cargo.lock 必须提交：这是产二进制的 workspace，lockfile 是供应链基线
+# （配合 cargo audit）。只有纯 library crate 才该忽略它。
+
+# Python bytecode from the parity tooling
+__pycache__/
+*.pyc
+
+# 上游 Python 源码。clone 下来只做对译时的参照，不入库。
+#
+# **不带尾部斜杠**：pattern 末尾的 `/` 只匹配**目录**，而 git worktree 里为了
+# 共享同一份上游源码（它是只读参照材料，共享不可能冲突）会建一个**符号链接**
+# —— git 视为文件，于是 `upstream/` 匹配不到，它会以 `?? upstream` 出现在
+# `git status` 里，并在下一次 `git add -A` 时被提交进去。
+upstream
+
+# 并行开发的 git worktree（各自独立分支 + 独立 target 目录）
+.worktrees/
+
+# 跨 CodeBuddy 实例的协作通道（本地交换用，不入库）
+.bridge/
+
+# 编辑器产生的回收站目录
+.Trash-*/
+
+# CodeBuddy 的项目数据目录（IDE 生成，不入库）
+.codebuddy/
+
+# 本地手工联调用的临时工作目录（跑完即删，不入库）。
+# 典型内容：临时 config.toml、插件包、灌库 SQL、造包的 python 脚本。
+.tmp-*/

@@ -1,0 +1,19 @@
+[package]
+name = "sm-db"
+version = "0.1.0"
+edition.workspace = true
+description = "sqlx 连接池与 Peewee 实体映射（schema 完全保留，零数据迁移）"
+
+[dependencies]
+sm-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# tests/ 下的集成测试是独立二进制，需要自己的 tokio 运行时。
+tokio = { workspace = true }

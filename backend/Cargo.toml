@@ -1,0 +1,246 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hashing",
+    "crates/media-file-hash",
+    "crates/svc-hash",
+    "crates/svc-image",
+    "crates/svc-probe",
+    "crates/parity-cli",
+    "crates/plugin-ref-local",
+    "crates/plugin-javdb-ranking",
+    "crates/plugin-actor-metadata",
+    "crates/plugin-judge-collection",
+    "crates/plugin-more-movies",
+    "crates/plugin-scrape-translate",
+    "crates/plugin-subtitlecat",
+    "crates/plugin-javbus-metadata",
+    "crates/plugin-115-provider",
+    "crates/sm-core",
+    "crates/sm-db",
+    "crates/sm-plugin-api",
+    "crates/sm-plugins",
+    "crates/sm-service",
+    "crates/sm-api",
+    "crates/sm-scheduler",
+    "crates/sm-server",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+hashing = { path = "crates/hashing" }
+media-file-hash = { path = "crates/media-file-hash" }
+svc-hash = { path = "crates/svc-hash" }
+svc-image = { path = "crates/svc-image" }
+svc-probe = { path = "crates/svc-probe" }
+plugin-ref-local = { path = "crates/plugin-ref-local" }
+plugin-javdb-ranking = { path = "crates/plugin-javdb-ranking" }
+plugin-javbus-metadata = { path = "crates/plugin-javbus-metadata" }
+plugin-actor-metadata = { path = "crates/plugin-actor-metadata" }
+plugin-115-provider = { path = "crates/plugin-115-provider" }
+plugin-judge-collection = { path = "crates/plugin-judge-collection" }
+plugin-more-movies = { path = "crates/plugin-more-movies" }
+plugin-scrape-translate = { path = "crates/plugin-scrape-translate" }
+plugin-subtitlecat = { path = "crates/plugin-subtitlecat" }
+sm-core = { path = "crates/sm-core" }
+sm-db = { path = "crates/sm-db" }
+sm-plugin-api = { path = "crates/sm-plugin-api" }
+sm-plugins = { path = "crates/sm-plugins" }
+sm-service = { path = "crates/sm-service" }
+sm-api = { path = "crates/sm-api" }
+sm-scheduler = { path = "crates/sm-scheduler" }
+
+# 契约层：客户端是 Flutter，API 契约必须逐字节不变
+# 126 端点 / 156 DTO / 80 枚举 / SSE 13 事件 / 错误信封 {error:{code,message,details}}
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 异步运行时（替代 asyncio + uvicorn）
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP 服务（替代 FastAPI / starlette）
+# multipart：上传（插件 zip / 图片）。提取器在 sm-api::extract，
+# 对齐上游 FastAPI 的 `UploadFile = File(...)`。
+axum = { version = "0.8", features = ["multipart"] }
+# 重复 query 参数（`?state=a&state=b`）只靠 axum 自带的 `Query` 解析不了：
+# 它走 `serde_urlencoded`，而后者把「字段期待序列」直接转发成 `visit_str`。
+# 上游 `GET /download-tasks` 的 `state` 就是 `list[str]`，所以那条路由需要
+# `query` 特性提供的 `axum_extra::extract::Query`（内部是 `serde_html_form`）。
+axum-extra = { version = "0.10", features = ["query"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors"] }
+# 读取响应体（集成测试断言用）
+http-body-util = "0.1"
+
+# 数据库（替代 Peewee 4.5）：schema 完全保留，只做查询不引迁移框架
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "json", "chrono", "uuid"] }
+
+# gRPC 插件 ABI（替代进程内 Python import）
+tonic = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+
+# 向量库客户端（替代 Python qdrant-client）。与 tonic/prost 同一套 gRPC 栈，
+# 版本精确一致（Cargo.lock 里不会因此出现第二份 tonic/prost）。
+# 它唯一的必需增量是 `derive_builder`。
+qdrant-client = "1.19"
+
+# HTTP 客户端（替代 httpx）
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart", "form", "query"] }
+
+# 时间与标识
+chrono = { version = "0.4", features = ["serde"] }
+# `v5`：JavDB 登录的设备指纹 `device_uuid` 是 `uuid5(固定命名空间, 账号名)`
+# （上游 `_device_payload`，`javdb.py:503-506`）—— 同账号每次登录必须是同一个
+# 设备标识，自己拼 sha1 会有抄错版本位/变体位而「看起来像但不相等」的风险。
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+# 认证（替代 python-jose + bcrypt）
+#
+# JWT 是 sm-core 自实现的 HS256（见 crates/sm-core/src/jwt.rs），
+# **不引入 jsonwebtoken**：上游 payload 只有 sub/type/exp 三个 claim，
+# 引入一个完整 JOSE 实现换不来对等的收益，反而多一份要审计的密码学代码。
+argon2 = "0.6"
+# 只用于**验证**存量 bcrypt 哈希（迁移路径），写侧仍是 Argon2id。
+# 纯 Rust：blowfish 由 cipher 实现，交叉编译与离线 NAS 构建不受影响。
+bcrypt = "0.19"
+# `getrandom` 而非 `rand_core`：password-hash 0.6 的 `rand_core` 指向 rand_core 0.10，
+# 该版本不再提供 `OsRng`（已迁到 `rand` crate），手动造盐的那条路走不通。
+# 开 `getrandom` 后 `PasswordHasher::hash_password` 自带随机盐，语义等价且更短。
+password-hash = { version = "0.6", features = ["getrandom"] }
+rand = "0.8"
+
+# 调度（替代 APScheduler）
+# ADR §2/§3.1：`tokio-cron-scheduler` 自带 job store 与执行器，会与 DB 持久
+# 队列形成两套状态源，已被 `cron` + 自研 tick 取代（见 crates/sm-scheduler）。
+# 这里只留表达式解析：到点判定在 tick，领取与租约在 worker。
+#
+# ADR §6 还列了 `tokio-util` 与 `tracing-appender`：前者**故意不加** ——
+# SSE 用 axum 自带的 `response::sse::{Event,Sse,KeepAlive}`，优雅关闭用
+# `axum::serve(...).with_graceful_shutdown(...)`，两处都不需要它，而不使用的
+# 依赖声明就是 ADR §6 所说的幽灵配置。
+cron = "0.17"
+# 日志落盘（替代 logging.handlers.RotatingFileHandler），仅 release 组合根启用
+tracing-appender = "0.2"
+
+# 配置（替代 pydantic-settings + toml）
+#
+# 刻意**不**用 `config` crate：它给的是「扁平键 + 环境变量覆盖」，而本仓库要的
+# 恰恰是「按 sm_core::config_schema 的 `节.字段` 结构读」，默认值的唯一来源是
+# 那张模式表。环境变量那层由 sm-server::config 自己处理（键名是既有部署契约，
+# 不能动）。曾用过它，代价是 `database.url` 的默认值出现了第二份字面量，且已经
+# 与上游漂移（`/sakuramedia` vs `/sakuramediabe`）。
+# toml：与上面那个**不是**重复依赖，分工不同。
+#   - `config` 在**进程启动**时读配置，要支持环境变量覆盖（上游
+#     pydantic-settings 的 env 优先级），只有它做得到；
+#   - `toml` 在**运行期**读写配置文件（`ConfigService::update` 的原子写盘
+#     与「每次 PATCH 重读磁盘快照」），这里要的是精确控制序列化形状 ——
+#     `config` 是只读库，且 `to_string_pretty` 的输出会被运维直接阅读。
+# 要合并成一个的话，得给 `config` 加写回能力，那是它刻意不提供的方向。
+toml = "0.9"
+
+# 编码与解析（替代 Python 内建）
+base64 = "0.23"
+percent-encoding = "2"
+url = "2"
+regex = "1"
+# JavDB API 的 jdsignature（more-movies 插件，上游 javdb.py:_get_sign 的 md5）。
+md5 = "0.8"
+# 进程内插件的本地状态（scrape-translate 插件，上游 state.py 的 sqlite3）。
+# bundled：纯 Rust 构建，离线 NAS 编译不受影响。
+# 与 plugin-actor-metadata 对齐（0.37）：`links = "sqlite3"` 全 workspace
+# 只能出现一份，版本必须一致。
+rusqlite = { version = "0.37", features = ["bundled"] }
+# HTML 字符引用解码（scrape-translate 插件，上游 html.unescape）。
+html-escape = "0.2"
+# run_job 的进度流（scrape-translate 插件）。
+async-stream = "0.3"
+# 番号资产目录的分片名（`movies/<sha1 前 2 位>/<番号>`）。
+#
+# **必须是 SHA-1**：分片名要上游算出来一模一样，否则同一部影片在迁移后的
+# 数据目录里会散到两个分片下（找不到既有图片，等于全丢）。
+# 这不是「选个哈希都行」的场合 —— SHA-256 会算出完全不同的分片。
+sha1 = "0.10"
+# XML（Torznab 搜索响应）。替代上游的 xmltodict。
+quick-xml = "0.42"
+
+# ZIP 容器。**两类用法，对压缩特性的要求相反**：
+#
+# 1. **写**影片图片包 `assets.zip` / 缩略图包 `thumbnails.zip` —— 只用 **STORED**
+#    （只打包不压缩）：图片（webp/jpg）本身已是压缩格式，deflate 几乎不省空间
+#    却要花 CPU，而这里的场景是局域网内传输，CPU 比空间贵。
+# 2. **读**插件包（`sm-plugins::installer`）—— 那是**第三方打的 zip**，
+#    绝大多数用 deflate。没有这个特性时读它会报「不支持的压缩方式」，
+#    而插件作者不会为此改用 STORED。
+#
+# 所以 `default-features = false` 仍然是**硬要求**（默认特性会把 bzip2 /
+# aes-crypto / deflate64 / lzma / zstd 一整套拖进来，其中 bzip2 是 C 绑定），
+# 但**必须显式开一个 deflate 实现**，否则读压缩包会报「不支持的压缩方式」。
+#
+# 选 `deflate-flate2-zlib-rs` 而不是 `deflate`：后者 = `deflate-zopfli` +
+# `deflate-flate2-zlib-rs`，而 **zopfli 是压缩器**（写包时换更小的体积），
+# 本仓只读别人的包，白拖一个依赖。
+#
+# 也**不能**只用 `deflate-flate2`：它只 `dep:flate2` 而不给 flate2 任何后端
+# （zip 的 `flate2` 依赖带 `default-features = false`），于是 flate2 缺
+# `crc32fast` 直接编译失败。`-zlib-rs` 这一支把后端补上，且 `zlib-rs` 是
+# 纯 Rust 实现（不是 C 的 zlib）。
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# 系统信息（替代 psutil）：遥测心跳的 CPU 型号与内存总量。
+#
+# 版本照 ADR `2026-10-04-tech-selection.md` 选定的 0.39.6。
+# `default-features = false` 是硬要求：默认特性 = component + disk + network +
+# system + user，而本仓只用 `System`（CPU + 内存）—— 多开的四类会拖进
+# WMI / objc2-io-kit / objc2-open-directory 等平台绑定，与「纯 Rust、离线可编」冲突。
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# 图像（替代 Pillow + OpenCV）
+#
+# `default-features = false` 是硬要求：默认特性 = rayon + default-formats，
+# 而 default-formats 里的 avif 会拖进 ravif/rgb -> dav1d（AV1 解码的 C 绑定），
+# 与「纯 Rust、NAS 离线可编」冲突。只开实际用到的三种格式：
+#   jpeg -> zune-jpeg（纯 Rust）  png -> png（纯 Rust）  webp -> image-webp（纯 Rust）
+# 封面书脊检测的 Sobel 是自写的（crates/svc-image），不引 imageproc ——
+# 后者会拖进 nalgebra / rayon / rustdct，为 40 行卷积不值得。
+#
+# `apply_orientation`（EXIF 方向转正，`normalize_image_search_query` 要用）
+# 在 0.25 里是**无条件可用**的 —— 核实过它的 features 表，没有 `exif` 这个
+# feature（0.26 才把它拆出来），所以这里不需要为它开任何东西。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# dev（`cargo test` / `cargo check` / `cargo clippy`）默认 `debug = true`，而 MSVC 下
+# 每个二进制/库各写一份**独立的 .pdb** —— 这个仓有 60+ 个集成测试目标，实测
+# `target/debug/deps` 里 `.pdb` 占 **40GB**（`.rlib` 才 16GB），并且把 C: 顶到
+# 只剩 0.01GB、`link.exe` 直接开始报错。
+#
+# `line-tables-only` 保留**行号**（回溯里能看到「哪一行」），丢掉变量值/表达式信息。
+# 需要完整符号时临时 `CARGO_PROFILE_DEV_DEBUG=2 cargo test`（会另建一套指纹，
+# 于是又要一份全量产物 —— 别常态化）。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+# 服务端二进制不需要 unwind：panic 即进程退出，由 supervisor 重启。
+# 只作用于 release，`cargo test`（dev profile）仍是 unwind，不受影响。
+panic = "abort"

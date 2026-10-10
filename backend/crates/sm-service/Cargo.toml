@@ -1,0 +1,73 @@
+[package]
+name = "sm-service"
+version = "0.1.0"
+edition.workspace = true
+description = "业务逻辑层，对应 Python 的 114 个 service 文件"
+
+[dependencies]
+sm-core = { workspace = true }
+# 运行期读写配置文件（ConfigService 的原子写盘与重读磁盘快照）
+toml = { workspace = true }
+sm-db = { workspace = true }
+# 插件**契约层**（proto 生成物 + 交付校验 + 错误码）。刻意只依赖契约、
+# 不依赖 `sm-plugins`（宿主实现）：那是 ADR `2026-10-06-plugin-architecture.md`
+# 定的分层 —— 业务层能校验交付、判错误码，但不必拉起整个插件栈。
+sm-plugin-api = { workspace = true }
+# 刻意**不**依赖 sm-plugins：源码里没有任何 `sm_plugins::` 引用，而这一行
+# 会把依赖方向锁死 —— 插件任务要接 cron 触发，需要 `sm-plugins → sm-scheduler
+# → sm-service → sm-plugins` 不成环。等 service 层真要调插件时再按那时的
+# 分层加回来（ADR §6：不使用的依赖声明就是幽灵配置）。
+media-file-hash = { workspace = true }
+svc-hash = { workspace = true }
+chrono = { workspace = true }
+# 图搜会话 id：上游是 `uuid.uuid4().hex`（32 位无连字符十六进制）。
+uuid = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `discovery::qdrant` 的 upsert 重试要用 `tokio::time::sleep` 做退避。
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# `playback::proxy` 要把 reqwest 的 `bytes_stream()`（`stream` feature）重新装箱成
+# `Stream<Item = Result<Vec<u8>, _>>`，让上层不必为了拿字节而依赖 reqwest。
+futures = { workspace = true }
+# discovery 域的向量库存储层。Qdrant 走 gRPC，与插件 ABI 共用同一套 tonic/prost。
+qdrant-client = { workspace = true }
+# 影片相似度的别名**原子**切换要用生成的 gRPC stub：Qdrant 封装的
+# update_aliases 是私有的，且即使公开也只接受单个 action，表达不了上游要的
+# 「删旧 + 挂新同一请求」。lock 里已是同版本，不引入第二套 gRPC 栈。
+tonic = { workspace = true }
+url = { workspace = true }
+regex = { workspace = true }
+sqlx = { workspace = true }
+# Torznab 搜索响应是 XML。
+quick-xml = { workspace = true }
+# 番号目录分片名要 SHA-1（与上游一致，见根 Cargo.toml）。
+sha1 = { workspace = true }
+# 字幕指纹：`subtitle_asset` 要按内容算 SHA-256，而文件可能很大 —— 用本仓
+# `crates/hashing` 的**流式** `Sha256`（1 MiB 一块，照上游 `_sha256_file`），
+# 不把整个文件读进内存。同一个 crate 也提供 `hex`，不必再引十六进制编码依赖。
+hashing = { workspace = true }
+# 宿主侧图像原语：缩略图校验要 `is_webp`，读尺寸要 `decode`。
+svc-image = { workspace = true }
+# `ImageTasksBuilder` trait 需要 async 方法（`Box<dyn>` 对象安全）。
+async-trait = { workspace = true }
+svc-probe = { workspace = true }
+# 图片包（`assets.zip` / `thumbnails.zip`）：只写/读 STORED 条目，见根 Cargo.toml。
+zip = { workspace = true }
+# 遥测心跳的 CPU 型号与内存总量（替代上游 psutil 的 `virtual_memory().total`）。
+sysinfo = { workspace = true }
+
+[dev-dependencies]
+sm-db = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bcrypt = { workspace = true }
+sqlx = { workspace = true }
+# 集成测试（tests/）只链接 dev-dependencies，拿不到普通依赖里的 reqwest。
+# `embedding_http.rs` 要用 `reqwest::Client::builder().no_proxy()` 构造注入的
+# 客户端 —— no_proxy 是契约的一部分（见 TorznabClient 同款理由），不能省。
+reqwest = { workspace = true }
+# Torznab 的 HTTP 路径用假 indexer 起真实回环服务测（ADR §6）。
+wiremock = "0.6"

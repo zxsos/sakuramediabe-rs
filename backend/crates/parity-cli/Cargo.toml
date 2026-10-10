@@ -1,0 +1,20 @@
+[package]
+name = "parity-cli"
+version = "0.1.0"
+description = "对拍工具：把 Rust 实现的结果以 JSON 输出，供 Python 侧逐字段比对"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "parity-cli"
+path = "src/main.rs"
+
+[dependencies]
+hashing = { path = "../hashing" }
+media-file-hash = { path = "../media-file-hash" }
+svc-hash = { path = "../svc-hash" }
