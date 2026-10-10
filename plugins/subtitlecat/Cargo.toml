@@ -1,0 +1,52 @@
+[package]
+name = "plugin-subtitlecat"
+version = "0.1.0"
+description = "SubtitleCat 中文字幕插件：按番号抓取 zh-CN 字幕的 Rust 实现"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
+#
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖而不是
+# branch：按 branch 会让本插件与宿主静默漂移到不同版本的契约，症状是注册不上
+# 而不报错。
+#
+# tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+# 相对 URL 按搜索页基址解析（上游 urljoin）。
+url = "2"
+# 番号规范化用的正则（上游 _MOVIE_NUMBER_PATTERN）。
+regex = "1"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SRT 内容校验： prost Struct 构造 job 结果。
+prost-types = "0.14"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它
+# （见 sakuramediabe-rs 的 docs/adr/2026-10-05-plugin-lifecycle.md 第 5 节）。
+[[bin]]
+name = "sakuramedia_subtitlecat"
+path = "src/bin/sakuramedia_subtitlecat.rs"
+
+[dev-dependencies]
+# 页面交给本地假服务，测试不许联网。
+wiremock = "0.6"
+tokio = { version = "1", features = ["full"] }
