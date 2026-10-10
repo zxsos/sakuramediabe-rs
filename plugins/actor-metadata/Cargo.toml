@@ -1,0 +1,59 @@
+[package]
+name = "plugin-actor-metadata"
+version = "0.1.0"
+description = "SakuraMedia 女优资料补全插件：从 JavDB / MinnanoAV 补全演员资料的 Rust 实现"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# 独立仓库：不继承 workspace 的 lint 表，就地写死。
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# 契约只剩这一个后端依赖 —— 本仓库不依赖宿主实现。
+#
+# 契约仓在 **GitHub**（`zxsos/sakuramedia-plugin-api`），按 **tag** 依赖而不是
+# branch：按 branch 会让本插件与宿主静默漂移到不同版本的契约，症状是注册不上
+# 而不报错。
+#
+# tag 必须与宿主的 `ABI_MAJOR` 配套：宿主现为 2，所以用 v0.2.0。
+sm-plugin-api = { git = "https://github.com/zxsos/sakuramedia-plugin-api.git", tag = "v0.2.0" }
+
+tonic = "0.14"
+# BoxStream：RunJob 的流式返回类型被生成代码固定成它。
+futures = "0.3"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+# net：起真实 server 要 TcpListenerStream。
+tokio-stream = { version = "0.1", features = ["net"] }
+# HTTP（替代上游的 httpx）。
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+# 相对 URL 按基址解析（上游 urljoin）。
+url = "2"
+# 资料来源状态：SQLite（上游 state.py 的 actor_metadata.sqlite3）。
+rusqlite = { version = "0.37", features = ["bundled"] }
+# 任务并发锁（上游 portalocker.Lock(actor_metadata.lock)）。
+fs2 = "0.4"
+# 读宿主写好的配置文件（SAKURAMEDIA_PLUGIN_SETTINGS_FILE）。
+serde_json = "1"
+# JavDB API 签名（上游 hashlib.md5）。
+md-5 = "0.10"
+# 名字归一化的 NFKC（上游 unicodedata.normalize）。
+unicode-normalization = "0.1"
+# prost_types::Value 的构造（PatchActor 字段）。
+prost-types = "0.14"
+# 生日范围检查的今天（上游 date.today）。
+chrono = "0.4"
+
+# 插件的**可执行文件**：宿主按 `<root_dir>/<plugin_id>/<plugin_id>` 找它
+# （见 sakuramediabe-rs 的 docs/adr/2026-10-05-plugin-lifecycle.md 第 5 节）。
+[[bin]]
+name = "sakuramedia_actor_metadata"
+path = "src/bin/sakuramedia_actor_metadata.rs"
+
+[dev-dependencies]
+# 站点响应交给本地假服务，测试不许联网。
+wiremock = "0.6"
+tempfile = "3"
