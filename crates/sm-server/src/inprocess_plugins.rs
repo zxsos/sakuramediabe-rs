@@ -192,11 +192,18 @@ impl RankingGateway for InProcessRankingGateway {
 /// 进程内元数据网关。
 ///
 /// 直接调用 vendored 的 `plugin-javbus-metadata` 的 `Metadata` service，
-/// 不经过 gRPC。目前仅支持 `sakuramedia_javbus_metadata`。
+/// 不经过 gRPC。目前仅支持 javbus 插件（长短两种 id 都认，见
+/// [`JAVBUS_PLUGIN_IDS`]）。
 pub struct InProcessMetadataGateway {
     /// plugin_id -> settings JSON
     settings: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
+
+/// 网关支持的插件 id。长短两种都认：仓库里两种写法混用（tests 用 `"javbus"`，
+/// `plugins.rs` 的 `is_inprocess_plugin` 与插件二进制名用
+/// `"sakuramedia_javbus_metadata"`），生产配置的 `plugins.enabled` 用哪个只看
+/// 部署时的写法 —— 这里不赌，两个都认。
+const JAVBUS_PLUGIN_IDS: [&str; 2] = ["sakuramedia_javbus_metadata", "javbus"];
 
 impl InProcessMetadataGateway {
     pub fn new() -> Self {
@@ -212,12 +219,22 @@ impl InProcessMetadataGateway {
     }
 
     fn settings_for(&self, plugin_id: &str) -> serde_json::Value {
-        self.settings
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(plugin_id)
-            .cloned()
+        self.settings_opt(plugin_id)
             .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// 先按请求的 id 找，找不到再试另一个别名 —— `plugins.settings` 里写的是
+    /// 哪个 id，只看部署。
+    fn settings_opt(&self, plugin_id: &str) -> Option<serde_json::Value> {
+        let map = self.settings.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(value) = map.get(plugin_id) {
+            return Some(value.clone());
+        }
+        JAVBUS_PLUGIN_IDS
+            .iter()
+            .find(|id| **id != plugin_id)
+            .and_then(|alias| map.get(*alias))
+            .cloned()
     }
 }
 
@@ -231,7 +248,7 @@ impl Default for InProcessMetadataGateway {
 impl InProcessMetadataFetch for InProcessMetadataGateway {
     fn supports(&self, plugin_id: &str) -> bool {
         // 目前只有 javbus-metadata 实现了 MetadataSourceExtensionService。
-        plugin_id == "sakuramedia_javbus_metadata"
+        JAVBUS_PLUGIN_IDS.contains(&plugin_id)
     }
 
     async fn fetch_movie(
@@ -239,14 +256,14 @@ impl InProcessMetadataFetch for InProcessMetadataGateway {
         plugin_id: &str,
         request: FetchMovieRequest,
     ) -> Result<FetchMovieResponse, MetadataSourceError> {
-        if plugin_id != "sakuramedia_javbus_metadata" {
+        if !self.supports(plugin_id) {
             return Err(MetadataSourceError::Disabled(format!(
                 "进程内元数据网关不支持插件 {plugin_id}"
             )));
         }
 
-        // 从 settings 构造 JavBusSource。
-        let settings_value = self.settings_for("sakuramedia_javbus_metadata");
+        // 从 settings 构造 JavBusSource（带别名回退，见 settings_opt）。
+        let settings_value = self.settings_for(plugin_id);
         let settings = plugin_javbus_metadata::settings::Settings::from_json(&settings_value);
         let source = plugin_javbus_metadata::javbus::JavBusSource::new(&settings).map_err(|e| {
             MetadataSourceError::RequestFailed(format!("JavBusSource 初始化失败：{e}"))
@@ -267,5 +284,41 @@ impl InProcessMetadataFetch for InProcessMetadataGateway {
             }
         })?;
         Ok(response.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sm_service::catalog::metadata_source::InProcessMetadataFetch;
+
+    /// ★ 长短两种插件 id 都认：仓库里两种写法混用，生产配置用哪个只看部署。
+    #[test]
+    fn gateway_recognizes_both_plugin_id_spellings() {
+        let gateway = InProcessMetadataGateway::new();
+        assert!(gateway.supports("sakuramedia_javbus_metadata"));
+        assert!(gateway.supports("javbus"));
+        assert!(!gateway.supports("something-else"));
+    }
+
+    /// settings 按别名回退：配置里写的是哪个 id 只看部署，网关两边都找。
+    #[test]
+    fn settings_fall_back_to_the_alias_id() {
+        let mut map = HashMap::new();
+        map.insert(
+            "javbus".to_owned(),
+            serde_json::json!({"timeout_seconds": 8}),
+        );
+        let gateway = InProcessMetadataGateway::with_settings(map);
+        // 按长 id 查，配置里只有短 id —— 别名回退要命中。
+        assert_eq!(
+            gateway.settings_for("sakuramedia_javbus_metadata")["timeout_seconds"],
+            8
+        );
+        // 直接命中优先于别名。
+        assert_eq!(gateway.settings_for("javbus")["timeout_seconds"], 8);
+        // 两个都不在 → Null（插件按默认跑）。
+        let empty = InProcessMetadataGateway::new();
+        assert!(empty.settings_for("javbus").is_null());
     }
 }
