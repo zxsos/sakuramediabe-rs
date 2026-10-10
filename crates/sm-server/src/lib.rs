@@ -307,7 +307,12 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
             }
         };
         let metadata_source = Arc::new(
-            sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider),
+            sm_service::catalog::metadata_source::MetadataSourceService::new(sources, provider)
+                // 进程内优先：javbus-metadata 已 vendoring，直接调进程内版本，
+                // 不起进程、不走 gRPC。
+                .with_inprocess(std::sync::Arc::new(
+                    inprocess_plugins::InProcessMetadataGateway::new(),
+                )),
         );
         // 入库服务（元数据落地的唯一入口）：图片任务管线 + 真实下载器。
         let image_root = sm_service::catalog::media_paths::media_image_root_path(&config_service)

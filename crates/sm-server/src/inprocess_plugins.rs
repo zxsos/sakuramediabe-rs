@@ -15,8 +15,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use sm_plugin_api::v1::metadata_source_extension_service_server::MetadataSourceExtensionService;
 use sm_plugin_api::v1::ranking_source_extension_service_server::RankingSourceExtensionService;
-use sm_plugin_api::v1::{FetchRankingRequest, ResolveRankingPeriodsRequest};
+use sm_plugin_api::v1::{
+    FetchMovieRequest, FetchMovieResponse, FetchRankingRequest, ResolveRankingPeriodsRequest,
+};
+use sm_service::catalog::metadata_source::{InProcessMetadataFetch, MetadataSourceError};
 use sm_service::discovery::ranking::{RankingCallError, RankingGateway};
 
 /// 进程内排行插件网关。
@@ -182,5 +186,86 @@ impl RankingGateway for InProcessRankingGateway {
             })?;
             Ok(response.into_inner().periods)
         })
+    }
+}
+
+/// 进程内元数据网关。
+///
+/// 直接调用 vendored 的 `plugin-javbus-metadata` 的 `Metadata` service，
+/// 不经过 gRPC。目前仅支持 `sakuramedia_javbus_metadata`。
+pub struct InProcessMetadataGateway {
+    /// plugin_id -> settings JSON
+    settings: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+}
+
+impl InProcessMetadataGateway {
+    pub fn new() -> Self {
+        Self {
+            settings: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_settings(settings: HashMap<String, serde_json::Value>) -> Self {
+        Self {
+            settings: Arc::new(Mutex::new(settings)),
+        }
+    }
+
+    fn settings_for(&self, plugin_id: &str) -> serde_json::Value {
+        self.settings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl Default for InProcessMetadataGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[tonic::async_trait]
+impl InProcessMetadataFetch for InProcessMetadataGateway {
+    fn supports(&self, plugin_id: &str) -> bool {
+        // 目前只有 javbus-metadata 实现了 MetadataSourceExtensionService。
+        plugin_id == "sakuramedia_javbus_metadata"
+    }
+
+    async fn fetch_movie(
+        &self,
+        plugin_id: &str,
+        request: FetchMovieRequest,
+    ) -> Result<FetchMovieResponse, MetadataSourceError> {
+        if plugin_id != "sakuramedia_javbus_metadata" {
+            return Err(MetadataSourceError::Disabled(format!(
+                "进程内元数据网关不支持插件 {plugin_id}"
+            )));
+        }
+
+        // 从 settings 构造 JavBusSource。
+        let settings_value = self.settings_for("sakuramedia_javbus_metadata");
+        let settings = plugin_javbus_metadata::settings::Settings::from_json(&settings_value);
+        let source = plugin_javbus_metadata::javbus::JavBusSource::new(&settings).map_err(|e| {
+            MetadataSourceError::RequestFailed(format!("JavBusSource 初始化失败：{e}"))
+        })?;
+        let metadata = plugin_javbus_metadata::service::Metadata::new(source);
+
+        // 直接调用 trait 方法，不走 gRPC。
+        let tonic_request = tonic::Request::new(request);
+        let response = metadata.fetch_movie(tonic_request).await.map_err(|s| {
+            // 与 gRPC 路径的错误分类保持一致：
+            // DeadlineExceeded -> RequestFailed，其他 -> RequestFailed。
+            // `found=false` 的情况插件返回 Ok，由调用方判 NotFound。
+            match s.code() {
+                tonic::Code::DeadlineExceeded => {
+                    MetadataSourceError::RequestFailed("插件索取超时".to_owned())
+                }
+                _ => MetadataSourceError::RequestFailed(s.to_string()),
+            }
+        })?;
+        Ok(response.into_inner())
     }
 }

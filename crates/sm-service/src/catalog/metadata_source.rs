@@ -188,6 +188,22 @@ pub struct JavdbMovieListItem {
     pub cover_image: Option<String>,
 }
 
+/// 进程内元数据抓取。
+///
+/// 由宿主（sm-server）实现，直接调用 vendored 插件的 service，
+/// 不走 gRPC。`None` = 该插件不支持进程内调用，走 gRPC 路径。
+#[tonic::async_trait]
+pub trait InProcessMetadataFetch: Send + Sync {
+    /// 按插件 ID 判断是否支持进程内调用。
+    fn supports(&self, plugin_id: &str) -> bool;
+    /// 进程内执行 `FetchMovie`。
+    async fn fetch_movie(
+        &self,
+        plugin_id: &str,
+        request: sm_plugin_api::v1::FetchMovieRequest,
+    ) -> Result<sm_plugin_api::v1::FetchMovieResponse, MetadataSourceError>;
+}
+
 pub struct MetadataSourceService {
     /// 已注册且已启用的插件来源（顺序见 [`Self::enabled_plugin_sources`]）。
     sources: Vec<RegisteredSource>,
@@ -199,6 +215,9 @@ pub struct MetadataSourceService {
     /// 约束整条链都装不进去。实现方（`JavdbProvider`、测试替身）本来就是
     /// `Send + Sync` —— 约束写在这里，只是别让 trait 对象把它擦掉。
     provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
+    /// 进程内元数据抓取器（vendored 插件直接调用，不走 gRPC）。
+    /// `None` = 全部走 gRPC。
+    inprocess: Option<std::sync::Arc<dyn InProcessMetadataFetch>>,
 }
 
 /// 一个已注册的插件来源。
@@ -223,7 +242,20 @@ impl MetadataSourceService {
         sources: Vec<RegisteredSource>,
         provider: Option<Box<dyn MetadataProvider + Send + Sync>>,
     ) -> Self {
-        Self { sources, provider }
+        Self {
+            sources,
+            provider,
+            inprocess: None,
+        }
+    }
+
+    /// 设置进程内元数据抓取器（vendored 插件直接调用）。
+    pub fn with_inprocess(
+        mut self,
+        fetcher: std::sync::Arc<dyn InProcessMetadataFetch>,
+    ) -> Self {
+        self.inprocess = Some(fetcher);
+        self
     }
 
     /// 按宿主配置**过滤并排序**已注册的来源。
@@ -373,7 +405,19 @@ impl MetadataSourceService {
         };
         // 校验还要用 `request`（它带着 `delivery_dir` 这个边界），所以这里传副本
         // —— 一次 `FetchMovie` 只有两个小字段，克隆的代价远小于把边界再算一遍。
-        let response = fetch_from_plugin(&source.endpoint, request.clone()).await?;
+        //
+        // 进程内优先：vendored 插件直接调用，不走 gRPC。
+        let response = if let Some(fetcher) = &self.inprocess {
+            if fetcher.supports(&source.plugin_id) {
+                fetcher
+                    .fetch_movie(&source.plugin_id, request.clone())
+                    .await?
+            } else {
+                fetch_from_plugin(&source.endpoint, request.clone()).await?
+            }
+        } else {
+            fetch_from_plugin(&source.endpoint, request.clone()).await?
+        };
         // `found = false` 是「没收录」，不是失败 —— 上层据此试下一个来源。
         if !response.found {
             cleanup_delivery(&[]);
