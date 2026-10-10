@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --bin plugin-ref-local
+
+      - name: Create manifest
+        run: |
+          cat > manifest.json << 'MANIFEST'
+          {
+            "id": "plugin_ref_local",
+            "version": "${{ github.ref_name }}",
+            "entry": "plugin_ref_local",
+            "display_name": "Reference Local"
+          }
+          MANIFEST
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/plugin-ref-local dist/plugin_ref_local
+          cp manifest.json dist/
+          cd dist && zip -r ../plugin-ref-local-${{ github.ref_name }}.zip manifest.json plugin_ref_local
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: plugin-ref-local-${{ github.ref_name }}.zip
